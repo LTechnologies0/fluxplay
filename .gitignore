@@ -1,0 +1,18 @@
+/target
+**/*.rs.bk
+.DS_Store
+*.swp
+*.log
+
+# Secrets & local config (never commit)
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+credentials.json
+secrets/
+
+# Local FluxPlay state may contain portal credentials
+**/state.json
+fluxplay-state.json

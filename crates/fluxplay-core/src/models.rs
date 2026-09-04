@@ -1,0 +1,402 @@
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use uuid::Uuid;
+
+use crate::protocol::StreamScheme;
+
+/// How the user authenticates / discovers content.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceKind {
+    M3u,
+    M3uPlus,
+    Xtream,
+    Stalker,
+    Xmltv,
+    DirectUrl,
+}
+
+impl SourceKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::M3u => "M3U",
+            Self::M3uPlus => "M3U Plus",
+            Self::Xtream => "Xtream Codes",
+            Self::Stalker => "Stalker Portal",
+            Self::Xmltv => "XMLTV / EPG",
+            Self::DirectUrl => "URL directe",
+        }
+    }
+}
+
+/// Persisted IPTV source (playlist / portal / EPG).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MediaSource {
+    pub id: Uuid,
+    pub name: String,
+    pub kind: SourceKind,
+    pub endpoint: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
+    /// Never log this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub password: Option<String>,
+    /// Stalker MAC address (AA:BB:CC:DD:EE:FF).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mac: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub epg_url: Option<String>,
+    /// Per-playlist User-Agent (IPTVnator-style).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_agent: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub http_referer: Option<String>,
+    #[serde(default)]
+    pub auto_refresh: bool,
+    pub created_at: DateTime<Utc>,
+    #[serde(default = "default_source_enabled")]
+    pub enabled: bool,
+}
+
+fn default_source_enabled() -> bool {
+    true
+}
+
+impl MediaSource {
+    pub fn new(name: impl Into<String>, kind: SourceKind, endpoint: impl Into<String>) -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            name: name.into(),
+            kind,
+            endpoint: endpoint.into(),
+            username: None,
+            password: None,
+            mac: None,
+            epg_url: None,
+            user_agent: None,
+            http_referer: None,
+            auto_refresh: true,
+            created_at: Utc::now(),
+            enabled: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Channel {
+    pub id: String,
+    pub name: String,
+    pub stream_url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logo: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tvg_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tvg_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tvg_logo: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub epg_channel_id: Option<String>,
+    #[serde(default)]
+    pub scheme: Option<StreamScheme>,
+    #[serde(default)]
+    pub source_id: Option<Uuid>,
+    #[serde(default)]
+    pub kind: ContentKind,
+    /// Catch-up / archive (M3U Plus / IPTVnator).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub catchup: Option<CatchupInfo>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CatchupInfo {
+    pub mode: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub days: Option<u32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContentKind {
+    #[default]
+    Live,
+    Vod,
+    Series,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Category {
+    pub id: String,
+    pub name: String,
+    pub content: ContentKind,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VodItem {
+    pub id: String,
+    pub name: String,
+    pub stream_url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub poster: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plot: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub year: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rating: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub category_id: Option<String>,
+    pub source_id: Option<Uuid>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SeriesItem {
+    pub id: String,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cover: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub banner: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plot: Option<String>,
+    #[serde(default)]
+    pub seasons: Vec<SeriesSeason>,
+    pub source_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub category_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SeriesSeason {
+    pub season_number: u32,
+    pub episodes: Vec<SeriesEpisode>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SeriesEpisode {
+    pub id: String,
+    pub title: String,
+    pub stream_url: String,
+    pub episode_num: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EpgProgramme {
+    pub channel_id: String,
+    pub title: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    pub start: DateTime<Utc>,
+    pub stop: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub category: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PlaylistBundle {
+    pub channels: Vec<Channel>,
+    pub categories: Vec<Category>,
+    pub vod: Vec<VodItem>,
+    pub series: Vec<SeriesItem>,
+    pub epg: Vec<EpgProgramme>,
+}
+
+impl PlaylistBundle {
+    pub fn group_names(&self) -> Vec<String> {
+        let mut groups: Vec<String> = self
+            .channels
+            .iter()
+            .filter_map(|c| c.group.clone())
+            .collect();
+        groups.sort();
+        groups.dedup();
+        groups
+    }
+
+    pub fn live_in_group<'a>(&'a self, group: Option<&str>) -> Vec<&'a Channel> {
+        self.channels
+            .iter()
+            .filter(|c| c.kind == ContentKind::Live)
+            .filter(|c| match group {
+                None | Some("Tous") => true,
+                Some(g) => c.group.as_deref() == Some(g),
+            })
+            .collect()
+    }
+
+    /// Current + next programme for a channel (tvg-id / epg id / stream id match).
+    pub fn now_next(&self, channel: &Channel, at: DateTime<Utc>) -> (Option<&EpgProgramme>, Option<&EpgProgramme>) {
+        let keys: Vec<&str> = [
+            channel.epg_channel_id.as_deref(),
+            channel.tvg_id.as_deref(),
+            Some(channel.id.as_str()),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        let mut for_ch: Vec<&EpgProgramme> = self
+            .epg
+            .iter()
+            .filter(|p| keys.iter().any(|k| p.channel_id == *k))
+            .collect();
+        for_ch.sort_by_key(|p| p.start);
+        // Dedup identical start times (duplicate keys for stream id + tvg id).
+        for_ch.dedup_by(|a, b| a.start == b.start && a.title == b.title);
+        let now = for_ch.iter().copied().find(|p| p.start <= at && at < p.stop);
+        let next = for_ch.iter().copied().find(|p| {
+            if let Some(n) = now {
+                p.start >= n.stop
+            } else {
+                p.start >= at
+            }
+        });
+        (now, next)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ThemeMode {
+    Day,
+    Night,
+    System,
+}
+
+impl ThemeMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Day => "Jour",
+            Self::Night => "Nuit",
+            Self::System => "Système",
+        }
+    }
+
+    pub fn cycle(self) -> Self {
+        match self {
+            Self::Day => Self::Night,
+            Self::Night => Self::System,
+            Self::System => Self::Day,
+        }
+    }
+}
+
+/// Preferred native decode engine (desktop).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlayerBackendPref {
+    #[default]
+    Auto,
+    Mpv,
+    Ffmpeg,
+    External,
+}
+
+impl PlayerBackendPref {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "Auto (mpv → FFmpeg)",
+            Self::Mpv => "mpv",
+            Self::Ffmpeg => "FFmpeg / ffplay",
+            Self::External => "Système",
+        }
+    }
+
+    pub fn cycle(self) -> Self {
+        match self {
+            Self::Auto => Self::Mpv,
+            Self::Mpv => Self::Ffmpeg,
+            Self::Ffmpeg => Self::External,
+            Self::External => Self::Auto,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AppSettings {
+    pub theme: ThemeMode,
+    pub last_source_id: Option<Uuid>,
+    pub volume: f32,
+    pub remember_position: bool,
+    #[serde(default)]
+    pub player_backend: PlayerBackendPref,
+    #[serde(default = "default_true")]
+    pub hwdec: bool,
+    #[serde(default = "default_cache_ms")]
+    pub cache_ms: u32,
+    #[serde(default = "default_demux_secs")]
+    pub demux_secs: f32,
+    #[serde(default)]
+    pub low_latency: bool,
+    #[serde(default)]
+    pub favorites: Vec<String>,
+    #[serde(default)]
+    pub recent: Vec<RecentChannel>,
+}
+
+fn default_true() -> bool {
+    true
+}
+fn default_cache_ms() -> u32 {
+    4000
+}
+fn default_demux_secs() -> f32 {
+    8.0
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecentChannel {
+    pub channel_id: String,
+    pub name: String,
+    pub stream_url: String,
+    pub played_at: DateTime<Utc>,
+}
+
+impl Default for AppSettings {
+    fn default() -> Self {
+        Self {
+            theme: ThemeMode::System,
+            last_source_id: None,
+            volume: 0.85,
+            remember_position: true,
+            player_backend: PlayerBackendPref::Auto,
+            hwdec: true,
+            cache_ms: 4000,
+            demux_secs: 8.0,
+            low_latency: false,
+            favorites: Vec::new(),
+            recent: Vec::new(),
+        }
+    }
+}
+
+impl AppSettings {
+    pub fn toggle_favorite(&mut self, channel_id: &str) {
+        if let Some(i) = self.favorites.iter().position(|f| f == channel_id) {
+            self.favorites.remove(i);
+        } else {
+            self.favorites.push(channel_id.to_string());
+        }
+    }
+
+    pub fn is_favorite(&self, channel_id: &str) -> bool {
+        self.favorites.iter().any(|f| f == channel_id)
+    }
+
+    pub fn push_recent(&mut self, ch: &Channel) {
+        self.recent.retain(|r| r.channel_id != ch.id);
+        self.recent.insert(
+            0,
+            RecentChannel {
+                channel_id: ch.id.clone(),
+                name: ch.name.clone(),
+                stream_url: ch.stream_url.clone(),
+                played_at: Utc::now(),
+            },
+        );
+        self.recent.truncate(30);
+    }
+}

@@ -1,0 +1,26 @@
+[package]
+name = "fluxplay-providers"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "IPTV access providers: M3U, Xtream Codes, Stalker Portal, XMLTV"
+
+[dependencies]
+fluxplay-core.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+url.workspace = true
+chrono.workspace = true
+reqwest.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+base64.workspace = true
+sha2.workspace = true
+hex.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+tracing-subscriber = { workspace = true }

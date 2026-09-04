@@ -1,0 +1,15 @@
+// FluxPlay iOS shell stub — link static libfluxplay_ffi.a + AVPlayer.
+// Create an Xcode target that includes this bridging header.
+
+/*
+#ifndef FluxPlayBridge_h
+#define FluxPlayBridge_h
+#include <stdint.h>
+int32_t fluxplay_parse_m3u(const char *body);
+const char *fluxplay_playlist_json(void);
+int32_t fluxplay_channel_count(void);
+uint32_t fluxplay_platform_id(void);
+const char *fluxplay_recommended_decoder(void);
+const char *fluxplay_last_error(void);
+#endif
+*/

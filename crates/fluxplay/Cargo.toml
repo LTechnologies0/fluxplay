@@ -1,0 +1,30 @@
+[package]
+name = "fluxplay"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "FluxPlay — cross-platform IPTV media player (Material Expressive)"
+
+[[bin]]
+name = "fluxplay"
+path = "src/main.rs"
+
+[dependencies]
+fluxplay-core.workspace = true
+fluxplay-providers.workspace = true
+fluxplay-player.workspace = true
+anyhow.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+iced.workspace = true
+dirs.workspace = true
+rfd.workspace = true
+open.workspace = true
+url.workspace = true
+dark-light = "2"

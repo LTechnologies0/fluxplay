@@ -1,0 +1,18 @@
+// FluxPlay Android shell stub — load Rust FFI + ExoPlayer.
+// Wire this into a Gradle module under mobile/android when scaffolding the full app.
+
+package app.fluxplay
+
+/*
+object FluxPlayNative {
+    init { System.loadLibrary("fluxplay_ffi") }
+    external fun platformId(): Int
+    external fun recommendedDecoder(): String
+    external fun parseM3u(body: String): Int
+    external fun playlistJson(): String?
+    external fun channelCount(): Int
+    external fun lastError(): String?
+}
+
+// Playback: Media3 ExoPlayer with the stream URL + User-Agent from Rust playlist JSON.
+*/
