@@ -16,9 +16,10 @@ use fluxplay_player::{
 use iced::widget::{
     button, column, container, row, scrollable, text, text_input, Column, Row, Space,
 };
+use iced::window;
 use iced::{
-    Alignment, Background, Border, Color, Element, Fill, Length, Padding, Shadow, Subscription,
-    Task, Theme,
+    Alignment, Background, Border, Color, Element, Fill, Length, Padding, Shadow, Size,
+    Subscription, Task, Theme,
 };
 use uuid::Uuid;
 
@@ -36,12 +37,10 @@ fn main() -> iced::Result {
         )
         .init();
 
-    iced::application(FluxPlay::new, FluxPlay::update, FluxPlay::view)
-        .title("FluxPlay")
-        .theme(FluxPlay::theme)
+    iced::daemon(FluxPlay::new, FluxPlay::update, FluxPlay::view)
+        .title(FluxPlay::title)
+        .theme(FluxPlay::theme_for)
         .subscription(FluxPlay::subscription)
-        .window_size((1280.0, 860.0))
-        .centered()
         .run()
 }
 
@@ -111,6 +110,8 @@ struct FluxPlay {
     list_limit: usize,
     images: crate::images::ImageCache,
     autoplay_done: bool,
+    main_id: Option<window::Id>,
+    player_id: Option<window::Id>,
 }
 
 #[derive(Debug, Clone)]
@@ -185,6 +186,10 @@ enum Message {
         vod: Vec<VodItem>,
         series: Vec<SeriesItem>,
     },
+    MainWindowOpened(window::Id),
+    PlayerWindowOpened(window::Id),
+    WindowClosed(window::Id),
+    ClosePlayerWindow,
 }
 
 impl FluxPlay {
@@ -203,6 +208,12 @@ impl FluxPlay {
         let system_dark = matches!(dark_light::detect(), Ok(dark_light::Mode::Dark));
 
         let opts = play_options_from(&settings);
+        let (main_id, open_main) = window::open(window::Settings {
+            size: Size::new(1280.0, 860.0),
+            position: window::Position::Centered,
+            exit_on_close_request: true,
+            ..Default::default()
+        });
         let app = Self {
             settings,
             sources,
@@ -229,10 +240,31 @@ impl FluxPlay {
             list_limit: LIST_PAGE,
             images: crate::images::ImageCache::default(),
             autoplay_done: false,
+            main_id: Some(main_id),
+            player_id: None,
         };
 
-        let task = app.reload_all_task();
+        let task = Task::batch([
+            open_main.map(Message::MainWindowOpened),
+            app.reload_all_task(),
+        ]);
         (app, task)
+    }
+
+    fn title(&self, id: window::Id) -> String {
+        if self.player_id == Some(id) {
+            self.session
+                .channel
+                .as_ref()
+                .map(|c| format!("FluxPlay Lecteur · {}", c.name))
+                .unwrap_or_else(|| "FluxPlay Lecteur".into())
+        } else {
+            "FluxPlay".into()
+        }
+    }
+
+    fn theme_for(&self, _id: window::Id) -> Option<Theme> {
+        Some(self.theme())
     }
 
     fn is_day(&self) -> bool {
@@ -252,14 +284,36 @@ impl FluxPlay {
     }
 
     fn subscription(&self) -> Subscription<Message> {
-        if matches!(
+        let closes = window::close_events().map(Message::WindowClosed);
+        let tick = if matches!(
             self.session.state,
             PlaybackState::Playing | PlaybackState::Paused | PlaybackState::Buffering
         ) {
             iced::time::every(std::time::Duration::from_millis(500)).map(|_| Message::PlayerTick)
         } else {
             Subscription::none()
+        };
+        Subscription::batch([closes, tick])
+    }
+
+    fn open_or_focus_player(&self) -> Task<Message> {
+        if let Some(id) = self.player_id {
+            return window::gain_focus(id);
         }
+        let (_id, open) = window::open(window::Settings {
+            size: Size::new(1000.0, 720.0),
+            position: window::Position::Centered,
+            exit_on_close_request: true,
+            ..Default::default()
+        });
+        open.map(Message::PlayerWindowOpened)
+    }
+
+    fn close_player_window(&mut self) -> Task<Message> {
+        if let Some(id) = self.player_id.take() {
+            return window::close(id);
+        }
+        Task::none()
     }
 
     fn persist(&self) {
@@ -287,6 +341,32 @@ impl FluxPlay {
 
     fn update(&mut self, message: Message) -> Task<Message> {
         match message {
+            Message::MainWindowOpened(id) => {
+                self.main_id = Some(id);
+            }
+            Message::PlayerWindowOpened(id) => {
+                self.player_id = Some(id);
+            }
+            Message::WindowClosed(id) => {
+                if self.player_id == Some(id) {
+                    self.player_id = None;
+                    self.session.stop();
+                    self.status = "Lecteur fermé".into();
+                }
+                if self.main_id == Some(id) {
+                    self.main_id = None;
+                    self.session.stop();
+                    if let Some(pid) = self.player_id.take() {
+                        return Task::batch([window::close(pid), iced::exit()]);
+                    }
+                    return iced::exit();
+                }
+            }
+            Message::ClosePlayerWindow => {
+                self.session.stop();
+                self.status = "Arrêté".into();
+                return self.close_player_window();
+            }
             Message::Tab(tab) => {
                 self.tab = tab;
                 self.cat_filter.clear();
@@ -361,13 +441,18 @@ impl FluxPlay {
                     Ok(()) => {
                         self.status = self.session.status_line();
                         self.persist();
+                        return Task::batch([
+                            epg_task,
+                            art_task,
+                            self.open_or_focus_player(),
+                        ]);
                     }
                     Err(e) => {
                         self.status = format!("{e} — essayez Externe ou installez mpv");
                         self.persist();
+                        return Task::batch([epg_task, art_task, self.open_or_focus_player()]);
                     }
                 }
-                return Task::batch([epg_task, art_task]);
             }
             Message::PlayVod {
                 name,
@@ -405,20 +490,23 @@ impl FluxPlay {
                             None,
                             None,
                         );
-                        return art
+                        let art_task = art
                             .map(|u| self.prefetch_urls(std::iter::once(u)))
                             .unwrap_or_else(Task::none);
+                        return Task::batch([art_task, self.open_or_focus_player()]);
                     }
                     Err(e) => {
                         self.status = format!(
                             "{e} — 1 connexion max: Stop puis réessayez, ou Externe"
                         );
+                        return self.open_or_focus_player();
                     }
                 }
             }
             Message::Stop => {
                 self.session.stop();
                 self.status = "Arrêté".into();
+                return self.close_player_window();
             }
             Message::TogglePause => {
                 match self.session.state {
@@ -1080,11 +1168,20 @@ impl FluxPlay {
         self.bundle = PlaylistBundle::default();
     }
 
-    fn view(&self) -> Element<'_, Message> {
+    fn view(&self, id: window::Id) -> Element<'_, Message> {
+        if self.player_id == Some(id) {
+            return self.view_player_window();
+        }
+        self.view_browser()
+    }
+
+    fn view_browser(&self) -> Element<'_, Message> {
         let day = self.is_day();
         let rail = browser::mode_rail(
             day,
-            Tab::all().iter().map(|t| (t.label(), Message::Tab(*t), self.tab == *t)),
+            Tab::all()
+                .iter()
+                .map(|t| (t.label(), Message::Tab(*t), self.tab == *t)),
         );
 
         let body = match self.tab {
@@ -1097,72 +1194,76 @@ impl FluxPlay {
             Tab::Settings | Tab::Protocols => self.view_settings(day),
         };
 
-        let now_title = self
+        let status_bar = container(
+            text(if self.loading {
+                format!("Chargement… · {}", self.status)
+            } else {
+                self.status.clone()
+            })
+            .size(12)
+            .color(ink_muted(day)),
+        )
+        .padding(Padding::from([6, 10]))
+        .width(Fill);
+
+        container(
+            column![row![rail, body].spacing(10).height(Fill), status_bar]
+                .spacing(8)
+                .padding(12),
+        )
+        .width(Fill)
+        .height(Fill)
+        .style(move |_t: &Theme| container::Style {
+            background: Some(Background::Color(browser::shell_background(day))),
+            ..Default::default()
+        })
+        .into()
+    }
+
+    fn view_player_window(&self) -> Element<'_, Message> {
+        let day = self.is_day();
+        let title = self
             .session
             .channel
             .as_ref()
             .map(|c| c.name.as_str())
-            .unwrap_or("Aucune lecture");
+            .unwrap_or("FluxPlay Lecteur");
         let meta = self
             .session
             .channel
             .as_ref()
             .and_then(|c| c.group.as_deref())
-            .unwrap_or("Choisissez un média dans le navigateur");
-
-        let now_art = self
-            .session
-            .channel
-            .as_ref()
-            .and_then(|c| {
-                crate::images::pick_art(
-                    c.logo.as_deref().or(c.tvg_logo.as_deref()),
-                    None,
-                    None,
-                    None,
-                )
-            })
-            .and_then(|u| self.images.get(&u));
-
-        let backend_label = self
-            .session
-            .backend
-            .map(|b| b.label())
             .unwrap_or("—");
+        let art = self.session.channel.as_ref().and_then(|c| {
+            crate::images::pick_art(
+                c.logo.as_deref().or(c.tvg_logo.as_deref()),
+                None,
+                None,
+                None,
+            )
+            .and_then(|u| self.images.get(&u))
+        });
+        let backend_label = self.session.backend.map(|b| b.label()).unwrap_or("—");
         let active = !matches!(
             self.session.state,
-            PlaybackState::Idle | PlaybackState::Error
+            PlaybackState::Idle
         ) || self.session.channel.is_some();
 
-        let chrome = column![
-            row![rail, body].spacing(10).height(Fill),
-            player_ui::player_dock(player_ui::PlayerChrome {
-                day,
-                title: now_title,
-                meta,
-                status: &self.status,
-                state: self.session.state,
-                backend: backend_label,
-                live: self.session.is_live(),
-                muted: self.session.muted,
-                volume: self.session.volume,
-                progress: self.session.progress_ratio(),
-                time_label: self.session.elapsed_label(),
-                art: now_art,
-                active,
-            }),
-        ]
-        .spacing(10)
-        .padding(12);
-
-        container(chrome)
-            .width(Fill)
-            .height(Fill)
-            .style(move |_t: &Theme| container::Style {
-                background: Some(Background::Color(browser::shell_background(day))),
-                ..Default::default()
-            })
-            .into()
+        player_ui::player_window(player_ui::PlayerChrome {
+            day,
+            title,
+            meta,
+            status: &self.status,
+            state: self.session.state,
+            backend: backend_label,
+            live: self.session.is_live(),
+            muted: self.session.muted,
+            volume: self.session.volume,
+            progress: self.session.progress_ratio(),
+            time_label: self.session.elapsed_label(),
+            art,
+            active,
+        })
     }
 
     fn filtered_categories(

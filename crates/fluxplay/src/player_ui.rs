@@ -1,5 +1,4 @@
-//! Video player chrome — transport, scrubber, volume, state chips.
-//! Material Expressive teal; compact dock (not a dashboard of cards).
+//! Dedicated video player window chrome (separate from the media browser).
 
 use iced::widget::{
     button, column, container, image, row, slider, text, Space,
@@ -32,27 +31,98 @@ pub struct PlayerChrome<'a> {
     pub active: bool,
 }
 
-pub fn player_dock(p: PlayerChrome<'_>) -> Element<'_, Message> {
+/// Full-window player: stage + transport (opens as a second OS window).
+pub fn player_window(p: PlayerChrome<'_>) -> Element<'_, Message> {
     let day = p.day;
-    let art = art_block(day, p.art);
+    let stage = stage_panel(day, p.art, p.title, p.live, p.state);
     let header = meta_header(day, &p);
-    let scrub = scrubber(day, p.live, p.progress, p.time_label, p.active);
+    let scrub = scrubber(day, p.live, p.progress, p.time_label.clone(), p.active);
     let transport = transport_row(day, p.state, p.active, p.live);
     let volume = volume_block(day, p.muted, p.volume);
     let extras = extras_row(day, p.active);
 
     container(
         column![
-            row![art, header].spacing(12).align_y(Alignment::Center),
+            stage,
+            header,
             scrub,
-            row![transport, Space::new().width(8), volume, Space::new().width(Fill), extras]
-                .spacing(8)
+            row![transport, Space::new().width(Fill), volume]
+                .spacing(12)
                 .align_y(Alignment::Center),
+            extras,
         ]
-        .spacing(8)
-        .padding(Padding::from([10, 14])),
+        .spacing(12)
+        .padding(Padding::from([16, 18])),
     )
     .width(Fill)
+    .height(Fill)
+    .style(move |_t: &Theme| container::Style {
+        background: Some(Background::Color(if day {
+            Color::from_rgb8(0xE6, 0xEC, 0xF2)
+        } else {
+            Color::from_rgb8(0x08, 0x0D, 0x14)
+        })),
+        ..Default::default()
+    })
+    .into()
+}
+
+fn stage_panel<'a>(
+    day: bool,
+    art: Option<&'a Handle>,
+    title: &str,
+    live: bool,
+    state: PlaybackState,
+) -> Element<'a, Message> {
+    let poster: Element<'a, Message> = if let Some(handle) = art {
+        image(handle)
+            .width(Fill)
+            .height(Fill)
+            .content_fit(iced::ContentFit::Contain)
+            .into()
+    } else {
+        column![
+            text("▶").size(48).color(accent(day)),
+            text(title.to_string()).size(18).color(if day {
+                Color::from_rgb8(0x12, 0x1A, 0x24)
+            } else {
+                Color::WHITE
+            }),
+        ]
+        .spacing(12)
+        .align_x(Alignment::Center)
+        .into()
+    };
+
+    let badge = if live { "DIRECT" } else { "VOD / SÉRIE" };
+    let hint = match state {
+        PlaybackState::Playing | PlaybackState::Paused | PlaybackState::Buffering => {
+            "Image vidéo → fenêtre « FluxPlay Video » (mpv)"
+        }
+        PlaybackState::Opening => "Ouverture du flux…",
+        PlaybackState::Error => "Erreur de lecture — Stop puis réessayez",
+        PlaybackState::Idle => "En attente d’un média",
+    };
+
+    container(
+        column![
+            container(poster)
+                .width(Fill)
+                .height(Fill)
+                .center_x(Fill)
+                .center_y(Fill)
+                .padding(12),
+            row![
+                text(badge).size(11).color(accent(day)),
+                Space::new().width(Fill),
+                text(hint).size(12).color(ink_muted(day)),
+            ]
+            .padding(Padding::from([0, 4])),
+        ]
+        .height(Fill),
+    )
+    .width(Fill)
+    .height(Length::FillPortion(3))
     .style(move |_t: &Theme| container::Style {
         background: Some(Background::Color(surface(day))),
         border: Border {
@@ -62,40 +132,12 @@ pub fn player_dock(p: PlayerChrome<'_>) -> Element<'_, Message> {
         },
         shadow: Shadow {
             color: Color::from_rgba(0.0, 0.0, 0.0, if day { 0.06 } else { 0.35 }),
-            offset: iced::Vector::new(0.0, 4.0),
-            blur_radius: 14.0,
+            offset: iced::Vector::new(0.0, 6.0),
+            blur_radius: 18.0,
         },
         ..Default::default()
     })
     .into()
-}
-
-fn art_block<'a>(day: bool, art: Option<&'a Handle>) -> Element<'a, Message> {
-    let inner: Element<'a, Message> = if let Some(handle) = art {
-        image(handle)
-            .width(Length::Fixed(72.0))
-            .height(Length::Fixed(42.0))
-            .content_fit(iced::ContentFit::Cover)
-            .into()
-    } else {
-        container(text("FP").size(14).color(accent(day)))
-            .width(Length::Fixed(72.0))
-            .height(Length::Fixed(42.0))
-            .center_x(Fill)
-            .center_y(Fill)
-            .into()
-    };
-    container(inner)
-        .style(move |_t: &Theme| container::Style {
-            background: Some(Background::Color(surface_muted(day))),
-            border: Border {
-                color: outline(day),
-                width: 1.0,
-                radius: RADIUS_MD.into(),
-            },
-            ..Default::default()
-        })
-        .into()
 }
 
 fn meta_header<'a>(day: bool, p: &PlayerChrome<'a>) -> Element<'a, Message> {
@@ -111,7 +153,7 @@ fn meta_header<'a>(day: bool, p: &PlayerChrome<'a>) -> Element<'a, Message> {
         } else if p.active {
             soft_chip(day, "VOD")
         } else {
-            soft_chip(day, "Idle")
+            soft_chip(day, "—")
         },
         soft_chip(day, p.backend),
     ]
@@ -120,7 +162,7 @@ fn meta_header<'a>(day: bool, p: &PlayerChrome<'a>) -> Element<'a, Message> {
     column![
         row![
             text(p.title.to_string())
-                .size(15)
+                .size(18)
                 .color(title_color)
                 .width(Fill),
             chips,
@@ -128,10 +170,10 @@ fn meta_header<'a>(day: bool, p: &PlayerChrome<'a>) -> Element<'a, Message> {
         .spacing(8)
         .align_y(Alignment::Center),
         text(format!("{} · {}", p.meta, p.status))
-            .size(11)
+            .size(12)
             .color(ink_muted(day)),
     ]
-    .spacing(2)
+    .spacing(4)
     .width(Fill)
     .into()
 }
@@ -219,7 +261,7 @@ fn scrubber(
 ) -> Element<'static, Message> {
     let track: Element<'static, Message> = if !active {
         container(
-            text("Sélectionnez une chaîne, un film ou un épisode pour démarrer")
+            text("Choisissez un média dans le catalogue FluxPlay")
                 .size(11)
                 .color(ink_muted(day)),
         )
@@ -304,7 +346,7 @@ fn volume_block(day: bool, muted: bool, volume: f32) -> Element<'static, Message
                     s
                 }),
         )
-        .width(Length::Fixed(100.0)),
+        .width(Length::Fixed(120.0)),
         text(format!("{:.0}%", shown * 100.0))
             .size(11)
             .color(ink_muted(day))
@@ -324,6 +366,7 @@ fn extras_row(day: bool, active: bool) -> Element<'static, Message> {
         ctrl_btn(day, "Audio", Message::CycleAudio, active),
         ctrl_btn(day, "ST", Message::CycleSubtitles, active),
         ctrl_btn(day, "Externe", Message::OpenExternal, active),
+        ctrl_btn(day, "Fermer lecteur", Message::ClosePlayerWindow, true),
         ctrl_btn(day, "Theme", Message::CycleTheme, true),
     ]
     .spacing(5)
