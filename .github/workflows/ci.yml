@@ -21,8 +21,9 @@ jobs:
           - name: linux-aarch64
             os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
+          # Cross-compile Intel macOS from Apple Silicon runners (macos-13 often starved).
           - name: macos-x86_64
-            os: macos-13
+            os: macos-latest
             target: x86_64-apple-darwin
           - name: macos-aarch64
             os: macos-latest
@@ -32,7 +33,7 @@ jobs:
             target: x86_64-pc-windows-msvc
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install Linux GUI deps
         if: runner.os == 'Linux'
@@ -55,19 +56,20 @@ jobs:
       - name: Build desktop app
         run: cargo build -p fluxplay --release --target ${{ matrix.target }}
 
-      - name: Test workspace (host)
-        if: matrix.target == 'x86_64-unknown-linux-gnu' || matrix.target == 'aarch64-apple-darwin' || matrix.target == 'x86_64-pc-windows-msvc'
+      - name: Test workspace (host arch only)
+        if: matrix.target == 'x86_64-unknown-linux-gnu' || matrix.target == 'aarch64-apple-darwin' || matrix.target == 'x86_64-pc-windows-msvc' || matrix.target == 'aarch64-unknown-linux-gnu'
         run: cargo test --workspace --exclude fluxplay
 
   android-ffi:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: aarch64-linux-android,x86_64-linux-android
       - name: Build FFI host
         run: cargo build -p fluxplay-ffi
-      - name: Build FFI (Android aarch64)
-        run: cargo build -p fluxplay-ffi --target aarch64-linux-android
+      # Android NDK not installed by default — keep informational.
+      - name: Build FFI Android aarch64 (best-effort)
+        run: |
+          rustup target add aarch64-linux-android
+          cargo build -p fluxplay-ffi --target aarch64-linux-android
         continue-on-error: true
