@@ -463,17 +463,27 @@ pub struct LayoutMetrics {
     pub stack_header: bool,
     pub top_nav: bool,
     pub short: bool,
+    /// Phone landscape: single-row tab strip instead of 2-col grid.
+    pub nav_strip: bool,
 }
 
 impl LayoutMetrics {
     pub fn compute(width: f32, height: f32) -> Self {
         let w = width.max(280.0);
         let h = height.max(200.0);
-        let bp = Breakpoint::from_width(w);
+        // Phone landscape is often ≥600 wide but ~360 tall — width-only breakpoints
+        // wrongly switch to rail + category sidebar and crush the UI.
         let short = h < 520.0;
+        let landscape = w > h * 1.05;
+        let compact = w.min(h) < 520.0 || h < 480.0 || (landscape && h < 560.0);
+        let bp = if compact {
+            Breakpoint::Phone
+        } else {
+            Breakpoint::from_width(w)
+        };
 
         #[cfg(target_os = "android")]
-        let pad = 8.0_f32;
+        let pad = if short { 6.0_f32 } else { 8.0_f32 };
         #[cfg(not(target_os = "android"))]
         let pad = match bp {
             Breakpoint::Phone => 8.0,
@@ -481,17 +491,22 @@ impl LayoutMetrics {
             _ => 12.0,
         };
         let gap = match bp {
-            Breakpoint::Phone => 6.0,
+            Breakpoint::Phone => if short { 4.0 } else { 6.0 },
             Breakpoint::Tablet => 8.0,
             _ => 10.0,
         };
 
-        let (top_nav, rail_w, cat_w) = match bp {
-            Breakpoint::Phone => (true, 0.0, 0.0),
-            Breakpoint::Tablet => (false, 120.0, (w * 0.26).clamp(140.0, 180.0)),
-            Breakpoint::Laptop => (false, 148.0, 200.0),
-            Breakpoint::Desktop => (false, 168.0, 240.0),
-            Breakpoint::Tv => (false, 200.0, 280.0),
+        // Compact / phone always uses top tabs + category chips (never side rail).
+        let (top_nav, rail_w, cat_w) = if compact || matches!(bp, Breakpoint::Phone) {
+            (true, 0.0, 0.0)
+        } else {
+            match bp {
+                Breakpoint::Tablet => (false, 120.0, (w * 0.26).clamp(140.0, 180.0)),
+                Breakpoint::Laptop => (false, 148.0, 200.0),
+                Breakpoint::Desktop => (false, 168.0, 240.0),
+                Breakpoint::Tv => (false, 200.0, 280.0),
+                Breakpoint::Phone => (true, 0.0, 0.0),
+            }
         };
 
         let mut chrome = pad * 2.0;
@@ -506,6 +521,7 @@ impl LayoutMetrics {
         let content_w = (w - rail_w - cat_w - chrome).max(120.0);
 
         let max_cols = match bp {
+            Breakpoint::Phone if short && landscape => 3,
             Breakpoint::Phone => 2,
             Breakpoint::Tablet => 4,
             Breakpoint::Laptop => 6,
@@ -520,11 +536,17 @@ impl LayoutMetrics {
         };
 
         let (title_size, body_size, rail_size, thumb, player_chrome_h) = match bp {
-            Breakpoint::Phone => (18.0, 13.0, 14.0, 40.0, if short { 96.0 } else { 112.0 }),
-            Breakpoint::Tablet => (20.0, 13.0, 14.0, 44.0, 120.0),
-            Breakpoint::Laptop => (22.0, 14.0, 15.0, 48.0, 128.0),
-            Breakpoint::Desktop => (22.0, 14.0, 15.0, 52.0, 128.0),
-            Breakpoint::Tv => (26.0, 16.0, 18.0, 64.0, 160.0),
+            Breakpoint::Phone => (
+                if short { 16.0 } else { 18.0 },
+                if short { 12.0 } else { 13.0 },
+                if short { 12.0 } else { 14.0 },
+                if short { 36.0 } else { 40.0 },
+                if short { 72.0 } else { 100.0 },
+            ),
+            Breakpoint::Tablet => (20.0, 13.0, 14.0, 44.0, 104.0),
+            Breakpoint::Laptop => (22.0, 14.0, 15.0, 48.0, 108.0),
+            Breakpoint::Desktop => (22.0, 14.0, 15.0, 52.0, 108.0),
+            Breakpoint::Tv => (26.0, 16.0, 18.0, 64.0, 128.0),
         };
 
         Self {
@@ -547,6 +569,7 @@ impl LayoutMetrics {
             stack_header: matches!(bp, Breakpoint::Phone) || search_w >= content_w * 0.85,
             top_nav,
             short,
+            nav_strip: top_nav && short && landscape,
         }
     }
 }

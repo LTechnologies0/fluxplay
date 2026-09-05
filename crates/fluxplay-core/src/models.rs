@@ -284,31 +284,42 @@ impl PlaylistBundle {
     }
 
     /// Current + next programme for a channel (tvg-id / epg id / stream id match).
+    /// Single pass — no per-call Vec alloc/sort (hot path: live list paint).
     pub fn now_next(&self, channel: &Channel, at: DateTime<Utc>) -> (Option<&EpgProgramme>, Option<&EpgProgramme>) {
-        let keys: Vec<&str> = [
-            channel.epg_channel_id.as_deref(),
-            channel.tvg_id.as_deref(),
-            Some(channel.id.as_str()),
-        ]
-        .into_iter()
-        .flatten()
-        .collect();
-        let mut for_ch: Vec<&EpgProgramme> = self
-            .epg
-            .iter()
-            .filter(|p| keys.iter().any(|k| p.channel_id == *k))
-            .collect();
-        for_ch.sort_by_key(|p| p.start);
-        // Dedup identical start times (duplicate keys for stream id + tvg id).
-        for_ch.dedup_by(|a, b| a.start == b.start && a.title == b.title);
-        let now = for_ch.iter().copied().find(|p| p.start <= at && at < p.stop);
-        let next = for_ch.iter().copied().find(|p| {
-            if let Some(n) = now {
-                p.start >= n.stop
-            } else {
-                p.start >= at
+        let k0 = channel.epg_channel_id.as_deref();
+        let k1 = channel.tvg_id.as_deref();
+        let k2 = channel.id.as_str();
+        let matches = |cid: &str| {
+            k0 == Some(cid) || k1 == Some(cid) || cid == k2
+        };
+
+        let mut now: Option<&EpgProgramme> = None;
+        let mut next: Option<&EpgProgramme> = None;
+        for p in &self.epg {
+            if !matches(&p.channel_id) {
+                continue;
             }
-        });
+            if p.start <= at && at < p.stop {
+                // Prefer the tightest window if duplicates exist.
+                now = Some(match now {
+                    Some(n) if n.start >= p.start => n,
+                    _ => p,
+                });
+            } else if p.start >= at {
+                next = Some(match next {
+                    Some(n) if n.start <= p.start => n,
+                    _ => p,
+                });
+            }
+        }
+        if let Some(n) = now {
+            // Next must start at/after current programme end.
+            next = self
+                .epg
+                .iter()
+                .filter(|p| matches(&p.channel_id) && p.start >= n.stop)
+                .min_by_key(|p| p.start);
+        }
         (now, next)
     }
 }
@@ -511,6 +522,9 @@ pub struct AppSettings {
     pub favorites: Vec<String>,
     #[serde(default)]
     pub recent: Vec<RecentChannel>,
+    /// OMDb API key (IMDb gateway). Env `OMDB_API_KEY` overrides when set.
+    #[serde(default)]
+    pub omdb_api_key: String,
 }
 
 fn default_true() -> bool {
@@ -547,6 +561,7 @@ impl Default for AppSettings {
             prefetch_next_episode: true,
             favorites: Vec::new(),
             recent: Vec::new(),
+            omdb_api_key: String::new(),
         }
     }
 }

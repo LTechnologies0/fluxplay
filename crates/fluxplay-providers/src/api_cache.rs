@@ -102,7 +102,7 @@ pub fn ttl_for_action(action: Option<&str>) -> Duration {
         | Some("get_series_categories") => Duration::from_secs(24 * 3600),
         Some("get_live_streams") => Duration::from_secs(12 * 3600),
         Some("get_vod_streams") | Some("get_series") => Duration::from_secs(12 * 3600),
-        Some("get_series_info") => Duration::from_secs(24 * 3600),
+        Some("get_series_info") | Some("get_vod_info") => Duration::from_secs(24 * 3600),
         Some("get_short_epg") | Some("get_simple_data_table") => Duration::from_secs(45 * 60),
         _ => Duration::from_secs(6 * 3600),
     }

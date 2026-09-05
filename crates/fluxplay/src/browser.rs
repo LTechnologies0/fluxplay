@@ -21,6 +21,10 @@ use crate::app::Message;
 
 pub const LIST_PAGE: usize = 24;
 pub const CAT_PAGE: usize = 60;
+/// Hard cap — LoadMore must not grow an unbounded iced widget tree.
+pub const LIST_MAX: usize = 96;
+/// Episodes shown per series detail page before “Afficher plus”.
+pub const EPISODE_PAGE: usize = 40;
 
 pub fn shell_background(ui: UiTheme) -> Color {
     ui.shell()
@@ -171,14 +175,64 @@ pub fn mode_top_nav<'a>(
     label_size: f32,
     items: impl IntoIterator<Item = (&'a str, Message, bool)>,
 ) -> Element<'a, Message> {
+    mode_top_nav_ex(ui, label_size, false, items)
+}
+
+/// Phone landscape: horizontal chip strip (saves vertical space).
+pub fn mode_top_nav_ex<'a>(
+    ui: UiTheme,
+    label_size: f32,
+    landscape_strip: bool,
+    items: impl IntoIterator<Item = (&'a str, Message, bool)>,
+) -> Element<'a, Message> {
     let collected: Vec<_> = items.into_iter().collect();
+    if landscape_strip {
+        let mut strip = Row::new().spacing(SPACE_SM).align_y(Alignment::Center);
+        strip = strip.push(text("FluxPlay").size(label_size + 1.0).color(ui.accent()));
+        for (label, msg, active) in collected {
+            let fg = if active { ui.on_accent() } else { ui.ink() };
+            let bg = if active {
+                ui.accent()
+            } else {
+                ui.secondary_container()
+            };
+            let chip = container(text(label).size(label_size).color(fg))
+                .padding(Padding::from([8, 12]))
+                .style(move |_t: &Theme| container::Style {
+                    background: Some(Background::Color(bg)),
+                    border: Border {
+                        color: if active {
+                            ui.accent()
+                        } else {
+                            ui.outline_variant()
+                        },
+                        width: 1.0,
+                        radius: RADIUS_FULL.into(),
+                    },
+                    ..Default::default()
+                });
+            strip = strip.push(mouse_area(chip).on_press(msg));
+        }
+        return scrollable(strip.padding(Padding::from([2, 0])))
+            .direction(scrollable::Direction::Horizontal(
+                scrollable::Scrollbar::new().width(0).scroller_width(0),
+            ))
+            .width(Fill)
+            .into();
+    }
+
     let mid = collected.len().div_ceil(2).max(1);
     let mut left = Column::new().spacing(SPACE_XS).width(Fill);
     let mut right = Column::new().spacing(SPACE_XS).width(Fill);
     for (i, (label, msg, active)) in collected.into_iter().enumerate() {
         let fg = if active { ui.accent() } else { ui.ink() };
         let line = format!("{}  {label}", if active { "▸" } else { "·" });
-        let cell = mouse_area(text(line).size(label_size).color(fg).width(Fill)).on_press(msg);
+        let cell = mouse_area(
+            container(text(line).size(label_size).color(fg).width(Fill))
+                .padding(Padding::from([10, 6]))
+                .width(Fill),
+        )
+        .on_press(msg);
         if i < mid {
             left = left.push(cell);
         } else {
@@ -477,9 +531,13 @@ pub fn empty_hint(ui: UiTheme, msg: impl Into<String>) -> Element<'static, Messa
     .into()
 }
 
-pub fn load_more_btn(ui: UiTheme, remaining: usize) -> Element<'static, Message> {
+pub fn load_more_btn(ui: UiTheme, remaining: Option<usize>) -> Element<'static, Message> {
     // OutlinedButton + pill — M3 Expressive “show more” pattern
-    button(text(format!("Afficher plus (+{remaining})")).size(13))
+    let label = match remaining {
+        Some(n) if n > 0 => format!("Afficher plus (+{n})"),
+        _ => "Afficher plus".into(),
+    };
+    button(text(label).size(13))
         .on_press(Message::LoadMore)
         .padding(Padding::from([14, 20]))
         .width(Fill)
@@ -799,11 +857,19 @@ pub fn media_detail_page<'a>(
         body = body.push(section_block(
             ui,
             "Synopsis",
-            "Chargement de la fiche IMDb…",
+            "Chargement de la fiche (panel / IMDb)…",
+        ));
+    } else {
+        body = body.push(section_block(
+            ui,
+            "Synopsis",
+            "Synopsis indisponible pour ce titre.",
         ));
     }
     if let Some(a) = actors.filter(|s| !s.trim().is_empty()) {
         body = body.push(section_block(ui, "Acteurs", a));
+    } else if loading_meta {
+        body = body.push(section_block(ui, "Acteurs", "Chargement…"));
     }
     let mut crew: Vec<String> = Vec::new();
     if let Some(d) = director.filter(|s| !s.trim().is_empty()) {

@@ -101,6 +101,18 @@ pub async fn load_xtream_series_info(
     client.series_info(series_id).await
 }
 
+/// Full VOD metadata (plot / cast / director) for one movie.
+pub async fn load_xtream_vod_info(
+    source: &MediaSource,
+    vod_id: &str,
+) -> Result<fluxplay_core::models::VodItem> {
+    debug!(source_id = %source.id, %vod_id, "load_xtream_vod_info");
+    let client = xtream_client_for(source).ok_or_else(|| {
+        ProviderError::Message("source Xtream requise pour les détails VOD".into())
+    })?;
+    client.vod_info(vod_id).await
+}
+
 #[derive(Debug, Error)]
 pub enum ProviderError {
     #[error("http: {0}")]

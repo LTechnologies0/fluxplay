@@ -835,17 +835,193 @@ impl XtreamClient {
             rating,
             genre,
             imdb_id,
-            actors: None,
-            director: None,
+            actors: info
+                .get("cast")
+                .or_else(|| info.get("actors"))
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string),
+            director: info
+                .get("director")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string),
             writer: None,
             runtime: None,
             rated: None,
             awards: None,
             language: None,
-            country: None,
+            country: info
+                .get("country")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string),
             seasons,
             source_id: Some(self.source_id),
             category_id: None,
+        })
+    }
+
+    /// Full VOD metadata (`get_vod_info`) — plot, cast, director like series_info.
+    pub async fn vod_info(&self, vod_id: &str) -> Result<VodItem> {
+        debug!(%vod_id, "vod_info");
+        let value = self
+            .get_json_action("get_vod_info", &[("vod_id", vod_id)])
+            .await?;
+
+        let info = value.get("info").cloned().unwrap_or(Value::Null);
+        let movie = value.get("movie_data").cloned().unwrap_or(Value::Null);
+
+        let name = info
+            .get("name")
+            .or_else(|| movie.get("name"))
+            .and_then(|v| v.as_str())
+            .unwrap_or(vod_id)
+            .to_string();
+        let ext = movie
+            .get("container_extension")
+            .and_then(|v| v.as_str())
+            .unwrap_or_else(|| self.media_ext(None));
+        let stream_url = self.vod_stream_url(vod_id, ext);
+
+        let poster = info
+            .get("movie_image")
+            .or_else(|| info.get("cover_big"))
+            .or_else(|| info.get("cover"))
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+
+        let plot = info
+            .get("plot")
+            .or_else(|| info.get("description"))
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+
+        let year = info
+            .get("releasedate")
+            .or_else(|| info.get("releaseDate"))
+            .or_else(|| info.get("release_date"))
+            .or_else(|| info.get("year"))
+            .and_then(|v| {
+                v.as_str()
+                    .map(str::to_string)
+                    .or_else(|| v.as_u64().map(|n| n.to_string()))
+            })
+            .map(|s| {
+                // "2024-05-02" → "2024"
+                s.chars().take(4).collect::<String>()
+            })
+            .filter(|s| s.len() == 4 && s.chars().all(|c| c.is_ascii_digit()));
+
+        let rating = info
+            .get("rating")
+            .and_then(|v| {
+                v.as_str()
+                    .map(str::to_string)
+                    .or_else(|| v.as_f64().map(|n| format!("{n:.1}")))
+            });
+
+        let genre = info.get("genre").and_then(|v| match v {
+            Value::String(s) if !s.trim().is_empty() => Some(s.trim().to_string()),
+            Value::Array(a) => {
+                let p: Vec<_> = a
+                    .iter()
+                    .filter_map(|x| x.as_str())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+                    .collect();
+                if p.is_empty() {
+                    None
+                } else {
+                    Some(p.join(", "))
+                }
+            }
+            _ => None,
+        });
+
+        let actors = info
+            .get("actors")
+            .or_else(|| info.get("cast"))
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+
+        let director = info
+            .get("director")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+
+        let runtime = info
+            .get("duration")
+            .or_else(|| info.get("episode_run_time"))
+            .and_then(|v| {
+                v.as_str()
+                    .map(str::to_string)
+                    .or_else(|| v.as_u64().map(|n| format!("{n} min")))
+            });
+
+        let imdb_id = info
+            .get("imdb_id")
+            .or_else(|| info.get("imdbid"))
+            .or_else(|| info.get("IMDB_ID"))
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty() && *s != "0")
+            .map(str::to_string);
+
+        let country = info
+            .get("country")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+
+        let rated = info
+            .get("mpaa_rating")
+            .or_else(|| info.get("age"))
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+
+        info!(
+            %vod_id,
+            has_plot = plot.is_some(),
+            has_actors = actors.is_some(),
+            "vod_info loaded"
+        );
+
+        Ok(VodItem {
+            id: vod_id.to_string(),
+            name,
+            stream_url,
+            poster,
+            plot,
+            year,
+            rating,
+            genre,
+            imdb_id,
+            actors,
+            director,
+            writer: None,
+            runtime,
+            rated,
+            awards: None,
+            language: None,
+            country,
+            category_id: movie
+                .get("category_id")
+                .and_then(|v| v.as_str().map(str::to_string).or_else(|| v.as_u64().map(|n| n.to_string()))),
+            source_id: Some(self.source_id),
         })
     }
 }

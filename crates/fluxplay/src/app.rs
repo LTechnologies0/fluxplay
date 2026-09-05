@@ -17,7 +17,7 @@ use iced::{
 };
 use uuid::Uuid;
 
-use crate::browser::{CAT_PAGE, LIST_PAGE};
+use crate::browser::{CAT_PAGE, EPISODE_PAGE, LIST_MAX, LIST_PAGE};
 use crate::player_ui::PlayerPanel;
 use crate::theme::{
     LayoutMetrics, UiTheme, RADIUS_FULL, RADIUS_MD, PLAYER_PAD,
@@ -136,6 +136,7 @@ struct FluxPlay {
     form_pass: String,
     form_mac: String,
     form_epg: String,
+    form_omdb_key: String,
     system_dark: bool,
     cat_filter: String,
     list_limit: usize,
@@ -149,6 +150,10 @@ struct FluxPlay {
     player_embedded: bool,
     /// Logical size of the main browser window (updated on resize).
     main_size: Size,
+    /// Cached layout metrics for `main_size` (invalidate on resize).
+    layout_cache: Option<(Size, LayoutMetrics)>,
+    /// Cached `detect_backends()` — probing PATH every Settings paint is expensive.
+    backends_cache: Option<Vec<fluxplay_player::BackendInfo>>,
     /// Last known outer position of the player window (legacy CLI overlay sizing).
     player_pos: Option<Point>,
     /// Embedded video frame (libmpv software render → iced image).
@@ -168,6 +173,21 @@ struct FluxPlay {
     series_queue: Vec<(String, String)>,
     series_queue_idx: usize,
     prefetch_armed_for: Option<String>,
+}
+
+/// Which text field should receive a clipboard paste.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PasteTarget {
+    FormName,
+    FormEndpoint,
+    FormUser,
+    FormPass,
+    FormMac,
+    FormEpg,
+    FormOmdbKey,
+    Search,
+    CatFilter,
+    Goto,
 }
 
 #[derive(Debug, Clone)]
@@ -204,6 +224,11 @@ pub(crate) enum Message {
     FormPass(String),
     FormMac(String),
     FormEpg(String),
+    FormOmdbKey(String),
+    SaveOmdbKey,
+    /// Touch-friendly paste (Android has no text-input context menu).
+    PasteInto(PasteTarget),
+    ClipboardText(PasteTarget, Option<String>),
     AddSource,
     AddPublicDemo { name: String, endpoint: String },
     RemoveSource(Uuid),
@@ -238,6 +263,9 @@ pub(crate) enum Message {
     SeriesEpisodesEnriched(SeriesItem),
     CloseSeriesDetail,
     OpenVodDetail(VodItem),
+    VodDetailLoaded(Result<VodItem, String>),
+    /// Parallel Xtream `get_vod_info` batch after catalog load/reload.
+    VodInfoBatch(Vec<VodItem>),
     CloseVodDetail,
     DetailMetaLoaded {
         is_series: bool,
@@ -387,7 +415,7 @@ impl FluxPlay {
             (Some(id), open)
         };
         let session = StreamSession::with_options(opts);
-        let app = Self {
+        let mut app = Self {
             settings,
             sources,
             bundle,
@@ -410,6 +438,7 @@ impl FluxPlay {
             form_pass: String::new(),
             form_mac: String::new(),
             form_epg: String::new(),
+            form_omdb_key: String::new(), // filled below from settings
             system_dark,
             cat_filter: String::new(),
             list_limit: LIST_PAGE,
@@ -420,7 +449,12 @@ impl FluxPlay {
             player_id: None,
             #[cfg(target_os = "android")]
             player_embedded: false,
+            #[cfg(target_os = "android")]
+            main_size: Size::new(360.0, 720.0),
+            #[cfg(not(target_os = "android"))]
             main_size: Size::new(1280.0, 720.0),
+            layout_cache: None,
+            backends_cache: None,
             player_pos: None,
             video_frame: None,
             video_frame_wh: (0, 0),
@@ -436,6 +470,12 @@ impl FluxPlay {
             series_queue_idx: 0,
             prefetch_armed_for: None,
         };
+        app.form_omdb_key = app.settings.omdb_api_key.clone();
+        crate::metadata::set_omdb_api_key(if app.settings.omdb_api_key.is_empty() {
+            None
+        } else {
+            Some(app.settings.omdb_api_key.clone())
+        });
 
         // Offline-first: skip portal storm when SQLite catalog is still fresh.
         let mut boot = Vec::new();
@@ -450,8 +490,7 @@ impl FluxPlay {
             boot.push(android_bind_window());
         }
         if sync_fresh {
-            boot.push(app.prefetch_visible_art_boot());
-            boot.push(app.enrich_metadata_task());
+            boot.push(app.after_catalog_ready_tasks());
         } else if has_real || !app.sources.is_empty() {
             boot.push(app.reload_all_task());
         }
@@ -466,12 +505,6 @@ impl FluxPlay {
             "FluxPlay::new ready"
         );
         (app, task)
-    }
-
-    /// Prefetch without &mut self (boot path) — only schedules known URLs after load.
-    fn prefetch_visible_art_boot(&self) -> Task<Message> {
-        // Lightweight: art loads on first paint via Tab/LoadMore; avoid duplicate storms.
-        Task::none()
     }
 
     fn title(&self, id: window::Id) -> String {
@@ -523,7 +556,19 @@ impl FluxPlay {
 
     /// Responsive chrome metrics from the current main window size.
     fn layout_metrics(&self) -> LayoutMetrics {
+        if let Some((sz, m)) = self.layout_cache {
+            if (sz.width - self.main_size.width).abs() < 0.5
+                && (sz.height - self.main_size.height).abs() < 0.5
+            {
+                return m;
+            }
+        }
         LayoutMetrics::compute(self.main_size.width, self.main_size.height)
+    }
+
+    fn refresh_layout_cache(&mut self) {
+        let m = LayoutMetrics::compute(self.main_size.width, self.main_size.height);
+        self.layout_cache = Some((self.main_size, m));
     }
 
     /// Category sidebar or phone chips + content pane.
@@ -569,27 +614,58 @@ impl FluxPlay {
             window::Event::Moved(_) => Some(Message::PlayerLayoutDirty(id)),
             _ => None,
         });
-        let tick = if matches!(
-            self.session.state,
-            PlaybackState::Playing | PlaybackState::Paused | PlaybackState::Buffering
-        ) || self.sleep_until.is_some()
-            || (self.player_id.is_some() && self.player_chrome_visible)
-        {
-            iced::time::every(std::time::Duration::from_millis(42)).map(|_| Message::PlayerTick)
-        } else {
-            Subscription::none()
+        let tick = {
+            let soft_video = self.session.has_embedded_video()
+                && matches!(
+                    self.session.state,
+                    PlaybackState::Playing | PlaybackState::Buffering
+                );
+            let playing_like = matches!(
+                self.session.state,
+                PlaybackState::Playing | PlaybackState::Paused | PlaybackState::Buffering
+            );
+            let player_open = {
+                #[cfg(target_os = "android")]
+                {
+                    self.player_embedded || self.player_id.is_some()
+                }
+                #[cfg(not(target_os = "android"))]
+                {
+                    self.player_id.is_some()
+                }
+            };
+            // Soft-render needs ~15 fps max; chrome/time labels are fine at 4 Hz.
+            // Never arm 24 Hz ticks for paused chrome-only — that re-paints the browser too.
+            let period_ms = if soft_video {
+                66u64
+            } else if self.sleep_until.is_some() {
+                1000
+            } else if playing_like && player_open {
+                250
+            } else {
+                0
+            };
+            if period_ms > 0 {
+                iced::time::every(std::time::Duration::from_millis(period_ms))
+                    .map(|_| Message::PlayerTick)
+            } else {
+                Subscription::none()
+            }
         };
-        let chrome_tick = if self.player_id.is_some()
-            && self.player_chrome_visible
-            && self.player_panel == PlayerPanel::None
-            && matches!(self.session.state, PlaybackState::Playing | PlaybackState::Buffering)
-        {
-            iced::time::every(std::time::Duration::from_millis(400))
-                .map(|_| Message::PlayerChromeTick)
-        } else {
-            Subscription::none()
+        // Autohide is handled inside PlayerTick — avoid a second 400ms re-view pulse.
+        let chrome_tick = Subscription::none();
+        let keys = {
+            #[cfg(target_os = "android")]
+            let player_open = self.player_embedded || self.player_id.is_some();
+            #[cfg(not(target_os = "android"))]
+            let player_open = self.player_id.is_some();
+            if player_open {
+                event::listen_with(map_player_hotkeys)
+            } else {
+                // Avoid stealing Space/arrows/Ctrl while typing in Sources/Settings.
+                Subscription::none()
+            }
         };
-        let keys = event::listen_with(map_player_hotkeys);
         Subscription::batch([closes, opens, moves, tick, chrome_tick, keys])
     }
 
@@ -697,6 +773,7 @@ impl FluxPlay {
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
+        let _prof = fluxplay_core::InteractionGuard::begin("update", profile_message_label(&message));
         if let Some(action) = ui_action_label(&message) {
             tracing::info!(target: "fluxplay::ui", %action, "ui.interaction");
         }
@@ -718,6 +795,22 @@ impl FluxPlay {
                         if let Some(ch) = self.bundle.channels.first().cloned() {
                             tracing::info!(name = %ch.name, "FLUXPLAY_AUTO_PLAY → opening player");
                             return Task::batch([size_task, Task::done(Message::PlayChannel(ch))]);
+                        }
+                    }
+                    if let Ok(vod_id) = std::env::var("FLUXPLAY_AUTO_VOD") {
+                        if let Some(v) = self
+                            .bundle
+                            .vod
+                            .iter()
+                            .find(|v| v.id == vod_id || v.name.contains(&vod_id))
+                            .cloned()
+                        {
+                            tracing::info!(name = %v.name, "FLUXPLAY_AUTO_VOD → opening detail");
+                            self.tab = Tab::Vod;
+                            return Task::batch([
+                                size_task,
+                                Task::done(Message::OpenVodDetail(v)),
+                            ]);
                         }
                     }
                     return size_task;
@@ -758,6 +851,7 @@ impl FluxPlay {
                     // Guard against zero / garbage sizes from early surface churn.
                     if size.width >= 32.0 && size.height >= 32.0 {
                         self.main_size = size;
+                        self.refresh_layout_cache();
                         tracing::info!(w = size.width, h = size.height, "main window size");
                     } else {
                         tracing::warn!(
@@ -815,6 +909,9 @@ impl FluxPlay {
                 self.series_detail = None;
                 self.vod_detail = None;
                 self.detail_meta_loading = false;
+                if tab == Tab::Settings && self.backends_cache.is_none() {
+                    self.backends_cache = Some(detect_backends());
+                }
                 if tab == Tab::Vod && self.selected_vod_category.is_none() {
                     self.selected_vod_category = Some("*".into());
                 }
@@ -832,7 +929,7 @@ impl FluxPlay {
             }
             Message::LoadMore => {
                 tracing::debug!(list_limit = self.list_limit, "load more");
-                self.list_limit = self.list_limit.saturating_add(LIST_PAGE);
+                self.list_limit = (self.list_limit.saturating_add(LIST_PAGE)).min(LIST_MAX);
                 return self.prefetch_visible_art();
             }
             Message::SelectBrowseCategory(id) => {
@@ -1062,8 +1159,17 @@ impl FluxPlay {
                 return window::set_mode(id, window::Mode::Fullscreen);
             }
             Message::PlayerPointerActivity => {
+                // Cheap wake: skip if chrome already visible and recently touched.
+                let now = std::time::Instant::now();
+                if self.player_chrome_visible {
+                    if let Some(at) = self.player_pointer_at {
+                        if now.duration_since(at) < std::time::Duration::from_millis(200) {
+                            return Task::none();
+                        }
+                    }
+                }
                 self.player_chrome_visible = true;
-                self.player_pointer_at = Some(std::time::Instant::now());
+                self.player_pointer_at = Some(now);
             }
             Message::PlayerChromeTick => {
                 self.maybe_autohide_player_chrome();
@@ -1088,11 +1194,11 @@ impl FluxPlay {
                     self.video_frame = None;
                     self.status = "Lecture terminée".into();
                 }
-                // Pull embedded frame into iced stage.
+                // Soft-render frames only while actively playing/buffering — not when paused.
                 if self.session.has_embedded_video()
                     && matches!(
                         self.session.state,
-                        PlaybackState::Playing | PlaybackState::Paused | PlaybackState::Buffering
+                        PlaybackState::Playing | PlaybackState::Buffering
                     )
                 {
                     let (fw, fh) = self
@@ -1101,9 +1207,9 @@ impl FluxPlay {
                         .video_rect()
                         .map(|r| (r.w, r.h))
                         .unwrap_or((960, 540));
-                    // Cap CPU: render at most ~960px wide.
-                    let scale = if fw > 960 {
-                        960.0 / fw as f32
+                    // Cap CPU: render at most ~720px wide (~15 fps budget).
+                    let scale = if fw > 720 {
+                        720.0 / fw as f32
                     } else {
                         1.0
                     };
@@ -1422,6 +1528,49 @@ impl FluxPlay {
             Message::FormPass(s) => self.form_pass = s,
             Message::FormMac(s) => self.form_mac = s,
             Message::FormEpg(s) => self.form_epg = s,
+            Message::FormOmdbKey(s) => self.form_omdb_key = s,
+            Message::PasteInto(target) => {
+                return iced::clipboard::read()
+                    .map(move |text| Message::ClipboardText(target, text));
+            }
+            Message::ClipboardText(target, text) => {
+                let Some(text) = text.filter(|t| !t.is_empty()) else {
+                    self.status = "Presse-papiers vide".into();
+                    return Task::none();
+                };
+                // Strip control chars (same filter as iced text_input paste).
+                let cleaned: String = text.chars().filter(|c| !c.is_control()).collect();
+                match target {
+                    PasteTarget::FormName => self.form_name = cleaned,
+                    PasteTarget::FormEndpoint => self.form_endpoint = cleaned,
+                    PasteTarget::FormUser => self.form_user = cleaned,
+                    PasteTarget::FormPass => self.form_pass = cleaned,
+                    PasteTarget::FormMac => self.form_mac = cleaned,
+                    PasteTarget::FormEpg => self.form_epg = cleaned,
+                    PasteTarget::FormOmdbKey => self.form_omdb_key = cleaned,
+                    PasteTarget::Search => {
+                        self.search = cleaned;
+                        self.list_limit = LIST_PAGE;
+                    }
+                    PasteTarget::CatFilter => self.cat_filter = cleaned,
+                    PasteTarget::Goto => self.goto_draft = cleaned,
+                }
+                self.status = "Texte collé".into();
+            }
+            Message::SaveOmdbKey => {
+                self.settings.omdb_api_key = self.form_omdb_key.trim().to_string();
+                crate::metadata::set_omdb_api_key(if self.settings.omdb_api_key.is_empty() {
+                    None
+                } else {
+                    Some(self.settings.omdb_api_key.clone())
+                });
+                self.persist();
+                self.status = if crate::metadata::omdb_configured() {
+                    "Clé OMDb enregistrée — rouvrez une fiche film/série".into()
+                } else {
+                    "Clé OMDb effacée".into()
+                };
+            }
             Message::AddPublicDemo { name, endpoint } => {
                 let mut src = MediaSource::new(name.trim(), SourceKind::M3uPlus, endpoint.trim());
                 src.enabled = true;
@@ -1538,7 +1687,7 @@ impl FluxPlay {
                 if let Some(db) = &self.catalog_db {
                     db.mark_full_sync_now();
                 }
-                return Task::batch([self.prefetch_visible_art(), self.enrich_metadata_task()]);
+                return self.after_catalog_ready_tasks();
             }
             Message::SourceLoaded { source_id, result } => {
                 self.loading = false;
@@ -1575,10 +1724,7 @@ impl FluxPlay {
                         if let Some(db) = &self.catalog_db {
                             db.mark_full_sync_now();
                         }
-                        let mut tasks = vec![
-                            self.prefetch_visible_art(),
-                            self.enrich_metadata_task(),
-                        ];
+                        let mut tasks = vec![self.after_catalog_ready_tasks()];
                         if !self.autoplay_done
                             && std::env::var_os("FLUXPLAY_AUTOPLAY").is_some()
                         {
@@ -1632,7 +1778,25 @@ impl FluxPlay {
                         self.vod_detail = Some(updated.clone());
                     }
                 }
-                return self.prefetch_visible_art();
+                return self.prefetch_catalog_art();
+            }
+            Message::VodInfoBatch(items) => {
+                for item in items {
+                    if let Some(existing) = self.bundle.vod.iter_mut().find(|v| v.id == item.id) {
+                        merge_xtream_vod_fields(existing, &item);
+                        if let (Some(db), Some(sid)) = (&self.catalog_db, existing.source_id) {
+                            let mut saved = existing.clone();
+                            saved.source_id = Some(sid);
+                            let _ = db.persist_vod(&saved);
+                        }
+                    }
+                    if self.vod_detail.as_ref().map(|d| d.id.as_str()) == Some(item.id.as_str()) {
+                        if let Some(updated) = self.bundle.vod.iter().find(|v| v.id == item.id) {
+                            self.vod_detail = Some(updated.clone());
+                        }
+                    }
+                }
+                return self.prefetch_catalog_art();
             }
             Message::OpenImdb(id_or_query) => {
                 let url = crate::metadata::imdb_title_url(&id_or_query);
@@ -1824,6 +1988,7 @@ impl FluxPlay {
             Message::OpenSeries(id) => {
                 self.vod_detail = None;
                 self.detail_meta_loading = false;
+                self.list_limit = EPISODE_PAGE;
                 if let Some(existing) = self.bundle.series.iter().find(|s| s.id == id) {
                     self.series_detail = Some(existing.clone());
                 }
@@ -1866,6 +2031,8 @@ impl FluxPlay {
                         existing.genre = item.genre.clone().or(existing.genre.clone());
                         existing.rating = item.rating.clone().or(existing.rating.clone());
                         existing.imdb_id = item.imdb_id.clone().or(existing.imdb_id.clone());
+                        existing.actors = item.actors.clone().or(existing.actors.clone());
+                        existing.director = item.director.clone().or(existing.director.clone());
                     }
                     self.series_detail = Some(item);
                     return Task::batch([
@@ -1897,6 +2064,7 @@ impl FluxPlay {
             }
             Message::OpenVodDetail(item) => {
                 self.series_detail = None;
+                self.detail_meta_loading = true;
                 // Keep catalog list in sync when the tile came from a DB search hit.
                 if let Some(existing) = self.bundle.vod.iter_mut().find(|v| v.id == item.id) {
                     *existing = item.clone();
@@ -1904,12 +2072,72 @@ impl FluxPlay {
                     self.bundle.vod.push(item.clone());
                 }
                 self.status = format!("{} — fiche", item.name);
+                let vod_id = item.id.clone();
                 self.vod_detail = Some(item);
-                return Task::batch([
-                    self.prefetch_visible_art(),
-                    self.enrich_open_detail_task(false),
-                ]);
+                let src = self
+                    .sources
+                    .iter()
+                    .find(|s| s.enabled && s.kind == SourceKind::Xtream)
+                    .cloned();
+                let xtream = if let Some(src) = src {
+                    Task::perform(
+                        async move {
+                            fluxplay_providers::load_xtream_vod_info(&src, &vod_id)
+                                .await
+                                .map_err(|e| e.to_string())
+                        },
+                        Message::VodDetailLoaded,
+                    )
+                } else {
+                    self.enrich_open_detail_task(false)
+                };
+                return Task::batch([self.prefetch_visible_art(), xtream]);
             }
+            Message::VodDetailLoaded(result) => match result {
+                Ok(item) => {
+                    if let Some(existing) = self.bundle.vod.iter_mut().find(|v| v.id == item.id) {
+                        merge_xtream_vod_fields(existing, &item);
+                        if let (Some(db), Some(sid)) = (&self.catalog_db, existing.source_id) {
+                            let mut saved = existing.clone();
+                            saved.source_id = Some(sid);
+                            let _ = db.persist_vod(&saved);
+                        }
+                    }
+                    if self.vod_detail.as_ref().map(|d| d.id.as_str()) == Some(item.id.as_str()) {
+                        let stream_url = self
+                            .vod_detail
+                            .as_ref()
+                            .map(|d| d.stream_url.clone())
+                            .unwrap_or_else(|| item.stream_url.clone());
+                        let poster = self
+                            .vod_detail
+                            .as_ref()
+                            .and_then(|d| d.poster.clone())
+                            .or(item.poster.clone());
+                        let mut merged = item;
+                        merged.stream_url = stream_url;
+                        if merged.poster.is_none() {
+                            merged.poster = poster;
+                        }
+                        self.status = if merged.plot.is_some() {
+                            format!("{} · fiche Xtream", merged.name)
+                        } else {
+                            format!("{} — enrichissement…", merged.name)
+                        };
+                        self.vod_detail = Some(merged);
+                    }
+                    self.detail_meta_loading = false;
+                    return Task::batch([
+                        self.prefetch_visible_art(),
+                        self.enrich_open_detail_task(false),
+                    ]);
+                }
+                Err(e) => {
+                    tracing::warn!(%e, "vod_info failed — falling back to OMDb/Wikipedia");
+                    self.status = format!("Fiche panel: {e}");
+                    return self.enrich_open_detail_task(false);
+                }
+            },
             Message::CloseVodDetail => {
                 self.vod_detail = None;
                 self.detail_meta_loading = false;
@@ -2110,6 +2338,15 @@ impl FluxPlay {
         )
     }
 
+    /// After catalog load/reload: art + Xtream vod_info + OMDb/TVMaze in parallel.
+    fn after_catalog_ready_tasks(&mut self) -> Task<Message> {
+        Task::batch([
+            self.prefetch_catalog_art(),
+            self.enrich_xtream_vod_batch_task(),
+            self.enrich_metadata_task(),
+        ])
+    }
+
     fn enrich_metadata_task(&self) -> Task<Message> {
         let mut series_cached = Vec::new();
         let mut series_fetch = Vec::new();
@@ -2118,7 +2355,7 @@ impl FluxPlay {
             .series
             .iter()
             .filter(|s| crate::metadata::needs_series_enrich(s))
-            .take(24)
+            .take(40)
         {
             let q = crate::metadata::parse_title_query(&s.name);
             let key = q.cache_key("series");
@@ -2139,7 +2376,7 @@ impl FluxPlay {
             .vod
             .iter()
             .filter(|v| crate::metadata::needs_vod_enrich(v))
-            .take(20)
+            .take(64)
         {
             let q = crate::metadata::parse_title_query(&v.name);
             let key = q.cache_key("movie");
@@ -2170,27 +2407,29 @@ impl FluxPlay {
                 let mut vod_out = vod_cached;
                 let db = crate::catalog_db::CatalogDb::open();
                 let mut set = tokio::task::JoinSet::new();
-                const META_PARALLEL: usize = 3;
+                // OMDb free tier is rate-limited; keep a modest pool but no artificial sleep.
+                const META_PARALLEL: usize = 8;
 
                 let mut si = 0usize;
                 let mut vi = 0usize;
+                // Prefer VOD (movies) first — user-facing catalog art/synopsis.
                 while si < series_fetch.len() || vi < vod_fetch.len() || !set.is_empty() {
                     while set.len() < META_PARALLEL
                         && (si < series_fetch.len() || vi < vod_fetch.len())
                     {
-                        if si < series_fetch.len() {
-                            let (id, sid, name) = series_fetch[si].clone();
-                            si += 1;
-                            set.spawn(async move {
-                                let patch = crate::metadata::enrich_series(&name).await;
-                                (true, id, sid, name, patch)
-                            });
-                        } else if vi < vod_fetch.len() {
+                        if vi < vod_fetch.len() {
                             let (id, sid, name) = vod_fetch[vi].clone();
                             vi += 1;
                             set.spawn(async move {
                                 let patch = crate::metadata::enrich_vod(&name).await;
                                 (false, id, sid, name, patch)
+                            });
+                        } else if si < series_fetch.len() {
+                            let (id, sid, name) = series_fetch[si].clone();
+                            si += 1;
+                            set.spawn(async move {
+                                let patch = crate::metadata::enrich_series(&name).await;
+                                (true, id, sid, name, patch)
                             });
                         }
                     }
@@ -2211,12 +2450,70 @@ impl FluxPlay {
                             }
                         }
                     }
-                    tokio::time::sleep(std::time::Duration::from_millis(80)).await;
                 }
                 Message::MetaEnriched {
                     series: series_out,
                     vod: vod_out,
                 }
+            },
+            |m| m,
+        )
+    }
+
+    /// Parallel Xtream `get_vod_info` for movies missing plot/cast/director/poster.
+    fn enrich_xtream_vod_batch_task(&self) -> Task<Message> {
+        let mut jobs: Vec<(MediaSource, String)> = Vec::new();
+        for v in self
+            .bundle
+            .vod
+            .iter()
+            .filter(|v| crate::metadata::needs_vod_enrich(v))
+            .take(48)
+        {
+            let src = v
+                .source_id
+                .and_then(|id| {
+                    self.sources.iter().find(|s| {
+                        s.id == id && s.enabled && s.kind == SourceKind::Xtream
+                    })
+                })
+                .or_else(|| {
+                    self.sources
+                        .iter()
+                        .find(|s| s.enabled && s.kind == SourceKind::Xtream)
+                });
+            if let Some(src) = src {
+                jobs.push((src.clone(), v.id.clone()));
+            }
+        }
+        if jobs.is_empty() {
+            return Task::none();
+        }
+        tracing::info!(n = jobs.len(), "xtream vod_info batch start");
+        Task::perform(
+            async move {
+                let mut out = Vec::new();
+                let mut set = tokio::task::JoinSet::new();
+                const PARALLEL: usize = 6;
+                let mut i = 0usize;
+                while i < jobs.len() || !set.is_empty() {
+                    while set.len() < PARALLEL && i < jobs.len() {
+                        let (src, id) = jobs[i].clone();
+                        i += 1;
+                        set.spawn(async move {
+                            fluxplay_providers::load_xtream_vod_info(&src, &id)
+                                .await
+                                .ok()
+                        });
+                    }
+                    if let Some(joined) = set.join_next().await {
+                        if let Ok(Some(item)) = joined {
+                            out.push(item);
+                        }
+                    }
+                }
+                tracing::info!(n = out.len(), "xtream vod_info batch done");
+                Message::VodInfoBatch(out)
             },
             |m| m,
         )
@@ -2297,9 +2594,17 @@ impl FluxPlay {
     }
 
     fn prefetch_urls(&mut self, urls: impl IntoIterator<Item = String>) -> Task<Message> {
+        self.prefetch_urls_capped(urls, 8)
+    }
+
+    fn prefetch_urls_capped(
+        &mut self,
+        urls: impl IntoIterator<Item = String>,
+        max: usize,
+    ) -> Task<Message> {
         let mut tasks = Vec::new();
         for url in urls {
-            if tasks.len() >= 8 {
+            if tasks.len() >= max {
                 break;
             }
             if let crate::images::RequestOutcome::Fetch(u) = self.images.request(&url) {
@@ -2314,6 +2619,68 @@ impl FluxPlay {
         } else {
             Task::batch(tasks)
         }
+    }
+
+    /// Prefetch posters / covers / banners across the catalog (not only the visible tab).
+    fn prefetch_catalog_art(&mut self) -> Task<Message> {
+        let mut urls = Vec::new();
+        for v in self.bundle.vod.iter().take(64) {
+            if let Some(u) = crate::images::pick_art(None, v.poster.as_deref(), None, None) {
+                urls.push(u);
+            }
+        }
+        for s in self.bundle.series.iter().take(48) {
+            if let Some(c) = s.cover.as_deref().filter(|u| {
+                u.starts_with("http://") || u.starts_with("https://")
+            }) {
+                urls.push(c.to_string());
+            }
+            if let Some(b) = s.banner.as_deref().filter(|u| {
+                u.starts_with("http://") || u.starts_with("https://")
+            }) {
+                urls.push(b.to_string());
+            }
+        }
+        // Also include currently visible tab so navigation stays snappy.
+        let visible = match self.tab {
+            Tab::Vod => self
+                .bundle
+                .vod
+                .iter()
+                .filter(|v| {
+                    self.selected_vod_category
+                        .as_deref()
+                        .map(|id| id == "*" || v.category_id.as_deref() == Some(id))
+                        .unwrap_or(true)
+                })
+                .take(self.list_limit)
+                .filter_map(|v| crate::images::pick_art(None, v.poster.as_deref(), None, None))
+                .collect::<Vec<_>>(),
+            Tab::Series => self
+                .bundle
+                .series
+                .iter()
+                .filter(|s| {
+                    self.selected_series_category
+                        .as_deref()
+                        .map(|id| id == "*" || s.category_id.as_deref() == Some(id))
+                        .unwrap_or(true)
+                })
+                .take(self.list_limit)
+                .flat_map(|s| {
+                    [
+                        s.cover.clone(),
+                        s.banner.clone(),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .filter(|u| u.starts_with("http://") || u.starts_with("https://"))
+                })
+                .collect::<Vec<_>>(),
+            _ => Vec::new(),
+        };
+        urls.extend(visible);
+        self.prefetch_urls_capped(urls, 48)
     }
 
     fn prefetch_visible_art(&mut self) -> Task<Message> {
@@ -2574,12 +2941,31 @@ impl FluxPlay {
     }
 
     fn view(&self, id: window::Id) -> Element<'_, Message> {
+        let view_name = {
+            #[cfg(target_os = "android")]
+            {
+                let _ = id;
+                if self.player_embedded {
+                    "player"
+                } else {
+                    "browser"
+                }
+            }
+            #[cfg(not(target_os = "android"))]
+            {
+                if self.player_id == Some(id) {
+                    "player"
+                } else {
+                    "browser"
+                }
+            }
+        };
+        let _prof = fluxplay_core::InteractionGuard::begin_view(view_name);
         #[cfg(target_os = "android")]
         {
             if self.player_embedded {
                 return self.view_player_window();
             }
-            let _ = id;
             return self.view_browser();
         }
         #[cfg(not(target_os = "android"))]
@@ -2613,12 +2999,19 @@ impl FluxPlay {
             Tab::Settings => self.view_settings(ui),
         };
 
-        let status_bar = container(
-            text(if self.loading {
-                format!("Chargement… · {}", self.status)
+        let status_text = if let Some(prof) = fluxplay_core::overlay_status_line() {
+            if self.loading {
+                format!("Chargement… · {} · {prof}", self.status)
             } else {
-                self.status.clone()
-            })
+                format!("{} · {prof}", self.status)
+            }
+        } else if self.loading {
+            format!("Chargement… · {}", self.status)
+        } else {
+            self.status.clone()
+        };
+        let status_bar = container(
+            text(status_text)
             .size((m.body_size - 1.0).max(11.0))
             .color(ui.ink_muted()),
         )
@@ -2637,7 +3030,7 @@ impl FluxPlay {
 
         let main_row: Element<'_, Message> = if m.top_nav || m.rail_w <= 1.0 {
             column![
-                browser::mode_top_nav(ui, m.rail_size, tab_items),
+                browser::mode_top_nav_ex(ui, m.rail_size, m.nav_strip, tab_items),
                 container(body)
                     .width(Fill)
                     .height(Fill)
@@ -2813,50 +3206,53 @@ impl FluxPlay {
         if cats.is_empty() {
             for (id, name) in derived.into_iter().take(CAT_PAGE) {
                 let active = self.selected_group.as_deref() == Some(name.as_str());
-                let count = self
-                    .bundle
-                    .channels
-                    .iter()
-                    .filter(|c| c.group.as_deref() == Some(name.as_str()))
-                    .count();
-                cat_entries.push((id, name, active, count));
+                // Skip O(n) per-group channel counts — labels are enough for browse UX.
+                cat_entries.push((id, name, active, 0));
             }
         } else {
             for c in cats.into_iter().take(CAT_PAGE) {
                 let active = self.selected_group.as_deref() == Some(c.name.as_str());
-                // Cheap count skip for speed — show 0; name is enough
                 cat_entries.push((c.name.clone(), c.name.clone(), active, 0));
             }
         }
 
-        let filtered: Vec<&Channel> = self
-            .bundle
-            .live_in_group(self.selected_group.as_deref())
-            .into_iter()
-            .filter(|c| q.is_empty() || c.name.to_ascii_lowercase().contains(&q))
-            .collect();
-        let total = filtered.len();
-        let page = filtered
-            .iter()
-            .take(self.list_limit)
-            .copied()
-            .collect::<Vec<_>>();
+        // Early-exit pagination: stop after list_limit+1 matches (has_more probe).
+        let limit = self.list_limit.min(LIST_MAX);
+        let mut page: Vec<&Channel> = Vec::with_capacity(limit);
+        let mut has_more = false;
+        let q_empty = q.is_empty();
+        let group = self.selected_group.as_deref();
+        for c in &self.bundle.channels {
+            if c.kind != ContentKind::Live {
+                continue;
+            }
+            let in_group = match group {
+                None | Some("Tous") | Some("*") => true,
+                Some(g) => c.group.as_deref() == Some(g),
+            };
+            if !in_group {
+                continue;
+            }
+            if !q_empty && !c.name.to_ascii_lowercase().contains(&q) {
+                continue;
+            }
+            if page.len() < limit {
+                page.push(c);
+            } else {
+                has_more = true;
+                break;
+            }
+        }
 
         let mut items = Column::new().spacing(4).width(Fill);
-        let show_list = true; // Paginated via list_limit — always show (Toutes / group / search).
-        if !show_list {
-            items = items.push(browser::empty_hint(
-                ui,
-                "Sélectionnez une catégorie à gauche, ou lancez une recherche.",
-            ));
-        } else if page.is_empty() {
+        if page.is_empty() {
             items = items.push(browser::empty_hint(
                 ui,
                 "Aucune chaîne dans cette sélection.",
             ));
         } else {
+            let now = chrono::Utc::now();
             for ch in &page {
-                let now = chrono::Utc::now();
                 let (epg_now, _) = self.bundle.now_next(ch, now);
                 let epg_bit = epg_now
                     .map(|p| format!(" · {}", p.title))
@@ -2884,8 +3280,8 @@ impl FluxPlay {
                     m.thumb,
                 ));
             }
-            if total > page.len() {
-                items = items.push(browser::load_more_btn(ui, total - page.len()));
+            if has_more && self.list_limit < LIST_MAX {
+                items = items.push(browser::load_more_btn(ui, None));
             }
         }
 
@@ -2894,7 +3290,11 @@ impl FluxPlay {
             self.selected_group
                 .clone()
                 .unwrap_or_else(|| "Toutes les chaînes".into()),
-            format!("{total} chaînes · clic = lecture"),
+            if has_more {
+                format!("{}+ chaînes · clic = lecture", page.len())
+            } else {
+                format!("{} chaînes · clic = lecture", page.len())
+            },
             &self.search,
             m.search_w,
             m.title_size,
@@ -2978,8 +3378,8 @@ impl FluxPlay {
         } else {
             body = body.push(browser::mosaic_grid(tiles, cols));
         }
-        if total > page.len() {
-            body = body.push(browser::load_more_btn(ui, total - page.len()));
+        if total > page.len() && self.list_limit < LIST_MAX {
+            body = body.push(browser::load_more_btn(ui, Some(total - page.len())));
         }
 
         let selected = self.selected_vod_category.as_deref();
@@ -3093,17 +3493,30 @@ impl FluxPlay {
         };
 
         let mut eps = Column::new().spacing(4).width(Fill);
+        let ep_limit = self.list_limit.min(LIST_MAX).max(EPISODE_PAGE);
+        let mut shown = 0usize;
+        let mut total_eps = 0usize;
         for season in &detail.seasons {
+            total_eps += season.episodes.len();
+        }
+        'seasons: for season in &detail.seasons {
+            if shown >= ep_limit {
+                break;
+            }
             eps = eps.push(text(format!("Saison {}", season.season_number)).size(14));
             for ep in &season.episodes {
+                if shown >= ep_limit {
+                    break 'seasons;
+                }
+                shown += 1;
                 let sub = match ep.plot.as_deref().filter(|s| !s.is_empty()) {
                     Some(p) => {
-                        let chars: Vec<char> = p.chars().collect();
-                        if chars.len() > 90 {
-                            let short: String = chars.into_iter().take(90).collect();
+                        let mut it = p.chars();
+                        let short: String = it.by_ref().take(90).collect();
+                        if it.next().is_some() {
                             format!("E{} · {short}…", ep.episode_num)
                         } else {
-                            format!("E{} · {p}", ep.episode_num)
+                            format!("E{} · {short}", ep.episode_num)
                         }
                     }
                     None => format!("Épisode {}", ep.episode_num),
@@ -3124,6 +3537,9 @@ impl FluxPlay {
                     m.thumb,
                 ));
             }
+        }
+        if total_eps > shown && self.list_limit < LIST_MAX {
+            eps = eps.push(browser::load_more_btn(ui, Some(total_eps - shown)));
         }
         let episodes = if detail.seasons.is_empty() {
             None
@@ -3222,8 +3638,8 @@ impl FluxPlay {
         } else {
             body = body.push(browser::mosaic_grid(tiles, cols));
         }
-        if total > page.len() {
-            body = body.push(browser::load_more_btn(ui, total - page.len()));
+        if total > page.len() && self.list_limit < LIST_MAX {
+            body = body.push(browser::load_more_btn(ui, Some(total - page.len())));
         }
 
         let selected = self.selected_series_category.as_deref();
@@ -3318,9 +3734,17 @@ impl FluxPlay {
     fn view_settings(&self, ui: UiTheme) -> Element<'_, Message> {
         let m = self.layout_metrics();
         let profile = target_profile();
-        let backends = detect_backends();
+        let empty = Vec::new();
+        let backends = self.backends_cache.as_deref().unwrap_or(&empty);
         let mut be_list = Column::new().spacing(4).width(Fill);
-        for b in &backends {
+        if backends.is_empty() {
+            be_list = be_list.push(
+                text("Détection backends au prochain affichage…")
+                    .size(12)
+                    .color(ui.ink_muted()),
+            );
+        }
+        for b in backends {
             let mark = if b.available { "Disponible" } else { "Absent" };
             be_list = be_list.push(
                 text(format!("• {} — {} ({})", b.id.label(), b.detail, mark))
@@ -3386,20 +3810,32 @@ impl FluxPlay {
             .color(ui.ink_muted()),
             accent_mosaic,
             section(
-                "2. Métadonnées IMDb",
-                "Enrichissement VOD/Séries : TVMaze + OMDb (IMDb) — synopsis, acteurs, notes.",
+                "2. Métadonnées IMDb (OMDb)",
+                "API officielle OMDb → synopsis, acteurs, notes IMDb. Gratuit : https://www.omdbapi.com/apikey.aspx",
             ),
-            text(if crate::metadata::omdb_configured() {
-                "OMDb configuré (OMDB_API_KEY) — fiche détail complète (plot, cast, ★)."
-            } else {
-                "Sans OMDB_API_KEY : séries via TVMaze. Clé .env pour films IMDb complets."
-            })
-            .size(12)
-            .color(if crate::metadata::omdb_configured() {
-                ui.accent()
-            } else {
-                ui.ink_muted()
-            }),
+            field(
+                "Clé API OMDb",
+                &self.form_omdb_key,
+                Message::FormOmdbKey,
+                Some(PasteTarget::FormOmdbKey),
+                ui,
+            ),
+            row![
+                pill_button(text("Enregistrer la clé"), Message::SaveOmdbKey, ui, true),
+                text(if crate::metadata::omdb_configured() {
+                    "OMDb actif"
+                } else {
+                    "OMDb inactif — collez une clé puis Enregistrer"
+                })
+                .size(12)
+                .color(if crate::metadata::omdb_configured() {
+                    ui.accent()
+                } else {
+                    ui.ink_muted()
+                }),
+            ]
+            .spacing(10)
+            .align_y(Alignment::Center),
             text("3. Material 3 Expressive")
                 .size(13)
                 .color(ui.ink()),
@@ -3624,7 +4060,7 @@ impl FluxPlay {
         let form = column![
             text("Nouvelle source").size(16),
             kind_row,
-            field("Nom", &self.form_name, Message::FormName, ui),
+            field("Nom", &self.form_name, Message::FormName, Some(PasteTarget::FormName), ui),
             field(
                 match self.form_kind {
                     SourceKind::Xtream => "URL serveur",
@@ -3634,21 +4070,46 @@ impl FluxPlay {
                 },
                 &self.form_endpoint,
                 Message::FormEndpoint,
+                Some(PasteTarget::FormEndpoint),
                 ui,
             ),
             if matches!(self.form_kind, SourceKind::Xtream) {
                 row![
-                    field("Utilisateur", &self.form_user, Message::FormUser, ui),
-                    field("Mot de passe", &self.form_pass, Message::FormPass, ui),
+                    field(
+                        "Utilisateur",
+                        &self.form_user,
+                        Message::FormUser,
+                        Some(PasteTarget::FormUser),
+                        ui,
+                    ),
+                    field(
+                        "Mot de passe",
+                        &self.form_pass,
+                        Message::FormPass,
+                        Some(PasteTarget::FormPass),
+                        ui,
+                    ),
                 ]
                 .spacing(8)
                 .into()
             } else if self.form_kind == SourceKind::Stalker {
-                field("Adresse MAC", &self.form_mac, Message::FormMac, ui)
+                field(
+                    "Adresse MAC",
+                    &self.form_mac,
+                    Message::FormMac,
+                    Some(PasteTarget::FormMac),
+                    ui,
+                )
             } else {
                 Space::new().height(0).into()
             },
-            field("EPG XMLTV (optionnel)", &self.form_epg, Message::FormEpg, ui),
+            field(
+                "EPG XMLTV (optionnel)",
+                &self.form_epg,
+                Message::FormEpg,
+                Some(PasteTarget::FormEpg),
+                ui,
+            ),
             row![
                 pill_button(text("Ajouter"), Message::AddSource, ui, true),
                 pill_button(text("Fichier M3U…"), Message::PickPlaylistFile, ui, false),
@@ -3837,6 +4298,51 @@ async fn prefetch_episode_file(url: String, ua: String) -> Result<String, String
     Ok(path.display().to_string())
 }
 
+fn merge_xtream_vod_fields(existing: &mut VodItem, item: &VodItem) {
+    if item.plot.is_some() {
+        existing.plot = item.plot.clone();
+    }
+    if item.actors.is_some() {
+        existing.actors = item.actors.clone();
+    }
+    if item.director.is_some() {
+        existing.director = item.director.clone();
+    }
+    if item.writer.is_some() {
+        existing.writer = item.writer.clone();
+    }
+    if item.genre.is_some() {
+        existing.genre = item.genre.clone();
+    }
+    if item.year.is_some() {
+        existing.year = item.year.clone();
+    }
+    if item.rating.is_some() {
+        existing.rating = item.rating.clone();
+    }
+    if item.runtime.is_some() {
+        existing.runtime = item.runtime.clone();
+    }
+    if item.imdb_id.is_some() {
+        existing.imdb_id = item.imdb_id.clone();
+    }
+    if item.poster.is_some() && existing.poster.is_none() {
+        existing.poster = item.poster.clone();
+    }
+    if item.rated.is_some() {
+        existing.rated = item.rated.clone();
+    }
+    if item.language.is_some() {
+        existing.language = item.language.clone();
+    }
+    if item.country.is_some() {
+        existing.country = item.country.clone();
+    }
+    if item.awards.is_some() {
+        existing.awards = item.awards.clone();
+    }
+}
+
 fn replace_source_bundle(into: &mut PlaylistBundle, source_id: Uuid, part: PlaylistBundle) {
     into.channels.retain(|c| c.source_id != Some(source_id));
     into.vod.retain(|v| v.source_id != Some(source_id));
@@ -3876,6 +4382,34 @@ fn redact_endpoint(endpoint: &str) -> String {
     }
 }
 
+
+fn profile_message_label(message: &Message) -> &'static str {
+    match message {
+        Message::PlayerTick => "tick.player",
+        Message::PlayerChromeTick => "tick.chrome",
+        Message::ImageLoaded(_) => "async.image",
+        Message::MetaEnriched { .. } => "async.meta",
+        Message::VodInfoBatch(_) => "async.vod_info_batch",
+        Message::PlayerLayout { .. } => "layout.player",
+        Message::PlayerLayoutDirty(_) => "layout.player_dirty",
+        Message::WindowResized { .. } => "layout.resize",
+        Message::PlayerPointerActivity => "input.pointer",
+        Message::DetailMetaLoaded { .. } => "async.detail_meta",
+        Message::SeriesDetailLoaded(_) => "async.series_detail",
+        Message::SeriesEpisodesEnriched(_) => "async.series_episodes",
+        Message::VodDetailLoaded(_) => "async.vod_detail",
+        Message::VodCategoryLoaded { .. } => "async.vod_category",
+        Message::SeriesCategoryLoaded { .. } => "async.series_category",
+        Message::SourceLoaded { .. } => "async.source",
+        Message::SourcesBatchLoaded(_) => "async.sources_batch",
+        Message::EpgFetched(_) => "async.epg",
+        Message::PrefetchDone(_) => "async.prefetch",
+        Message::DiagnoseDone(_) => "async.diagnose",
+        Message::ClipboardText(_, _) => "async.clipboard",
+        Message::PlaylistFilePicked(_) => "async.file_pick",
+        other => ui_action_label(other).unwrap_or("ui.autre"),
+    }
+}
 
 fn ui_action_label(message: &Message) -> Option<&'static str> {
     Some(match message {
@@ -3932,6 +4466,9 @@ fn ui_action_label(message: &Message) -> Option<&'static str> {
         Message::CycleCache => "reglages.cache",
         Message::CycleDemux => "reglages.demux",
         Message::CycleTheme => "reglages.theme",
+        Message::FormOmdbKey(_) => "reglages.omdb_key",
+        Message::SaveOmdbKey => "reglages.omdb_save",
+        Message::PasteInto(_) | Message::ClipboardText(_, _) => "presse_papiers.coller",
         Message::CycleAccent | Message::SetAccent(_) => "reglages.accent",
         Message::CycleBackend => "reglages.backend",
         Message::ToggleHwdec => "reglages.hwdec",
@@ -3948,6 +4485,8 @@ fn ui_action_label(message: &Message) -> Option<&'static str> {
         Message::SeriesEpisodesEnriched(_) => "series.episodes_meta",
         Message::CloseSeriesDetail => "series.close",
         Message::OpenVodDetail(_) => "vod.open_detail",
+        Message::VodDetailLoaded(_) => "vod.detail_loaded",
+        Message::VodInfoBatch(_) => "vod.info_batch",
         Message::CloseVodDetail => "vod.close_detail",
         Message::DetailMetaLoaded { .. } => "meta.detail",
         Message::LoadMore => "nav.load_more",
@@ -4022,20 +4561,34 @@ fn field<'a>(
     label: &'a str,
     value: &str,
     on_input: impl Fn(String) -> Message + 'a,
+    paste: Option<PasteTarget>,
     ui: UiTheme,
 ) -> Element<'a, Message> {
+    let input = text_input(label, value)
+        .on_input(on_input)
+        .padding(12)
+        .size(14)
+        .style(move |theme: &Theme, status| {
+            let mut s = text_input::default(theme, status);
+            s.border.radius = RADIUS_MD.into();
+            s.background = Background::Color(ui.surface_muted());
+            s
+        });
+    let input_row: Element<'a, Message> = if let Some(target) = paste {
+        row![
+            container(input).width(Fill),
+            pill_button(text("Coller"), Message::PasteInto(target), ui, false),
+        ]
+        .spacing(8)
+        .align_y(Alignment::Center)
+        .width(Fill)
+        .into()
+    } else {
+        input.into()
+    };
     column![
         text(label).size(12).color(ui.ink_muted()),
-        text_input(label, value)
-            .on_input(on_input)
-            .padding(12)
-            .size(14)
-            .style(move |theme: &Theme, status| {
-                let mut s = text_input::default(theme, status);
-                s.border.radius = RADIUS_MD.into();
-                s.background = Background::Color(ui.surface_muted());
-                s
-            }),
+        input_row,
     ]
     .spacing(4)
     .width(Fill)

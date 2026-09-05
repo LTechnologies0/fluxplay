@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 360 96" role="img" aria-label="FluxPlay">
+  <defs>
+    <linearGradient id="w" x1="0" y1="0" x2="340" y2="0" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#FFF6EC"/>
+      <stop offset="0.55" stop-color="#FFCC80"/>
+      <stop offset="1" stop-color="#FF8A4C"/>
+    </linearGradient>
+  </defs>
+  <text x="0" y="68" font-family="Segoe UI, Helvetica Neue, Arial, sans-serif" font-size="72" font-weight="700" letter-spacing="-2" fill="url(#w)">FluxPlay</text>
+  <path fill="#E65100" d="M318 78l10 6c.8.5.8 1.7 0 2.2l-10 6c-.9.5-2-.1-2-1.1V79.1c0-1 1.1-1.6 2-1.1z"/>
+</svg>

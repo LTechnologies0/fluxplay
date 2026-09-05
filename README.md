@@ -106,20 +106,28 @@ Profils dans le `Cargo.toml` racine : `lto=fat`, `codegen-units=1`, `panic=abort
 
 ## Logging
 
-Niveaux `tracing` : **TRACE** / **DEBUG** / **INFO** / **WARN** / **ERROR**, plus cible **profiler** (timing).
+Niveaux `tracing` : **TRACE** / **DEBUG** / **INFO** / **WARN** / **ERROR**, plus cible **profiler** (timing / CPU / RAM / FPS).
 
 ```bash
 # défaut (tous les crates workspace à info ; profiler off)
 cargo run -p fluxplay
 
-# détail complet + profiler
+# profiler d’interactions GUI + overlay FPS dans la barre de statut
+FLUXPLAY_PROFILE=1 cargo run -p fluxplay
+
+# overlay FPS seul (sans CPU/RSS sur chaque message)
+FLUXPLAY_FPS=1 cargo run -p fluxplay
+
+# détail complet + samples TRACE (ns, ms, % CPU/cœur, RSS B/KiB/MiB/GiB, FPS)
 RUST_LOG=fluxplay=trace,fluxplay_core=trace,fluxplay_providers=trace,fluxplay_player=trace,fluxplay_ffi=trace,profiler=trace cargo run -p fluxplay
 
 # un crate seulement
 RUST_LOG=fluxplay_providers=debug,profiler=trace cargo run -p fluxplay
 ```
 
-Helpers : `fluxplay_core::profiler!`, `profile_scope!`, `Stopwatch`, filtre défaut `DEFAULT_ENV_FILTER`.
+Chaque `update(Message)` et chaque `view` émettent (si activé) : `wall_ns` / `wall_ms`, `cpu_pct_core` / `cpu_pct_machine`, `rss_*` (octets + humain), et le compteur **FPS** GUI. Les `Stopwatch` / `ResourceStopwatch` existants (providers, player, catalogue…) ajoutent les mêmes métriques autour des tâches async lourdes.
+
+Helpers : `fluxplay_core::profiler!`, `profile_scope!`, `Stopwatch`, `InteractionGuard`, `overlay_status_line`, filtre défaut `DEFAULT_ENV_FILTER`.
 
 ## Catalogue local
 

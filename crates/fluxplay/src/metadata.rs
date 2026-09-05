@@ -217,7 +217,8 @@ fn is_lang_tag(head: &str) -> bool {
             | "TR" | "RU" | "XX" | "XXX" | "NF" | "NRC" | "DK" | "SC" | "AF" | "ALB" | "PK"
             | "ID" | "MX" | "US" | "UK" | "VO" | "VF" | "MULTI" | "EX" | "DS" | "NO" | "FI"
             | "HU" | "RO" | "CZ" | "SK" | "BG" | "HR" | "RS" | "UA" | "JP" | "KR" | "CN"
-            | "BR" | "LAT" | "BIA" | "BAT" | "ONE" | "ALF"
+            | "BR" | "LAT" | "BIA" | "BAT" | "ONE" | "ALF" | "AZ" | "ZA" | "HQ" | "HE"
+            | "SUB" | "RAW" | "CAM" | "WEB" | "BLU"
     ) {
         return true;
     }
@@ -466,12 +467,6 @@ fn http() -> &'static reqwest::Client {
     })
 }
 
-pub fn omdb_configured() -> bool {
-    std::env::var("OMDB_API_KEY")
-        .map(|k| !k.trim().is_empty())
-        .unwrap_or(false)
-}
-
 pub fn imdb_title_url(imdb_id: &str) -> String {
     let id = imdb_id.trim();
     if id.starts_with("tt") {
@@ -482,21 +477,14 @@ pub fn imdb_title_url(imdb_id: &str) -> String {
 }
 
 pub async fn enrich_series(name: &str) -> Option<MetaPatch> {
+    let mut patch = enrich_title_full(name, "series", None)
+        .await
+        .unwrap_or_default();
     let q = parse_title_query(name);
-    debug!(%name, title = %q.title, year = ?q.year, "enrich_series");
-    let mut patch = MetaPatch::default();
-    if let Some(p) = tvmaze_show(&q.title).await {
-        patch.merge(p);
-    }
-    if let Some(p) = omdb_lookup(&q, "series").await {
-        patch.merge(p);
-    } else if patch.imdb_id.is_none() {
-        if let Some(p) = omdb_lookup(&q, "").await {
+    if patch.actors.is_none() || patch.plot.is_none() {
+        if let Some(p) = tvmaze_show(&q.title).await {
             patch.merge(p);
         }
-    }
-    if patch.year.is_none() {
-        patch.year = q.year.clone();
     }
     if patch.is_empty() {
         None
@@ -506,66 +494,66 @@ pub async fn enrich_series(name: &str) -> Option<MetaPatch> {
 }
 
 pub async fn enrich_vod(name: &str) -> Option<MetaPatch> {
-    let q = parse_title_query(name);
-    debug!(%name, title = %q.title, year = ?q.year, "enrich_vod");
-    let mut patch = MetaPatch::default();
-    if let Some(p) = omdb_lookup(&q, "movie").await {
-        patch.merge(p);
-    } else if let Some(p) = omdb_lookup(&q, "").await {
-        patch.merge(p);
-    } else if let Some(p) = omdb_search_first(&q, "movie").await {
-        if let Some(id) = p.imdb_id.clone() {
-            if let Some(full) = omdb_by_id(&id).await {
-                patch.merge(full);
-            } else {
-                patch.merge(p);
-            }
-        }
-    }
-    if patch.year.is_none() {
-        patch.year = q.year.clone();
-    }
-    if patch.is_empty() {
-        None
-    } else {
-        Some(patch)
-    }
+    enrich_title_full(name, "movie", None).await
 }
 
 /// Full IMDb-via-OMDb detail for the media page (synopsis + cast). Prefer `i=tt…`.
+///
+/// Strategy (official OMDb REST — not HTML scraping):
+/// 1. `i=` by known IMDb id → full plot + actors
+/// 2. `t=` exact title (+ year + type)
+/// 3. `s=` search → pick best hit by year/title → `i=` full fetch
 pub async fn enrich_title_full(
     name: &str,
     kind: &str,
     imdb_id: Option<&str>,
 ) -> Option<MetaPatch> {
     let q = parse_title_query(name);
+    debug!(%name, title = %q.title, year = ?q.year, %kind, "enrich_title_full");
     let mut patch = MetaPatch::default();
+
     if let Some(id) = imdb_id.filter(|s| s.starts_with("tt")) {
         if let Some(p) = omdb_by_id(id).await {
             patch.merge(p);
         }
     }
-    if patch.actors.is_none() || patch.plot.is_none() {
+
+    if needs_full_credits(patch.actors.as_deref(), patch.plot.as_deref()) {
         if let Some(p) = omdb_lookup(&q, kind).await {
             patch.merge(p);
         }
     }
-    if patch.imdb_id.is_none() {
-        if let Some(p) = omdb_search_first(&q, kind).await {
-            if let Some(id) = p.imdb_id.clone() {
+
+    // Untyped title pass (some OMDb rows omit type=movie).
+    if needs_full_credits(patch.actors.as_deref(), patch.plot.as_deref()) && !kind.is_empty() {
+        if let Some(p) = omdb_lookup(&q, "").await {
+            patch.merge(p);
+        }
+    }
+
+    if needs_full_credits(patch.actors.as_deref(), patch.plot.as_deref())
+        || patch.imdb_id.is_none()
+    {
+        if let Some(hit) = omdb_search_best(&q, kind).await {
+            if let Some(id) = hit.imdb_id.clone() {
                 if let Some(full) = omdb_by_id(&id).await {
                     patch.merge(full);
                 } else {
-                    patch.merge(p);
+                    patch.merge(hit);
                 }
+            } else {
+                patch.merge(hit);
             }
         }
     }
+
+    // Series cast fallback when OMDb has no Actors field.
     if kind == "series" && patch.actors.is_none() {
         if let Some(p) = tvmaze_show(&q.title).await {
             patch.merge(p);
         }
     }
+
     if patch.year.is_none() {
         patch.year = q.year.clone();
     }
@@ -614,14 +602,18 @@ pub fn needs_series_enrich(s: &SeriesItem) -> bool {
     s.imdb_id.is_none()
         || s.plot.as_ref().map(|p| p.len() < 40).unwrap_or(true)
         || s.actors.is_none()
+        || s.director.is_none()
         || s.rating.is_none()
+        || (s.cover.is_none() && s.banner.is_none())
 }
 
 pub fn needs_vod_enrich(v: &VodItem) -> bool {
     v.imdb_id.is_none()
         || v.plot.as_ref().map(|p| p.len() < 40).unwrap_or(true)
         || v.actors.is_none()
+        || v.director.is_none()
         || v.rating.is_none()
+        || v.poster.is_none()
 }
 
 pub fn needs_full_credits(actors: Option<&str>, plot: Option<&str>) -> bool {
@@ -746,46 +738,148 @@ async fn omdb_by_id(imdb_id: &str) -> Option<MetaPatch> {
     omdb_get(&url, imdb_id).await
 }
 
-async fn omdb_search_first(q: &TitleQuery, kind: &str) -> Option<MetaPatch> {
+/// Search (`s=`) then pick the best row (year + title similarity), not blindly the first.
+async fn omdb_search_best(q: &TitleQuery, kind: &str) -> Option<MetaPatch> {
     let key = omdb_key()?;
-    let mut url = format!(
-        "https://www.omdbapi.com/?apikey={}&s={}",
-        urlencoding_lite(&key),
-        urlencoding_lite(&q.title)
+    let mut candidates = Vec::new();
+
+    // Try full title, then a shortened form (drop trailing subtitle noise).
+    let mut queries = vec![q.title.clone()];
+    if let Some((head, _)) = q.title.split_once(':') {
+        let h = head.trim();
+        if h.len() >= 3 {
+            queries.push(h.to_string());
+        }
+    }
+    let words: Vec<_> = q.title.split_whitespace().collect();
+    if words.len() > 4 {
+        queries.push(words[..4].join(" "));
+    }
+
+    for title_q in queries {
+        let mut url = format!(
+            "https://www.omdbapi.com/?apikey={}&s={}",
+            urlencoding_lite(&key),
+            urlencoding_lite(&title_q)
+        );
+        if !kind.is_empty() {
+            url.push_str("&type=");
+            url.push_str(kind);
+        }
+        if let Some(y) = &q.year {
+            url.push_str("&y=");
+            url.push_str(y);
+        }
+        let Some(resp) = http().get(&url).send().await.ok() else {
+            continue;
+        };
+        if !resp.status().is_success() {
+            continue;
+        }
+        let Ok(body) = resp.json::<OmdbSearchResp>().await else {
+            continue;
+        };
+        if body.response.as_deref() == Some("False") {
+            // Retry without year — OMDb year filter is strict.
+            if q.year.is_some() {
+                let mut url2 = format!(
+                    "https://www.omdbapi.com/?apikey={}&s={}",
+                    urlencoding_lite(&key),
+                    urlencoding_lite(&title_q)
+                );
+                if !kind.is_empty() {
+                    url2.push_str("&type=");
+                    url2.push_str(kind);
+                }
+                if let Ok(resp2) = http().get(&url2).send().await {
+                    if let Ok(body2) = resp2.json::<OmdbSearchResp>().await {
+                        if let Some(list) = body2.search {
+                            candidates.extend(list);
+                        }
+                    }
+                }
+            }
+            continue;
+        }
+        if let Some(list) = body.search {
+            candidates.extend(list);
+        }
+        if !candidates.is_empty() {
+            break;
+        }
+    }
+
+    if candidates.is_empty() {
+        return None;
+    }
+
+    let want = q.title.to_ascii_lowercase();
+    let want_year = q.year.clone();
+    candidates.sort_by_key(|c| {
+        let title = c.title.as_deref().unwrap_or("").to_ascii_lowercase();
+        let year_ok = match (&want_year, c.year.as_deref()) {
+            (Some(wy), Some(cy)) if cy.starts_with(wy.as_str()) => 0i32,
+            (Some(_), _) => 2,
+            _ => 1,
+        };
+        let exact = if title == want { 0 } else { 1 };
+        let starts = if title.starts_with(&want) || want.starts_with(&title) {
+            0
+        } else {
+            1
+        };
+        (year_ok, exact, starts, title.len() as i32)
+    });
+
+    let best = candidates.into_iter().next()?;
+    debug!(
+        query = %q.title,
+        hit = ?best.title,
+        year = ?best.year,
+        id = ?best.imdb_id,
+        "omdb search best"
     );
-    if !kind.is_empty() {
-        url.push_str("&type=");
-        url.push_str(kind);
-    }
-    if let Some(y) = &q.year {
-        url.push_str("&y=");
-        url.push_str(y);
-    }
-    let resp = http().get(&url).send().await.ok()?;
-    if !resp.status().is_success() {
-        return None;
-    }
-    let body: OmdbSearchResp = resp.json().await.ok()?;
-    if body.response.as_deref() == Some("False") {
-        return None;
-    }
-    let first = body.search?.into_iter().next()?;
     Some(MetaPatch {
-        year: first.year.filter(|y| y != "N/A"),
-        poster: first.poster.filter(|p| p != "N/A"),
-        imdb_id: first.imdb_id.filter(|id| id != "N/A"),
+        year: best.year.filter(|y| y != "N/A"),
+        poster: best.poster.filter(|p| p != "N/A"),
+        imdb_id: best.imdb_id.filter(|id| id != "N/A"),
         ..Default::default()
     })
 }
 
-fn omdb_key() -> Option<String> {
-    match std::env::var("OMDB_API_KEY") {
-        Ok(k) if !k.trim().is_empty() => Some(k),
-        _ => {
-            trace!("omdb skipped — no OMDB_API_KEY");
+use std::sync::Mutex;
+
+static OMDB_KEY_RUNTIME: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+
+/// Push the settings / UI key so OMDb works without restarting for env alone.
+pub fn set_omdb_api_key(key: Option<String>) {
+    let cell = OMDB_KEY_RUNTIME.get_or_init(|| Mutex::new(None));
+    let cleaned = key.and_then(|k| {
+        let t = k.trim().to_string();
+        if t.is_empty() {
             None
+        } else {
+            Some(t)
+        }
+    });
+    if let Ok(mut g) = cell.lock() {
+        *g = cleaned;
+    }
+}
+
+pub fn omdb_configured() -> bool {
+    omdb_key().is_some()
+}
+
+fn omdb_key() -> Option<String> {
+    if let Ok(k) = std::env::var("OMDB_API_KEY") {
+        let t = k.trim();
+        if !t.is_empty() {
+            return Some(t.to_string());
         }
     }
+    let cell = OMDB_KEY_RUNTIME.get_or_init(|| Mutex::new(None));
+    cell.lock().ok().and_then(|g| g.clone()).filter(|k| !k.is_empty())
 }
 
 async fn omdb_get(url: &str, label: &str) -> Option<MetaPatch> {
@@ -802,11 +896,17 @@ async fn omdb_get(url: &str, label: &str) -> Option<MetaPatch> {
         }
     };
     if body.response.as_deref() == Some("False") {
-        trace!(%label, "omdb miss");
+        debug!(%label, err = ?body.error, "omdb miss");
         return None;
     }
     let na = |s: Option<String>| s.filter(|v| v != "N/A" && !v.is_empty());
-    debug!(%label, year = ?body.year, actors = ?body.actors, "omdb/IMDb hit");
+    debug!(
+        %label,
+        year = ?body.year,
+        actors = ?body.actors,
+        plot_len = body.plot.as_ref().map(|p| p.len()),
+        "omdb/IMDb hit"
+    );
     Some(MetaPatch {
         year: na(body.year),
         genre: na(body.genre),
@@ -924,6 +1024,8 @@ struct TvMazePerson {
 struct OmdbResp {
     #[serde(rename = "Response")]
     response: Option<String>,
+    #[serde(rename = "Error")]
+    error: Option<String>,
     #[serde(rename = "Year")]
     year: Option<String>,
     #[serde(rename = "Genre")]
@@ -964,6 +1066,8 @@ struct OmdbSearchResp {
 
 #[derive(Debug, Deserialize)]
 struct OmdbSearchItem {
+    #[serde(rename = "Title")]
+    title: Option<String>,
     #[serde(rename = "Year")]
     year: Option<String>,
     #[serde(rename = "Poster")]
@@ -981,6 +1085,16 @@ mod tests {
         let q = parse_title_query("EN - Guardians of the Galaxy Vol. 2 - 2017-sub");
         assert_eq!(q.title, "Guardians of the Galaxy Vol 2");
         assert_eq!(q.year.as_deref(), Some("2017"));
+    }
+
+    #[test]
+    fn strips_az_catalog_prefix_idea_of_you() {
+        let q = parse_title_query("AZ - The Idea of You - 2024");
+        assert_eq!(q.title, "The Idea of You");
+        assert_eq!(q.year.as_deref(), Some("2024"));
+        // Must not strip trailing "You" as a fake lang tag.
+        let q2 = parse_title_query("The Idea of You");
+        assert_eq!(q2.title, "The Idea of You");
     }
 
     #[test]

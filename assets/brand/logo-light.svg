@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 560 140" role="img" aria-label="FluxPlay">
+  <defs>
+    <linearGradient id="g" x1="20" y1="26" x2="110" y2="116" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#FFB74D"/>
+      <stop offset="0.45" stop-color="#EF6C00"/>
+      <stop offset="1" stop-color="#E65100"/>
+    </linearGradient>
+    <linearGradient id="r" x1="32" y1="70" x2="76" y2="70" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#FFCC80" stop-opacity="0.2"/>
+      <stop offset="0.4" stop-color="#FFB068" stop-opacity="0.85"/>
+      <stop offset="1" stop-color="#EF6C00"/>
+    </linearGradient>
+    <linearGradient id="bg" x1="6" y1="6" x2="134" y2="134" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#FFF8F0"/>
+      <stop offset="1" stop-color="#FFE0B2"/>
+    </linearGradient>
+  </defs>
+
+  <g transform="translate(6,6)">
+    <rect width="128" height="128" rx="32" fill="url(#bg)" stroke="#E65100" stroke-opacity="0.14" stroke-width="2"/>
+    <g fill="none" stroke="url(#g)" stroke-linecap="round">
+      <path d="M30 42c16-12 36-12 52 0" stroke-width="3" opacity="0.3"/>
+      <path d="M26 56c20-16 44-16 64 0" stroke-width="3.8" opacity="0.5"/>
+      <path d="M24 70c22-18 50-18 72 0" stroke-width="4.8" opacity="0.9"/>
+    </g>
+    <path
+      fill="url(#r)"
+      d="M24 80c11-3 19-9 25-17 3.8-5 8.5-9 14.2-11
+         1.8 6.2 1.8 12.8 0 19
+         -5.7 2-10.4 6-14.2 11
+         -6 8-14 14-25 17
+         -1.8-6.2-1.8-12.8 0-19z"
+    />
+    <path
+      fill="url(#g)"
+      d="M57 41.8c0-2.5 2.7-4 4.9-2.8l37.2 21.2c2.2 1.2 2.2 4.3 0 5.5L61.9 87c-2.2 1.2-4.9-.3-4.9-2.8V41.8z"
+    />
+  </g>
+
+  <text x="168" y="84" font-family="Segoe UI, Helvetica Neue, Arial, sans-serif" font-size="68" font-weight="700" letter-spacing="-1.8" fill="#1A222C">FluxPlay</text>
+  <text x="172" y="118" font-family="Segoe UI, Helvetica Neue, Arial, sans-serif" font-size="15" font-weight="600" letter-spacing="5.2" fill="#E65100">STREAM · WATCH · FLOW</text>
+</svg>

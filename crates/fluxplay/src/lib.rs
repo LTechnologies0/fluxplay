@@ -19,6 +19,13 @@ use tracing_subscriber::EnvFilter;
 pub fn run() -> iced::Result {
     init_tracing();
     tracing::info!("FluxPlay starting (desktop)");
+    if fluxplay_core::profiling_enabled() {
+        tracing::info!(
+            target: "fluxplay::profile",
+            overlay = fluxplay_core::overlay_enabled(),
+            "interaction profiler ON (wall_ns/ms, cpu%/core, rss, fps)"
+        );
+    }
     fluxplay_core::profiler!("boot");
     app::run_daemon()
 }

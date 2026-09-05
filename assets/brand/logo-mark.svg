@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-label="FluxPlay">
+  <defs>
+    <linearGradient id="g" x1="20" y1="20" x2="110" y2="110" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#FFCC80"/>
+      <stop offset="0.45" stop-color="#FF8A4C"/>
+      <stop offset="1" stop-color="#E65100"/>
+    </linearGradient>
+    <linearGradient id="r" x1="26" y1="64" x2="70" y2="64" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#FFCC80" stop-opacity="0.12"/>
+      <stop offset="0.4" stop-color="#FFB068" stop-opacity="0.8"/>
+      <stop offset="1" stop-color="#FF8A4C"/>
+    </linearGradient>
+    <linearGradient id="bg" x1="0" y1="0" x2="128" y2="128" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#1A222C"/>
+      <stop offset="1" stop-color="#0B1016"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="128" height="128" rx="32" fill="url(#bg)"/>
+  <circle cx="94" cy="32" r="30" fill="#FF8A4C" opacity="0.1"/>
+  <circle cx="26" cy="100" r="24" fill="#FFCC80" opacity="0.07"/>
+
+  <!-- Flux signal arcs -->
+  <g fill="none" stroke="url(#g)" stroke-linecap="round">
+    <path d="M30 42c16-12 36-12 52 0" stroke-width="3" opacity="0.3"/>
+    <path d="M26 56c20-16 44-16 64 0" stroke-width="3.8" opacity="0.5"/>
+    <path d="M24 70c22-18 50-18 72 0" stroke-width="4.8" opacity="0.82"/>
+  </g>
+
+  <!-- Flow ribbon -->
+  <path
+    fill="url(#r)"
+    d="M24 80c11-3 19-9 25-17 3.8-5 8.5-9 14.2-11
+       1.8 6.2 1.8 12.8 0 19
+       -5.7 2-10.4 6-14.2 11
+       -6 8-14 14-25 17
+       -1.8-6.2-1.8-12.8 0-19z"
+  />
+
+  <!-- Play -->
+  <path
+    fill="url(#g)"
+    d="M57 41.8c0-2.5 2.7-4 4.9-2.8l37.2 21.2c2.2 1.2 2.2 4.3 0 5.5L61.9 87c-2.2 1.2-4.9-.3-4.9-2.8V41.8z"
+  />
+  <path
+    fill="#FFF8F0"
+    opacity="0.2"
+    d="M61.5 46l29.2 16.5c.7.4.7 1.4 0 1.8L61.5 80.8V46z"
+  />
+</svg>
