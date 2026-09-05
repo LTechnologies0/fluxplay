@@ -2,40 +2,57 @@ use std::path::Path;
 
 use fluxplay_core::m3u;
 use fluxplay_core::models::{MediaSource, PlaylistBundle};
-use tracing::{info, warn};
+use fluxplay_core::Stopwatch;
+use tracing::{debug, error, info, warn};
 
 use crate::user_agents::agents_for;
 use crate::{http_client, xtream_url, Result};
 
 pub async fn load_m3u_source(source: &MediaSource) -> Result<PlaylistBundle> {
+    let _prof = Stopwatch::start("load_m3u_source");
     let endpoint = source.endpoint.trim();
+    debug!(source_id = %source.id, "load_m3u_source start");
     let body = if endpoint.starts_with("http://") || endpoint.starts_with("https://") {
         fetch_playlist_body(endpoint, source).await?
     } else if Path::new(endpoint).exists() {
+        debug!("reading playlist from local path");
         tokio::fs::read_to_string(endpoint)
             .await
             .map_err(|e| crate::ProviderError::Message(format!("read playlist: {e}")))?
     } else {
+        debug!("treating endpoint as inline playlist body");
         endpoint.to_string()
     };
 
     if body.trim().is_empty() {
+        error!(source_id = %source.id, "playlist empty");
         return Err(crate::ProviderError::Message(
             "playlist vide (serveur a renvoyé un corps vide)".into(),
         ));
     }
 
     let mut bundle = m3u::parse_m3u(&body, Some(source.id))?;
+    info!(
+        source_id = %source.id,
+        channels = bundle.channels.len(),
+        "M3U parsed"
+    );
     bundle = crate::attach_epg(source, bundle).await?;
     Ok(bundle)
 }
 
 /// Download playlist text, rotating IPTV User-Agents on 885 / 403 / empty body.
 pub async fn fetch_playlist_body(endpoint: &str, source: &MediaSource) -> Result<String> {
+    let _prof = Stopwatch::start("fetch_playlist_body");
     let client = http_client()?;
     let agents = agents_for(source.user_agent.as_deref());
     let mut last_status = 0u16;
     let mut last_err = String::new();
+    debug!(
+        source_id = %source.id,
+        agents = agents.len(),
+        "fetching playlist with UA rotation"
+    );
 
     for (i, ua) in agents.iter().enumerate() {
         let mut req = client.get(endpoint).header(reqwest::header::USER_AGENT, ua);
@@ -88,6 +105,13 @@ pub async fn fetch_playlist_body(endpoint: &str, source: &MediaSource) -> Result
         }
     }
 
+    error!(
+        source_id = %source.id,
+        agents = agents.len(),
+        last_status,
+        last_err = %last_err,
+        "all User-Agents failed for playlist fetch"
+    );
     Err(crate::ProviderError::Message(format!(
         "échec get.php/M3U après {} User-Agents (dernier: HTTP {last_status} — {last_err}). \
          Si c'est un panel Xtream, FluxPlay bascule sur player_api.",

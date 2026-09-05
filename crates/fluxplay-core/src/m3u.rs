@@ -1,22 +1,30 @@
 //! M3U / M3U Plus / M3U8 playlist parser (IPTV `#EXTINF` dialect).
 
 use regex::Regex;
+use tracing::{debug, info, trace, warn};
 use uuid::Uuid;
 
 use crate::error::{Error, Result};
 use crate::models::{CatchupInfo, Channel, ContentKind, PlaylistBundle};
 use crate::protocol::StreamScheme;
+use crate::Stopwatch;
 
 /// Parse an M3U / M3U Plus body into a [`PlaylistBundle`].
 pub fn parse_m3u(body: &str, source_id: Option<Uuid>) -> Result<PlaylistBundle> {
+    let _prof = Stopwatch::start("parse_m3u");
     let text = body.strip_prefix('\u{feff}').unwrap_or(body);
+    debug!(bytes = text.len(), ?source_id, "parse_m3u start");
     if !text.lines().next().map(|l| l.trim_start().starts_with("#EXTM3U")).unwrap_or(false)
         && !text.contains("#EXTINF")
     {
         // Allow bare URL lists used by some IPTV exporters.
         if text.lines().any(|l| looks_like_url(l.trim())) {
-            return Ok(parse_bare_urls(text, source_id));
+            info!("parse_m3u bare-URL fallback");
+            let bundle = parse_bare_urls(text, source_id);
+            info!(channels = bundle.channels.len(), "parse_m3u bare done");
+            return Ok(bundle);
         }
+        warn!("parse_m3u missing #EXTM3U / #EXTINF header");
         return Err(Error::InvalidPlaylist(
             "missing #EXTM3U / #EXTINF header".into(),
         ));
@@ -58,6 +66,7 @@ pub fn parse_m3u(body: &str, source_id: Option<Uuid>) -> Result<PlaylistBundle> 
 
         let url = line.to_string();
         if !looks_like_url(&url) {
+            trace!(%url, "parse_m3u skip non-url line");
             continue;
         }
 
@@ -91,6 +100,12 @@ pub fn parse_m3u(body: &str, source_id: Option<Uuid>) -> Result<PlaylistBundle> 
             kind: ContentKind::Live,
             catchup: catchup_info,
         });
+    }
+
+    if channels.is_empty() {
+        warn!("parse_m3u produced zero channels");
+    } else {
+        info!(channels = channels.len(), "parse_m3u done");
     }
 
     Ok(PlaylistBundle {

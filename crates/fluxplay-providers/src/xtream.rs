@@ -8,12 +8,13 @@ use fluxplay_core::models::{
     SeriesSeason, SourceKind, VodItem,
 };
 use fluxplay_core::protocol::StreamScheme;
+use fluxplay_core::Stopwatch;
 use serde::Deserialize;
 use serde_json::Value;
-use tracing::info;
+use tracing::{debug, error, info, trace, warn};
 use url::Url;
 
-use crate::{http_client, ProviderError, Result};
+use crate::{ProviderError, Result};
 
 /// Same UA string IPTV Smarters Pro sends on many panels.
 pub const SMARTERS_UA: &str = "IPTVSmartersPlayer";
@@ -46,6 +47,13 @@ impl XtreamClient {
         url.set_query(None);
         url.set_fragment(None);
         // Ensure trailing slash semantics for format!
+        // Never log password.
+        debug!(
+            source_id = %source_id,
+            portal = %url,
+            user = %username,
+            "XtreamClient from_credentials"
+        );
         Ok(Self {
             stream_base: url.clone(),
             portal: url,
@@ -60,14 +68,14 @@ impl XtreamClient {
         if source.kind != SourceKind::Xtream {
             return Err(ProviderError::Unsupported(source.kind));
         }
-        let username = source
-            .username
-            .clone()
-            .ok_or_else(|| ProviderError::Auth("Xtream username required".into()))?;
-        let password = source
-            .password
-            .clone()
-            .ok_or_else(|| ProviderError::Auth("Xtream password required".into()))?;
+        let username = source.username.clone().ok_or_else(|| {
+            error!(source_id = %source.id, "Xtream username missing");
+            ProviderError::Auth("Xtream username required".into())
+        })?;
+        let password = source.password.clone().ok_or_else(|| {
+            error!(source_id = %source.id, "Xtream password missing");
+            ProviderError::Auth("Xtream password required".into())
+        })?;
         Self::from_credentials(source.id, &source.endpoint, username, password)
     }
 
@@ -86,19 +94,86 @@ impl XtreamClient {
     }
 
     async fn get_json(&self, action: Option<&str>) -> Result<Value> {
-        let client = http_client()?;
-        let url = self.api_url(action)?;
-        let resp = client
-            .get(url)
-            .header(reqwest::header::USER_AGENT, SMARTERS_UA)
-            .send()
-            .await?;
-        if !resp.status().is_success() {
-            return Err(crate::xtream_url::map_http_error(
-                resp.error_for_status().unwrap_err(),
-            ));
+        self.fetch_api_json(action, &[]).await
+    }
+
+    pub(crate) async fn get_json_action(
+        &self,
+        action: &str,
+        extra: &[(&str, &str)],
+    ) -> Result<Value> {
+        let extras: Vec<&str> = extra.iter().flat_map(|(k, v)| [*k, *v]).collect();
+        self.fetch_api_json(Some(action), &extras).await
+    }
+
+    async fn fetch_api_json(&self, action: Option<&str>, extras: &[&str]) -> Result<Value> {
+        let _prof = Stopwatch::start("xtream_get_json");
+        let action_label = action.unwrap_or("auth");
+        // Do not log password or full auth URL — action + portal only.
+        debug!(
+            portal = %self.portal,
+            %action_label,
+            extras = extras.len(),
+            "xtream get_json"
+        );
+        let key = crate::api_cache::key(
+            self.portal.as_str(),
+            &self.username,
+            action_label,
+            extras,
+        );
+        let ttl = crate::api_cache::ttl_for_action(action);
+        if let Some(cached) = crate::api_cache::get_fresh(&key, ttl) {
+            return Ok(cached);
         }
-        Ok(resp.json().await?)
+
+        let mut url = self.api_url(action)?;
+        {
+            let mut q = url.query_pairs_mut();
+            let mut it = extras.iter();
+            while let (Some(k), Some(v)) = (it.next(), it.next()) {
+                q.append_pair(k, v);
+            }
+        }
+
+        let fetch = || async {
+            let client = crate::api_cache::shared_http()?;
+            let resp = client
+                .get(url.clone())
+                .header(reqwest::header::USER_AGENT, SMARTERS_UA)
+                .send()
+                .await?;
+            let status = resp.status();
+            if status.as_u16() == 429 {
+                warn!(%action_label, "HTTP 429 from portal");
+                return Err(ProviderError::Message(
+                    "HTTP 429 Too Many Requests — ralentissez / cache".into(),
+                ));
+            }
+            if !status.is_success() {
+                warn!(%action_label, status = %status, "xtream API HTTP error");
+                return Err(crate::xtream_url::map_http_error(
+                    resp.error_for_status().unwrap_err(),
+                ));
+            }
+            Ok(resp.json::<Value>().await?)
+        };
+
+        match crate::api_cache::with_portal_limit(fetch).await {
+            Ok(value) => {
+                crate::api_cache::put(&key, &value);
+                trace!(%action_label, "xtream get_json OK");
+                Ok(value)
+            }
+            Err(e) => {
+                if let Some(stale) = crate::api_cache::get_stale(&key) {
+                    warn!(error = %e, %action_label, "serving stale xtream cache");
+                    Ok(stale)
+                } else {
+                    Err(e)
+                }
+            }
+        }
     }
 
     /// Apply `server_info` like Smarters (host/port/protocol for media paths).
@@ -206,41 +281,33 @@ impl XtreamClient {
         )
     }
 
-    async fn get_json_action(&self, action: &str, extra: &[(&str, &str)]) -> Result<Value> {
-        let client = http_client()?;
-        let mut url = self.api_url(Some(action))?;
-        {
-            let mut q = url.query_pairs_mut();
-            for (k, v) in extra {
-                q.append_pair(k, v);
-            }
-        }
-        let resp = client
-            .get(url)
-            .header(reqwest::header::USER_AGENT, SMARTERS_UA)
-            .send()
-            .await?;
-        if !resp.status().is_success() {
-            return Err(crate::xtream_url::map_http_error(
-                resp.error_for_status().unwrap_err(),
-            ));
-        }
-        Ok(resp.json().await?)
-    }
-
     pub async fn load_bundle(&mut self) -> Result<PlaylistBundle> {
+        let _prof = Stopwatch::start("xtream_load_bundle");
+        info!(
+            source_id = %self.source_id,
+            portal = %self.portal,
+            user = %self.username,
+            "Xtream load_bundle start"
+        );
         // Auth + server_info first (exactly like Smarters login).
         let auth = self.get_json(None).await?;
         if auth.pointer("/user_info/auth").and_then(|v| v.as_u64()) == Some(0)
             || auth.pointer("/user_info/auth").and_then(|v| v.as_i64()) == Some(0)
         {
+            error!(
+                portal = %self.portal,
+                user = %self.username,
+                "Xtream auth failed"
+            );
             return Err(ProviderError::Auth(
                 "Xtream auth failed (identifiants ou panel)".into(),
             ));
         }
+        debug!(portal = %self.portal, "Xtream auth OK");
         self.apply_server_info(&auth);
 
         // Parallel catalog headers (live streams + all category lists).
+        fluxplay_core::profiler!(step = "catalog_headers", "parallel live/vod/series categories");
         let (live_cats, live, vod_cats, series_cats) = tokio::join!(
             self.get_json(Some("get_live_categories")),
             self.get_json(Some("get_live_streams")),
@@ -251,6 +318,12 @@ impl XtreamClient {
         let live = live?;
         let vod_cats = vod_cats.ok();
         let series_cats = series_cats.ok();
+        debug!(
+            live_cats = live_cats.is_some(),
+            vod_cats = vod_cats.is_some(),
+            series_cats = series_cats.is_some(),
+            "catalog headers fetched"
+        );
 
         let mut categories = Vec::new();
         if let Some(Value::Array(arr)) = live_cats {
@@ -335,24 +408,8 @@ impl XtreamClient {
             }
         }
 
-        // Prefetch several non-adult VOD/series categories in parallel (Smarters-style).
-        let vod_prefetch: Vec<String> = categories
-            .iter()
-            .filter(|c| c.content == ContentKind::Vod && !is_adult_category(&c.name))
-            .map(|c| c.id.clone())
-            .take(6)
-            .collect();
-        let series_prefetch: Vec<String> = categories
-            .iter()
-            .filter(|c| c.content == ContentKind::Series && !is_adult_category(&c.name))
-            .map(|c| c.id.clone())
-            .take(6)
-            .collect();
-
-        let (vod, series) = tokio::join!(
-            self.load_vod_categories_parallel(&vod_prefetch, 4),
-            self.load_series_categories_parallel(&series_prefetch, 4),
-        );
+        // Prefetch: try full dumps first (1 call each), else all non-adult categories.
+        let (vod, series) = self.load_vod_and_series_full(&categories).await;
 
         info!(
             channels = channels.len(),
@@ -371,6 +428,140 @@ impl XtreamClient {
             series,
             epg: Vec::new(),
         })
+    }
+
+    /// Prefer panel-wide dumps; fall back to walking every non-adult category.
+    async fn load_vod_and_series_full(
+        &self,
+        categories: &[Category],
+    ) -> (Vec<VodItem>, Vec<SeriesItem>) {
+        let _prof = Stopwatch::start("xtream_vod_series_full");
+        let (vod_dump, series_dump) = tokio::join!(
+            self.try_load_all_vod(),
+            self.try_load_all_series(),
+        );
+
+        let mut vod = vod_dump.unwrap_or_default();
+        let mut series = series_dump.unwrap_or_default();
+
+        let vod_ids: Vec<String> = if vod.is_empty() {
+            categories
+                .iter()
+                .filter(|c| c.content == ContentKind::Vod && !is_adult_category(&c.name))
+                .map(|c| c.id.clone())
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let series_ids: Vec<String> = if series.is_empty() {
+            categories
+                .iter()
+                .filter(|c| c.content == ContentKind::Series && !is_adult_category(&c.name))
+                .map(|c| c.id.clone())
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        if !vod_ids.is_empty() || !series_ids.is_empty() {
+            info!(
+                vod_cats = vod_ids.len(),
+                series_cats = series_ids.len(),
+                "dumps empty — syncing categories in parallel"
+            );
+            let (vod_fb, series_fb) = tokio::join!(
+                async {
+                    if vod_ids.is_empty() {
+                        Vec::new()
+                    } else {
+                        self.load_vod_categories_parallel(&vod_ids, 2).await
+                    }
+                },
+                async {
+                    if series_ids.is_empty() {
+                        Vec::new()
+                    } else {
+                        self.load_series_categories_parallel(&series_ids, 2).await
+                    }
+                },
+            );
+            if vod.is_empty() {
+                vod = vod_fb;
+            }
+            if series.is_empty() {
+                series = series_fb;
+            }
+        }
+
+        (vod, series)
+    }
+
+    async fn try_load_all_vod(&self) -> Option<Vec<VodItem>> {
+        let value = self.get_json(Some("get_vod_streams")).await.ok()?;
+        let Value::Array(arr) = value else {
+            return None;
+        };
+        if arr.is_empty() || arr.len() < 8 {
+            // Tiny payloads often mean "need category_id".
+            return None;
+        }
+        let mut out = Vec::with_capacity(arr.len());
+        for item in arr {
+            let Ok(s) = serde_json::from_value::<XcVodStream>(item) else {
+                continue;
+            };
+            let ext = self.media_ext(s.container_extension.as_deref());
+            let url = if let Some(ds) = s.direct_source.filter(|d| !d.is_empty()) {
+                ds
+            } else {
+                self.vod_stream_url(&s.stream_id, ext)
+            };
+            out.push(VodItem {
+                id: s.stream_id,
+                name: s.name,
+                stream_url: url,
+                poster: s.stream_icon,
+                plot: s.plot,
+                year: s.year.or(s.release_date),
+                rating: s.rating,
+                genre: s.genre,
+                category_id: s.category_id,
+                source_id: Some(self.source_id),
+            });
+        }
+        info!(n = out.len(), "VOD full dump loaded");
+        Some(out)
+    }
+
+    async fn try_load_all_series(&self) -> Option<Vec<SeriesItem>> {
+        let value = self.get_json(Some("get_series")).await.ok()?;
+        let Value::Array(arr) = value else {
+            return None;
+        };
+        if arr.is_empty() || arr.len() < 8 {
+            return None;
+        }
+        let mut out = Vec::with_capacity(arr.len());
+        for item in arr {
+            let Ok(s) = serde_json::from_value::<XcSeries>(item) else {
+                continue;
+            };
+            out.push(SeriesItem {
+                id: s.series_id,
+                name: s.name,
+                cover: s.cover.or(s.cover_big.clone()),
+                banner: s.cover_big,
+                plot: s.plot,
+                year: s.year.or(s.release_date),
+                rating: s.rating,
+                genre: s.genre,
+                seasons: Vec::new(),
+                source_id: Some(self.source_id),
+                category_id: s.category_id,
+            });
+        }
+        info!(n = out.len(), "Series full dump loaded");
+        Some(out)
     }
 
     /// Concurrent VOD category loads (capped). Safe: each task uses a cloned client.
@@ -397,16 +588,17 @@ impl XtreamClient {
 
     /// VOD streams for one category (`get_vod_streams&category_id=`).
     pub async fn load_vod_category(&self, category_id: &str) -> Result<Vec<VodItem>> {
+        debug!(%category_id, "load_vod_category");
         let value = self
             .get_json_action("get_vod_streams", &[("category_id", category_id)])
             .await?;
         let mut out = Vec::new();
-        let Some(arr) = value.as_array() else {
+        let Value::Array(arr) = value else {
             return Ok(out);
         };
         out.reserve(arr.len());
         for item in arr {
-            let Ok(s) = serde_json::from_value::<XcVodStream>(item.clone()) else {
+            let Ok(s) = serde_json::from_value::<XcVodStream>(item) else {
                 continue;
             };
             let ext = self.media_ext(s.container_extension.as_deref());
@@ -423,25 +615,28 @@ impl XtreamClient {
                 plot: s.plot,
                 year: s.year.or(s.release_date),
                 rating: s.rating,
+                genre: s.genre,
                 category_id: s.category_id.or_else(|| Some(category_id.to_string())),
                 source_id: Some(self.source_id),
             });
         }
+        debug!(%category_id, n = out.len(), "load_vod_category done");
         Ok(out)
     }
 
     /// Series list for one category (`get_series&category_id=`).
     pub async fn load_series_category(&self, category_id: &str) -> Result<Vec<SeriesItem>> {
+        debug!(%category_id, "load_series_category");
         let value = self
             .get_json_action("get_series", &[("category_id", category_id)])
             .await?;
         let mut out = Vec::new();
-        let Some(arr) = value.as_array() else {
+        let Value::Array(arr) = value else {
             return Ok(out);
         };
         out.reserve(arr.len());
         for item in arr {
-            let Ok(s) = serde_json::from_value::<XcSeries>(item.clone()) else {
+            let Ok(s) = serde_json::from_value::<XcSeries>(item) else {
                 continue;
             };
             out.push(SeriesItem {
@@ -450,25 +645,22 @@ impl XtreamClient {
                 cover: s.cover.or(s.cover_big.clone()),
                 banner: s.cover_big,
                 plot: s.plot,
+                year: s.year.or(s.release_date),
+                rating: s.rating,
+                genre: s.genre,
                 seasons: Vec::new(),
                 source_id: Some(self.source_id),
                 category_id: s.category_id.or_else(|| Some(category_id.to_string())),
             });
         }
+        debug!(%category_id, n = out.len(), "load_series_category done");
         Ok(out)
     }
 
     pub async fn series_info(&self, series_id: &str) -> Result<SeriesItem> {
-        let mut u = self.api_url(Some("get_series_info"))?;
-        u.query_pairs_mut().append_pair("series_id", series_id);
-        let client = http_client()?;
-        let value: Value = client
-            .get(u)
-            .header(reqwest::header::USER_AGENT, SMARTERS_UA)
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
+        debug!(%series_id, "series_info");
+        let value = self
+            .get_json_action("get_series_info", &[("series_id", series_id)])
             .await?;
 
         let info = value.get("info").cloned().unwrap_or(Value::Null);
@@ -507,6 +699,32 @@ impl XtreamClient {
             .get("plot")
             .and_then(|v| v.as_str())
             .map(str::to_string);
+        let year = info
+            .get("releaseDate")
+            .or_else(|| info.get("release_date"))
+            .or_else(|| info.get("year"))
+            .and_then(|v| v.as_str().map(str::to_string).or_else(|| v.as_u64().map(|n| n.to_string())));
+        let rating = info
+            .get("rating")
+            .and_then(|v| v.as_str().map(str::to_string).or_else(|| v.as_f64().map(|n| format!("{n:.1}"))));
+        let genre = info.get("genre").and_then(|v| match v {
+            Value::String(s) if !s.trim().is_empty() => Some(s.trim().to_string()),
+            Value::Array(a) => {
+                let p: Vec<_> = a
+                    .iter()
+                    .filter_map(|x| x.as_str())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+                    .collect();
+                if p.is_empty() {
+                    None
+                } else {
+                    Some(p.join(", "))
+                }
+            }
+            _ => None,
+        });
 
         let mut seasons = Vec::new();
         if let Some(episodes) = value.get("episodes").and_then(|e| e.as_object()) {
@@ -552,12 +770,21 @@ impl XtreamClient {
         }
         seasons.sort_by_key(|s| s.season_number);
 
+        info!(
+            %series_id,
+            seasons = seasons.len(),
+            episodes = seasons.iter().map(|s| s.episodes.len()).sum::<usize>(),
+            "series_info loaded"
+        );
         Ok(SeriesItem {
             id: series_id.to_string(),
             name,
             cover,
             banner,
             plot,
+            year,
+            rating,
+            genre,
             seasons,
             source_id: Some(self.source_id),
             category_id: None,
@@ -576,11 +803,18 @@ async fn parallel_map_categories(
     parallel: usize,
     vod: bool,
 ) -> (Vec<VodItem>, Vec<SeriesItem>) {
+    let _prof = Stopwatch::start("xtream_parallel_categories");
     let mut vod_out = Vec::new();
     let mut series_out = Vec::new();
     if category_ids.is_empty() {
         return (vod_out, series_out);
     }
+    info!(
+        cats = category_ids.len(),
+        parallel,
+        vod,
+        "parallel category prefetch start"
+    );
     let mut set = tokio::task::JoinSet::new();
     let mut idx = 0usize;
     let spawn = |set: &mut tokio::task::JoinSet<_>, cid: String, c: XtreamClient, vod: bool| {
@@ -616,12 +850,17 @@ async fn parallel_map_categories(
                     series_out.append(&mut items);
                 }
                 if let Some(e) = err {
-                    tracing::warn!(category = %cid, error = %e, vod, "category prefetch failed");
+                    warn!(category = %cid, error = %e, vod, "category prefetch failed");
                 }
             }
-            Err(e) => tracing::warn!(error = %e, "category join failed"),
+            Err(e) => warn!(error = %e, "category join failed"),
         }
     }
+    info!(
+        vod = vod_out.len(),
+        series = series_out.len(),
+        "parallel category prefetch done"
+    );
     (vod_out, series_out)
 }
 
@@ -670,6 +909,8 @@ struct XcVodStream {
     release_date: Option<String>,
     #[serde(default)]
     rating: Option<String>,
+    #[serde(default, deserialize_with = "de_opt_strish")]
+    genre: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -683,6 +924,14 @@ struct XcSeries {
     cover_big: Option<String>,
     #[serde(default)]
     plot: Option<String>,
+    #[serde(default)]
+    year: Option<String>,
+    #[serde(default)]
+    release_date: Option<String>,
+    #[serde(default)]
+    rating: Option<String>,
+    #[serde(default, deserialize_with = "de_opt_strish")]
+    genre: Option<String>,
     #[serde(default, deserialize_with = "de_opt_id")]
     category_id: Option<String>,
 }
@@ -710,5 +959,44 @@ where
         Some(Value::String(s)) => Some(s),
         Some(Value::Number(n)) => Some(n.to_string()),
         Some(other) => Some(other.to_string()),
+    })
+}
+
+/// Genre may arrive as string or array of strings.
+fn de_opt_strish<'de, D>(deserializer: D) -> std::result::Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let v = Option::<Value>::deserialize(deserializer)?;
+    Ok(match v {
+        None | Some(Value::Null) => None,
+        Some(Value::String(s)) => {
+            let t = s.trim();
+            if t.is_empty() {
+                None
+            } else {
+                Some(t.to_string())
+            }
+        }
+        Some(Value::Array(arr)) => {
+            let parts: Vec<String> = arr
+                .iter()
+                .filter_map(|x| x.as_str().map(|s| s.trim().to_string()))
+                .filter(|s| !s.is_empty())
+                .collect();
+            if parts.is_empty() {
+                None
+            } else {
+                Some(parts.join(", "))
+            }
+        }
+        Some(other) => {
+            let s = other.to_string();
+            if s.is_empty() || s == "null" {
+                None
+            } else {
+                Some(s.trim_matches('"').to_string())
+            }
+        }
     })
 }

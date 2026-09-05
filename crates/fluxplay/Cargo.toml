@@ -9,10 +9,15 @@ description = "FluxPlay — cross-platform IPTV media player (Material Expressiv
 name = "fluxplay"
 path = "src/main.rs"
 
+[features]
+default = ["native-player"]
+native-player = ["fluxplay-player/native-mpv", "fluxplay-player/cli-player", "fluxplay-player/bundle-rpath"]
+static-mpv = ["fluxplay-player/static-link", "fluxplay-player/bundle-rpath"]
+
 [dependencies]
 fluxplay-core.workspace = true
 fluxplay-providers.workspace = true
-fluxplay-player.workspace = true
+fluxplay-player = { workspace = true }
 anyhow.workspace = true
 reqwest.workspace = true
 serde.workspace = true
@@ -28,3 +33,6 @@ rfd.workspace = true
 open.workspace = true
 url.workspace = true
 dark-light = "2"
+rusqlite.workspace = true
+sha2.workspace = true
+hex.workspace = true

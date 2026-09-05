@@ -10,7 +10,7 @@ members = [
 default-members = ["crates/fluxplay"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 license = "MIT"
 authors = ["FluxPlay"]
@@ -42,3 +42,38 @@ iced = { version = "0.14", features = ["tokio", "image", "svg", "advanced"] }
 dirs = "6"
 rfd = "0.15"
 open = "5"
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+# ── Release binaries: max opt, dead-code elimination, stripped ──────────────
+# Default: `cargo build --release` / `cargo install`
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+debug = false
+debug-assertions = false
+overflow-checks = false
+incremental = false
+rpath = false
+
+# Smaller download (CLI-style): prefer size over peak speed
+#   cargo build --profile release-size -p fluxplay
+[profile.release-size]
+inherits = "release"
+opt-level = "z"
+strip = "symbols"
+
+# Faster CI compile while still better than stock release
+#   cargo build --profile release-ci -p fluxplay
+[profile.release-ci]
+inherits = "release"
+lto = "thin"
+codegen-units = 4
+strip = "symbols"
+
+# Dev: speed up heavy deps without slowing your edit–compile loop too much
+[profile.dev.package."*"]
+opt-level = 1
+

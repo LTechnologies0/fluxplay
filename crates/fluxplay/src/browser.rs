@@ -1,4 +1,7 @@
 //! Media-center chrome: dense panes, capped lists, reliable selection.
+//! Inspired by TiviMate / MYTV / IPTVnator / Smarters + Material 3 Expressive.
+//!
+//! Pure view helpers — operational logs live in `main` Message handlers.
 
 use iced::widget::{
     button, column, container, image, row, scrollable, text, text_input, Column, Row, Space,
@@ -9,42 +12,37 @@ use iced::{
 };
 
 use crate::theme::{
-    accent, ink_muted, on_primary, outline, surface, surface_elevated, surface_muted, RADIUS_LG,
-    RADIUS_MD, RADIUS_SM,
+    UiTheme, MOSAIC_GAP, RADIUS_FULL, RADIUS_MD, RADIUS_SM, RADIUS_XL,
 };
 use crate::Message;
 
-pub const LIST_PAGE: usize = 48;
-pub const CAT_PAGE: usize = 80;
+pub const LIST_PAGE: usize = 24;
+pub const CAT_PAGE: usize = 60;
 
-pub fn shell_background(day: bool) -> Color {
-    if day {
-        Color::from_rgb8(0xE6, 0xEC, 0xF2)
-    } else {
-        Color::from_rgb8(0x08, 0x0D, 0x14)
-    }
+pub fn shell_background(ui: UiTheme) -> Color {
+    ui.shell()
 }
 
 pub fn pane<'a>(
-    day: bool,
+    ui: UiTheme,
     width: Length,
     body: impl Into<Element<'a, Message>>,
 ) -> Element<'a, Message> {
     container(body)
         .width(width)
         .height(Fill)
-        .padding(10)
+        .padding(12)
         .style(move |_t: &Theme| container::Style {
-            background: Some(Background::Color(surface(day))),
+            background: Some(Background::Color(ui.surface())),
             border: Border {
-                color: outline(day),
+                color: ui.outline(),
                 width: 1.0,
-                radius: RADIUS_LG.into(),
+                radius: RADIUS_XL.into(),
             },
             shadow: Shadow {
-                color: Color::from_rgba(0.0, 0.0, 0.0, if day { 0.04 } else { 0.25 }),
-                offset: iced::Vector::new(0.0, 4.0),
-                blur_radius: 16.0,
+                color: Color::from_rgba(0.0, 0.0, 0.0, if ui.day { 0.05 } else { 0.35 }),
+                offset: iced::Vector::new(0.0, 8.0),
+                blur_radius: 24.0,
             },
             ..Default::default()
         })
@@ -52,50 +50,61 @@ pub fn pane<'a>(
 }
 
 pub fn mode_rail<'a>(
-    day: bool,
+    ui: UiTheme,
+    width: f32,
     items: impl IntoIterator<Item = (&'a str, Message, bool)>,
 ) -> Element<'a, Message> {
-    let mut col = Column::new().spacing(4).width(Fill);
-    col = col.push(text("FluxPlay").size(16).color(accent(day)));
-    col = col.push(Space::new().height(8));
+    let mut col = Column::new().spacing(6).width(Fill);
+    col = col.push(
+        column![
+            text("FluxPlay").size(22).color(ui.accent()),
+            text("Media Center").size(11).color(ui.ink_muted()),
+        ]
+        .spacing(2),
+    );
+    col = col.push(Space::new().height(10));
     for (label, msg, active) in items {
-        col = col.push(rail_btn(label, msg, day, active));
+        col = col.push(rail_btn(label, msg, ui, active));
     }
-    pane(day, Length::Fixed(112.0), col)
+    pane(ui, Length::Fixed(width), col)
 }
 
-fn rail_btn<'a>(label: &'a str, msg: Message, day: bool, active: bool) -> Element<'a, Message> {
+fn rail_btn<'a>(label: &'a str, msg: Message, ui: UiTheme, active: bool) -> Element<'a, Message> {
     let fg = if active {
-        on_primary(day)
-    } else if day {
-        Color::from_rgb8(0x12, 0x1A, 0x24)
+        ui.on_primary_container()
     } else {
-        Color::from_rgb8(0xE8, 0xEE, 0xF5)
+        ui.ink()
     };
-    button(text(label).size(13).color(fg))
+    button(text(label).size(14).color(fg))
         .on_press(msg)
-        .padding(Padding::from([10, 12]))
+        .padding(Padding::from([12, 14]))
         .width(Fill)
-        .style(move |theme: &Theme, status| {
-            let mut s = if active {
-                button::primary(theme, status)
+        .style(move |_theme: &Theme, status| {
+            let hovered = matches!(status, button::Status::Hovered);
+            let bg = if active {
+                ui.primary_container()
+            } else if hovered {
+                ui.surface_muted()
             } else {
-                button::text(theme, status)
+                Color::TRANSPARENT
             };
-            s.border.radius = RADIUS_MD.into();
-            if active {
-                s.background = Some(Background::Color(accent(day)));
-                s.text_color = on_primary(day);
-            } else if matches!(status, button::Status::Hovered) {
-                s.background = Some(Background::Color(surface_muted(day)));
+            button::Style {
+                background: Some(Background::Color(bg)),
+                text_color: fg,
+                border: Border {
+                    color: Color::TRANSPARENT,
+                    width: 0.0,
+                    radius: RADIUS_FULL.into(),
+                },
+                ..Default::default()
             }
-            s
         })
         .into()
 }
 
 pub fn category_sidebar<'a>(
-    day: bool,
+    ui: UiTheme,
+    width: f32,
     title: &'a str,
     filter: &str,
     entries: Vec<(String, String, bool, usize)>,
@@ -107,13 +116,13 @@ pub fn category_sidebar<'a>(
         .style(move |theme: &Theme, status| {
             let mut s = text_input::default(theme, status);
             s.border.radius = RADIUS_MD.into();
-            s.background = Background::Color(surface_muted(day));
+            s.background = Background::Color(ui.surface_muted());
             s
         });
 
     let mut list = Column::new().spacing(2).width(Fill);
     if entries.is_empty() {
-        list = list.push(text("Aucune catégorie").size(12).color(ink_muted(day)));
+        list = list.push(text("Aucune catégorie").size(12).color(ui.ink_muted()));
     }
     for (id, name, active, count) in entries {
         let label = if count > 0 {
@@ -121,14 +130,14 @@ pub fn category_sidebar<'a>(
         } else {
             name
         };
-        list = list.push(cat_row(label, Message::SelectBrowseCategory(id), day, active));
+        list = list.push(cat_row(label, Message::SelectBrowseCategory(id), ui, active));
     }
 
     pane(
-        day,
-        Length::Fixed(240.0),
+        ui,
+        Length::Fixed(width),
         column![
-            text(title).size(14).color(ink_muted(day)),
+            text(title).size(14).color(ui.ink_muted()),
             filter_input,
             scrollable(list).height(Fill),
         ]
@@ -137,13 +146,11 @@ pub fn category_sidebar<'a>(
     )
 }
 
-fn cat_row(label: String, msg: Message, day: bool, active: bool) -> Element<'static, Message> {
+fn cat_row(label: String, msg: Message, ui: UiTheme, active: bool) -> Element<'static, Message> {
     let fg = if active {
-        accent(day)
-    } else if day {
-        Color::from_rgb8(0x12, 0x1A, 0x24)
+        ui.accent()
     } else {
-        Color::from_rgb8(0xE8, 0xEE, 0xF5)
+        ui.ink()
     };
     button(
         container(text(label).size(13).color(fg))
@@ -158,11 +165,11 @@ fn cat_row(label: String, msg: Message, day: bool, active: bool) -> Element<'sta
         s.border.radius = RADIUS_SM.into();
         s.text_color = fg;
         if active {
-            s.background = Some(Background::Color(surface_elevated(day)));
+            s.background = Some(Background::Color(ui.surface_elevated()));
             s.border.width = 1.0;
-            s.border.color = accent(day);
+            s.border.color = ui.accent();
         } else if matches!(status, button::Status::Hovered) {
-            s.background = Some(Background::Color(surface_muted(day)));
+            s.background = Some(Background::Color(ui.surface_muted()));
         }
         s
     })
@@ -170,15 +177,16 @@ fn cat_row(label: String, msg: Message, day: bool, active: bool) -> Element<'sta
 }
 
 pub fn content_header<'a>(
-    day: bool,
+    ui: UiTheme,
     title: String,
     subtitle: String,
     search: &str,
+    search_width: f32,
 ) -> Element<'a, Message> {
     row![
         column![
             text(title).size(22),
-            text(subtitle).size(12).color(ink_muted(day)),
+            text(subtitle).size(12).color(ui.ink_muted()),
         ]
         .spacing(2)
         .width(Fill),
@@ -186,11 +194,11 @@ pub fn content_header<'a>(
             .on_input(Message::SearchChanged)
             .padding(12)
             .size(14)
-            .width(Length::Fixed(280.0))
+            .width(Length::Fixed(search_width.clamp(140.0, 420.0)))
             .style(move |theme: &Theme, status| {
                 let mut s = text_input::default(theme, status);
                 s.border.radius = RADIUS_MD.into();
-                s.background = Background::Color(surface_muted(day));
+                s.background = Background::Color(ui.surface_muted());
                 s
             }),
     ]
@@ -204,17 +212,11 @@ pub fn media_row<'a>(
     subtitle: String,
     on_open: Message,
     on_fav: Option<(bool, Message)>,
-    day: bool,
+    ui: UiTheme,
     active: bool,
     thumb: Option<&'a Handle>,
 ) -> Element<'a, Message> {
-    let title_c = if active {
-        accent(day)
-    } else if day {
-        Color::from_rgb8(0x12, 0x1A, 0x24)
-    } else {
-        Color::WHITE
-    };
+    let title_c = if active { ui.accent() } else { ui.ink() };
 
     let thumb_el: Element<'a, Message> = if let Some(handle) = thumb {
         container(
@@ -226,7 +228,7 @@ pub fn media_row<'a>(
         .width(Length::Fixed(56.0))
         .height(Length::Fixed(56.0))
         .style(move |_t: &Theme| container::Style {
-            background: Some(Background::Color(surface_muted(day))),
+            background: Some(Background::Color(ui.surface_muted())),
             border: Border {
                 radius: RADIUS_SM.into(),
                 ..Default::default()
@@ -239,7 +241,7 @@ pub fn media_row<'a>(
             .width(Length::Fixed(56.0))
             .height(Length::Fixed(56.0))
             .style(move |_t: &Theme| container::Style {
-                background: Some(Background::Color(surface_muted(day))),
+                background: Some(Background::Color(ui.surface_muted())),
                 border: Border {
                     radius: RADIUS_SM.into(),
                     ..Default::default()
@@ -251,7 +253,7 @@ pub fn media_row<'a>(
 
     let body = column![
         text(title).size(14).color(title_c),
-        text(subtitle).size(11).color(ink_muted(day)),
+        text(subtitle).size(11).color(ui.ink_muted()),
     ]
     .spacing(2)
     .width(Fill);
@@ -268,17 +270,17 @@ pub fn media_row<'a>(
                 s.border.radius = RADIUS_MD.into();
                 s.text_color = title_c;
                 let mut bg = if active {
-                    surface_elevated(day)
+                    ui.surface_elevated()
                 } else {
                     Color::TRANSPARENT
                 };
                 if matches!(status, button::Status::Hovered) {
-                    bg = surface_muted(day);
+                    bg = ui.surface_muted();
                 }
                 s.background = Some(Background::Color(bg));
                 if active {
                     s.border.width = 1.5;
-                    s.border.color = accent(day);
+                    s.border.color = ui.accent();
                 }
                 s
             }),
@@ -291,11 +293,11 @@ pub fn media_row<'a>(
                 .style(move |theme: &Theme, status| {
                     let mut s = button::secondary(theme, status);
                     s.border.radius = RADIUS_MD.into();
-                    s.background = Some(Background::Color(surface_muted(day)));
+                    s.background = Some(Background::Color(ui.surface_muted()));
                     s.text_color = if is_fav {
                         Color::from_rgb8(0xF5, 0xBF, 0x2A)
                     } else {
-                        ink_muted(day)
+                        ui.ink_muted()
                     };
                     s
                 }),
@@ -304,11 +306,11 @@ pub fn media_row<'a>(
     row.into()
 }
 
-pub fn empty_hint(day: bool, msg: impl Into<String>) -> Element<'static, Message> {
+pub fn empty_hint(ui: UiTheme, msg: impl Into<String>) -> Element<'static, Message> {
     container(
         text(msg.into())
             .size(14)
-            .color(ink_muted(day)),
+            .color(ui.ink_muted()),
     )
     .padding(24)
     .width(Fill)
@@ -316,7 +318,7 @@ pub fn empty_hint(day: bool, msg: impl Into<String>) -> Element<'static, Message
     .into()
 }
 
-pub fn load_more_btn(day: bool, remaining: usize) -> Element<'static, Message> {
+pub fn load_more_btn(ui: UiTheme, remaining: usize) -> Element<'static, Message> {
     button(text(format!("Afficher plus (+{remaining})")).size(13))
         .on_press(Message::LoadMore)
         .padding(12)
@@ -324,9 +326,145 @@ pub fn load_more_btn(day: bool, remaining: usize) -> Element<'static, Message> {
         .style(move |theme: &Theme, status| {
             let mut s = button::secondary(theme, status);
             s.border.radius = RADIUS_MD.into();
-            s.background = Some(Background::Color(surface_muted(day)));
-            s.text_color = accent(day);
+            s.background = Some(Background::Color(ui.surface_muted()));
+            s.text_color = ui.accent();
             s
         })
         .into()
+}
+
+/// MYTV-style poster tile: vertical art + title + "year, genre".
+pub fn mosaic_tile<'a>(
+    title: String,
+    meta_line: String,
+    on_open: Message,
+    ui: UiTheme,
+    tile_w: f32,
+    thumb: Option<&'a Handle>,
+) -> Element<'a, Message> {
+    let w = tile_w.max(120.0);
+    // Classic poster aspect ~2:3
+    let h = (w * 1.5).round();
+
+    let poster: Element<'a, Message> = if let Some(handle) = thumb {
+        container(
+            image(handle)
+                .width(Length::Fixed(w))
+                .height(Length::Fixed(h))
+                .content_fit(iced::ContentFit::Cover),
+        )
+        .width(Length::Fixed(w))
+        .height(Length::Fixed(h))
+        .style(move |_t: &Theme| container::Style {
+            background: Some(Background::Color(ui.surface_muted())),
+            border: Border {
+                radius: RADIUS_XL.into(),
+                width: 0.0,
+                color: Color::TRANSPARENT,
+            },
+            ..Default::default()
+        })
+        .into()
+    } else {
+        container(Space::new().width(w).height(h))
+            .width(Length::Fixed(w))
+            .height(Length::Fixed(h))
+            .style(move |_t: &Theme| container::Style {
+                background: Some(Background::Color(ui.surface_muted())),
+                border: Border {
+                    radius: RADIUS_XL.into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+            .into()
+    };
+
+    let title_el = text(title).size(13).color(ui.ink());
+    let meta_el = text(meta_line).size(11).color(ui.ink_muted());
+
+    let body = column![poster, title_el, meta_el]
+        .spacing(4)
+        .width(Length::Fixed(w));
+
+    button(body)
+        .on_press(on_open)
+        .padding(4)
+        .width(Length::Fixed(w + 8.0))
+        .style(move |theme: &Theme, status| {
+            let mut s = button::text(theme, status);
+            s.border.radius = RADIUS_MD.into();
+            if matches!(status, iced::widget::button::Status::Hovered) {
+                s.background = Some(Background::Color(ui.surface_elevated()));
+            }
+            s
+        })
+        .into()
+}
+
+pub fn mosaic_grid<'a>(tiles: Vec<Element<'a, Message>>, cols: usize) -> Element<'a, Message> {
+    let cols = cols.max(1);
+    let mut col = Column::new().spacing(MOSAIC_GAP).width(Fill);
+    let mut row_tiles: Vec<Element<'a, Message>> = Vec::new();
+    for tile in tiles {
+        row_tiles.push(tile);
+        if row_tiles.len() == cols {
+            let mut r = Row::new().spacing(MOSAIC_GAP).width(Fill);
+            for t in row_tiles.drain(..) {
+                r = r.push(t);
+            }
+            // Stretch leftover space so the row fills the content pane.
+            r = r.push(Space::new().width(Fill));
+            col = col.push(r);
+        }
+    }
+    if !row_tiles.is_empty() {
+        let mut r = Row::new().spacing(MOSAIC_GAP).width(Fill);
+        for t in row_tiles {
+            r = r.push(t);
+        }
+        r = r.push(Space::new().width(Fill));
+        col = col.push(r);
+    }
+    col.into()
+}
+
+/// Accent color swatch for settings.
+pub fn accent_swatch(
+    ui: UiTheme,
+    preset: fluxplay_core::models::AccentPreset,
+    active: bool,
+) -> Element<'static, Message> {
+    let sample = UiTheme::new(ui.day, preset).accent();
+    button(
+        container(Space::new().width(28).height(28))
+            .width(Length::Fixed(36.0))
+            .height(Length::Fixed(36.0))
+            .center_x(Fill)
+            .center_y(Fill)
+            .style(move |_t: &Theme| container::Style {
+                background: Some(Background::Color(sample)),
+                border: Border {
+                    color: if active {
+                        ui.ink()
+                    } else {
+                        ui.outline()
+                    },
+                    width: if active { 2.5 } else { 1.0 },
+                    radius: RADIUS_FULL.into(),
+                },
+                ..Default::default()
+            }),
+    )
+    .on_press(Message::SetAccent(preset))
+    .padding(4)
+    .style(move |theme: &Theme, status| {
+        let mut s = button::text(theme, status);
+        s.border.radius = RADIUS_FULL.into();
+        if matches!(status, button::Status::Hovered) {
+            s.background = Some(Background::Color(ui.surface_muted()));
+        }
+        s
+    })
+    .into()
 }

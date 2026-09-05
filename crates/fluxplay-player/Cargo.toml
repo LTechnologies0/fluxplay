@@ -5,6 +5,17 @@ edition.workspace = true
 license.workspace = true
 description = "Protocol router and stream session manager for FluxPlay"
 
+[features]
+default = ["native-mpv", "cli-player", "bundle-rpath"]
+# In-process libmpv FFI (standalone — no `mpv` binary required at runtime).
+native-mpv = []
+# Prefer linking `libmpv.a` (+ optional FLUXPLAY_MPV_STATIC_DEPS).
+static-link = ["native-mpv"]
+# Embed `$ORIGIN/lib` rpath so a bundled `lib/libmpv.so` resolves next to the binary.
+bundle-rpath = ["native-mpv"]
+# Keep spawning system `mpv`/`ffplay` as fallback (FFmpeg backend + emergency).
+cli-player = []
+
 [dependencies]
 fluxplay-core.workspace = true
 anyhow.workspace = true
@@ -13,7 +24,6 @@ serde.workspace = true
 serde_json.workspace = true
 url.workspace = true
 tokio.workspace = true
-# blocking: resolve CDN redirects before spawning mpv/ffplay
 reqwest = { workspace = true, features = ["blocking"] }
 tracing.workspace = true
 chrono.workspace = true

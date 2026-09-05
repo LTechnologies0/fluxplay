@@ -6,9 +6,12 @@ license.workspace = true
 description = "C FFI bridge for Android / iOS FluxPlay shells"
 
 [lib]
-crate-type = ["cdylib", "staticlib", "rlib"]
+# Prefer static archive for mobile shells; cdylib for JNI.
+crate-type = ["staticlib", "cdylib", "rlib"]
 
 [dependencies]
 fluxplay-core.workspace = true
-fluxplay-player.workspace = true
+# Path dep so we can disable desktop libmpv (mobile uses ExoPlayer / AVPlayer).
+fluxplay-player = { path = "../fluxplay-player", default-features = false }
 serde_json.workspace = true
+tracing.workspace = true

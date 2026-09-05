@@ -1,6 +1,8 @@
 //! Portal / stream health checks (Xtream panels).
 
+use fluxplay_core::Stopwatch;
 use serde::{Deserialize, Serialize};
+use tracing::{debug, error, info, warn};
 
 use crate::{http_client, ProviderError, Result};
 
@@ -21,6 +23,7 @@ pub struct PortalHealth {
 
 /// Quick health scan for an Xtream portal (Smarters-compatible).
 pub async fn check_xtream_portal(portal: &str, username: &str, password: &str) -> Result<PortalHealth> {
+    let _prof = Stopwatch::start("check_xtream_portal");
     let mut notes = Vec::new();
     let client = http_client()?;
 
@@ -28,12 +31,25 @@ pub async fn check_xtream_portal(portal: &str, username: &str, password: &str) -
     if !base.contains("://") {
         base = format!("http://{base}");
     }
+    // Never log password — portal + username only.
+    info!(portal = %base, user = %username, "portal health check start");
 
     let auth_url = format!(
         "{base}/player_api.php?username={username}&password={password}"
     );
-    let auth_resp = client.get(&auth_url).send().await?;
+    let auth_resp = match client.get(&auth_url).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            error!(portal = %base, error = %e, "portal auth request failed");
+            return Err(e.into());
+        }
+    };
     if !auth_resp.status().is_success() {
+        error!(
+            portal = %base,
+            status = %auth_resp.status(),
+            "portal auth HTTP failure"
+        );
         return Ok(PortalHealth {
             portal: base,
             ok: false,
@@ -68,6 +84,18 @@ pub async fn check_xtream_portal(portal: &str, username: &str, password: &str) -
         .and_then(|v| v.as_str().and_then(|s| s.parse().ok()).or_else(|| v.as_u64()))
         .unwrap_or(0) as u32;
 
+    if !auth_ok {
+        error!(portal = %base, user = %username, %status, "portal auth rejected");
+    } else {
+        debug!(
+            portal = %base,
+            %status,
+            active_cons,
+            max_connections,
+            "portal auth OK"
+        );
+    }
+
     if max_connections == 1 {
         notes.push("max_connections=1 — une seule lecture à la fois (comme Smarters)".into());
     }
@@ -82,6 +110,7 @@ pub async fn check_xtream_portal(portal: &str, username: &str, password: &str) -
     let get_php_ok = match client.get(&get_url).send().await {
         Ok(r) if r.status().is_success() => {
             let n = r.bytes().await.map(|b| b.len()).unwrap_or(0);
+            debug!(bytes = n, "get.php probe succeeded");
             n > 64
         }
         Ok(r) => {
@@ -90,13 +119,16 @@ pub async fn check_xtream_portal(portal: &str, username: &str, password: &str) -
                 notes.push(
                     "get.php HTTP 885: export M3U désactivé — normal; utiliser l'API Xtream".into(),
                 );
+                debug!("get.php HTTP 885 (expected for many panels)");
             } else {
                 notes.push(format!("get.php HTTP {code}"));
+                warn!(code, "get.php probe non-success");
             }
             false
         }
         Err(e) => {
             notes.push(format!("get.php erreur: {e}"));
+            warn!(error = %e, "get.php probe network error");
             false
         }
     };
@@ -130,6 +162,7 @@ pub async fn check_xtream_portal(portal: &str, username: &str, password: &str) -
                 })
                 .take(4)
                 .collect();
+            debug!(categories = cat_ids.len(), "probing live streams for health");
 
             'probe: for (cid, _) in cat_ids {
                 let streams_url = format!(
@@ -156,6 +189,7 @@ pub async fn check_xtream_portal(portal: &str, username: &str, password: &str) -
                     .collect();
 
                 for sid in ids {
+                    // Stream URL embeds password — never log the full URL.
                     let stream_url = format!("{base}/live/{username}/{password}/{sid}.m3u8");
                     match client.get(&stream_url).send().await {
                         Ok(r) if r.status().is_success() => {
@@ -169,7 +203,9 @@ pub async fn check_xtream_portal(portal: &str, username: &str, password: &str) -
                                     );
                                 }
                                 stream_ok = true;
+                                // Store for diagnostics but do not log (may contain creds).
                                 stream_final_url = Some(final_u);
+                                debug!(stream_id = %sid, "stream probe HLS OK");
                                 break 'probe;
                             }
                         }
@@ -183,10 +219,12 @@ pub async fn check_xtream_portal(portal: &str, username: &str, password: &str) -
             }
             if !stream_ok {
                 notes.push("aucun stream HLS testable (PPV/402 ou CDN)".into());
+                warn!(portal = %base, "no testable HLS stream found");
             }
         }
     } else {
         notes.push("catégories live injoignables".into());
+        warn!(portal = %base, "live categories unreachable during health check");
     }
 
     // xmltv size warning (often 50MB+)
@@ -198,11 +236,21 @@ pub async fn check_xtream_portal(portal: &str, username: &str, password: &str) -
                     "xmltv.php ≈ {:.0} Mo — trop gros; préférer get_short_epg / ne pas charger tout",
                     len as f64 / 1_000_000.0
                 ));
+                debug!(len, "xmltv.php oversized");
             }
         }
     }
 
     let ok = auth_ok && status.eq_ignore_ascii_case("Active") && stream_ok;
+    info!(
+        portal = %base,
+        auth = auth_ok,
+        %status,
+        stream_ok,
+        get_php_ok,
+        ok,
+        "portal health check done"
+    );
     Ok(PortalHealth {
         portal: base,
         ok,
@@ -233,10 +281,13 @@ pub fn format_health(h: &PortalHealth) -> String {
         s.push_str(" | ");
         s.push_str(n);
     }
+    debug!(portal = %h.portal, ok = h.ok, "format_health");
     s
 }
 
 #[allow(dead_code)]
 pub fn health_error(msg: impl Into<String>) -> ProviderError {
-    ProviderError::Message(msg.into())
+    let msg = msg.into();
+    error!(%msg, "health_error");
+    ProviderError::Message(msg)
 }

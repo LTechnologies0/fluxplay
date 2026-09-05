@@ -6,45 +6,38 @@ use std::collections::HashSet;
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
 use fluxplay_core::models::EpgProgramme;
+use fluxplay_core::Stopwatch;
 use serde_json::Value;
-use tracing::warn;
+use tracing::{debug, info, trace, warn};
 
-use crate::xtream::{XtreamClient, SMARTERS_UA};
-use crate::{http_client, Result};
+use crate::xtream::XtreamClient;
+use crate::Result;
 
 impl XtreamClient {
     /// Now/next style listings for one live stream (Smarters default).
     pub async fn get_short_epg(&self, stream_id: &str, limit: u32) -> Result<Vec<EpgProgramme>> {
-        let mut u = self.api_url(Some("get_short_epg"))?;
-        u.query_pairs_mut()
-            .append_pair("stream_id", stream_id)
-            .append_pair("limit", &limit.to_string());
-        let client = http_client()?;
-        let value: Value = client
-            .get(u)
-            .header(reqwest::header::USER_AGENT, SMARTERS_UA)
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
+        debug!(%stream_id, limit, "get_short_epg");
+        let limit_s = limit.to_string();
+        let value = self
+            .get_json_action(
+                "get_short_epg",
+                &[("stream_id", stream_id), ("limit", limit_s.as_str())],
+            )
             .await?;
-        Ok(parse_epg_listings(&value, stream_id))
+        let list = parse_epg_listings(&value, stream_id);
+        debug!(%stream_id, programmes = list.len(), "get_short_epg done");
+        Ok(list)
     }
 
     /// Full day (or multi-day) table for one stream — heavier; use sparingly.
     pub async fn get_simple_data_table(&self, stream_id: &str) -> Result<Vec<EpgProgramme>> {
-        let mut u = self.api_url(Some("get_simple_data_table"))?;
-        u.query_pairs_mut().append_pair("stream_id", stream_id);
-        let client = http_client()?;
-        let value: Value = client
-            .get(u)
-            .header(reqwest::header::USER_AGENT, SMARTERS_UA)
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
+        debug!(%stream_id, "get_simple_data_table");
+        let value = self
+            .get_json_action("get_simple_data_table", &[("stream_id", stream_id)])
             .await?;
-        Ok(parse_epg_listings(&value, stream_id))
+        let list = parse_epg_listings(&value, stream_id);
+        debug!(%stream_id, programmes = list.len(), "get_simple_data_table done");
+        Ok(list)
     }
 
     /// Concurrent short-EPG fetch for many streams (capped parallelism).
@@ -54,9 +47,16 @@ impl XtreamClient {
         limit_per: u32,
         max_parallel: usize,
     ) -> Vec<EpgProgramme> {
+        let _prof = Stopwatch::start("fetch_short_epg_batch");
         let mut out = Vec::new();
         let mut seen_keys = HashSet::new();
         let parallel = max_parallel.max(1);
+        info!(
+            streams = stream_ids.len(),
+            limit_per,
+            parallel,
+            "short EPG batch start"
+        );
 
         for chunk in stream_ids.chunks(parallel) {
             let mut handles = Vec::with_capacity(chunk.len());
@@ -95,6 +95,7 @@ impl XtreamClient {
                 }
             }
         }
+        info!(programmes = out.len(), "short EPG batch done");
         out
     }
 }
@@ -105,6 +106,7 @@ fn parse_epg_listings(value: &Value, stream_id: &str) -> Vec<EpgProgramme> {
         .and_then(|v| v.as_array())
         .or_else(|| value.as_array())
     else {
+        trace!(%stream_id, "no epg_listings array");
         return Vec::new();
     };
 

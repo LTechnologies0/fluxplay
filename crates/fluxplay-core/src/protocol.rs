@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use tracing::{debug, trace, warn};
 use url::Url;
 
 use crate::error::{Error, Result};
@@ -48,7 +49,12 @@ impl StreamScheme {
             "rist" => Self::Rist,
             "quic" | "http3" => Self::Quic,
             "file" => Self::File,
-            _ => Self::Unknown,
+            other => {
+                if !other.is_empty() {
+                    trace!(scheme = %other, "StreamScheme::parse unknown");
+                }
+                Self::Unknown
+            }
         }
     }
 
@@ -121,7 +127,7 @@ pub enum DeliveryKind {
 impl DeliveryKind {
     pub fn detect(url: &str) -> Self {
         let lower = url.to_ascii_lowercase();
-        if lower.contains(".mpd") || lower.contains("dash") {
+        let kind = if lower.contains(".mpd") || lower.contains("dash") {
             Self::Dash
         } else if lower.contains("llhls") || lower.contains("lowlatency") {
             Self::LlHls
@@ -135,7 +141,9 @@ impl DeliveryKind {
             Self::ProgressiveHttp
         } else {
             Self::Unknown
-        }
+        };
+        trace!(?kind, "DeliveryKind::detect");
+        kind
     }
 
     pub fn label(self) -> &'static str {
@@ -191,11 +199,13 @@ impl StreamUrl {
     pub fn parse(raw: &str) -> Result<Self> {
         let trimmed = raw.trim();
         if trimmed.is_empty() {
+            warn!("StreamUrl::parse empty");
             return Err(Error::Validation("empty stream URL".into()));
         }
 
         let scheme = StreamScheme::parse(trimmed);
         let delivery = DeliveryKind::detect(trimmed);
+        trace!(?scheme, ?delivery, "StreamUrl::parse detect");
 
         // url::Url does not know all IPTV schemes; normalize a few for host/port.
         let (host, port) = match scheme {
@@ -218,6 +228,7 @@ impl StreamUrl {
             _ => (None, scheme.default_port()),
         };
 
+        debug!(?scheme, ?delivery, host = ?host, "StreamUrl::parse ok");
         Ok(Self {
             raw: trimmed.to_string(),
             scheme,

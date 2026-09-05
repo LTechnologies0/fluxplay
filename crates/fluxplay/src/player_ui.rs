@@ -1,406 +1,494 @@
-//! Dedicated video player window chrome (separate from the media browser).
+//! Dedicated video player — cinema stage + compact dock + overflow sheets.
+//! Primary chrome stays minimal (Netflix / TiviMate); power features live in panels.
 
 use iced::widget::{
-    button, column, container, image, row, slider, text, Space,
+    button, column, container, row, slider, text, text_input, Row, Space,
 };
 use iced::widget::image::Handle;
 use iced::{
     Alignment, Background, Border, Color, Element, Fill, Length, Padding, Shadow, Theme,
 };
-use fluxplay_player::PlaybackState;
+use fluxplay_player::{PlaybackState, StreamSession};
 
 use crate::theme::{
-    accent, ink_muted, on_primary, outline, surface, surface_elevated, surface_muted, RADIUS_LG,
-    RADIUS_MD, RADIUS_SM,
+    stage_black, UiTheme, PLAYER_CHROME_H, RADIUS_FULL, RADIUS_LG, RADIUS_XL, RADIUS_XXL,
 };
 use crate::Message;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PlayerPanel {
+    #[default]
+    None,
+    More,
+    Advanced,
+    Goto,
+}
+
 pub struct PlayerChrome<'a> {
-    pub day: bool,
+    pub ui: UiTheme,
     pub title: &'a str,
     pub meta: &'a str,
     pub status: &'a str,
-    pub state: PlaybackState,
-    pub backend: &'a str,
-    pub live: bool,
-    pub muted: bool,
-    pub volume: f32,
-    pub progress: f64,
-    pub time_label: String,
+    pub session: &'a StreamSession,
     pub art: Option<&'a Handle>,
     pub active: bool,
+    pub panel: PlayerPanel,
+    pub goto_draft: &'a str,
+    pub sleep_mins: Option<u32>,
+    pub pip: bool,
 }
 
-/// Full-window player: stage + transport (opens as a second OS window).
 pub fn player_window(p: PlayerChrome<'_>) -> Element<'_, Message> {
-    let day = p.day;
-    let stage = stage_panel(day, p.art, p.title, p.live, p.state);
-    let header = meta_header(day, &p);
-    let scrub = scrubber(day, p.live, p.progress, p.time_label.clone(), p.active);
-    let transport = transport_row(day, p.state, p.active, p.live);
-    let volume = volume_block(day, p.muted, p.volume);
-    let extras = extras_row(day, p.active);
+    let ui = p.ui;
+    let stage = stage_panel(ui, p.art, p.title, p.session);
+    let dock = control_dock(&p);
+    let sheet: Element<'_, Message> = match p.panel {
+        PlayerPanel::None => Space::new().height(0).into(),
+        PlayerPanel::More => more_sheet(&p),
+        PlayerPanel::Advanced => advanced_sheet(&p),
+        PlayerPanel::Goto => goto_sheet(ui, p.goto_draft),
+    };
 
     container(
-        column![
-            stage,
-            header,
-            scrub,
-            row![transport, Space::new().width(Fill), volume]
-                .spacing(12)
-                .align_y(Alignment::Center),
-            extras,
-        ]
-        .spacing(12)
-        .padding(Padding::from([16, 18])),
+        column![stage, sheet, dock]
+            .spacing(0)
+            .height(Fill),
     )
     .width(Fill)
     .height(Fill)
     .style(move |_t: &Theme| container::Style {
-        background: Some(Background::Color(if day {
-            Color::from_rgb8(0xE6, 0xEC, 0xF2)
-        } else {
-            Color::from_rgb8(0x08, 0x0D, 0x14)
-        })),
+        background: Some(Background::Color(stage_black())),
         ..Default::default()
     })
     .into()
 }
 
 fn stage_panel<'a>(
-    day: bool,
+    ui: UiTheme,
     art: Option<&'a Handle>,
     title: &str,
-    live: bool,
-    state: PlaybackState,
+    session: &StreamSession,
 ) -> Element<'a, Message> {
-    let poster: Element<'a, Message> = if let Some(handle) = art {
-        image(handle)
+    let playing = matches!(
+        session.state,
+        PlaybackState::Playing | PlaybackState::Paused | PlaybackState::Buffering
+    );
+    let live = session.is_live();
+
+    let center: Element<'a, Message> = if playing {
+        column![
+            text(if live { "DIRECT" } else { "LECTURE" })
+                .size(12)
+                .color(Color::from_rgba8(0xFF, 0xFF, 0xFF, 0.35)),
+        ]
+        .align_x(Alignment::Center)
+        .into()
+    } else if let Some(handle) = art {
+        iced::widget::image(handle)
             .width(Fill)
             .height(Fill)
             .content_fit(iced::ContentFit::Contain)
             .into()
     } else {
         column![
-            text("▶").size(48).color(accent(day)),
-            text(title.to_string()).size(18).color(if day {
-                Color::from_rgb8(0x12, 0x1A, 0x24)
-            } else {
-                Color::WHITE
-            }),
+            text("▶").size(56).color(ui.accent()),
+            text(title.to_string()).size(22).color(Color::WHITE),
         ]
-        .spacing(12)
+        .spacing(14)
         .align_x(Alignment::Center)
         .into()
     };
 
-    let badge = if live { "DIRECT" } else { "VOD / SÉRIE" };
-    let hint = match state {
+    let badge = if live {
+        chip_live()
+    } else {
+        soft_chip(ui, "VOD / SÉRIE")
+    };
+    let hint = match session.state {
         PlaybackState::Playing | PlaybackState::Paused | PlaybackState::Buffering => {
-            "Image vidéo → fenêtre « FluxPlay Video » (mpv)"
+            "Espace pause · ←→ seek · M mute · F plein écran · ⋯ plus"
         }
         PlaybackState::Opening => "Ouverture du flux…",
-        PlaybackState::Error => "Erreur de lecture — Stop puis réessayez",
+        PlaybackState::Error => "Erreur — Stop puis réessayez",
         PlaybackState::Idle => "En attente d’un média",
     };
 
     container(
         column![
-            container(poster)
+            row![
+                badge,
+                Space::new().width(Fill),
+                text(hint)
+                    .size(11)
+                    .color(Color::from_rgba8(0xFF, 0xFF, 0xFF, 0.42)),
+            ]
+            .padding(Padding::from([10, 14])),
+            container(center)
                 .width(Fill)
                 .height(Fill)
                 .center_x(Fill)
-                .center_y(Fill)
-                .padding(12),
-            row![
-                text(badge).size(11).color(accent(day)),
-                Space::new().width(Fill),
-                text(hint).size(12).color(ink_muted(day)),
-            ]
-            .padding(Padding::from([0, 4])),
+                .center_y(Fill),
         ]
         .height(Fill),
     )
     .width(Fill)
-    .height(Length::FillPortion(3))
+    .height(Fill)
     .style(move |_t: &Theme| container::Style {
-        background: Some(Background::Color(surface(day))),
+        background: Some(Background::Color(stage_black())),
+        ..Default::default()
+    })
+    .into()
+}
+
+fn control_dock<'a>(p: &PlayerChrome<'a>) -> Element<'a, Message> {
+    let ui = p.ui;
+    let s = p.session;
+    let live = s.is_live();
+    let active = p.active;
+    let paused = s.state == PlaybackState::Paused || s.state == PlaybackState::Idle;
+    let play_label = if paused { "▶" } else { "⏸" };
+    let can_seek = active && !live;
+    let mute_label = if s.muted { "🔇" } else { "🔊" };
+    let progress = s.progress_ratio();
+    let time_label = s.elapsed_label();
+    let vol = if s.muted { 0.0 } else { s.volume };
+
+    let title_row = row![
+        column![
+            text(p.title.to_string()).size(18).color(ui.ink()),
+            text(format!("{} · {}", p.meta, p.status))
+                .size(11)
+                .color(ui.ink_muted()),
+        ]
+        .spacing(2)
+        .width(Fill),
+        soft_chip(ui, s.backend.map(|b| b.label()).unwrap_or("—")),
+        if live { chip_live() } else { soft_chip(ui, "VOD") },
+    ]
+    .spacing(8)
+    .align_y(Alignment::Center);
+
+    let scrub: Element<'a, Message> = if !active {
+        text("Choisissez un média").size(12).color(ui.ink_muted()).into()
+    } else if live {
+        text(format!("●  {time_label}"))
+            .size(12)
+            .color(ui.ink_muted())
+            .into()
+    } else {
+        row![
+            slider(0.0..=1.0, progress as f32, |v| Message::SeekPercent(v as f64))
+                .step(0.001)
+                .style(move |theme: &Theme, status| {
+                    let mut st = slider::default(theme, status);
+                    st.rail.backgrounds.0 = Background::Color(ui.accent());
+                    st.rail.backgrounds.1 = Background::Color(ui.surface_muted());
+                    st.handle.background = Background::Color(ui.accent());
+                    st.handle.shape = slider::HandleShape::Circle { radius: 7.0 };
+                    st
+                }),
+            text(time_label)
+                .size(12)
+                .color(ui.ink_muted())
+                .width(Length::Fixed(96.0)),
+        ]
+        .spacing(10)
+        .align_y(Alignment::Center)
+        .into()
+    };
+
+    let transport = row![
+        icon_btn(ui, "−10", Message::SeekRel(-10), can_seek),
+        primary_round(ui, play_label, Message::TogglePause, active),
+        icon_btn(ui, "+10", Message::SeekRel(10), can_seek),
+        icon_btn(ui, "■", Message::Stop, active),
+        Space::new().width(8),
+        icon_btn(ui, mute_label, Message::ToggleMute, true),
+        container(
+            slider(0.0..=1.0, vol, Message::VolumeChanged)
+                .step(0.01)
+                .style(move |theme: &Theme, status| {
+                    let mut st = slider::default(theme, status);
+                    st.rail.backgrounds.0 = Background::Color(ui.accent());
+                    st.rail.backgrounds.1 = Background::Color(ui.surface_muted());
+                    st.handle.background = Background::Color(ui.accent());
+                    st.handle.shape = slider::HandleShape::Circle { radius: 6.0 };
+                    st
+                }),
+        )
+        .width(Length::Fixed(110.0)),
+        Space::new().width(Fill),
+        icon_btn(ui, "⛶", Message::ToggleFullscreen, active),
+        icon_btn(
+            ui,
+            "⋯",
+            Message::PlayerPanel(if p.panel == PlayerPanel::More {
+                PlayerPanel::None
+            } else {
+                PlayerPanel::More
+            }),
+            true,
+        ),
+    ]
+    .spacing(6)
+    .align_y(Alignment::Center);
+
+    container(
+        column![title_row, scrub, transport]
+            .spacing(10)
+            .padding(Padding::from([14, 18])),
+    )
+    .width(Fill)
+    .height(Length::Fixed(PLAYER_CHROME_H - 40.0))
+    .style(move |_t: &Theme| container::Style {
+        background: Some(Background::Color(if ui.day {
+            Color::from_rgb8(0xF2, 0xF6, 0xFA)
+        } else {
+            Color::from_rgb8(0x12, 0x18, 0x22)
+        })),
         border: Border {
-            color: outline(day),
-            width: 1.0,
-            radius: RADIUS_LG.into(),
+            color: ui.outline(),
+            width: 0.0,
+            radius: iced::border::Radius {
+                top_left: RADIUS_XXL,
+                top_right: RADIUS_XXL,
+                bottom_right: 0.0,
+                bottom_left: 0.0,
+            },
         },
         shadow: Shadow {
-            color: Color::from_rgba(0.0, 0.0, 0.0, if day { 0.06 } else { 0.35 }),
-            offset: iced::Vector::new(0.0, 6.0),
-            blur_radius: 18.0,
+            color: Color::from_rgba(0.0, 0.0, 0.0, if ui.day { 0.10 } else { 0.45 }),
+            offset: iced::Vector::new(0.0, -8.0),
+            blur_radius: 28.0,
         },
         ..Default::default()
     })
     .into()
 }
 
-fn meta_header<'a>(day: bool, p: &PlayerChrome<'a>) -> Element<'a, Message> {
-    let title_color = if day {
-        Color::from_rgb8(0x12, 0x1A, 0x24)
-    } else {
-        Color::WHITE
+fn more_sheet<'a>(p: &PlayerChrome<'a>) -> Element<'a, Message> {
+    let ui = p.ui;
+    let s = p.session;
+    let active = p.active;
+    let speed = format!("{:.2}×", s.speed);
+    let loop_l = if s.loop_file { "Loop ON" } else { "Loop" };
+    let ontop_l = if s.ontop { "Ontop ON" } else { "Ontop" };
+    let pip_l = if p.pip { "PiP ON" } else { "PiP" };
+    let sleep_l = match p.sleep_mins {
+        Some(m) => format!("Veille {m}m"),
+        None => "Veille".into(),
     };
-    let chips = row![
-        state_chip(day, p.state),
-        if p.live {
-            live_chip()
-        } else if p.active {
-            soft_chip(day, "VOD")
-        } else {
-            soft_chip(day, "—")
-        },
-        soft_chip(day, p.backend),
-    ]
-    .spacing(6);
 
-    column![
-        row![
-            text(p.title.to_string())
-                .size(18)
-                .color(title_color)
-                .width(Fill),
-            chips,
-        ]
-        .spacing(8)
-        .align_y(Alignment::Center),
-        text(format!("{} · {}", p.meta, p.status))
-            .size(12)
-            .color(ink_muted(day)),
+    let row1 = row![
+        chip_btn(ui, &format!("Vitesse {speed}"), Message::CycleSpeed, active),
+        chip_btn(ui, loop_l, Message::ToggleLoop, active),
+        chip_btn(ui, "Capture", Message::Screenshot, active),
+        chip_btn(ui, "Aller à…", Message::PlayerPanel(PlayerPanel::Goto), active && !s.is_live()),
+        chip_btn(ui, "Reprise", Message::RestartStream, active),
     ]
-    .spacing(4)
-    .width(Fill)
-    .into()
+    .spacing(6)
+    .wrap();
+
+    let row2 = row![
+        chip_btn(ui, "Audio", Message::CycleAudio, active),
+        chip_btn(ui, "ST", Message::CycleSubtitles, active),
+        chip_btn(ui, "ST on/off", Message::ToggleSubVisibility, active),
+        chip_btn(ui, s.aspect.label(), Message::CycleAspect, active),
+        chip_btn(ui, ontop_l, Message::ToggleOntop, active),
+        chip_btn(ui, pip_l, Message::TogglePip, true),
+    ]
+    .spacing(6)
+    .wrap();
+
+    let row3 = row![
+        chip_btn(ui, "◀ Chap", Message::ChapterStep(-1), active && !s.is_live()),
+        chip_btn(ui, "Chap ▶", Message::ChapterStep(1), active && !s.is_live()),
+        chip_btn(ui, "◀ Piste", Message::PlaylistPrev, true),
+        chip_btn(ui, "Piste ▶", Message::PlaylistNext, true),
+        chip_btn(ui, "★ Signet", Message::AddBookmark, active && !s.is_live()),
+        chip_btn(ui, &sleep_l, Message::CycleSleepTimer, true),
+        chip_btn(ui, "Avancé", Message::PlayerPanel(PlayerPanel::Advanced), true),
+        chip_btn(ui, "Externe", Message::OpenExternal, active),
+        chip_btn(ui, "Thème", Message::CycleTheme, true),
+        chip_btn(ui, "Fermer", Message::ClosePlayerWindow, true),
+    ]
+    .spacing(6)
+    .wrap();
+
+    let bookmarks: Element<'a, Message> = {
+        let mut chips: Vec<Element<'a, Message>> = Vec::new();
+        if s.bookmarks.is_empty() {
+            chips.push(text("Aucun signet").size(11).color(ui.ink_muted()).into());
+        } else {
+            for (i, b) in s.bookmarks.iter().enumerate() {
+                chips.push(chip_btn(ui, &b.label, Message::JumpBookmark(i), active));
+            }
+        }
+        Row::with_children(chips).spacing(6).wrap().into()
+    };
+
+    sheet_box(
+        ui,
+        column![
+            text("Plus").size(13).color(ui.ink_muted()),
+            row1,
+            row2,
+            row3,
+            text("Signets").size(12).color(ui.ink_muted()),
+            bookmarks,
+        ]
+        .spacing(8),
+    )
 }
 
-fn state_chip(day: bool, state: PlaybackState) -> Element<'static, Message> {
-    let (label, bg, fg) = match state {
-        PlaybackState::Playing => (
-            "LECTURE",
-            Color::from_rgba8(0x0D, 0x94, 0x88, if day { 0.18 } else { 0.28 }),
-            accent(day),
-        ),
-        PlaybackState::Paused => (
-            "PAUSE",
-            Color::from_rgba8(0xD9, 0x77, 0x06, 0.20),
-            Color::from_rgb8(0xD9, 0x77, 0x06),
-        ),
-        PlaybackState::Buffering | PlaybackState::Opening => (
-            "BUFFER",
-            Color::from_rgba8(0x2D, 0xD4, 0xBF, 0.18),
-            accent(day),
-        ),
-        PlaybackState::Error => (
-            "ERREUR",
-            Color::from_rgba8(0xD4, 0x3B, 0x3B, 0.20),
-            Color::from_rgb8(0xD4, 0x3B, 0x3B),
-        ),
-        PlaybackState::Idle => ("PRET", surface_muted(day), ink_muted(day)),
+fn advanced_sheet<'a>(p: &PlayerChrome<'a>) -> Element<'a, Message> {
+    let ui = p.ui;
+    let s = p.session;
+    let active = p.active;
+    let ab = match (s.ab_a, s.ab_b) {
+        (Some(a), Some(b)) => format!("A–B {:.0}–{:.0}s", a, b),
+        (Some(a), None) => format!("A={:.0}s · set B", a),
+        _ => "A–B".into(),
     };
-    container(text(label).size(10).color(fg))
-        .padding(Padding::from([3, 7]))
+    let night = if s.night_vf { "Nuit ON" } else { "Nuit VF" };
+    let deint = if s.deinterlace { "Désentr. ON" } else { "Désentr." };
+    let loud = if s.loudnorm { "Norm ON" } else { "Norm" };
+
+    sheet_box(
+        ui,
+        column![
+            text("Avancé").size(13).color(ui.ink_muted()),
+            row![
+                chip_btn(ui, "A ←", Message::MarkAbA, active && !s.is_live()),
+                chip_btn(ui, "B →", Message::MarkAbB, active && !s.is_live()),
+                chip_btn(ui, &ab, Message::ClearAbLoop, active),
+                chip_btn(ui, &format!("ST {:+.1}s", s.sub_delay), Message::SubDelay(-0.1), active),
+                chip_btn(ui, "ST+", Message::SubDelay(0.1), active),
+                chip_btn(ui, &format!("A/V {:+.1}s", s.audio_delay), Message::AudioDelay(-0.1), active),
+                chip_btn(ui, "A/V+", Message::AudioDelay(0.1), active),
+            ]
+            .spacing(6)
+            .wrap(),
+            row![
+                chip_btn(ui, s.audio_mode.label(), Message::CycleAudioMode, active),
+                chip_btn(ui, s.eq_preset.label(), Message::CycleEq, active),
+                chip_btn(ui, loud, Message::ToggleLoudnorm, active),
+                chip_btn(ui, deint, Message::ToggleDeinterlace, active),
+                chip_btn(ui, &format!("Rot {}", s.rotate_deg), Message::CycleRotate, active),
+                chip_btn(ui, "Zoom−", Message::NudgeZoom(-0.1), active),
+                chip_btn(ui, "Zoom+", Message::NudgeZoom(0.1), active),
+                chip_btn(ui, night, Message::ToggleNightVf, active),
+            ]
+            .spacing(6)
+            .wrap(),
+            row![
+                chip_btn(ui, "Retour ⋯", Message::PlayerPanel(PlayerPanel::More), true),
+                chip_btn(ui, "Fermer panneau", Message::PlayerPanel(PlayerPanel::None), true),
+            ]
+            .spacing(6),
+        ]
+        .spacing(8),
+    )
+}
+
+fn goto_sheet(ui: UiTheme, draft: &str) -> Element<'_, Message> {
+    sheet_box(
+        ui,
+        column![
+            text("Aller à (mm:ss ou hh:mm:ss)").size(13).color(ui.ink_muted()),
+            row![
+                text_input("01:30", draft)
+                    .on_input(Message::GotoDraftChanged)
+                    .on_submit(Message::GotoSubmit)
+                    .padding(10)
+                    .width(Length::Fixed(160.0)),
+                chip_btn(ui, "OK", Message::GotoSubmit, true),
+                chip_btn(ui, "Annuler", Message::PlayerPanel(PlayerPanel::None), true),
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center),
+        ]
+        .spacing(8),
+    )
+}
+
+fn sheet_box<'a>(ui: UiTheme, body: impl Into<Element<'a, Message>>) -> Element<'a, Message> {
+    container(body)
+        .width(Fill)
+        .padding(Padding::from([12, 18]))
         .style(move |_t: &Theme| container::Style {
-            background: Some(Background::Color(bg)),
+            background: Some(Background::Color(ui.surface_elevated())),
             border: Border {
-                color: Color::TRANSPARENT,
-                width: 0.0,
-                radius: RADIUS_SM.into(),
+                color: ui.outline(),
+                width: 1.0,
+                radius: 0.0.into(),
             },
             ..Default::default()
         })
         .into()
 }
 
-fn live_chip() -> Element<'static, Message> {
+fn chip_live() -> Element<'static, Message> {
     container(
         row![
-            text("●").size(9).color(Color::from_rgb8(0xE1, 0x1D, 0x48)),
-            text(" LIVE").size(10).color(Color::from_rgb8(0xE1, 0x1D, 0x48)),
+            text("●").size(10).color(Color::from_rgb8(0xE1, 0x1D, 0x48)),
+            text(" LIVE").size(11).color(Color::from_rgb8(0xE1, 0x1D, 0x48)),
         ]
         .align_y(Alignment::Center),
     )
-    .padding(Padding::from([3, 7]))
+    .padding(Padding::from([5, 12]))
     .style(move |_t: &Theme| container::Style {
-        background: Some(Background::Color(Color::from_rgba8(0xE1, 0x1D, 0x48, 0.12))),
+        background: Some(Background::Color(Color::from_rgba8(0xE1, 0x1D, 0x48, 0.14))),
         border: Border {
-            color: Color::TRANSPARENT,
-            width: 0.0,
-            radius: RADIUS_SM.into(),
+            radius: RADIUS_FULL.into(),
+            ..Default::default()
         },
         ..Default::default()
     })
     .into()
 }
 
-fn soft_chip(day: bool, label: &str) -> Element<'static, Message> {
-    container(text(label.to_string()).size(10).color(ink_muted(day)))
-        .padding(Padding::from([3, 7]))
+fn soft_chip(ui: UiTheme, label: &str) -> Element<'static, Message> {
+    container(text(label.to_string()).size(11).color(ui.ink_muted()))
+        .padding(Padding::from([5, 12]))
         .style(move |_t: &Theme| container::Style {
-            background: Some(Background::Color(surface_elevated(day))),
+            background: Some(Background::Color(ui.surface_elevated())),
             border: Border {
-                color: outline(day),
+                color: ui.outline(),
                 width: 1.0,
-                radius: RADIUS_SM.into(),
+                radius: RADIUS_FULL.into(),
             },
             ..Default::default()
         })
         .into()
 }
 
-fn scrubber(
-    day: bool,
-    live: bool,
-    progress: f64,
-    time_label: String,
-    active: bool,
-) -> Element<'static, Message> {
-    let track: Element<'static, Message> = if !active {
-        container(
-            text("Choisissez un média dans le catalogue FluxPlay")
-                .size(11)
-                .color(ink_muted(day)),
-        )
-        .width(Fill)
-        .padding(Padding::from([4, 0]))
-        .into()
-    } else if live {
-        container(
-            row![
-                text("●").size(11).color(Color::from_rgb8(0xE1, 0x1D, 0x48)),
-                text(format!("  {time_label} — seek désactivé en direct"))
-                    .size(11)
-                    .color(ink_muted(day)),
-            ]
-            .align_y(Alignment::Center),
-        )
-        .width(Fill)
-        .padding(Padding::from([4, 0]))
-        .into()
-    } else {
-        slider(0.0..=1.0, progress as f32, |v| Message::SeekPercent(v as f64))
-            .step(0.001)
-            .style(move |theme: &Theme, status| {
-                let mut s = slider::default(theme, status);
-                s.rail.backgrounds.0 = Background::Color(accent(day));
-                s.rail.backgrounds.1 = Background::Color(surface_muted(day));
-                s.handle.background = Background::Color(accent(day));
-                s
-            })
-            .into()
-    };
-
-    row![
-        track,
-        text(if active { time_label } else { "00:00".into() })
-            .size(12)
-            .color(ink_muted(day))
-            .width(Length::Fixed(100.0)),
-    ]
-    .spacing(10)
-    .align_y(Alignment::Center)
-    .into()
-}
-
-fn transport_row(
-    day: bool,
-    state: PlaybackState,
-    active: bool,
-    live: bool,
-) -> Element<'static, Message> {
-    let paused = state == PlaybackState::Paused || state == PlaybackState::Idle;
-    let play_label = if paused { "Play" } else { "Pause" };
-    let can_seek = active && !live;
-
-    row![
-        ctrl_btn(day, "-30s", Message::SeekRel(-30), can_seek),
-        ctrl_btn(day, "-10s", Message::SeekRel(-10), can_seek),
-        primary_btn(day, play_label, Message::TogglePause, active),
-        ctrl_btn(day, "Stop", Message::Stop, active),
-        ctrl_btn(day, "+10s", Message::SeekRel(10), can_seek),
-        ctrl_btn(day, "+30s", Message::SeekRel(30), can_seek),
-    ]
-    .spacing(5)
-    .align_y(Alignment::Center)
-    .into()
-}
-
-fn volume_block(day: bool, muted: bool, volume: f32) -> Element<'static, Message> {
-    let mute_label = if muted { "Muet" } else { "Son" };
-    let shown = if muted { 0.0 } else { volume };
-
-    row![
-        ctrl_btn(day, mute_label, Message::ToggleMute, true),
-        container(
-            slider(0.0..=1.0, shown, Message::VolumeChanged)
-                .step(0.01)
-                .style(move |theme: &Theme, status| {
-                    let mut s = slider::default(theme, status);
-                    s.rail.backgrounds.0 = Background::Color(accent(day));
-                    s.rail.backgrounds.1 = Background::Color(surface_muted(day));
-                    s.handle.background = Background::Color(accent(day));
-                    s
-                }),
-        )
-        .width(Length::Fixed(120.0)),
-        text(format!("{:.0}%", shown * 100.0))
-            .size(11)
-            .color(ink_muted(day))
-            .width(Length::Fixed(34.0)),
-        ctrl_btn(day, "-", Message::VolumeDelta(-0.05), true),
-        ctrl_btn(day, "+", Message::VolumeDelta(0.05), true),
-    ]
-    .spacing(5)
-    .align_y(Alignment::Center)
-    .into()
-}
-
-fn extras_row(day: bool, active: bool) -> Element<'static, Message> {
-    row![
-        ctrl_btn(day, "Reprise", Message::RestartStream, active),
-        ctrl_btn(day, "Plein ecran", Message::ToggleFullscreen, active),
-        ctrl_btn(day, "Audio", Message::CycleAudio, active),
-        ctrl_btn(day, "ST", Message::CycleSubtitles, active),
-        ctrl_btn(day, "Externe", Message::OpenExternal, active),
-        ctrl_btn(day, "Fermer lecteur", Message::ClosePlayerWindow, true),
-        ctrl_btn(day, "Theme", Message::CycleTheme, true),
-    ]
-    .spacing(5)
-    .into()
-}
-
-fn primary_btn(
-    day: bool,
+fn primary_round(
+    ui: UiTheme,
     label: impl Into<String>,
     msg: Message,
     enabled: bool,
 ) -> Element<'static, Message> {
-    let mut b = button(text(label.into()).size(13))
-        .padding(Padding::from([8, 14]))
+    let mut b = button(text(label.into()).size(16))
+        .padding(Padding::from([10, 18]))
         .style(move |_theme: &Theme, status| {
             let hovered = matches!(status, button::Status::Hovered);
-            let bg = if !enabled {
-                surface_muted(day)
-            } else if hovered {
-                Color::from_rgb8(0x0A, 0x7A, 0x70)
-            } else {
-                accent(day)
-            };
             button::Style {
-                background: Some(Background::Color(bg)),
-                text_color: if enabled {
-                    on_primary(day)
+                background: Some(Background::Color(if !enabled {
+                    ui.surface_muted()
+                } else if hovered {
+                    ui.primary_container()
                 } else {
-                    ink_muted(day)
+                    ui.accent()
+                })),
+                text_color: if enabled {
+                    ui.on_primary()
+                } else {
+                    ui.ink_muted()
                 },
                 border: Border {
-                    color: Color::TRANSPARENT,
-                    width: 0.0,
-                    radius: RADIUS_MD.into(),
+                    radius: RADIUS_XL.into(),
+                    ..Default::default()
                 },
                 ..Default::default()
             }
@@ -411,30 +499,51 @@ fn primary_btn(
     b.into()
 }
 
-fn ctrl_btn(
-    day: bool,
+fn icon_btn(
+    ui: UiTheme,
     label: impl Into<String>,
     msg: Message,
     enabled: bool,
 ) -> Element<'static, Message> {
-    let mut b = button(text(label.into()).size(11))
-        .padding(Padding::from([7, 10]))
-        .style(move |theme: &Theme, status| {
-            let mut s = button::secondary(theme, status);
-            s.border.radius = RADIUS_MD.into();
-            if !enabled {
-                s.background = Some(Background::Color(surface_elevated(day)));
-                s.text_color = ink_muted(day);
-            } else if matches!(status, button::Status::Hovered) {
-                s.background = Some(Background::Color(accent(day)));
-                s.text_color = on_primary(day);
-            } else {
-                s.background = Some(Background::Color(surface_muted(day)));
+    let mut b = button(text(label.into()).size(13))
+        .padding(Padding::from([9, 12]))
+        .style(move |_theme: &Theme, status| {
+            let hovered = matches!(status, button::Status::Hovered);
+            button::Style {
+                background: Some(Background::Color(if !enabled {
+                    ui.surface_elevated()
+                } else if hovered {
+                    ui.primary_container()
+                } else {
+                    ui.surface_muted()
+                })),
+                text_color: if enabled {
+                    if hovered {
+                        ui.on_primary_container()
+                    } else {
+                        ui.ink()
+                    }
+                } else {
+                    ui.ink_muted()
+                },
+                border: Border {
+                    radius: RADIUS_LG.into(),
+                    ..Default::default()
+                },
+                ..Default::default()
             }
-            s
         });
     if enabled {
         b = b.on_press(msg);
     }
     b.into()
+}
+
+fn chip_btn(
+    ui: UiTheme,
+    label: &str,
+    msg: Message,
+    enabled: bool,
+) -> Element<'static, Message> {
+    icon_btn(ui, label.to_string(), msg, enabled)
 }

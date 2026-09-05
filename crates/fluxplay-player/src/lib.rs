@@ -1,22 +1,28 @@
-//! FluxPlay player — protocol routing + native backends (mpv / FFmpeg / platform).
+//! FluxPlay player — protocol routing + native backends (libmpv / FFmpeg / platform).
 //!
-//! Desktop (Win/macOS/Linux): prefers **mpv** (embeds FFmpeg, HW accel) then **ffplay**.
+//! Desktop: **libmpv in-process** (static or shared link), optional CLI `mpv`/`ffplay` fallback.
 //! Mobile: core logic + FFI; decode via ExoPlayer (Android) / AVPlayer (iOS).
 
 mod backend;
+#[cfg(all(feature = "native-mpv", fluxplay_has_libmpv))]
+mod mpv_ffi;
 mod platform;
 mod session;
 
 use fluxplay_core::protocol::{DeliveryKind, StreamScheme, StreamUrl};
 use fluxplay_core::Channel;
+use fluxplay_core::Stopwatch;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use tracing::{debug, info, trace, warn};
 
 pub use backend::{
-    detect_backends, BackendId, BackendInfo, NativePlayer, PlayOptions, PlayerEvent,
+    detect_backends, BackendId, BackendInfo, NativePlayer, PlayOptions, PlayerEvent, VideoRect,
 };
 pub use platform::{target_profile, Platform, TargetProfile};
-pub use session::{PlaybackState, StreamSession};
+pub use session::{
+    AspectMode, AudioChannelMode, Bookmark, EqPreset, PlaybackState, StreamSession,
+};
 
 #[derive(Debug, Error)]
 pub enum PlayerError {
@@ -38,6 +44,18 @@ pub enum PlayerError {
 
 pub type Result<T> = std::result::Result<T, PlayerError>;
 
+/// Scheme + host only — avoids logging path/query credentials.
+pub(crate) fn url_endpoint(raw: &str) -> String {
+    if let Ok(u) = StreamUrl::parse(raw) {
+        match (u.scheme.label(), u.host.as_deref()) {
+            (scheme, Some(host)) => format!("{scheme}://{host}"),
+            (scheme, None) => scheme.to_string(),
+        }
+    } else {
+        raw.split(['?', '#']).next().unwrap_or(raw).to_string()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProtocolSupport {
     pub scheme: StreamScheme,
@@ -49,12 +67,14 @@ pub struct ProtocolSupport {
 
 pub fn support_matrix() -> Vec<ProtocolSupport> {
     let native = !detect_backends().is_empty();
-    let decode_note = if native {
+    let decode_note = if cfg!(all(feature = "native-mpv", fluxplay_has_libmpv)) {
+        "libmpv natif lié dans le binaire"
+    } else if native {
         "native decode via mpv/FFmpeg when available"
     } else {
         "install mpv or ffmpeg/ffplay for native decode"
     };
-    vec![
+    let matrix = vec![
         ProtocolSupport {
             scheme: StreamScheme::Http,
             classify: true,
@@ -139,7 +159,9 @@ pub fn support_matrix() -> Vec<ProtocolSupport> {
             decode: native,
             notes: "Local media".into(),
         },
-    ]
+    ];
+    trace!(entries = matrix.len(), native_decode = native, "support_matrix");
+    matrix
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -150,6 +172,9 @@ pub struct RoutedStream {
 }
 
 pub fn route(raw_url: &str) -> Result<RoutedStream> {
+    let _prof = Stopwatch::start("route");
+    let endpoint = url_endpoint(raw_url);
+    debug!(%endpoint, "route start");
     let url = StreamUrl::parse(raw_url)?;
     let support = support_matrix()
         .into_iter()
@@ -163,17 +188,32 @@ pub fn route(raw_url: &str) -> Result<RoutedStream> {
         });
 
     if !url.scheme.is_playback_ready() && url.scheme != StreamScheme::Unknown {
+        warn!(
+            scheme = %url.scheme.label(),
+            %endpoint,
+            "route unsupported scheme"
+        );
         return Err(PlayerError::Unsupported(url.scheme.label().into()));
     }
 
-    Ok(RoutedStream {
+    let routed = RoutedStream {
         open_externally: !support.decode,
         url,
         support,
-    })
+    };
+    info!(
+        scheme = %routed.url.scheme.label(),
+        delivery = %routed.url.delivery.label(),
+        host = ?routed.url.host,
+        decode = routed.support.decode,
+        open_externally = routed.open_externally,
+        "route ok"
+    );
+    Ok(routed)
 }
 
 pub fn route_channel(channel: &Channel) -> Result<RoutedStream> {
+    debug!(channel_id = %channel.id, channel_name = %channel.name, "route_channel");
     route(&channel.stream_url)
 }
 
@@ -186,8 +226,16 @@ pub struct HlsProbe {
 }
 
 pub async fn probe_hls_manifest(url: &str) -> Result<HlsProbe> {
+    let _prof = Stopwatch::start("probe_hls_manifest");
+    let endpoint = url_endpoint(url);
+    debug!(%endpoint, "probe_hls_manifest start");
     let parsed = StreamUrl::parse(url)?;
     if parsed.delivery != DeliveryKind::Hls && parsed.delivery != DeliveryKind::LlHls {
+        warn!(
+            delivery = %parsed.delivery.label(),
+            %endpoint,
+            "probe_hls_manifest not HLS"
+        );
         return Err(PlayerError::Message("not an HLS URL".into()));
     }
     let client = reqwest::Client::builder()
@@ -203,10 +251,18 @@ pub async fn probe_hls_manifest(url: &str) -> Result<HlsProbe> {
         .lines()
         .find_map(|l| l.strip_prefix("#EXT-X-MEDIA-SEQUENCE:"))
         .and_then(|s| s.trim().parse().ok());
-    Ok(HlsProbe {
+    let probe = HlsProbe {
         is_master,
         variant_count: variants,
         media_sequence: media_seq,
         bytes: text.len(),
-    })
+    };
+    info!(
+        %endpoint,
+        is_master = probe.is_master,
+        variants = probe.variant_count,
+        bytes = probe.bytes,
+        "probe_hls_manifest ok"
+    );
+    Ok(probe)
 }

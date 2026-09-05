@@ -1,0 +1,12 @@
+# Host-local overrides (not required for CI / cross builds).
+# Uncomment for native CPU codegen on your machine only:
+# [build]
+# rustflags = ["-C", "target-cpu=native"]
+
+[alias]
+# Production binary (fat LTO + strip + panic=abort)
+rel = "build -p fluxplay --release"
+# Size-optimized binary
+rel-size = "build -p fluxplay --profile release-size"
+# Faster CI-ish release
+rel-ci = "build -p fluxplay --profile release-ci"

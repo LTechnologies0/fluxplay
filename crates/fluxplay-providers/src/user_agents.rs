@@ -1,5 +1,7 @@
 //! User-Agents commonly accepted by IPTV panels / CDN WAFs.
 
+use tracing::{debug, trace};
+
 /// Rotate through these when a playlist URL returns HTTP 885 / empty / 403.
 pub const IPTV_USER_AGENTS: &[&str] = &[
     "IPTVSmartersPlayer",
@@ -27,6 +29,7 @@ pub fn agents_for(source_ua: Option<&str>) -> Vec<String> {
     let mut out = Vec::new();
     if let Some(ua) = source_ua {
         if !ua.trim().is_empty() {
+            trace!(%ua, "preferring source User-Agent");
             out.push(ua.trim().to_string());
         }
     }
@@ -35,5 +38,10 @@ pub fn agents_for(source_ua: Option<&str>) -> Vec<String> {
             out.push((*ua).to_string());
         }
     }
+    debug!(
+        count = out.len(),
+        custom = source_ua.is_some_and(|u| !u.trim().is_empty()),
+        "UA rotation list ready"
+    );
     out
 }

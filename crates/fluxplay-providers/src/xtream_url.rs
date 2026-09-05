@@ -3,6 +3,7 @@
 //! Many panels return non-standard HTTP status / empty body for
 //! `get.php` while `player_api.php` works — IPTVnator-style apps fall back to XC API.
 
+use tracing::{debug, trace};
 use url::Url;
 
 use crate::ProviderError;
@@ -20,6 +21,7 @@ pub fn parse_xtream_get_php(endpoint: &str) -> Option<XtreamCredentials> {
     let url = Url::parse(endpoint).ok()?;
     let path = url.path().to_ascii_lowercase();
     if !path.ends_with("get.php") && !path.contains("/get.php") {
+        trace!("endpoint is not get.php");
         return None;
     }
 
@@ -40,15 +42,22 @@ pub fn parse_xtream_get_php(endpoint: &str) -> Option<XtreamCredentials> {
     base.set_query(None);
     base.set_fragment(None);
 
-    Some(XtreamCredentials {
+    let creds = XtreamCredentials {
         base: base.as_str().trim_end_matches('/').to_string(),
         username,
         password,
-    })
+    };
+    // Never log password — only base + username.
+    debug!(
+        base = %creds.base,
+        user = %creds.username,
+        "parsed get.php Xtream credentials"
+    );
+    Some(creds)
 }
 
 pub fn http_status_hint(status: u16) -> Option<&'static str> {
-    match status {
+    let hint = match status {
         885 | 886 | 887 => Some(
             "endpoint get.php bloqué par le panel (souvent indépendant du User-Agent). Fallback API Xtream.",
         ),
@@ -57,17 +66,24 @@ pub fn http_status_hint(status: u16) -> Option<&'static str> {
         429 => Some("trop de requêtes — réessayez"),
         500..=599 => Some("erreur serveur IPTV"),
         _ => None,
+    };
+    if let Some(h) = hint {
+        trace!(status, hint = h, "HTTP status hint");
     }
+    hint
 }
 
 pub fn map_http_error(err: reqwest::Error) -> ProviderError {
     if let Some(status) = err.status() {
         let code = status.as_u16();
         if let Some(hint) = http_status_hint(code) {
+            debug!(code, hint, "mapped HTTP error with hint");
             return ProviderError::Message(format!("HTTP {code}: {hint}"));
         }
+        debug!(code, "mapped HTTP error");
         return ProviderError::Message(format!("HTTP {code}: {err}"));
     }
+    debug!(error = %err, "mapped network HTTP error");
     ProviderError::Http(err)
 }
 

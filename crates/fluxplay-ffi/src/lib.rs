@@ -9,14 +9,18 @@ use std::sync::Mutex;
 
 use fluxplay_core::m3u;
 use fluxplay_core::models::PlaylistBundle;
+use fluxplay_core::Stopwatch;
 use fluxplay_player::{target_profile, Platform};
+use tracing::{debug, error, info, warn};
 
 static LAST_ERROR: Mutex<Option<CString>> = Mutex::new(None);
 static BUNDLE_JSON: Mutex<Option<CString>> = Mutex::new(None);
 
 fn set_err(msg: impl Into<String>) {
-    let s = CString::new(msg.into()).unwrap_or_else(|_| CString::new("error").unwrap());
-    *LAST_ERROR.lock().unwrap() = Some(s);
+    let s = msg.into();
+    warn!(%s, "ffi set_err");
+    let c = CString::new(s).unwrap_or_else(|_| CString::new("error").unwrap());
+    *LAST_ERROR.lock().unwrap() = Some(c);
 }
 
 /// Returns last error message (borrowed; valid until next call), or null.
@@ -33,14 +37,16 @@ pub extern "C" fn fluxplay_last_error() -> *const c_char {
 /// Platform id: 0 linux, 1 macos, 2 windows, 3 android, 4 ios, 255 unknown.
 #[no_mangle]
 pub extern "C" fn fluxplay_platform_id() -> u32 {
-    match Platform::current() {
+    let id = match Platform::current() {
         Platform::Linux => 0,
         Platform::MacOs => 1,
         Platform::Windows => 2,
         Platform::Android => 3,
         Platform::Ios => 4,
         Platform::Unknown => 255,
-    }
+    };
+    debug!(id, "fluxplay_platform_id");
+    id
 }
 
 /// Recommended native decoder name for this target (static C string).
@@ -48,6 +54,7 @@ pub extern "C" fn fluxplay_platform_id() -> u32 {
 pub extern "C" fn fluxplay_recommended_decoder() -> *const c_char {
     let p = target_profile();
     let name = p.preferred_backends.first().copied().unwrap_or("external");
+    info!(decoder = name, "fluxplay_recommended_decoder");
     match name {
         "mpv" => c"mpv".as_ptr(),
         "ffmpeg" => c"ffmpeg".as_ptr(),
@@ -63,6 +70,7 @@ pub extern "C" fn fluxplay_recommended_decoder() -> *const c_char {
 /// `body` must be a valid NUL-terminated UTF-8 C string.
 #[no_mangle]
 pub unsafe extern "C" fn fluxplay_parse_m3u(body: *const c_char) -> i32 {
+    let _prof = Stopwatch::start("ffi_parse_m3u");
     if body.is_null() {
         set_err("null body");
         return -1;
@@ -75,9 +83,18 @@ pub unsafe extern "C" fn fluxplay_parse_m3u(body: *const c_char) -> i32 {
             return -2;
         }
     };
+    debug!(bytes = text.len(), "fluxplay_parse_m3u");
     match m3u::parse_m3u(text, None) {
-        Ok(bundle) => store_bundle(bundle),
+        Ok(bundle) => {
+            let n = bundle.channels.len();
+            let rc = store_bundle(bundle);
+            if rc == 0 {
+                info!(channels = n, "fluxplay_parse_m3u ok");
+            }
+            rc
+        }
         Err(e) => {
+            error!(error = %e, "fluxplay_parse_m3u failed");
             set_err(e.to_string());
             -3
         }
@@ -124,7 +141,9 @@ pub extern "C" fn fluxplay_channel_count() -> i32 {
     let Ok(s) = raw.to_str() else {
         return 0;
     };
-    serde_json::from_str::<PlaylistBundle>(s)
+    let n = serde_json::from_str::<PlaylistBundle>(s)
         .map(|b| b.channels.len() as i32)
-        .unwrap_or(0)
+        .unwrap_or(0);
+    debug!(channels = n, "fluxplay_channel_count");
+    n
 }

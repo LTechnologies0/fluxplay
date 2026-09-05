@@ -3,12 +3,16 @@
 use chrono::{DateTime, NaiveDateTime, Utc};
 use quick_xml::events::Event;
 use quick_xml::Reader;
+use tracing::{debug, error, info, trace, warn};
 
 use crate::error::{Error, Result};
 use crate::models::EpgProgramme;
+use crate::Stopwatch;
 
 /// Parse XMLTV document bytes into programme list.
 pub fn parse_xmltv(xml: &str) -> Result<Vec<EpgProgramme>> {
+    let _prof = Stopwatch::start("parse_xmltv");
+    debug!(bytes = xml.len(), "parse_xmltv start");
     let mut reader = Reader::from_str(xml);
     reader.config_mut().trim_text(true);
 
@@ -104,12 +108,20 @@ pub fn parse_xmltv(xml: &str) -> Result<Vec<EpgProgramme>> {
                 }
             }
             Ok(Event::Eof) => break,
-            Err(e) => return Err(Error::Parse(format!("xmltv: {e}"))),
+            Err(e) => {
+                error!(error = %e, "parse_xmltv read failed");
+                return Err(Error::Parse(format!("xmltv: {e}")));
+            }
             _ => {}
         }
         buf.clear();
     }
 
+    if programmes.is_empty() {
+        warn!("parse_xmltv produced zero programmes");
+    } else {
+        info!(programmes = programmes.len(), "parse_xmltv done");
+    }
     Ok(programmes)
 }
 
@@ -118,6 +130,7 @@ fn parse_xmltv_time(raw: &str) -> Option<DateTime<Utc>> {
     let raw = raw.trim();
     let digits: String = raw.chars().take_while(|c| c.is_ascii_digit()).collect();
     if digits.len() < 12 {
+        trace!(%raw, "parse_xmltv_time too short");
         return None;
     }
     let naive = NaiveDateTime::parse_from_str(&digits[..14.min(digits.len())], "%Y%m%d%H%M%S")

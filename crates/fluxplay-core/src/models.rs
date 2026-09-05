@@ -1,5 +1,6 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use tracing::{debug, trace};
 use uuid::Uuid;
 
 use crate::protocol::StreamScheme;
@@ -149,6 +150,8 @@ pub struct VodItem {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rating: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub genre: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub category_id: Option<String>,
     pub source_id: Option<Uuid>,
 }
@@ -163,6 +166,12 @@ pub struct SeriesItem {
     pub banner: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plot: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub year: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rating: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub genre: Option<String>,
     #[serde(default)]
     pub seasons: Vec<SeriesSeason>,
     pub source_id: Option<Uuid>,
@@ -284,6 +293,52 @@ impl ThemeMode {
     }
 }
 
+/// Accent / brand color family for the GUI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AccentPreset {
+    #[default]
+    Teal,
+    Ocean,
+    Ember,
+    Violet,
+    Forest,
+    Rose,
+    Slate,
+}
+
+impl AccentPreset {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Teal => "Teal (broadcast)",
+            Self::Ocean => "Océan",
+            Self::Ember => "Ember",
+            Self::Violet => "Violet",
+            Self::Forest => "Forêt",
+            Self::Rose => "Rose",
+            Self::Slate => "Ardoise",
+        }
+    }
+
+    pub fn all() -> &'static [AccentPreset] {
+        &[
+            Self::Teal,
+            Self::Ocean,
+            Self::Ember,
+            Self::Violet,
+            Self::Forest,
+            Self::Rose,
+            Self::Slate,
+        ]
+    }
+
+    pub fn cycle(self) -> Self {
+        let all = Self::all();
+        let i = all.iter().position(|a| *a == self).unwrap_or(0);
+        all[(i + 1) % all.len()]
+    }
+}
+
 /// Preferred native decode engine (desktop).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -298,8 +353,8 @@ pub enum PlayerBackendPref {
 impl PlayerBackendPref {
     pub fn label(self) -> &'static str {
         match self {
-            Self::Auto => "Auto (mpv → FFmpeg)",
-            Self::Mpv => "mpv",
+            Self::Auto => "Auto (libmpv → FFmpeg)",
+            Self::Mpv => "libmpv",
             Self::Ffmpeg => "FFmpeg / ffplay",
             Self::External => "Système",
         }
@@ -318,6 +373,8 @@ impl PlayerBackendPref {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppSettings {
     pub theme: ThemeMode,
+    #[serde(default)]
+    pub accent: AccentPreset,
     pub last_source_id: Option<Uuid>,
     pub volume: f32,
     pub remember_position: bool,
@@ -359,6 +416,7 @@ impl Default for AppSettings {
     fn default() -> Self {
         Self {
             theme: ThemeMode::System,
+            accent: AccentPreset::Teal,
             last_source_id: None,
             volume: 0.85,
             remember_position: true,
@@ -377,8 +435,10 @@ impl AppSettings {
     pub fn toggle_favorite(&mut self, channel_id: &str) {
         if let Some(i) = self.favorites.iter().position(|f| f == channel_id) {
             self.favorites.remove(i);
+            debug!(%channel_id, favorite = false, "toggle_favorite");
         } else {
             self.favorites.push(channel_id.to_string());
+            debug!(%channel_id, favorite = true, "toggle_favorite");
         }
     }
 
@@ -387,6 +447,7 @@ impl AppSettings {
     }
 
     pub fn push_recent(&mut self, ch: &Channel) {
+        trace!(channel_id = %ch.id, name = %ch.name, "push_recent");
         self.recent.retain(|r| r.channel_id != ch.id);
         self.recent.insert(
             0,

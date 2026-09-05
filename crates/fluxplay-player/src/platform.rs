@@ -1,6 +1,7 @@
 //! Platform / target profiles for FluxPlay (desktop + mobile).
 
 use serde::{Deserialize, Serialize};
+use tracing::{debug, info, trace};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -15,7 +16,7 @@ pub enum Platform {
 
 impl Platform {
     pub fn current() -> Self {
-        if cfg!(target_os = "android") {
+        let p = if cfg!(target_os = "android") {
             Self::Android
         } else if cfg!(target_os = "ios") {
             Self::Ios
@@ -27,7 +28,9 @@ impl Platform {
             Self::Linux
         } else {
             Self::Unknown
-        }
+        };
+        trace!(platform = %p.label(), "Platform::current");
+        p
     }
 
     pub fn label(self) -> &'static str {
@@ -61,7 +64,7 @@ pub struct TargetProfile {
 }
 
 pub fn target_profile() -> TargetProfile {
-    match Platform::current() {
+    let profile = match Platform::current() {
         Platform::Linux => TargetProfile {
             platform: Platform::Linux,
             ui_shell: "iced (desktop)",
@@ -104,5 +107,17 @@ pub fn target_profile() -> TargetProfile {
             hw_accel: "none",
             notes: "fallback open URL",
         },
-    }
+    };
+    debug!(
+        platform = %profile.platform.label(),
+        ui = profile.ui_shell,
+        backends = ?profile.preferred_backends,
+        "target_profile"
+    );
+    info!(
+        platform = %profile.platform.label(),
+        preferred = profile.preferred_backends.first().copied().unwrap_or("external"),
+        "target profile ready"
+    );
+    profile
 }

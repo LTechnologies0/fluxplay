@@ -1,4 +1,4 @@
-//! Native playback backends — mpv (preferred) and FFmpeg/ffplay.
+//! Native playback backends — **libmpv in-process** (preferred) and optional CLI mpv/ffplay.
 //! Inspired by IPTVnator embedded MPV and Kodi's FFmpeg pipeline.
 
 use std::io::Write;
@@ -9,10 +9,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use fluxplay_core::models::PlayerBackendPref;
+use fluxplay_core::Stopwatch;
 use serde::{Deserialize, Serialize};
-use tracing::{info, warn};
+use tracing::{debug, error, info, trace, warn};
 
-use crate::{PlayerError, Result};
+use crate::{url_endpoint, PlayerError, Result};
 
 static IPC_SEQ: AtomicU64 = AtomicU64::new(1);
 
@@ -29,7 +30,7 @@ pub enum BackendId {
 impl BackendId {
     pub fn label(self) -> &'static str {
         match self {
-            Self::Mpv => "mpv (FFmpeg)",
+            Self::Mpv => "libmpv (natif)",
             Self::Ffmpeg => "FFmpeg / ffplay",
             Self::External => "Lecteur système",
             Self::ExoPlayer => "ExoPlayer (Android)",
@@ -61,6 +62,25 @@ pub struct PlayOptions {
     pub preferred: PlayerBackendPref,
 }
 
+/// Screen-space rectangle for the borderless mpv video surface (overlay on iced stage).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VideoRect {
+    pub x: i32,
+    pub y: i32,
+    pub w: u32,
+    pub h: u32,
+}
+
+impl VideoRect {
+    pub fn to_geometry(self) -> String {
+        format!("{}x{}{:+}{:+}", self.w, self.h, self.x, self.y)
+    }
+
+    pub fn is_usable(self) -> bool {
+        self.w >= 64 && self.h >= 64
+    }
+}
+
 impl Default for PlayOptions {
     fn default() -> Self {
         Self {
@@ -85,21 +105,37 @@ pub enum PlayerEvent {
     Error(String),
 }
 
-/// Detect installed desktop backends (PATH).
+/// Detect available desktop backends (linked libmpv and/or PATH tools).
 pub fn detect_backends() -> Vec<BackendInfo> {
     let mut out = Vec::new();
 
-    let mpv = which("mpv");
-    out.push(BackendInfo {
-        id: BackendId::Mpv,
-        available: mpv.is_some(),
-        path: mpv.clone(),
-        detail: if mpv.is_some() {
-            "libmpv/mpv — HLS/DASH/RTSP/RTMP/SRT, HW accel (best IPTV)".into()
-        } else {
-            "Install mpv for best quality (apt/brew/choco: mpv)".into()
-        },
-    });
+    #[cfg(all(feature = "native-mpv", fluxplay_has_libmpv))]
+    {
+        out.push(BackendInfo {
+            id: BackendId::Mpv,
+            available: true,
+            path: Some("libmpv".into()),
+            detail: if cfg!(feature = "static-link") {
+                "libmpv lié statiquement — HLS/DASH/RTSP/HW".into()
+            } else {
+                "libmpv natif (FFI) — HLS/DASH/RTSP/RTMP/SRT, HW accel".into()
+            },
+        });
+    }
+    #[cfg(not(all(feature = "native-mpv", fluxplay_has_libmpv)))]
+    {
+        let mpv = which("mpv");
+        out.push(BackendInfo {
+            id: BackendId::Mpv,
+            available: mpv.is_some(),
+            path: mpv.clone(),
+            detail: if mpv.is_some() {
+                "mpv CLI (fallback)".into()
+            } else {
+                "Installez libmpv (dev) pour le FFI natif, ou mpv en CLI".into()
+            },
+        });
+    }
 
     let ffplay = which("ffplay").or_else(|| which("ffmpeg"));
     out.push(BackendInfo {
@@ -107,11 +143,11 @@ pub fn detect_backends() -> Vec<BackendInfo> {
         available: ffplay.is_some(),
         path: ffplay.clone(),
         detail: if which("ffplay").is_some() {
-            "ffplay — FFmpeg native window".into()
+            "ffplay — FFmpeg fenêtre (optionnel)".into()
         } else if which("ffmpeg").is_some() {
-            "ffmpeg present (ffplay recommended for GUI window)".into()
+            "ffmpeg présent (ffplay recommandé pour GUI)".into()
         } else {
-            "Install ffmpeg/ffplay".into()
+            "ffplay optionnel (libmpv suffit)".into()
         },
     });
 
@@ -138,6 +174,14 @@ pub fn detect_backends() -> Vec<BackendInfo> {
         detail: "AVPlayer via Swift shell".into(),
     });
 
+    debug!(
+        count = out.len(),
+        available = out.iter().filter(|b| b.available).count(),
+        "detect_backends"
+    );
+    for b in &out {
+        trace!(?b.id, available = b.available, path = ?b.path, "backend candidate");
+    }
     out
 }
 
@@ -281,7 +325,7 @@ fn pick_backend(pref: PlayerBackendPref) -> Result<BackendId> {
 
     let choose = |id: BackendId| available.contains(&id);
 
-    match pref {
+    let result = match pref {
         PlayerBackendPref::Auto => {
             if choose(BackendId::Mpv) {
                 Ok(BackendId::Mpv)
@@ -296,7 +340,7 @@ fn pick_backend(pref: PlayerBackendPref) -> Result<BackendId> {
                 Ok(BackendId::Mpv)
             } else {
                 Err(PlayerError::Backend(
-                    "mpv introuvable — installez mpv ou choisissez Auto/FFmpeg".into(),
+                    "libmpv indisponible — recompilez avec native-mpv ou installez mpv".into(),
                 ))
             }
         }
@@ -308,15 +352,24 @@ fn pick_backend(pref: PlayerBackendPref) -> Result<BackendId> {
             }
         }
         PlayerBackendPref::External => Ok(BackendId::External),
+    };
+    match &result {
+        Ok(id) => debug!(?pref, ?id, "pick_backend"),
+        Err(e) => warn!(?pref, error = %e, "pick_backend failed"),
     }
+    result
 }
 
-/// Controls a native player process for high-quality IPTV.
+/// Controls native playback (in-process libmpv, optional CLI child).
 pub struct NativePlayer {
     backend: Option<BackendId>,
+    #[cfg(all(feature = "native-mpv", fluxplay_has_libmpv))]
+    libmpv: Option<crate::mpv_ffi::LibMpv>,
     child: Option<Child>,
     ipc_path: Option<PathBuf>,
     opts: PlayOptions,
+    /// Borderless mpv window locked to the iced player stage.
+    video_rect: Option<VideoRect>,
 }
 
 impl Default for NativePlayer {
@@ -327,11 +380,21 @@ impl Default for NativePlayer {
 
 impl NativePlayer {
     pub fn new(opts: PlayOptions) -> Self {
+        debug!(
+            preferred = ?opts.preferred,
+            hwdec = opts.hwdec,
+            cache_ms = opts.cache_ms,
+            volume = opts.volume,
+            "NativePlayer::new"
+        );
         Self {
             backend: None,
+            #[cfg(all(feature = "native-mpv", fluxplay_has_libmpv))]
+            libmpv: None,
             child: None,
             ipc_path: None,
             opts,
+            video_rect: None,
         }
     }
 
@@ -339,11 +402,52 @@ impl NativePlayer {
         &mut self.opts
     }
 
+    /// Pin the video surface over the iced lecteur stage (screen coordinates).
+    pub fn set_video_rect(&mut self, rect: VideoRect) {
+        if !rect.is_usable() {
+            return;
+        }
+        if self.video_rect == Some(rect) {
+            return;
+        }
+        debug!(?rect, "NativePlayer::set_video_rect");
+        self.video_rect = Some(rect);
+        self.apply_video_geometry();
+    }
+
+    pub fn video_rect(&self) -> Option<VideoRect> {
+        self.video_rect
+    }
+
+    fn apply_video_geometry(&mut self) {
+        let Some(rect) = self.video_rect.filter(|r| r.is_usable()) else {
+            return;
+        };
+        let geo = rect.to_geometry();
+        #[cfg(all(feature = "native-mpv", fluxplay_has_libmpv))]
+        if let Some(mpv) = &self.libmpv {
+            let _ = mpv.set_property("geometry", &geo);
+            let _ = mpv.set_property("border", "no");
+            let _ = mpv.set_property("ontop", "no");
+            return;
+        }
+        if let Some(path) = &self.ipc_path {
+            let _ = mpv_cmd(path, &["set_property", "geometry", &geo]);
+            let _ = mpv_cmd(path, &["set_property", "border", "no"]);
+        }
+    }
+
     pub fn active_backend(&self) -> Option<BackendId> {
         self.backend
     }
 
     pub fn is_running(&mut self) -> bool {
+        #[cfg(all(feature = "native-mpv", fluxplay_has_libmpv))]
+        {
+            if self.libmpv.is_some() {
+                return true;
+            }
+        }
         match &mut self.child {
             Some(c) => matches!(c.try_wait(), Ok(None)),
             None => false,
@@ -351,6 +455,9 @@ impl NativePlayer {
     }
 
     pub fn play(&mut self, url: &str) -> Result<BackendId> {
+        let _prof = Stopwatch::start("native_play");
+        let endpoint = url_endpoint(url);
+        debug!(%endpoint, preferred = ?self.opts.preferred, "NativePlayer::play");
         self.stop();
         // Panels with max_connections=1 need a beat to release the CDN slot.
         std::thread::sleep(std::time::Duration::from_millis(650));
@@ -369,7 +476,10 @@ impl NativePlayer {
             }
         };
 
-        attempt(self, backend, url)?;
+        if let Err(e) = attempt(self, backend, url) {
+            error!(?backend, %endpoint, error = %e, "native play attempt failed");
+            return Err(e);
+        }
 
         // Reap immediate crash so UI can surface the error; one retry after another pause.
         if let Some(child) = &mut self.child {
@@ -381,12 +491,16 @@ impl NativePlayer {
                 self.ipc_path = None;
                 warn!(%status, %url, "player exited immediately — retry once");
                 std::thread::sleep(std::time::Duration::from_millis(800));
-                attempt(self, backend, url)?;
+                if let Err(e) = attempt(self, backend, url) {
+                    error!(?backend, %endpoint, error = %e, "native play retry failed");
+                    return Err(e);
+                }
                 if let Some(child) = &mut self.child {
                     std::thread::sleep(std::time::Duration::from_millis(500));
                     if let Ok(Some(status)) = child.try_wait() {
                         self.child = None;
                         self.backend = None;
+                        error!(%status, %endpoint, "player exited after retry");
                         return Err(PlayerError::Backend(format!(
                             "lecteur fermé aussitôt (code {status}). Stoppez les autres clients IPTV (1 connexion max) ou vérifiez le flux."
                         )));
@@ -400,23 +514,43 @@ impl NativePlayer {
     }
 
     pub fn stop(&mut self) {
+        let had = self.backend;
+        #[cfg(all(feature = "native-mpv", fluxplay_has_libmpv))]
+        {
+            if let Some(mpv) = self.libmpv.take() {
+                debug!("NativePlayer::stop libmpv quit");
+                let _ = mpv.command(&["quit"]);
+                drop(mpv);
+            }
+        }
         if let Some(path) = self.ipc_path.take() {
+            debug!(ipc = %path.display(), "NativePlayer::stop ipc quit");
             let _ = mpv_cmd(&path, &["quit"]);
             let _ = std::fs::remove_file(&path);
         }
         if let Some(mut child) = self.child.take() {
+            debug!("NativePlayer::stop kill child");
             let _ = child.kill();
             let _ = child.wait();
+        }
+        if had.is_some() {
+            info!(?had, "NativePlayer::stop");
+        } else {
+            trace!("NativePlayer::stop idle");
         }
         self.backend = None;
     }
 
     pub fn pause(&mut self, paused: bool) -> Result<()> {
+        debug!(paused, backend = ?self.backend, "NativePlayer::pause");
+        #[cfg(all(feature = "native-mpv", fluxplay_has_libmpv))]
+        if let Some(mpv) = &self.libmpv {
+            return mpv.set_property("pause", if paused { "yes" } else { "no" });
+        }
         if let Some(path) = &self.ipc_path {
             mpv_cmd(path, &["set_property", "pause", if paused { "true" } else { "false" }])?;
             return Ok(());
         }
-        // ffplay: space toggles pause — only send when we want toggle-like behavior.
         if self.backend == Some(BackendId::Ffmpeg) {
             ffplay_send_key("space");
         }
@@ -425,20 +559,29 @@ impl NativePlayer {
 
     pub fn set_volume(&mut self, vol: f32) -> Result<()> {
         self.opts.volume = vol.clamp(0.0, 1.0);
+        let v = (self.opts.volume * 100.0).clamp(0.0, 100.0);
+        debug!(volume = self.opts.volume, "NativePlayer::set_volume");
+        #[cfg(all(feature = "native-mpv", fluxplay_has_libmpv))]
+        if let Some(mpv) = &self.libmpv {
+            return mpv.set_property("volume", &format!("{v:.0}"));
+        }
         if let Some(path) = &self.ipc_path {
-            let v = (self.opts.volume * 100.0).clamp(0.0, 100.0);
             mpv_cmd(path, &["set_property", "volume", &format!("{v:.0}")])?;
             return Ok(());
         }
         if self.backend == Some(BackendId::Ffmpeg) {
-            // ffplay: 0 = quieter, 9 = louder — approximate target with a few taps.
-            ffplay_send_key("m"); // unmute path often starts muted state unclear; skip
+            ffplay_send_key("m");
             let _ = vol;
         }
         Ok(())
     }
 
     pub fn set_mute(&mut self, muted: bool) -> Result<()> {
+        debug!(muted, "NativePlayer::set_mute");
+        #[cfg(all(feature = "native-mpv", fluxplay_has_libmpv))]
+        if let Some(mpv) = &self.libmpv {
+            return mpv.set_property("mute", if muted { "yes" } else { "no" });
+        }
         if let Some(path) = &self.ipc_path {
             mpv_cmd(path, &["set_property", "mute", if muted { "yes" } else { "no" }])?;
             return Ok(());
@@ -452,6 +595,11 @@ impl NativePlayer {
 
     /// Relative seek in seconds (negative = rewind). Best with mpv / VOD.
     pub fn seek_relative(&mut self, secs: f64) -> Result<()> {
+        debug!(secs, "NativePlayer::seek_relative");
+        #[cfg(all(feature = "native-mpv", fluxplay_has_libmpv))]
+        if let Some(mpv) = &self.libmpv {
+            return mpv.command(&["seek", &format!("{secs}"), "relative"]);
+        }
         if let Some(path) = &self.ipc_path {
             return mpv_cmd(path, &["seek", &format!("{secs}"), "relative"]);
         }
@@ -471,16 +619,27 @@ impl NativePlayer {
     }
 
     pub fn seek_percent(&mut self, pct: f64) -> Result<()> {
+        let pct = pct.clamp(0.0, 100.0);
+        debug!(pct, "NativePlayer::seek_percent");
+        #[cfg(all(feature = "native-mpv", fluxplay_has_libmpv))]
+        if let Some(mpv) = &self.libmpv {
+            return mpv.command(&["seek", &format!("{pct}"), "absolute-percent"]);
+        }
         if let Some(path) = &self.ipc_path {
             return mpv_cmd(
                 path,
-                &["seek", &format!("{}", pct.clamp(0.0, 100.0)), "absolute-percent"],
+                &["seek", &format!("{pct}"), "absolute-percent"],
             );
         }
         Ok(())
     }
 
     pub fn toggle_fullscreen(&mut self) -> Result<()> {
+        debug!("NativePlayer::toggle_fullscreen");
+        #[cfg(all(feature = "native-mpv", fluxplay_has_libmpv))]
+        if let Some(mpv) = &self.libmpv {
+            return mpv.command(&["cycle", "fullscreen"]);
+        }
         if let Some(path) = &self.ipc_path {
             return mpv_cmd(path, &["cycle", "fullscreen"]);
         }
@@ -491,6 +650,11 @@ impl NativePlayer {
     }
 
     pub fn cycle_audio(&mut self) -> Result<()> {
+        debug!("NativePlayer::cycle_audio");
+        #[cfg(all(feature = "native-mpv", fluxplay_has_libmpv))]
+        if let Some(mpv) = &self.libmpv {
+            return mpv.command(&["cycle", "audio"]);
+        }
         if let Some(path) = &self.ipc_path {
             return mpv_cmd(path, &["cycle", "audio"]);
         }
@@ -501,6 +665,11 @@ impl NativePlayer {
     }
 
     pub fn cycle_subtitles(&mut self) -> Result<()> {
+        debug!("NativePlayer::cycle_subtitles");
+        #[cfg(all(feature = "native-mpv", fluxplay_has_libmpv))]
+        if let Some(mpv) = &self.libmpv {
+            return mpv.command(&["cycle", "sub"]);
+        }
         if let Some(path) = &self.ipc_path {
             return mpv_cmd(path, &["cycle", "sub"]);
         }
@@ -512,6 +681,14 @@ impl NativePlayer {
 
     /// Re-load the same URL (reconnect after stall / token refresh).
     pub fn restart(&mut self, url: &str) -> Result<()> {
+        let _prof = Stopwatch::start("native_restart");
+        let endpoint = url_endpoint(url);
+        info!(%endpoint, "NativePlayer::restart");
+        #[cfg(all(feature = "native-mpv", fluxplay_has_libmpv))]
+        if let Some(mpv) = &self.libmpv {
+            mpv.command(&["loadfile", url, "replace"])?;
+            return Ok(());
+        }
         if let Some(path) = &self.ipc_path {
             mpv_cmd(path, &["loadfile", url, "replace"])?;
             return Ok(());
@@ -521,6 +698,11 @@ impl NativePlayer {
     }
 
     pub fn frame_step(&mut self) -> Result<()> {
+        trace!("NativePlayer::frame_step");
+        #[cfg(all(feature = "native-mpv", fluxplay_has_libmpv))]
+        if let Some(mpv) = &self.libmpv {
+            return mpv.command(&["frame-step"]);
+        }
         if let Some(path) = &self.ipc_path {
             return mpv_cmd(path, &["frame-step"]);
         }
@@ -530,20 +712,282 @@ impl NativePlayer {
         Ok(())
     }
 
-    /// Query mpv playback position / duration (seconds). Returns None for ffplay.
+    /// Query playback position / duration (seconds).
     pub fn playback_times(&self) -> Option<(f64, f64)> {
+        #[cfg(all(feature = "native-mpv", fluxplay_has_libmpv))]
+        if let Some(mpv) = &self.libmpv {
+            let pos = mpv.get_property_f64("time-pos")?;
+            let dur = mpv.get_property_f64("duration").unwrap_or(0.0);
+            trace!(pos, dur, "playback_times libmpv");
+            return Some((pos, dur));
+        }
         let path = self.ipc_path.as_ref()?;
         let pos = mpv_get_number(path, "time-pos")?;
         let dur = mpv_get_number(path, "duration").unwrap_or(0.0);
+        trace!(pos, dur, "playback_times ipc");
         Some((pos, dur))
     }
 
+    fn set_prop(&self, name: &str, value: &str) -> Result<()> {
+        #[cfg(all(feature = "native-mpv", fluxplay_has_libmpv))]
+        if let Some(mpv) = &self.libmpv {
+            return mpv.set_property(name, value);
+        }
+        if let Some(path) = &self.ipc_path {
+            return mpv_cmd(path, &["set_property", name, value]);
+        }
+        Ok(())
+    }
+
+    fn run_cmd(&self, args: &[&str]) -> Result<()> {
+        #[cfg(all(feature = "native-mpv", fluxplay_has_libmpv))]
+        if let Some(mpv) = &self.libmpv {
+            return mpv.command(args);
+        }
+        if let Some(path) = &self.ipc_path {
+            return mpv_cmd(path, args);
+        }
+        Ok(())
+    }
+
+    pub fn set_speed(&mut self, speed: f64) -> Result<()> {
+        let speed = speed.clamp(0.25, 3.0);
+        debug!(speed, "NativePlayer::set_speed");
+        self.set_prop("speed", &format!("{speed:.2}"))
+    }
+
+    pub fn set_loop_file(&mut self, on: bool) -> Result<()> {
+        debug!(on, "NativePlayer::set_loop_file");
+        self.set_prop("loop-file", if on { "inf" } else { "no" })
+    }
+
+    pub fn set_ab_loop(&mut self, a: Option<f64>, b: Option<f64>) -> Result<()> {
+        debug!(?a, ?b, "NativePlayer::set_ab_loop");
+        match a {
+            Some(t) => self.set_prop("ab-loop-a", &format!("{t:.3}"))?,
+            None => self.set_prop("ab-loop-a", "no")?,
+        }
+        match b {
+            Some(t) => self.set_prop("ab-loop-b", &format!("{t:.3}"))?,
+            None => self.set_prop("ab-loop-b", "no")?,
+        }
+        Ok(())
+    }
+
+    pub fn screenshot_to(&mut self, path: &str) -> Result<()> {
+        info!(%path, "NativePlayer::screenshot");
+        self.run_cmd(&["screenshot-to-file", path, "video"])
+    }
+
+    pub fn seek_absolute(&mut self, secs: f64) -> Result<()> {
+        let secs = secs.max(0.0);
+        debug!(secs, "NativePlayer::seek_absolute");
+        self.run_cmd(&["seek", &format!("{secs}"), "absolute"])
+    }
+
+    pub fn chapter_step(&mut self, delta: i32) -> Result<()> {
+        debug!(delta, "NativePlayer::chapter_step");
+        if delta >= 0 {
+            self.run_cmd(&["add", "chapter", &format!("{delta}")])
+        } else {
+            self.run_cmd(&["add", "chapter", &format!("{delta}")])
+        }
+    }
+
+    pub fn set_sub_delay(&mut self, secs: f64) -> Result<()> {
+        debug!(secs, "NativePlayer::set_sub_delay");
+        self.set_prop("sub-delay", &format!("{secs:.2}"))
+    }
+
+    pub fn set_audio_delay(&mut self, secs: f64) -> Result<()> {
+        debug!(secs, "NativePlayer::set_audio_delay");
+        self.set_prop("audio-delay", &format!("{secs:.2}"))
+    }
+
+    pub fn set_audio_channels(&mut self, mode: &str) -> Result<()> {
+        // mono | auto | 1 | 2 | …
+        debug!(mode, "NativePlayer::set_audio_channels");
+        self.set_prop("audio-channels", mode)
+    }
+
+    pub fn set_af(&mut self, filter: &str) -> Result<()> {
+        debug!(filter, "NativePlayer::set_af");
+        self.set_prop("af", filter)
+    }
+
+    pub fn set_deinterlace(&mut self, on: bool) -> Result<()> {
+        debug!(on, "NativePlayer::set_deinterlace");
+        self.set_prop("deinterlace", if on { "yes" } else { "no" })
+    }
+
+    pub fn set_video_rotate(&mut self, deg: u32) -> Result<()> {
+        let deg = match deg {
+            90 | 180 | 270 => deg,
+            _ => 0,
+        };
+        debug!(deg, "NativePlayer::set_video_rotate");
+        self.set_prop("video-rotate", &format!("{deg}"))
+    }
+
+    pub fn set_video_zoom(&mut self, zoom: f64) -> Result<()> {
+        let zoom = zoom.clamp(-2.0, 2.0);
+        debug!(zoom, "NativePlayer::set_video_zoom");
+        self.set_prop("video-zoom", &format!("{zoom:.2}"))
+    }
+
+    pub fn set_aspect(&mut self, aspect: &str) -> Result<()> {
+        // "-1" = auto, "16:9", "4:3", "2.35", …
+        debug!(aspect, "NativePlayer::set_aspect");
+        self.set_prop("video-aspect-override", aspect)
+    }
+
+    pub fn set_ontop(&mut self, on: bool) -> Result<()> {
+        debug!(on, "NativePlayer::set_ontop");
+        self.set_prop("ontop", if on { "yes" } else { "no" })
+    }
+
+    pub fn set_vf(&mut self, filter: &str) -> Result<()> {
+        debug!(filter, "NativePlayer::set_vf");
+        self.set_prop("vf", filter)
+    }
+
+    pub fn toggle_sub_visibility(&mut self) -> Result<()> {
+        debug!("NativePlayer::toggle_sub_visibility");
+        self.run_cmd(&["cycle", "sub-visibility"])
+    }
+
     fn start_mpv(&mut self, url: &str) -> Result<()> {
+        let endpoint = url_endpoint(url);
+        debug!(%endpoint, "start_mpv");
+        #[cfg(all(feature = "native-mpv", fluxplay_has_libmpv))]
+        {
+            match self.start_libmpv(url) {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    warn!(error = %e, "libmpv start failed — trying CLI fallback");
+                    #[cfg(not(feature = "cli-player"))]
+                    {
+                        return Err(e);
+                    }
+                }
+            }
+        }
+        #[cfg(feature = "cli-player")]
+        {
+            return self.start_mpv_cli(url);
+        }
+        #[cfg(not(feature = "cli-player"))]
+        {
+            Err(PlayerError::Backend(
+                "Aucun backend mpv (activez native-mpv ou cli-player)".into(),
+            ))
+        }
+    }
+
+    #[cfg(all(feature = "native-mpv", fluxplay_has_libmpv))]
+    fn start_libmpv(&mut self, url: &str) -> Result<()> {
+        let _prof = Stopwatch::start("start_libmpv");
+        let endpoint = url_endpoint(url);
+        let mpeg_ts = looks_like_mpeg_ts(url);
+        let vod = looks_like_vod_container(url);
+        let cache_secs = if vod {
+            self.opts.demux_secs.max(20.0)
+        } else if mpeg_ts {
+            self.opts.demux_secs.max(8.0)
+        } else {
+            self.opts.demux_secs.max(4.0)
+        };
+        debug!(%endpoint, mpeg_ts, vod, cache_secs, "start_libmpv");
+
+        let mpv = crate::mpv_ffi::LibMpv::create()?;
+        // Options that must be set before initialize().
+        mpv.set_option("config", "no")?;
+        mpv.set_option("terminal", "no")?;
+        mpv.set_option("idle", "yes")?;
+        mpv.set_option("force-window", "yes")?;
+        mpv.set_option("keep-open", "yes")?;
+        // Borderless surface snapped onto the iced player stage (not a 3rd chrome window).
+        mpv.set_option("border", "no")?;
+        mpv.set_option("osc", "no")?;
+        mpv.set_option("osd-level", "0")?;
+        mpv.set_option("input-default-bindings", "no")?;
+        mpv.set_option("input-vo-keyboard", "no")?;
+        mpv.set_option("window-dragging", "no")?;
+        mpv.set_option("focus-on-open", "no")?;
+        mpv.set_option("keepaspect-window", "no")?;
+        mpv.set_option("title", "FluxPlay")?;
+        mpv.set_option("ytdl", "no")?;
+        if let Some(rect) = self.video_rect.filter(|r| r.is_usable()) {
+            mpv.set_option("geometry", &rect.to_geometry())?;
+        } else {
+            mpv.set_option("geometry", "960x540")?;
+        }
+        mpv.set_option("volume", &format!("{}", (self.opts.volume * 100.0) as u32))?;
+        mpv.set_option("cache-secs", &format!("{cache_secs}"))?;
+        mpv.set_option(
+            "demuxer-readahead-secs",
+            &format!("{}", if vod { 12.0 } else if mpeg_ts { 4.0 } else { 2.0 }),
+        )?;
+        mpv.set_option("cache", "yes")?;
+        mpv.set_option(
+            "stream-lavf-o",
+            "reconnect_streamed=1,reconnect_delay_max=5,reconnect_on_network_error=1",
+        )?;
+        mpv.set_option("demuxer-lavf-o", "reconnect_streamed=1")?;
+
+        if mpeg_ts || vod {
+            mpv.set_option("demuxer-lavf-probesize", "10000000")?;
+            mpv.set_option("demuxer-lavf-analyzeduration", "5")?;
+            mpv.set_option("cache-pause-initial", "yes")?;
+        }
+
+        if self.opts.hwdec {
+            mpv.set_option("hwdec", "auto-safe")?;
+        } else {
+            mpv.set_option("hwdec", "no")?;
+        }
+
+        if self.opts.low_latency && !mpeg_ts && !vod {
+            mpv.set_option("profile", "low-latency")?;
+            mpv.set_option("cache", "no")?;
+            mpv.set_option("untimed", "yes")?;
+        }
+
+        if let Some(ua) = &self.opts.user_agent {
+            mpv.set_option("user-agent", ua)?;
+        }
+        if let Some(ref_r) = &self.opts.referer {
+            mpv.set_option("referrer", ref_r)?;
+        }
+        if !self.opts.extra_headers.is_empty() {
+            let joined = self
+                .opts
+                .extra_headers
+                .iter()
+                .map(|(k, v)| format!("{k}: {v}"))
+                .collect::<Vec<_>>()
+                .join("\r\n");
+            mpv.set_option("http-header-fields", &joined)?;
+        }
+
+        mpv.initialize()?;
+        mpv.command(&["loadfile", url, "replace"])?;
+        self.libmpv = Some(mpv);
+        self.apply_video_geometry();
+        info!(%endpoint, "libmpv loadfile ok");
+        Ok(())
+    }
+
+    #[cfg(feature = "cli-player")]
+    fn start_mpv_cli(&mut self, url: &str) -> Result<()> {
+        let _prof = Stopwatch::start("start_mpv_cli");
+        let endpoint = url_endpoint(url);
         let mpv_bin = which("mpv").ok_or_else(|| {
             PlayerError::Backend(
-                "mpv introuvable — installez-le (brew/dnf: mpv) pour ouvrir la fenêtre vidéo".into(),
+                "mpv CLI introuvable — libmpv natif préféré; installez mpv pour le fallback".into(),
             )
         })?;
+        debug!(%endpoint, %mpv_bin, "start_mpv_cli");
         let ipc = ipc_socket_path();
         let mpeg_ts = looks_like_mpeg_ts(url);
         let vod = looks_like_vod_container(url);
@@ -555,11 +999,18 @@ impl NativePlayer {
             self.opts.demux_secs.max(4.0)
         };
         let mut args = vec![
-            "--force-window=immediate".into(),
+            "--force-window=yes".into(),
             "--keep-open=yes".into(),
             "--idle=no".into(),
-            "--title=FluxPlay Video".into(),
-            "--geometry=1280x720".into(),
+            "--border=no".into(),
+            "--osc=no".into(),
+            "--osd-level=0".into(),
+            "--input-default-bindings=no".into(),
+            "--input-vo-keyboard=no".into(),
+            "--window-dragging=no".into(),
+            "--focus-on-open=no".into(),
+            "--keepaspect-window=no".into(),
+            "--title=FluxPlay".into(),
             "--ytdl=no".into(),
             format!("--input-ipc-server={}", ipc.display()),
             format!("--volume={}", (self.opts.volume * 100.0) as u32),
@@ -570,13 +1021,16 @@ impl NativePlayer {
             ),
             "--cache=yes".into(),
             "--hwdec=auto".into(),
-            // IPTV resilience (Kodi-like reconnect behaviour)
             "--stream-lavf-o=reconnect_streamed=1,reconnect_delay_max=5,reconnect_on_network_error=1".into(),
             "--demuxer-lavf-o=reconnect_streamed=1".into(),
         ];
+        if let Some(rect) = self.video_rect.filter(|r| r.is_usable()) {
+            args.push(format!("--geometry={}", rect.to_geometry()));
+        } else {
+            args.push("--geometry=960x540".into());
+        }
 
         if mpeg_ts || vod {
-            // Progressive MPEG-TS / MP4/MKV need real probe — tiny probesize breaks demux.
             args.extend([
                 "--demuxer-lavf-probesize=10000000".into(),
                 "--demuxer-lavf-analyzeduration=5".into(),
@@ -627,16 +1081,21 @@ impl NativePlayer {
 
         self.child = Some(child);
         self.ipc_path = Some(ipc);
+        self.apply_video_geometry();
+        info!(%endpoint, %mpv_bin, "mpv CLI spawned");
         Ok(())
     }
 
     fn start_ffplay(&mut self, url: &str) -> Result<()> {
+        let _prof = Stopwatch::start("start_ffplay");
+        let endpoint = url_endpoint(url);
         // Prefer ffplay window; fall back to ffplay-less environments with mpv-less ffmpeg tip.
         let bin = which("ffplay").ok_or_else(|| {
             PlayerError::Backend(
                 "ffplay required for FFmpeg GUI playback (package ffmpeg)".into(),
             )
         })?;
+        debug!(%endpoint, %bin, "start_ffplay");
 
         let mut cmd = Command::new(&bin);
         cmd.arg("-hide_banner")
@@ -695,6 +1154,7 @@ impl NativePlayer {
             .map_err(|e| PlayerError::Backend(format!("ffplay spawn: {e}")))?;
 
         self.child = Some(child);
+        info!(%endpoint, %bin, "ffplay spawned");
         Ok(())
     }
 }

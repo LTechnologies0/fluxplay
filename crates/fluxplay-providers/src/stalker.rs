@@ -2,8 +2,10 @@
 
 use fluxplay_core::models::{Channel, ContentKind, MediaSource, PlaylistBundle, SourceKind};
 use fluxplay_core::protocol::StreamScheme;
+use fluxplay_core::Stopwatch;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use tracing::{debug, error, info, trace, warn};
 use url::Url;
 
 use crate::{http_client, ProviderError, Result};
@@ -24,7 +26,10 @@ impl StalkerClient {
         let mac = source
             .mac
             .clone()
-            .ok_or_else(|| ProviderError::Auth("Stalker MAC required".into()))?;
+            .ok_or_else(|| {
+                error!(source_id = %source.id, "Stalker MAC missing");
+                ProviderError::Auth("Stalker MAC required".into())
+            })?;
         let mac = normalize_mac(&mac)?;
 
         let mut base = source.endpoint.trim().to_string();
@@ -45,6 +50,8 @@ impl StalkerClient {
             portal.set_path(&new_path);
         }
 
+        // Never log MAC address.
+        info!(source_id = %source.id, portal = %portal, "Stalker client created");
         Ok(Self {
             portal,
             mac,
@@ -70,6 +77,7 @@ impl StalkerClient {
             }
         }
 
+        trace!(%action, extras = extra.len(), "Stalker request");
         let mut req = client
             .get(url)
             .header(reqwest::header::COOKIE, self.cookie_mac())
@@ -77,22 +85,44 @@ impl StalkerClient {
             .header("User-Agent", "Mozilla/5.0 (QtEmbedded; U; Linux; C) AppleWebKit/533.3");
 
         if let Some(token) = &self.token {
+            // Token value is secret — never log it.
             req = req.header("Authorization", format!("Bearer {token}"));
+            trace!(%action, "Stalker request with bearer token");
         }
 
-        let resp = req.send().await?.error_for_status()?;
+        let resp = match req.send().await {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(%action, error = %e, "Stalker request network error");
+                return Err(e.into());
+            }
+        };
+        let resp = match resp.error_for_status() {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(%action, error = %e, "Stalker request HTTP error");
+                return Err(e.into());
+            }
+        };
         let value: Value = resp.json().await?;
         Ok(value)
     }
 
     pub async fn handshake(&mut self) -> Result<()> {
+        let _prof = Stopwatch::start("stalker_handshake");
+        debug!(portal = %self.portal, "Stalker handshake start");
         let value = self.request("handshake", &[("token", "")]).await?;
         let token = value
             .pointer("/js/token")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| ProviderError::Auth("Stalker handshake: no token".into()))?
+            .ok_or_else(|| {
+                error!(portal = %self.portal, "Stalker handshake: no token");
+                ProviderError::Auth("Stalker handshake: no token".into())
+            })?
             .to_string();
         self.token = Some(token);
+        // Never log token contents.
+        info!(portal = %self.portal, "Stalker handshake OK");
 
         // get_profile is required by many portals after handshake.
         let _ = self
@@ -110,10 +140,13 @@ impl StalkerClient {
                 ],
             )
             .await;
+        debug!(portal = %self.portal, "Stalker get_profile done");
         Ok(())
     }
 
     pub async fn load_bundle(&mut self) -> Result<PlaylistBundle> {
+        let _prof = Stopwatch::start("stalker_load_bundle");
+        info!(source_id = %self.source_id, portal = %self.portal, "Stalker load_bundle start");
         if self.token.is_none() {
             self.handshake().await?;
         }
@@ -201,6 +234,11 @@ impl StalkerClient {
             });
         }
 
+        info!(
+            source_id = %self.source_id,
+            channels = channels.len(),
+            "Stalker catalog loaded"
+        );
         Ok(PlaylistBundle {
             channels,
             ..Default::default()
@@ -211,6 +249,7 @@ impl StalkerClient {
 fn normalize_mac(raw: &str) -> Result<String> {
     let hex: String = raw.chars().filter(|c| c.is_ascii_hexdigit()).collect();
     if hex.len() != 12 {
+        error!("invalid Stalker MAC length");
         return Err(ProviderError::Auth(
             "MAC must contain 12 hex digits (AA:BB:CC:DD:EE:FF)".into(),
         ));

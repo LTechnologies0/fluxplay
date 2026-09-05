@@ -57,7 +57,12 @@ jobs:
             build-essential pkg-config \
             libxkbcommon-dev libwayland-dev \
             libasound2-dev libgl1-mesa-dev \
-            libgtk-3-dev
+            libgtk-3-dev \
+            libmpv-dev
+
+      - name: Install macOS libmpv
+        if: runner.os == 'macOS'
+        run: brew install mpv pkg-config
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -68,14 +73,26 @@ jobs:
           key: release-${{ matrix.target }}
 
       - name: Build release binary
+        env:
+          FLUXPLAY_BUNDLE_RPATH: "1"
+          FLUXPLAY_REQUIRE_LIBMPV: ${{ runner.os == 'Windows' && '0' || '1' }}
         run: cargo build -p fluxplay --release --target ${{ matrix.target }}
+
+      - name: Bundle libmpv (Unix shared)
+        if: runner.os != 'Windows'
+        run: |
+          chmod +x scripts/bundle-libmpv.sh
+          scripts/bundle-libmpv.sh "target/${{ matrix.target }}/release/${{ matrix.bin }}" || true
 
       - name: Package (Unix)
         if: runner.os != 'Windows'
         run: |
-          mkdir -p dist
-          cp "target/${{ matrix.target }}/release/${{ matrix.bin }}" "dist/${{ matrix.artifact }}"
-          chmod +x "dist/${{ matrix.artifact }}"
+          mkdir -p dist/${{ matrix.artifact }}
+          cp "target/${{ matrix.target }}/release/${{ matrix.bin }}" "dist/${{ matrix.artifact }}/fluxplay"
+          chmod +x "dist/${{ matrix.artifact }}/fluxplay"
+          if [[ -d "target/${{ matrix.target }}/release/lib" ]]; then
+            cp -a "target/${{ matrix.target }}/release/lib" "dist/${{ matrix.artifact }}/"
+          fi
           (cd dist && tar -czf "${{ matrix.artifact }}.tar.gz" "${{ matrix.artifact }}")
           (cd dist && shasum -a 256 "${{ matrix.artifact }}.tar.gz" > "${{ matrix.artifact }}.tar.gz.sha256")
 
