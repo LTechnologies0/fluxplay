@@ -119,6 +119,16 @@ fn discover_lib_dir() -> Option<PathBuf> {
             return Some(lib);
         }
     }
+    // Cross-compiling macOS arch (e.g. aarch64 host → x86_64 target): host Homebrew
+    // libmpv is the wrong architecture and breaks the link step. Only honor explicit
+    // MPV_LIB_DIR / MPV_PREFIX overrides above.
+    if is_apple_darwin_arch_cross() {
+        println!(
+            "cargo:warning=skipping host Homebrew libmpv (TARGET≠HOST on apple-darwin); \
+             set MPV_LIB_DIR for a matching-arch build or rely on CLI mpv fallback"
+        );
+        return None;
+    }
     for candidate in candidate_lib_dirs() {
         if candidate.join("libmpv.so").is_file()
             || candidate.join("libmpv.dylib").is_file()
@@ -139,6 +149,16 @@ fn discover_lib_dir() -> Option<PathBuf> {
         }
     }
     None
+}
+
+fn is_apple_darwin_arch_cross() -> bool {
+    let target = env::var("TARGET").unwrap_or_default();
+    let host = env::var("HOST").unwrap_or_default();
+    target.contains("apple-darwin")
+        && host.contains("apple-darwin")
+        && !target.is_empty()
+        && !host.is_empty()
+        && target != host
 }
 
 fn discover_include_dir(lib_dir: &Option<PathBuf>) -> Option<PathBuf> {

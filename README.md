@@ -85,7 +85,7 @@ GitHub Actions builds desktop binaries for:
 - **Release** (tag `v*` or manual dispatch): upload archives + checksums  
 
 ```bash
-git tag v0.2.0 && git push origin v0.2.0
+git tag v0.2.1 && git push origin v0.2.1
 ```
 
 ## Builds release

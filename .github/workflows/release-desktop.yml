@@ -27,22 +27,28 @@ jobs:
             os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             bin: fluxplay
+            require_libmpv: "1"
           - artifact: fluxplay-linux-aarch64
             os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             bin: fluxplay
+            require_libmpv: "1"
+          # Intel macOS is cross-built on Apple Silicon runners — host brew libmpv is arm64.
           - artifact: fluxplay-macos-x86_64
             os: macos-latest
             target: x86_64-apple-darwin
             bin: fluxplay
+            require_libmpv: "0"
           - artifact: fluxplay-macos-aarch64
             os: macos-latest
             target: aarch64-apple-darwin
             bin: fluxplay
+            require_libmpv: "1"
           - artifact: fluxplay-windows-x86_64
             os: windows-latest
             target: x86_64-pc-windows-msvc
             bin: fluxplay.exe
+            require_libmpv: "0"
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v5
@@ -75,7 +81,7 @@ jobs:
       - name: Build release binary
         env:
           FLUXPLAY_BUNDLE_RPATH: "1"
-          FLUXPLAY_REQUIRE_LIBMPV: ${{ runner.os == 'Windows' && '0' || '1' }}
+          FLUXPLAY_REQUIRE_LIBMPV: ${{ matrix.require_libmpv }}
         run: cargo build -p fluxplay --release --target ${{ matrix.target }}
 
       - name: Bundle libmpv (Unix shared)

@@ -18,19 +18,24 @@ jobs:
           - name: linux-x86_64
             os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
+            require_libmpv: "1"
           - name: linux-aarch64
             os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
+            require_libmpv: "1"
           # Cross-compile Intel macOS from Apple Silicon runners (macos-13 often starved).
           - name: macos-x86_64
             os: macos-latest
             target: x86_64-apple-darwin
+            require_libmpv: "0"
           - name: macos-aarch64
             os: macos-latest
             target: aarch64-apple-darwin
+            require_libmpv: "1"
           - name: windows-x86_64
             os: windows-latest
             target: x86_64-pc-windows-msvc
+            require_libmpv: "0"
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v5
@@ -61,7 +66,7 @@ jobs:
       - name: Build desktop app
         env:
           FLUXPLAY_BUNDLE_RPATH: "1"
-          FLUXPLAY_REQUIRE_LIBMPV: ${{ runner.os == 'Windows' && '0' || '1' }}
+          FLUXPLAY_REQUIRE_LIBMPV: ${{ matrix.require_libmpv }}
         # Thin LTO profile — faster CI while still optimized/stripped
         run: cargo build -p fluxplay --profile release-ci --target ${{ matrix.target }}
 
