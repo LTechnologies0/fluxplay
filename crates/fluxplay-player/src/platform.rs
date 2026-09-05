@@ -88,10 +88,10 @@ pub fn target_profile() -> TargetProfile {
         },
         Platform::Android => TargetProfile {
             platform: Platform::Android,
-            ui_shell: "Kotlin/Jetpack + fluxplay-ffi",
-            preferred_backends: &["exoplayer", "mediacodec"],
+            ui_shell: "iced (same as desktop) + NativeActivity",
+            preferred_backends: &["intent", "exoplayer", "mediacodec"],
             hw_accel: "MediaCodec",
-            notes: "ExoPlayer (Media3) for HLS/DASH; Rust core via UniFFI/JNI",
+            notes: "iced UI; playback via ACTION_VIEW until NDK libmpv",
         },
         Platform::Ios => TargetProfile {
             platform: Platform::Ios,

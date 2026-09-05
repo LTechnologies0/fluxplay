@@ -3,27 +3,47 @@ use tracing::{debug, info};
 
 pub const DEMO_NAME: &str = "Démo FluxPlay";
 
-/// Built-in demo playlist — only used when no real source is registered.
+/// Built-in demo when the user has no saved profile.
+/// Uses public free-to-air M3U (iptv-org) + stable HLS samples — never pirate Xtream panels.
 pub fn demo_source() -> MediaSource {
-    let body = r#"#EXTM3U
-#EXTINF:-1 tvg-id="demo.news" tvg-logo="" group-title="Demo · News",FluxPlay News
-https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8
-#EXTINF:-1 tvg-id="demo.sport" group-title="Demo · Sport",FluxPlay Sport HLS
-https://devstreaming-cdn.apple.com/videos/streaming/examples/img_bipbop_adv_example_fmp4/master.m3u8
-#EXTINF:-1 tvg-id="demo.art" group-title="Demo · Culture",Big Buck Bunny (VOD HLS)
-https://test-streams.mux.dev/test_001/stream.m3u8
-"#;
-    let mut src = MediaSource::new(DEMO_NAME, SourceKind::M3uPlus, body);
+    // Prefer a compact public news slice so first sync stays respectful to hosts.
+    let mut src = MediaSource::new(
+        DEMO_NAME,
+        SourceKind::M3uPlus,
+        "https://iptv-org.github.io/iptv/categories/news.m3u",
+    );
     src.enabled = true;
-    info!("injecting demo source");
+    info!("injecting public demo source (iptv-org news)");
     src
 }
 
-pub fn is_demo(src: &MediaSource) -> bool {
-    src.name == DEMO_NAME
+/// Extra public playlists offered in Sources when still on demo (FR / EN / culture).
+pub fn public_demo_catalog() -> Vec<(String, String)> {
+    vec![
+        (
+            "Démo · News (iptv-org)".into(),
+            "https://iptv-org.github.io/iptv/categories/news.m3u".into(),
+        ),
+        (
+            "Démo · France (iptv-org)".into(),
+            "https://iptv-org.github.io/iptv/countries/fr.m3u".into(),
+        ),
+        (
+            "Démo · Documentary (iptv-org)".into(),
+            "https://iptv-org.github.io/iptv/categories/documentary.m3u".into(),
+        ),
+        (
+            "Démo · HLS sample (Mux)".into(),
+            "https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8".into(),
+        ),
+    ]
 }
 
-/// Drop the built-in demo whenever at least one real source exists.
+pub fn is_demo(src: &MediaSource) -> bool {
+    src.name == DEMO_NAME || src.name.starts_with("Démo ·")
+}
+
+/// Drop built-in demo entries whenever at least one real source exists.
 pub fn strip_demo_if_real(sources: &mut Vec<MediaSource>) {
     let has_real = sources.iter().any(|s| !is_demo(s));
     if has_real {

@@ -1,0 +1,81 @@
+[package]
+name = "fluxplay-android"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "FluxPlay Android / Android TV — iced NativeActivity (same UI as desktop)"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+name = "fluxplay_android"
+path = "src/lib.rs"
+
+[dependencies]
+fluxplay = { path = "../fluxplay", default-features = false }
+log = "0.4"
+
+[target.'cfg(target_os = "android")'.dependencies]
+android-activity = { version = "0.6", features = ["native-activity"] }
+
+####################
+# cargo-apk config #
+####################
+
+[package.metadata.android]
+package = "app.fluxplay.android"
+apk_name = "FluxPlay"
+build_targets = ["x86_64-linux-android", "aarch64-linux-android"]
+
+[package.metadata.android.sdk]
+min_sdk_version = 26
+target_sdk_version = 34
+
+[[package.metadata.android.uses_permission]]
+name = "android.permission.INTERNET"
+
+[[package.metadata.android.uses_permission]]
+name = "android.permission.ACCESS_NETWORK_STATE"
+
+[[package.metadata.android.uses_feature]]
+name = "android.hardware.touchscreen"
+required = false
+
+[[package.metadata.android.uses_feature]]
+name = "android.software.leanback"
+required = false
+
+[package.metadata.android.application]
+label = "FluxPlay"
+theme = "@android:style/Theme.DeviceDefault.NoActionBar.Fullscreen"
+debuggable = true
+
+# Use the Android debug keystore so `cargo apk build --release` works locally / Waydroid.
+[package.metadata.android.signing.release]
+path = "/home/user/.android/debug.keystore"
+keystore_password = "android"
+key_alias = "androiddebugkey"
+key_password = "android"
+
+[package.metadata.android.signing.release-ci]
+path = "/home/user/.android/debug.keystore"
+keystore_password = "android"
+key_alias = "androiddebugkey"
+key_password = "android"
+
+[package.metadata.android.application.activity]
+name = "android.app.NativeActivity"
+exported = true
+config_changes = "orientation|screenSize|screenLayout|keyboardHidden|uiMode"
+orientation = "unspecified"
+launch_mode = "singleTop"
+resizeable_activity = true
+always_retain_task_state = true
+
+[[package.metadata.android.application.activity.intent_filter]]
+actions = ["android.intent.action.MAIN"]
+categories = ["android.intent.category.LAUNCHER"]
+
+[[package.metadata.android.application.activity.intent_filter]]
+actions = ["android.intent.action.MAIN"]
+categories = ["android.intent.category.LEANBACK_LAUNCHER"]

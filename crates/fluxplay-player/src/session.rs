@@ -42,7 +42,8 @@ pub struct StreamSession {
     pub audio_mode: AudioChannelMode,
     pub eq_preset: EqPreset,
     pub loudnorm: bool,
-    pub deinterlace: bool,
+    pub deinterlace: DeinterlaceMode,
+    pub upscale: UpscaleMode,
     pub rotate_deg: u32,
     pub zoom: f64,
     pub aspect: AspectMode,
@@ -105,10 +106,10 @@ pub enum EqPreset {
 impl EqPreset {
     pub fn label(self) -> &'static str {
         match self {
-            Self::Off => "EQ off",
-            Self::Voice => "Voix",
-            Self::Bass => "Basses",
-            Self::Treble => "Aigus",
+            Self::Off => "Égaliseur off",
+            Self::Voice => "Égaliseur voix",
+            Self::Bass => "Égaliseur basses",
+            Self::Treble => "Égaliseur aigus",
         }
     }
 
@@ -143,10 +144,10 @@ pub enum AspectMode {
 impl AspectMode {
     pub fn label(self) -> &'static str {
         match self {
-            Self::Auto => "Auto",
-            Self::R16x9 => "16:9",
-            Self::R4x3 => "4:3",
-            Self::R235 => "2.35",
+            Self::Auto => "Format auto",
+            Self::R16x9 => "Format 16:9",
+            Self::R4x3 => "Format 4:3",
+            Self::R235 => "Format 2.35:1",
         }
     }
 
@@ -165,6 +166,82 @@ impl AspectMode {
             Self::R16x9 => Self::R4x3,
             Self::R4x3 => Self::R235,
             Self::R235 => Self::Auto,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum UpscaleMode {
+    #[default]
+    Auto,
+    Bilinear,
+    Lanczos,
+    EwaLanczos,
+    Nearest,
+}
+
+impl UpscaleMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "Upscale auto",
+            Self::Bilinear => "Upscale bilinéaire",
+            Self::Lanczos => "Upscale Lanczos",
+            Self::EwaLanczos => "Upscale EWA Lanczos (HQ)",
+            Self::Nearest => "Upscale nearest (pixel)",
+        }
+    }
+
+    pub fn mpv_scale(self) -> &'static str {
+        match self {
+            Self::Auto => "bilinear",
+            Self::Bilinear => "bilinear",
+            Self::Lanczos => "lanczos",
+            Self::EwaLanczos => "ewa_lanczossharp",
+            Self::Nearest => "nearest",
+        }
+    }
+
+    pub fn cycle(self) -> Self {
+        match self {
+            Self::Auto => Self::Bilinear,
+            Self::Bilinear => Self::Lanczos,
+            Self::Lanczos => Self::EwaLanczos,
+            Self::EwaLanczos => Self::Nearest,
+            Self::Nearest => Self::Auto,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DeinterlaceMode {
+    #[default]
+    Off,
+    Yes,
+    Auto,
+}
+
+impl DeinterlaceMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Off => "Désentrelacement off",
+            Self::Yes => "Désentrelacement ON",
+            Self::Auto => "Désentrelacement auto",
+        }
+    }
+
+    pub fn mpv_value(self) -> &'static str {
+        match self {
+            Self::Off => "no",
+            Self::Yes => "yes",
+            Self::Auto => "auto",
+        }
+    }
+
+    pub fn cycle(self) -> Self {
+        match self {
+            Self::Off => Self::Yes,
+            Self::Yes => Self::Auto,
+            Self::Auto => Self::Off,
         }
     }
 }
@@ -198,7 +275,8 @@ impl Default for StreamSession {
             audio_mode: AudioChannelMode::Auto,
             eq_preset: EqPreset::Off,
             loudnorm: false,
-            deinterlace: false,
+            deinterlace: DeinterlaceMode::Off,
+            upscale: UpscaleMode::Auto,
             rotate_deg: 0,
             zoom: 0.0,
             aspect: AspectMode::Auto,
@@ -218,9 +296,26 @@ impl StreamSession {
         s
     }
 
-    /// Align borderless mpv with the iced player video stage.
+    /// Align video stage size for embedded rendering (or CLI window geometry).
     pub fn set_video_rect(&mut self, rect: VideoRect) {
         self.native.set_video_rect(rect);
+    }
+
+    pub fn video_anchored(&self) -> bool {
+        true // embedded path always "in" the iced window
+    }
+
+    pub fn raise_video_window(&mut self) {
+        // No-op when video is embedded; CLI fallback may still have a window.
+        let _ = self.native.raise_video_window();
+    }
+
+    pub fn pull_video_frame(&mut self, w: u32, h: u32) -> Option<(u32, u32, Vec<u8>)> {
+        self.native.pull_video_frame(w, h)
+    }
+
+    pub fn has_embedded_video(&self) -> bool {
+        self.native.has_embedded_video()
     }
 
     pub fn is_live(&self) -> bool {
@@ -516,8 +611,19 @@ impl StreamSession {
     }
 
     pub fn toggle_deinterlace(&mut self) {
-        self.deinterlace = !self.deinterlace;
-        let _ = self.native.set_deinterlace(self.deinterlace);
+        self.deinterlace = self.deinterlace.cycle();
+        info!(mode = self.deinterlace.label(), "StreamSession::deinterlace");
+        if let Err(e) = self.native.set_deinterlace_mode(self.deinterlace.mpv_value()) {
+            warn!(error = %e, "deinterlace failed");
+        }
+    }
+
+    pub fn cycle_upscale(&mut self) {
+        self.upscale = self.upscale.cycle();
+        info!(mode = self.upscale.label(), "StreamSession::upscale");
+        if let Err(e) = self.native.set_scale(self.upscale.mpv_scale()) {
+            warn!(error = %e, "upscale/scale failed");
+        }
     }
 
     pub fn cycle_rotate(&mut self) {
@@ -527,36 +633,56 @@ impl StreamSession {
             180 => 270,
             _ => 0,
         };
-        let _ = self.native.set_video_rotate(self.rotate_deg);
+        info!(deg = self.rotate_deg, "StreamSession::rotate");
+        if let Err(e) = self.native.set_video_rotate(self.rotate_deg) {
+            warn!(error = %e, "rotate failed");
+        }
     }
 
     pub fn nudge_zoom(&mut self, delta: f64) {
         self.zoom = (self.zoom + delta).clamp(-1.5, 1.5);
-        let _ = self.native.set_video_zoom(self.zoom);
+        info!(zoom = self.zoom, "StreamSession::zoom");
+        if let Err(e) = self.native.set_video_zoom(self.zoom) {
+            warn!(error = %e, "zoom failed");
+        }
     }
 
     pub fn cycle_aspect(&mut self) {
         self.aspect = self.aspect.cycle();
-        let _ = self.native.set_aspect(self.aspect.mpv_value());
+        info!(aspect = self.aspect.label(), "StreamSession::aspect");
+        if let Err(e) = self.native.set_aspect(self.aspect.mpv_value()) {
+            warn!(error = %e, "aspect failed");
+        }
     }
 
     pub fn toggle_ontop(&mut self) {
         self.ontop = !self.ontop;
+        info!(ontop = self.ontop, "StreamSession::ontop (mpv prop; iced window handled by UI)");
         let _ = self.native.set_ontop(self.ontop);
     }
 
     pub fn toggle_night_vf(&mut self) {
         self.night_vf = !self.night_vf;
-        let vf = if self.night_vf {
-            "eq=gamma=0.85:saturation=0.85:contrast=1.05"
-        } else {
-            ""
-        };
-        let _ = self.native.set_vf(vf);
+        info!(night = self.night_vf, "StreamSession::night_vf");
+        self.apply_video_filters();
+    }
+
+    fn apply_video_filters(&mut self) {
+        let mut parts = Vec::new();
+        if self.night_vf {
+            parts.push("eq=gamma=0.85:saturation=0.85:contrast=1.05");
+        }
+        let vf = parts.join(",");
+        if let Err(e) = self.native.set_vf(&vf) {
+            warn!(error = %e, vf = %vf, "set_vf failed");
+        }
     }
 
     pub fn toggle_sub_visibility(&mut self) {
-        let _ = self.native.toggle_sub_visibility();
+        info!("StreamSession::toggle_sub_visibility");
+        if let Err(e) = self.native.toggle_sub_visibility() {
+            warn!(error = %e, "sub-visibility failed");
+        }
     }
 
     pub fn screenshot_to_path(&mut self, path: &std::path::Path) -> bool {

@@ -5,9 +5,14 @@ edition.workspace = true
 license.workspace = true
 description = "FluxPlay — cross-platform IPTV media player (Material Expressive)"
 
+[lib]
+name = "fluxplay"
+path = "src/lib.rs"
+
 [[bin]]
 name = "fluxplay"
 path = "src/main.rs"
+required-features = ["native-player"]
 
 [features]
 default = ["native-player"]
@@ -27,12 +32,23 @@ uuid.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
-iced.workspace = true
 dirs.workspace = true
-rfd.workspace = true
 open.workspace = true
 url.workspace = true
-dark-light = "2"
 rusqlite.workspace = true
 sha2.workspace = true
 hex.workspace = true
+
+[target.'cfg(not(target_os = "android"))'.dependencies]
+iced = { workspace = true, features = ["x11", "wayland", "linux-theme-detection", "tiny-skia"] }
+rfd.workspace = true
+dark-light = "2"
+
+[target.'cfg(target_os = "android")'.dependencies]
+iced = { workspace = true, features = ["android-native-activity", "fira-sans"] }
+android-activity = { version = "0.6", features = ["native-activity"] }
+android_logger = "0.14"
+log = "0.4"
+tracing-log = "0.2"
+jni = "0.21"
+ndk-context = "0.1"

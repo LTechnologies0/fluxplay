@@ -62,18 +62,47 @@ pub struct PlayOptions {
     pub preferred: PlayerBackendPref,
 }
 
-/// Screen-space rectangle for the borderless mpv video surface (overlay on iced stage).
+/// Screen-space rectangle for the mpv video surface.
+///
+/// `anchored = true`  → overlay: absolute `WxH+X+Y`, borderless, stays over iced stage.
+/// `anchored = false` → detached (typical Wayland): size-only `WxH`, normal window
+///                      managed by the compositor (no fake absolute coords).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VideoRect {
     pub x: i32,
     pub y: i32,
     pub w: u32,
     pub h: u32,
+    pub anchored: bool,
 }
 
 impl VideoRect {
+    pub fn overlay(x: i32, y: i32, w: u32, h: u32) -> Self {
+        Self {
+            x,
+            y,
+            w,
+            h,
+            anchored: true,
+        }
+    }
+
+    pub fn detached(w: u32, h: u32) -> Self {
+        Self {
+            x: 0,
+            y: 0,
+            w,
+            h,
+            anchored: false,
+        }
+    }
+
     pub fn to_geometry(self) -> String {
-        format!("{}x{}{:+}{:+}", self.w, self.h, self.x, self.y)
+        if self.anchored {
+            format!("{}x{}{:+}{:+}", self.w, self.h, self.x, self.y)
+        } else {
+            format!("{}x{}", self.w, self.h)
+        }
     }
 
     pub fn is_usable(self) -> bool {
@@ -201,6 +230,35 @@ fn looks_like_vod_container(url: &str) -> bool {
         || lower.contains(".avi")
         || lower.contains(".m4v")
         || lower.contains(".mov")
+}
+
+#[cfg(all(feature = "native-mpv", fluxplay_has_libmpv))]
+fn soft_set(mpv: &crate::mpv_ffi::LibMpv, name: &str, value: &str) -> bool {
+    match mpv.set_option(name, value) {
+        Ok(()) => true,
+        Err(e) => {
+            debug!(%name, error = %e, "libmpv soft option skipped");
+            false
+        }
+    }
+}
+
+fn tail_player_log() -> String {
+    let path = std::env::temp_dir().join("fluxplay-mpv.log");
+    std::fs::read_to_string(&path)
+        .ok()
+        .map(|s| {
+            s.lines()
+                .rev()
+                .take(6)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect::<Vec<_>>()
+                .join(" · ")
+        })
+        .filter(|s| !s.is_empty())
+        .unwrap_or_default()
 }
 
 #[allow(dead_code)]
@@ -402,7 +460,7 @@ impl NativePlayer {
         &mut self.opts
     }
 
-    /// Pin the video surface over the iced lecteur stage (screen coordinates).
+    /// Pin the video surface size for embedded software rendering (logical stage).
     pub fn set_video_rect(&mut self, rect: VideoRect) {
         if !rect.is_usable() {
             return;
@@ -412,28 +470,58 @@ impl NativePlayer {
         }
         debug!(?rect, "NativePlayer::set_video_rect");
         self.video_rect = Some(rect);
-        self.apply_video_geometry();
+        if !self.has_embedded_video() {
+            self.apply_video_geometry();
+        }
     }
 
     pub fn video_rect(&self) -> Option<VideoRect> {
         self.video_rect
     }
 
+    /// Pull an RGBA frame for the iced stage (embedded libmpv software render).
+    pub fn pull_video_frame(&mut self, w: u32, h: u32) -> Option<(u32, u32, Vec<u8>)> {
+        #[cfg(all(feature = "native-mpv", fluxplay_has_libmpv))]
+        {
+            let mpv = self.libmpv.as_mut()?;
+            let rw = w.clamp(2, 1920);
+            let rh = h.clamp(2, 1080);
+            let pixels = mpv.render_sw_rgba(rw, rh)?;
+            return Some((rw, rh, pixels));
+        }
+        #[cfg(not(all(feature = "native-mpv", fluxplay_has_libmpv)))]
+        {
+            let _ = (w, h);
+            None
+        }
+    }
+
+    pub fn has_embedded_video(&self) -> bool {
+        #[cfg(all(feature = "native-mpv", fluxplay_has_libmpv))]
+        {
+            return self.libmpv.is_some();
+        }
+        #[cfg(not(all(feature = "native-mpv", fluxplay_has_libmpv)))]
+        {
+            false
+        }
+    }
+
     fn apply_video_geometry(&mut self) {
         let Some(rect) = self.video_rect.filter(|r| r.is_usable()) else {
             return;
         };
-        let geo = rect.to_geometry();
-        #[cfg(all(feature = "native-mpv", fluxplay_has_libmpv))]
-        if let Some(mpv) = &self.libmpv {
-            let _ = mpv.set_property("geometry", &geo);
-            let _ = mpv.set_property("border", "no");
-            let _ = mpv.set_property("ontop", "no");
+        // Only applies to CLI mpv fallback (separate window).
+        if self.has_embedded_video() {
             return;
         }
+        let geo = rect.to_geometry();
+        let border = if rect.anchored { "no" } else { "yes" };
+        let ontop = if rect.anchored { "yes" } else { "no" };
         if let Some(path) = &self.ipc_path {
             let _ = mpv_cmd(path, &["set_property", "geometry", &geo]);
-            let _ = mpv_cmd(path, &["set_property", "border", "no"]);
+            let _ = mpv_cmd(path, &["set_property", "border", border]);
+            let _ = mpv_cmd(path, &["set_property", "ontop", ontop]);
         }
     }
 
@@ -501,9 +589,16 @@ impl NativePlayer {
                         self.child = None;
                         self.backend = None;
                         error!(%status, %endpoint, "player exited after retry");
-                        return Err(PlayerError::Backend(format!(
-                            "lecteur fermé aussitôt (code {status}). Stoppez les autres clients IPTV (1 connexion max) ou vérifiez le flux."
-                        )));
+                        let hint = tail_player_log();
+                        return Err(PlayerError::Backend(if hint.is_empty() {
+                            format!(
+                                "lecteur fermé aussitôt (code {status}). Stoppez les autres clients IPTV (1 connexion max) ou vérifiez le flux."
+                            )
+                        } else {
+                            format!(
+                                "lecteur fermé aussitôt (code {status}). {hint}"
+                            )
+                        }));
                     }
                 }
             }
@@ -518,9 +613,8 @@ impl NativePlayer {
         #[cfg(all(feature = "native-mpv", fluxplay_has_libmpv))]
         {
             if let Some(mpv) = self.libmpv.take() {
-                debug!("NativePlayer::stop libmpv quit");
-                let _ = mpv.command(&["quit"]);
-                drop(mpv);
+                debug!("NativePlayer::stop libmpv shutdown");
+                mpv.shutdown();
             }
         }
         if let Some(path) = self.ipc_path.take() {
@@ -729,24 +823,65 @@ impl NativePlayer {
     }
 
     fn set_prop(&self, name: &str, value: &str) -> Result<()> {
+        debug!(%name, %value, "NativePlayer::set_prop");
         #[cfg(all(feature = "native-mpv", fluxplay_has_libmpv))]
         if let Some(mpv) = &self.libmpv {
-            return mpv.set_property(name, value);
+            return match mpv.set_property(name, value) {
+                Ok(()) => {
+                    info!(%name, %value, "set_prop ok (libmpv)");
+                    Ok(())
+                }
+                Err(e) => {
+                    warn!(%name, %value, error = %e, "set_prop FAILED (libmpv)");
+                    Err(e)
+                }
+            };
         }
         if let Some(path) = &self.ipc_path {
-            return mpv_cmd(path, &["set_property", name, value]);
+            return match mpv_cmd(path, &["set_property", name, value]) {
+                Ok(()) => {
+                    info!(%name, %value, "set_prop ok (ipc)");
+                    Ok(())
+                }
+                Err(e) => {
+                    warn!(%name, %value, error = %e, "set_prop FAILED (ipc)");
+                    Err(e)
+                }
+            };
         }
+        warn!(%name, %value, "set_prop skipped — no active mpv");
         Ok(())
     }
 
     fn run_cmd(&self, args: &[&str]) -> Result<()> {
+        let cmd = args.first().copied().unwrap_or("");
+        debug!(%cmd, args = ?args, "NativePlayer::run_cmd");
         #[cfg(all(feature = "native-mpv", fluxplay_has_libmpv))]
         if let Some(mpv) = &self.libmpv {
-            return mpv.command(args);
+            return match mpv.command(args) {
+                Ok(()) => {
+                    info!(%cmd, "run_cmd ok (libmpv)");
+                    Ok(())
+                }
+                Err(e) => {
+                    warn!(%cmd, error = %e, "run_cmd FAILED (libmpv)");
+                    Err(e)
+                }
+            };
         }
         if let Some(path) = &self.ipc_path {
-            return mpv_cmd(path, args);
+            return match mpv_cmd(path, args) {
+                Ok(()) => {
+                    info!(%cmd, "run_cmd ok (ipc)");
+                    Ok(())
+                }
+                Err(e) => {
+                    warn!(%cmd, error = %e, "run_cmd FAILED (ipc)");
+                    Err(e)
+                }
+            };
         }
+        warn!(%cmd, "run_cmd skipped — no active mpv");
         Ok(())
     }
 
@@ -820,6 +955,18 @@ impl NativePlayer {
         self.set_prop("deinterlace", if on { "yes" } else { "no" })
     }
 
+    pub fn set_deinterlace_mode(&mut self, mode: &str) -> Result<()> {
+        debug!(mode, "NativePlayer::set_deinterlace_mode");
+        self.set_prop("deinterlace", mode)
+    }
+
+    pub fn set_scale(&mut self, scale: &str) -> Result<()> {
+        debug!(scale, "NativePlayer::set_scale");
+        self.set_prop("scale", scale)?;
+        self.set_prop("cscale", scale)?;
+        self.set_prop("dscale", scale)
+    }
+
     pub fn set_video_rotate(&mut self, deg: u32) -> Result<()> {
         let deg = match deg {
             90 | 180 | 270 => deg,
@@ -844,6 +991,14 @@ impl NativePlayer {
     pub fn set_ontop(&mut self, on: bool) -> Result<()> {
         debug!(on, "NativePlayer::set_ontop");
         self.set_prop("ontop", if on { "yes" } else { "no" })
+    }
+
+    /// Bring the mpv video window forward (Wayland/X11 managed window).
+    pub fn raise_video_window(&mut self) -> Result<()> {
+        debug!("NativePlayer::raise_video_window");
+        let _ = self.set_prop("ontop", "yes");
+        self.apply_video_geometry();
+        Ok(())
     }
 
     pub fn set_vf(&mut self, filter: &str) -> Result<()> {
@@ -897,67 +1052,62 @@ impl NativePlayer {
         } else {
             self.opts.demux_secs.max(4.0)
         };
-        debug!(%endpoint, mpeg_ts, vod, cache_secs, "start_libmpv");
+        debug!(%endpoint, mpeg_ts, vod, cache_secs, "start_libmpv embedded");
 
-        let mpv = crate::mpv_ffi::LibMpv::create()?;
-        // Options that must be set before initialize().
+        let mut mpv = crate::mpv_ffi::LibMpv::create()?;
+        // Embedded path: vo=libmpv + software render → frames drawn into iced (no OS video window).
         mpv.set_option("config", "no")?;
         mpv.set_option("terminal", "no")?;
         mpv.set_option("idle", "yes")?;
-        mpv.set_option("force-window", "yes")?;
+        mpv.set_option("vo", "libmpv")?;
+        mpv.set_option("force-window", "no")?;
         mpv.set_option("keep-open", "yes")?;
-        // Borderless surface snapped onto the iced player stage (not a 3rd chrome window).
-        mpv.set_option("border", "no")?;
-        mpv.set_option("osc", "no")?;
-        mpv.set_option("osd-level", "0")?;
-        mpv.set_option("input-default-bindings", "no")?;
-        mpv.set_option("input-vo-keyboard", "no")?;
-        mpv.set_option("window-dragging", "no")?;
-        mpv.set_option("focus-on-open", "no")?;
-        mpv.set_option("keepaspect-window", "no")?;
-        mpv.set_option("title", "FluxPlay")?;
         mpv.set_option("ytdl", "no")?;
-        if let Some(rect) = self.video_rect.filter(|r| r.is_usable()) {
-            mpv.set_option("geometry", &rect.to_geometry())?;
-        } else {
-            mpv.set_option("geometry", "960x540")?;
-        }
+        mpv.set_option("title", "FluxPlay")?;
+        soft_set(&mpv, "osc", "no");
+        soft_set(&mpv, "osd-level", "0");
+        soft_set(&mpv, "input-default-bindings", "no");
+        soft_set(&mpv, "input-vo-keyboard", "no");
+        soft_set(&mpv, "video-timing-offset", "0");
         mpv.set_option("volume", &format!("{}", (self.opts.volume * 100.0) as u32))?;
         mpv.set_option("cache-secs", &format!("{cache_secs}"))?;
         mpv.set_option(
             "demuxer-readahead-secs",
             &format!("{}", if vod { 12.0 } else if mpeg_ts { 4.0 } else { 2.0 }),
         )?;
-        mpv.set_option("cache", "yes")?;
-        mpv.set_option(
+        soft_set(&mpv, "cache", "yes");
+        soft_set(
+            &mpv,
             "stream-lavf-o",
             "reconnect_streamed=1,reconnect_delay_max=5,reconnect_on_network_error=1",
-        )?;
-        mpv.set_option("demuxer-lavf-o", "reconnect_streamed=1")?;
+        );
+        soft_set(&mpv, "demuxer-lavf-o", "reconnect_streamed=1");
 
         if mpeg_ts || vod {
-            mpv.set_option("demuxer-lavf-probesize", "10000000")?;
-            mpv.set_option("demuxer-lavf-analyzeduration", "5")?;
-            mpv.set_option("cache-pause-initial", "yes")?;
+            soft_set(&mpv, "demuxer-lavf-probesize", "10000000");
+            soft_set(&mpv, "demuxer-lavf-analyzeduration", "5");
+            soft_set(&mpv, "cache-pause-initial", "yes");
         }
 
         if self.opts.hwdec {
-            mpv.set_option("hwdec", "auto-safe")?;
+            soft_set(&mpv, "hwdec", "auto-safe");
         } else {
-            mpv.set_option("hwdec", "no")?;
+            soft_set(&mpv, "hwdec", "no");
         }
 
         if self.opts.low_latency && !mpeg_ts && !vod {
-            mpv.set_option("profile", "low-latency")?;
-            mpv.set_option("cache", "no")?;
-            mpv.set_option("untimed", "yes")?;
+            soft_set(&mpv, "profile", "low-latency");
+            soft_set(&mpv, "cache", "no");
+            soft_set(&mpv, "untimed", "yes");
         }
 
         if let Some(ua) = &self.opts.user_agent {
             mpv.set_option("user-agent", ua)?;
+        } else {
+            soft_set(&mpv, "user-agent", "IPTVSmartersPlayer");
         }
         if let Some(ref_r) = &self.opts.referer {
-            mpv.set_option("referrer", ref_r)?;
+            soft_set(&mpv, "referrer", ref_r);
         }
         if !self.opts.extra_headers.is_empty() {
             let joined = self
@@ -967,14 +1117,14 @@ impl NativePlayer {
                 .map(|(k, v)| format!("{k}: {v}"))
                 .collect::<Vec<_>>()
                 .join("\r\n");
-            mpv.set_option("http-header-fields", &joined)?;
+            soft_set(&mpv, "http-header-fields", &joined);
         }
 
         mpv.initialize()?;
+        mpv.init_sw_render()?;
         mpv.command(&["loadfile", url, "replace"])?;
         self.libmpv = Some(mpv);
-        self.apply_video_geometry();
-        info!(%endpoint, "libmpv loadfile ok");
+        info!(%endpoint, "libmpv embedded loadfile ok");
         Ok(())
     }
 
@@ -1001,15 +1151,14 @@ impl NativePlayer {
         let mut args = vec![
             "--force-window=yes".into(),
             "--keep-open=yes".into(),
-            "--idle=no".into(),
-            "--border=no".into(),
+            // Must stay yes: idle=no + failed open → immediate exit (status 1).
+            "--idle=yes".into(),
             "--osc=no".into(),
             "--osd-level=0".into(),
             "--input-default-bindings=no".into(),
             "--input-vo-keyboard=no".into(),
-            "--window-dragging=no".into(),
-            "--focus-on-open=no".into(),
-            "--keepaspect-window=no".into(),
+            // focus-on-open was removed; focus-on=never is the replacement.
+            "--focus-on=never".into(),
             "--title=FluxPlay".into(),
             "--ytdl=no".into(),
             format!("--input-ipc-server={}", ipc.display()),
@@ -1020,14 +1169,39 @@ impl NativePlayer {
                 if vod { 12.0 } else if mpeg_ts { 4.0 } else { 2.0 }
             ),
             "--cache=yes".into(),
-            "--hwdec=auto".into(),
             "--stream-lavf-o=reconnect_streamed=1,reconnect_delay_max=5,reconnect_on_network_error=1".into(),
             "--demuxer-lavf-o=reconnect_streamed=1".into(),
+            format!(
+                "--user-agent={}",
+                self.opts
+                    .user_agent
+                    .as_deref()
+                    .unwrap_or("IPTVSmartersPlayer")
+            ),
         ];
         if let Some(rect) = self.video_rect.filter(|r| r.is_usable()) {
             args.push(format!("--geometry={}", rect.to_geometry()));
+            if rect.anchored {
+                args.extend([
+                    "--border=no".into(),
+                    "--window-dragging=no".into(),
+                    "--keepaspect-window=no".into(),
+                    "--ontop=yes".into(),
+                ]);
+            } else {
+                args.extend([
+                    "--border=yes".into(),
+                    "--window-dragging=yes".into(),
+                    "--keepaspect-window=yes".into(),
+                ]);
+            }
         } else {
             args.push("--geometry=960x540".into());
+            args.extend([
+                "--border=yes".into(),
+                "--window-dragging=yes".into(),
+                "--keepaspect-window=yes".into(),
+            ]);
         }
 
         if mpeg_ts || vod {
@@ -1052,9 +1226,6 @@ impl NativePlayer {
             ]);
         }
 
-        if let Some(ua) = &self.opts.user_agent {
-            args.push(format!("--user-agent={ua}"));
-        }
         if let Some(ref_r) = &self.opts.referer {
             args.push(format!("--referrer={ref_r}"));
         }
@@ -1071,18 +1242,21 @@ impl NativePlayer {
 
         args.push(url.into());
 
+        let log = std::env::temp_dir().join("fluxplay-mpv.log");
+        let err_file = std::fs::File::create(&log).ok();
+
         let child = Command::new(&mpv_bin)
             .args(&args)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(err_file.map(Stdio::from).unwrap_or_else(Stdio::null))
             .spawn()
             .map_err(|e| PlayerError::Backend(format!("mpv spawn ({mpv_bin}): {e}")))?;
 
         self.child = Some(child);
         self.ipc_path = Some(ipc);
         self.apply_video_geometry();
-        info!(%endpoint, %mpv_bin, "mpv CLI spawned");
+        info!(%endpoint, %mpv_bin, log = %log.display(), "mpv CLI spawned");
         Ok(())
     }
 

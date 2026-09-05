@@ -525,6 +525,15 @@ impl XtreamClient {
                 year: s.year.or(s.release_date),
                 rating: s.rating,
                 genre: s.genre,
+                imdb_id: s.imdb_id.filter(|id| !id.is_empty() && id != "0"),
+                actors: None,
+                director: None,
+                writer: None,
+                runtime: None,
+                rated: None,
+                awards: None,
+                language: None,
+                country: None,
                 category_id: s.category_id,
                 source_id: Some(self.source_id),
             });
@@ -555,6 +564,15 @@ impl XtreamClient {
                 year: s.year.or(s.release_date),
                 rating: s.rating,
                 genre: s.genre,
+                imdb_id: s.imdb_id.filter(|id| !id.is_empty() && id != "0"),
+                actors: None,
+                director: None,
+                writer: None,
+                runtime: None,
+                rated: None,
+                awards: None,
+                language: None,
+                country: None,
                 seasons: Vec::new(),
                 source_id: Some(self.source_id),
                 category_id: s.category_id,
@@ -616,6 +634,15 @@ impl XtreamClient {
                 year: s.year.or(s.release_date),
                 rating: s.rating,
                 genre: s.genre,
+                imdb_id: s.imdb_id.filter(|id| !id.is_empty() && id != "0"),
+                actors: None,
+                director: None,
+                writer: None,
+                runtime: None,
+                rated: None,
+                awards: None,
+                language: None,
+                country: None,
                 category_id: s.category_id.or_else(|| Some(category_id.to_string())),
                 source_id: Some(self.source_id),
             });
@@ -648,6 +675,15 @@ impl XtreamClient {
                 year: s.year.or(s.release_date),
                 rating: s.rating,
                 genre: s.genre,
+                imdb_id: s.imdb_id.filter(|id| !id.is_empty() && id != "0"),
+                actors: None,
+                director: None,
+                writer: None,
+                runtime: None,
+                rated: None,
+                awards: None,
+                language: None,
+                country: None,
                 seasons: Vec::new(),
                 source_id: Some(self.source_id),
                 category_id: s.category_id.or_else(|| Some(category_id.to_string())),
@@ -725,6 +761,14 @@ impl XtreamClient {
             }
             _ => None,
         });
+        let imdb_id = info
+            .get("imdb_id")
+            .or_else(|| info.get("imdbid"))
+            .or_else(|| info.get("IMDB_ID"))
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty() && *s != "0")
+            .map(str::to_string);
 
         let mut seasons = Vec::new();
         if let Some(episodes) = value.get("episodes").and_then(|e| e.as_object()) {
@@ -759,6 +803,11 @@ impl XtreamClient {
                             title,
                             stream_url: self.series_stream_url(&id, ext),
                             episode_num,
+                            plot: None,
+                            rating: None,
+                            runtime: None,
+                            airdate: None,
+                            still: None,
                         });
                     }
                 }
@@ -785,6 +834,15 @@ impl XtreamClient {
             year,
             rating,
             genre,
+            imdb_id,
+            actors: None,
+            director: None,
+            writer: None,
+            runtime: None,
+            rated: None,
+            awards: None,
+            language: None,
+            country: None,
             seasons,
             source_id: Some(self.source_id),
             category_id: None,
@@ -911,6 +969,8 @@ struct XcVodStream {
     rating: Option<String>,
     #[serde(default, deserialize_with = "de_opt_strish")]
     genre: Option<String>,
+    #[serde(default)]
+    imdb_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -932,6 +992,8 @@ struct XcSeries {
     rating: Option<String>,
     #[serde(default, deserialize_with = "de_opt_strish")]
     genre: Option<String>,
+    #[serde(default)]
+    imdb_id: Option<String>,
     #[serde(default, deserialize_with = "de_opt_id")]
     category_id: Option<String>,
 }

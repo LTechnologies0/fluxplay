@@ -157,6 +157,14 @@ fn looks_like_html(bytes: &[u8]) -> bool {
 }
 
 fn disk_root() -> PathBuf {
+    #[cfg(target_os = "android")]
+    {
+        if let Some(app) = iced::android::ANDROID_APP.get() {
+            if let Some(base) = app.internal_data_path() {
+                return base.join("fluxplay").join("images");
+            }
+        }
+    }
     dirs::cache_dir()
         .unwrap_or_else(std::env::temp_dir)
         .join("fluxplay")

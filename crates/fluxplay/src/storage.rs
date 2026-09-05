@@ -12,6 +12,16 @@ pub struct PersistedState {
 }
 
 pub fn config_dir() -> PathBuf {
+    #[cfg(target_os = "android")]
+    {
+            if let Some(app) = iced::android::ANDROID_APP.get() {
+                if let Some(base) = app.internal_data_path() {
+                    let dir = base.join("fluxplay");
+                    debug!(path = %dir.display(), "config_dir (android)");
+                    return dir;
+                }
+            }
+    }
     let dir = dirs::config_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join("fluxplay");

@@ -152,6 +152,24 @@ pub struct VodItem {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub genre: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub imdb_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actors: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub director: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub writer: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rated: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub awards: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub country: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub category_id: Option<String>,
     pub source_id: Option<Uuid>,
 }
@@ -172,6 +190,24 @@ pub struct SeriesItem {
     pub rating: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub genre: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub imdb_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actors: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub director: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub writer: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rated: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub awards: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub country: Option<String>,
     #[serde(default)]
     pub seasons: Vec<SeriesSeason>,
     pub source_id: Option<Uuid>,
@@ -191,6 +227,16 @@ pub struct SeriesEpisode {
     pub title: String,
     pub stream_url: String,
     pub episode_num: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plot: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rating: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub airdate: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub still: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -305,30 +351,100 @@ pub enum AccentPreset {
     Forest,
     Rose,
     Slate,
+    // Extended mosaic palette
+    Cyan,
+    Sky,
+    Azure,
+    Indigo,
+    Grape,
+    Magenta,
+    HotPink,
+    Coral,
+    Scarlet,
+    Crimson,
+    Wine,
+    Peach,
+    Amber,
+    Gold,
+    Lime,
+    Mint,
+    Jade,
+    Olive,
+    Sand,
+    Chocolate,
+    Charcoal,
+    Ice,
+    Neon,
 }
 
 impl AccentPreset {
     pub fn label(self) -> &'static str {
         match self {
-            Self::Teal => "Teal (broadcast)",
+            Self::Teal => "Teal",
             Self::Ocean => "Océan",
             Self::Ember => "Ember",
             Self::Violet => "Violet",
             Self::Forest => "Forêt",
             Self::Rose => "Rose",
             Self::Slate => "Ardoise",
+            Self::Cyan => "Cyan",
+            Self::Sky => "Ciel",
+            Self::Azure => "Azur",
+            Self::Indigo => "Indigo",
+            Self::Grape => "Raisin",
+            Self::Magenta => "Magenta",
+            Self::HotPink => "Rose vif",
+            Self::Coral => "Corail",
+            Self::Scarlet => "Écarlate",
+            Self::Crimson => "Cramoisi",
+            Self::Wine => "Vin",
+            Self::Peach => "Pêche",
+            Self::Amber => "Ambre",
+            Self::Gold => "Or",
+            Self::Lime => "Citron vert",
+            Self::Mint => "Menthe",
+            Self::Jade => "Jade",
+            Self::Olive => "Olive",
+            Self::Sand => "Sable",
+            Self::Chocolate => "Chocolat",
+            Self::Charcoal => "Charbon",
+            Self::Ice => "Glace",
+            Self::Neon => "Néon",
         }
     }
 
     pub fn all() -> &'static [AccentPreset] {
         &[
             Self::Teal,
-            Self::Ocean,
-            Self::Ember,
-            Self::Violet,
+            Self::Cyan,
+            Self::Mint,
+            Self::Jade,
             Self::Forest,
+            Self::Lime,
+            Self::Olive,
+            Self::Ocean,
+            Self::Sky,
+            Self::Azure,
+            Self::Indigo,
+            Self::Violet,
+            Self::Grape,
+            Self::Magenta,
+            Self::HotPink,
             Self::Rose,
+            Self::Coral,
+            Self::Scarlet,
+            Self::Crimson,
+            Self::Wine,
+            Self::Ember,
+            Self::Peach,
+            Self::Amber,
+            Self::Gold,
+            Self::Sand,
+            Self::Chocolate,
             Self::Slate,
+            Self::Charcoal,
+            Self::Ice,
+            Self::Neon,
         ]
     }
 
@@ -388,6 +504,9 @@ pub struct AppSettings {
     pub demux_secs: f32,
     #[serde(default)]
     pub low_latency: bool,
+    /// After ~75% of a series episode, prefetch the next episode to disk.
+    #[serde(default = "default_true")]
+    pub prefetch_next_episode: bool,
     #[serde(default)]
     pub favorites: Vec<String>,
     #[serde(default)]
@@ -425,6 +544,7 @@ impl Default for AppSettings {
             cache_ms: 4000,
             demux_secs: 8.0,
             low_latency: false,
+            prefetch_next_episode: true,
             favorites: Vec::new(),
             recent: Vec::new(),
         }

@@ -112,12 +112,40 @@ impl CatalogDb {
                 bytes INTEGER NOT NULL,
                 accessed_at INTEGER NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS meta_cache (
+                cache_key TEXT PRIMARY KEY,
+                kind TEXT NOT NULL,
+                query_title TEXT NOT NULL,
+                query_year TEXT,
+                imdb_id TEXT,
+                payload TEXT NOT NULL,
+                is_miss INTEGER NOT NULL DEFAULT 0,
+                fetched_at INTEGER NOT NULL
+            );
             CREATE INDEX IF NOT EXISTS idx_vod_cat ON vod(category_id);
             CREATE INDEX IF NOT EXISTS idx_series_cat ON series(category_id);
             CREATE INDEX IF NOT EXISTS idx_vod_meta ON vod(meta_ok);
             CREATE INDEX IF NOT EXISTS idx_series_meta ON series(meta_ok);
+            CREATE INDEX IF NOT EXISTS idx_meta_cache_imdb ON meta_cache(imdb_id);
             "#,
         )?;
+
+        // Migrate older DBs that predate meta_cache.
+        let _ = self.conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS meta_cache (
+                cache_key TEXT PRIMARY KEY,
+                kind TEXT NOT NULL,
+                query_title TEXT NOT NULL,
+                query_year TEXT,
+                imdb_id TEXT,
+                payload TEXT NOT NULL,
+                is_miss INTEGER NOT NULL DEFAULT 0,
+                fetched_at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_meta_cache_imdb ON meta_cache(imdb_id);
+            "#,
+        );
 
         // FTS5 — ignore errors if already present / unsupported.
         let _ = self.conn.execute_batch(
@@ -561,6 +589,8 @@ impl CatalogDb {
         genre: Option<&str>,
         plot: Option<&str>,
         poster: Option<&str>,
+        rating: Option<&str>,
+        imdb_id: Option<&str>,
     ) -> rusqlite::Result<()> {
         let sid = source_id.to_string();
         let raw: Option<String> = self
@@ -583,6 +613,15 @@ impl CatalogDb {
             year: None,
             rating: None,
             genre: None,
+            imdb_id: None,
+            actors: None,
+            director: None,
+            writer: None,
+            runtime: None,
+            rated: None,
+            awards: None,
+            language: None,
+            country: None,
             category_id: None,
             source_id: Some(source_id),
         });
@@ -598,11 +637,26 @@ impl CatalogDb {
         if poster.is_some() {
             item.poster = poster.map(str::to_string);
         }
-        let payload = serde_json::to_string(&item).unwrap_or(raw);
+        if rating.is_some() {
+            item.rating = rating.map(str::to_string);
+        }
+        if imdb_id.is_some() {
+            item.imdb_id = imdb_id.map(str::to_string);
+        }
+        self.persist_vod(&item)
+    }
+
+    /// Write full VOD JSON payload (credits, ratings, IMDb id, …).
+    pub fn persist_vod(&self, item: &VodItem) -> rusqlite::Result<()> {
+        let Some(source_id) = item.source_id else {
+            return Ok(());
+        };
+        let sid = source_id.to_string();
+        let payload = serde_json::to_string(item).unwrap_or_default();
         self.conn.execute(
             "UPDATE vod SET payload = ?1, year = ?2, genre = ?3, meta_ok = 1
              WHERE source_id = ?4 AND id = ?5",
-            params![payload, item.year, item.genre, sid, id],
+            params![payload, item.year, item.genre, sid, item.id],
         )?;
         Ok(())
     }
@@ -615,6 +669,8 @@ impl CatalogDb {
         genre: Option<&str>,
         plot: Option<&str>,
         cover: Option<&str>,
+        rating: Option<&str>,
+        imdb_id: Option<&str>,
     ) -> rusqlite::Result<()> {
         let sid = source_id.to_string();
         let raw: Option<String> = self
@@ -637,6 +693,15 @@ impl CatalogDb {
             year: None,
             rating: None,
             genre: None,
+            imdb_id: None,
+            actors: None,
+            director: None,
+            writer: None,
+            runtime: None,
+            rated: None,
+            awards: None,
+            language: None,
+            country: None,
             seasons: Vec::new(),
             source_id: Some(source_id),
             category_id: None,
@@ -653,13 +718,98 @@ impl CatalogDb {
         if cover.is_some() {
             item.cover = cover.map(str::to_string);
         }
-        let payload = serde_json::to_string(&item).unwrap_or(raw);
+        if rating.is_some() {
+            item.rating = rating.map(str::to_string);
+        }
+        if imdb_id.is_some() {
+            item.imdb_id = imdb_id.map(str::to_string);
+        }
+        self.persist_series(&item)
+    }
+
+    /// Write full series JSON payload (credits, seasons, IMDb id, …).
+    pub fn persist_series(&self, item: &SeriesItem) -> rusqlite::Result<()> {
+        let Some(source_id) = item.source_id else {
+            return Ok(());
+        };
+        let sid = source_id.to_string();
+        let payload = serde_json::to_string(item).unwrap_or_default();
         self.conn.execute(
             "UPDATE series SET payload = ?1, year = ?2, genre = ?3, meta_ok = 1
              WHERE source_id = ?4 AND id = ?5",
-            params![payload, item.year, item.genre, sid, id],
+            params![payload, item.year, item.genre, sid, item.id],
         )?;
         Ok(())
+    }
+
+    /// OMDb/TVMaze response cache — avoids re-fetching the same cleaned title.
+    /// Hits never expire. Misses retry after 7 days.
+    pub fn meta_cache_get(
+        &self,
+        cache_key: &str,
+    ) -> Option<(bool /* is_miss */, crate::metadata::MetaPatch)> {
+        let row: Result<(i64, String, i64), _> = self.conn.query_row(
+            "SELECT is_miss, payload, fetched_at FROM meta_cache WHERE cache_key = ?1",
+            params![cache_key],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        );
+        let Ok((is_miss, payload, fetched_at)) = row else {
+            return None;
+        };
+        let age = now_secs().saturating_sub(fetched_at as u64);
+        if is_miss != 0 {
+            if age > 7 * 86400 {
+                return None; // allow retry
+            }
+            return Some((true, crate::metadata::MetaPatch::default()));
+        }
+        let patch = serde_json::from_str(&payload).unwrap_or_default();
+        Some((false, patch))
+    }
+
+    pub fn meta_cache_put(
+        &self,
+        cache_key: &str,
+        kind: &str,
+        query: &crate::metadata::TitleQuery,
+        patch: Option<&crate::metadata::MetaPatch>,
+    ) {
+        let is_miss = patch.is_none();
+        let payload = patch
+            .and_then(|p| serde_json::to_string(p).ok())
+            .unwrap_or_else(|| "{}".into());
+        let imdb = patch.and_then(|p| p.imdb_id.clone());
+        let _ = self.conn.execute(
+            "INSERT INTO meta_cache (cache_key, kind, query_title, query_year, imdb_id, payload, is_miss, fetched_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT(cache_key) DO UPDATE SET
+               payload=excluded.payload,
+               imdb_id=excluded.imdb_id,
+               is_miss=excluded.is_miss,
+               fetched_at=excluded.fetched_at",
+            params![
+                cache_key,
+                kind,
+                query.title,
+                query.year,
+                imdb,
+                payload,
+                if is_miss { 1 } else { 0 },
+                now_secs() as i64,
+            ],
+        );
+    }
+
+    pub fn meta_cache_get_imdb(
+        &self,
+        imdb_id: &str,
+    ) -> Option<crate::metadata::MetaPatch> {
+        let payload: Result<String, _> = self.conn.query_row(
+            "SELECT payload FROM meta_cache WHERE imdb_id = ?1 AND is_miss = 0 LIMIT 1",
+            params![imdb_id],
+            |r| r.get(0),
+        );
+        payload.ok().and_then(|p| serde_json::from_str(&p).ok())
     }
 
     pub fn counts(&self) -> (usize, usize, usize) {
@@ -680,6 +830,14 @@ impl CatalogDb {
 }
 
 fn db_path() -> PathBuf {
+    #[cfg(target_os = "android")]
+    {
+        if let Some(app) = iced::android::ANDROID_APP.get() {
+            if let Some(base) = app.internal_data_path() {
+                return base.join("fluxplay").join("catalog.sqlite3");
+            }
+        }
+    }
     dirs::data_dir()
         .or_else(dirs::cache_dir)
         .unwrap_or_else(|| PathBuf::from("."))

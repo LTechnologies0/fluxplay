@@ -21,7 +21,8 @@ pub use backend::{
 };
 pub use platform::{target_profile, Platform, TargetProfile};
 pub use session::{
-    AspectMode, AudioChannelMode, Bookmark, EqPreset, PlaybackState, StreamSession,
+    AspectMode, AudioChannelMode, Bookmark, DeinterlaceMode, EqPreset, PlaybackState,
+    StreamSession, UpscaleMode,
 };
 
 #[derive(Debug, Error)]

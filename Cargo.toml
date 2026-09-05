@@ -6,11 +6,12 @@ members = [
     "crates/fluxplay-player",
     "crates/fluxplay-ffi",
     "crates/fluxplay",
+    "crates/fluxplay-android",
 ]
 default-members = ["crates/fluxplay"]
 
 [workspace.package]
-version = "0.2.1"
+version = "0.2.2"
 edition = "2021"
 license = "MIT"
 authors = ["FluxPlay"]
@@ -19,7 +20,7 @@ repository = "https://github.com/fluxplay/fluxplay"
 [workspace.dependencies]
 fluxplay-core = { path = "crates/fluxplay-core" }
 fluxplay-providers = { path = "crates/fluxplay-providers" }
-fluxplay-player = { path = "crates/fluxplay-player" }
+fluxplay-player = { path = "crates/fluxplay-player", default-features = false }
 fluxplay-ffi = { path = "crates/fluxplay-ffi" }
 
 anyhow = "1"
@@ -38,11 +39,15 @@ regex = "1"
 base64 = "0.22"
 sha2 = "0.10"
 hex = "0.4"
-iced = { version = "0.14", features = ["tokio", "image", "svg", "advanced"] }
+iced = { version = "0.14", default-features = false, features = ["wgpu", "crisp", "web-colors", "tokio", "image", "svg", "advanced"] }
 dirs = "6"
 rfd = "0.15"
 open = "5"
 rusqlite = { version = "0.32", features = ["bundled"] }
+
+[patch.crates-io]
+iced = { path = "vendor/iced" }
+iced_winit = { path = "vendor/iced_winit" }
 
 # ── Release binaries: max opt, dead-code elimination, stripped ──────────────
 # Default: `cargo build --release` / `cargo install`
