@@ -16,7 +16,12 @@ required-features = ["native-player"]
 
 [features]
 default = ["native-player"]
-native-player = ["fluxplay-player/native-mpv", "fluxplay-player/cli-player", "fluxplay-player/bundle-rpath"]
+native-player = [
+    "fluxplay-player/native-mpv",
+    "fluxplay-player/native-ffmpeg",
+    "fluxplay-player/cli-player",
+    "fluxplay-player/bundle-rpath",
+]
 static-mpv = ["fluxplay-player/static-link", "fluxplay-player/bundle-rpath"]
 
 [dependencies]

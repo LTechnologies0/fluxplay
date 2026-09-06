@@ -8,9 +8,9 @@ Inspiré de **IPTVnator** (M3U/Xtream/Stalker, EPG, favoris, User-Agent, catch-u
 
 | Cible | UI | Decode | Statut |
 |---|---|---|---|
-| **Linux** | iced | mpv → ffplay → externe | ✅ app desktop |
-| **macOS** | iced | mpv (VideoToolbox) → ffplay → IINA | ✅ |
-| **Windows** | iced | mpv (D3D11VA) → ffplay → VLC | ✅ |
+| **Linux** | iced | libmpv / libav* → CLI → externe | ✅ app desktop |
+| **macOS** | iced | libmpv / libav* (VideoToolbox) → CLI → IINA | ✅ |
+| **Windows** | iced | libmpv / libav* (D3D11VA) → CLI → VLC | ✅ |
 | **Android** | Kotlin shell | Media3 ExoPlayer | ✅ cœur FFI (`fluxplay-ffi`) |
 | **iOS** | SwiftUI shell | AVPlayer | ✅ cœur FFI |
 
@@ -19,16 +19,24 @@ Voir [`mobile/README.md`](mobile/README.md) pour le bridge JNI/Swift.
 ## Lancer (desktop)
 
 ```bash
-# libmpv (recommandé) — linkage natif dans le binaire
-# Fedora: sudo dnf install mpv-libs-devel
-# Debian: sudo apt install libmpv-dev
-# macOS:  brew install mpv
+# libmpv + FFmpeg (recommandé) — linkage natif, vidéo embarquée dans iced
+# Fedora: sudo dnf install mpv-libs-devel ffmpeg-devel
+# Debian: sudo apt install libmpv-dev libavcodec-dev libavformat-dev libswscale-dev
+# macOS:  brew install mpv ffmpeg
 
 # Build natif + rpath standalone
 ./scripts/build-native.sh
 
 # Ou classique
 cargo run -p fluxplay
+
+# Debug verbeux (mpv + FFmpeg + iced + crates FluxPlay)
+FLUXPLAY_VERBOSE=1 cargo run -p fluxplay 2>&1 | tee /tmp/fluxplay-verbose.log
+# Affiner :
+#   FLUXPLAY_MPV_LOG=debug|trace
+#   FLUXPLAY_FFMPEG_LOG=debug|trace
+#   RUST_LOG=fluxplay=trace,fluxplay_player=debug,iced=info,iced_winit=debug
+# Fichier mpv : /tmp/fluxplay-mpv-verbose.log
 ```
 
 Réglages → **Auto (libmpv → FFmpeg)**, HW decode, low-latency.
@@ -41,7 +49,7 @@ Réglages → **Auto (libmpv → FFmpeg)**, HW decode, low-latency.
 | libmpv **statique** (`libmpv.a`) | `FLUXPLAY_STATIC_MPV=1 FLUXPLAY_REQUIRE_LIBMPV=1 cargo build -p fluxplay --release --features static-mpv` |
 | Déps statiques manquantes | `FLUXPLAY_MPV_STATIC_DEPS=ass:avcodec:avformat:avutil:...` |
 
-Features Cargo : `native-mpv` (FFI), `static-link`, `bundle-rpath`, `cli-player` (fallback `mpv`/`ffplay`).
+Features Cargo : `native-mpv`, `native-ffmpeg` (libav* → RGBA iced), `static-link`, `bundle-rpath`, `cli-player` (fallback `mpv`/`ffplay`).
 
 `fluxplay-ffi` produit une **`staticlib`** pour Android/iOS (sans libmpv desktop — ExoPlayer/AVPlayer).
 
@@ -51,14 +59,15 @@ Features Cargo : `native-mpv` (FFI), `static-link`, `bundle-rpath`, `cli-player`
 |---|---|
 | `fluxplay-core` | M3U/M3U+/XMLTV, catch-up, favoris, prefs player |
 | `fluxplay-providers` | M3U fetch, Xtream Codes, Stalker Portal |
-| `fluxplay-player` | Routage + **libmpv FFI natif** (static/shared) + fallback CLI |
+| `fluxplay-player` | Routage + **libmpv / libav* FFI** (RGBA embarqué) + fallback CLI |
 | `fluxplay-ffi` | `staticlib`/`cdylib` pour Android & iOS |
 | `fluxplay` | App iced desktop |
 
 ## Qualité IPTV (desktop)
 
-- **libmpv in-process** (embarque le décode FFmpeg de mpv) : HLS/DASH/RTSP/RTMP/SRT, HW accel, cache, reconnect lavf
-- **ffplay** : fallback FFmpeg avec fenêtre native (feature `cli-player`)
+- **libmpv in-process** : HLS/DASH/RTSP/RTMP/SRT, HW accel, cache, reconnect lavf → frames RGBA dans iced
+- **FFmpeg natif (libav*)** : demux/decode embarqué dans la fenêtre lecteur (même modèle que libmpv SW)
+- **CLI mpv/ffplay** : fallback d’urgence seulement (`cli-player`)
 - Options type Kodi : `hwdec`, cache réseau, demux readahead, low-latency, User-Agent / Referer par source
 
 ## Fonctions type IPTVnator
@@ -106,28 +115,25 @@ Profils dans le `Cargo.toml` racine : `lto=fat`, `codegen-units=1`, `panic=abort
 
 ## Logging
 
-Niveaux `tracing` : **TRACE** / **DEBUG** / **INFO** / **WARN** / **ERROR**, plus cible **profiler** (timing / CPU / RAM / FPS).
+Niveaux `tracing` : **TRACE** / **DEBUG** / **INFO** / **WARN** / **ERROR**.
+
+Par défaut (sans `RUST_LOG`) : profilage d’interactions **ON**, logs réseau `fluxplay::net`, profiler `info`.
 
 ```bash
-# défaut (tous les crates workspace à info ; profiler off)
 cargo run -p fluxplay
+# → net.request / net.response, fluxplay::profile interactions, player backend
 
-# profiler d’interactions GUI + overlay FPS dans la barre de statut
-FLUXPLAY_PROFILE=1 cargo run -p fluxplay
+# Couper le profilage
+FLUXPLAY_PROFILE=0 cargo run -p fluxplay
 
-# overlay FPS seul (sans CPU/RSS sur chaque message)
+# Overlay FPS dans la barre de statut
 FLUXPLAY_FPS=1 cargo run -p fluxplay
 
-# détail complet + samples TRACE (ns, ms, % CPU/cœur, RSS B/KiB/MiB/GiB, FPS)
-RUST_LOG=fluxplay=trace,fluxplay_core=trace,fluxplay_providers=trace,fluxplay_player=trace,fluxplay_ffi=trace,profiler=trace cargo run -p fluxplay
-
-# un crate seulement
-RUST_LOG=fluxplay_providers=debug,profiler=trace cargo run -p fluxplay
+# TRACE complet
+RUST_LOG=profiler=trace,fluxplay=trace,fluxplay_providers=trace,fluxplay_player=trace cargo run -p fluxplay
 ```
 
-Chaque `update(Message)` et chaque `view` émettent (si activé) : `wall_ns` / `wall_ms`, `cpu_pct_core` / `cpu_pct_machine`, `rss_*` (octets + humain), et le compteur **FPS** GUI. Les `Stopwatch` / `ResourceStopwatch` existants (providers, player, catalogue…) ajoutent les mêmes métriques autour des tâches async lourdes.
-
-Helpers : `fluxplay_core::profiler!`, `profile_scope!`, `Stopwatch`, `InteractionGuard`, `overlay_status_line`, filtre défaut `DEFAULT_ENV_FILTER`.
+Chaque `update`/`view`/`Stopwatch` : `wall_ns`/`wall_ms`, `% CPU/cœur`, RSS. Les appels HTTP Xtream/images sortent sous `fluxplay::net`.
 
 ## Catalogue local
 

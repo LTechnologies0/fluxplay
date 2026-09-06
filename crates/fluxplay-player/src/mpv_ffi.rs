@@ -8,7 +8,7 @@ use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use tracing::{debug, error, info, trace, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::{PlayerError, Result};
 
@@ -45,6 +45,9 @@ const MPV_RENDER_PARAM_SW_SIZE: c_int = 17;
 const MPV_RENDER_PARAM_SW_FORMAT: c_int = 18;
 const MPV_RENDER_PARAM_SW_STRIDE: c_int = 19;
 const MPV_RENDER_PARAM_SW_POINTER: c_int = 20;
+
+/// MPV_RENDER_UPDATE_FRAME — new video frame available for render.
+const MPV_RENDER_UPDATE_FRAME: u64 = 1 << 0;
 
 extern "C" {
     fn mpv_create() -> *mut mpv_handle;
@@ -111,6 +114,12 @@ pub struct LibMpv {
     ctx: *mut mpv_handle,
     render: *mut mpv_render_context,
     frame_dirty: Arc<AtomicBool>,
+    /// Reused tightly-packed RGBA scratch (render target).
+    sw_rgba: Vec<u8>,
+    sw_w: u32,
+    sw_h: u32,
+    /// First frame must render even if dirty flag races.
+    force_render: bool,
 }
 
 // Client API: one thread at a time per handle; UI/player tick owns it.
@@ -131,11 +140,14 @@ impl LibMpv {
             ctx,
             render: ptr::null_mut(),
             frame_dirty: Arc::new(AtomicBool::new(false)),
+            sw_rgba: Vec::new(),
+            sw_w: 0,
+            sw_h: 0,
+            force_render: true,
         })
     }
 
     pub fn set_option(&self, name: &str, value: &str) -> Result<()> {
-        trace!(%name, "LibMpv::set_option");
         let name = CString::new(name).map_err(|e| PlayerError::Backend(e.to_string()))?;
         let value = CString::new(value).map_err(|e| PlayerError::Backend(e.to_string()))?;
         mpv_err(unsafe { mpv_set_option_string(self.ctx, name.as_ptr(), value.as_ptr()) })
@@ -177,12 +189,12 @@ impl LibMpv {
             mpv_render_context_set_update_callback(self.render, Some(render_update_cb), cb_ptr);
         }
         self.frame_dirty.store(true, Ordering::Release);
+        self.force_render = true;
         info!("LibMpv software render context ready");
         Ok(())
     }
 
     pub fn set_property(&self, name: &str, value: &str) -> Result<()> {
-        trace!(%name, "LibMpv::set_property");
         let name = CString::new(name).map_err(|e| PlayerError::Backend(e.to_string()))?;
         let value = CString::new(value).map_err(|e| PlayerError::Backend(e.to_string()))?;
         mpv_err(unsafe { mpv_set_property_string(self.ctx, name.as_ptr(), value.as_ptr()) })
@@ -219,64 +231,95 @@ impl LibMpv {
     }
 
     pub fn frame_needs_redraw(&self) -> bool {
-        self.frame_dirty.load(Ordering::Acquire)
+        self.force_render || self.frame_dirty.load(Ordering::Acquire)
     }
 
     /// Render current video into tightly packed RGBA (`w * h * 4`).
+    /// Returns `None` when there is no new frame (caller should keep the last handle).
     pub fn render_sw_rgba(&mut self, w: u32, h: u32) -> Option<Vec<u8>> {
         if self.render.is_null() || w < 2 || h < 2 {
             return None;
         }
-        let w = w.min(1920);
-        let h = h.min(1080);
-        let _ = unsafe { mpv_render_context_update(self.render) };
+        // Even dims — required by some SW paths; allow full UHD for RTX / 4K displays.
+        let w = (w.min(3840) & !1).max(2);
+        let h = (h.min(2160) & !1).max(2);
 
-        let stride = ((w as usize * 4 + 63) / 64) * 64;
-        let mut buf = vec![0u8; stride * h as usize];
-        let mut size = [w as c_int, h as c_int];
-        let mut stride_sz = stride;
-        let fmt = CString::new("rgb0").ok()?;
-
-        let mut params = [
-            MpvRenderParam {
-                type_: MPV_RENDER_PARAM_SW_SIZE,
-                data: size.as_mut_ptr() as *mut c_void,
-            },
-            MpvRenderParam {
-                type_: MPV_RENDER_PARAM_SW_FORMAT,
-                data: fmt.as_ptr() as *mut c_void,
-            },
-            MpvRenderParam {
-                type_: MPV_RENDER_PARAM_SW_STRIDE,
-                data: (&mut stride_sz as *mut usize) as *mut c_void,
-            },
-            MpvRenderParam {
-                type_: MPV_RENDER_PARAM_SW_POINTER,
-                data: buf.as_mut_ptr() as *mut c_void,
-            },
-            MpvRenderParam {
-                type_: MPV_RENDER_PARAM_INVALID,
-                data: ptr::null_mut(),
-            },
-        ];
-
-        if unsafe { mpv_render_context_render(self.render, params.as_mut_ptr()) } < 0 {
+        let flags = unsafe { mpv_render_context_update(self.render) };
+        let dirty = self
+            .frame_dirty
+            .swap(false, Ordering::AcqRel)
+            || self.force_render
+            || (flags & MPV_RENDER_UPDATE_FRAME) != 0
+            || self.sw_w != w
+            || self.sw_h != h;
+        if !dirty {
             return None;
         }
-        self.frame_dirty.store(false, Ordering::Release);
 
-        // rgb0 → tight RGBA (alpha = 255)
-        let mut rgba = Vec::with_capacity((w * h * 4) as usize);
-        for y in 0..h as usize {
-            let row = &buf[y * stride..y * stride + (w as usize * 4)];
-            for px in row.chunks_exact(4) {
-                rgba.push(px[0]);
-                rgba.push(px[1]);
-                rgba.push(px[2]);
-                rgba.push(255);
+        let need = (w as usize).saturating_mul(h as usize).saturating_mul(4);
+        if self.sw_rgba.len() != need {
+            self.sw_rgba.resize(need, 0);
+        }
+
+        let mut size = [w as c_int, h as c_int];
+        let mut stride = (w as usize) * 4;
+        // Prefer packed rgba (no rgb0→RGBA permute). Fall back to rgb0 if needed.
+        let fmt_rgba = CString::new("rgba").ok()?;
+        let fmt_rgb0 = CString::new("rgb0").ok()?;
+
+        let mut try_render = |fmt: &CString, buf: &mut [u8], stride: &mut usize| -> c_int {
+            let mut params = [
+                MpvRenderParam {
+                    type_: MPV_RENDER_PARAM_SW_SIZE,
+                    data: size.as_mut_ptr() as *mut c_void,
+                },
+                MpvRenderParam {
+                    type_: MPV_RENDER_PARAM_SW_FORMAT,
+                    data: fmt.as_ptr() as *mut c_void,
+                },
+                MpvRenderParam {
+                    type_: MPV_RENDER_PARAM_SW_STRIDE,
+                    data: (stride as *mut usize) as *mut c_void,
+                },
+                MpvRenderParam {
+                    type_: MPV_RENDER_PARAM_SW_POINTER,
+                    data: buf.as_mut_ptr() as *mut c_void,
+                },
+                MpvRenderParam {
+                    type_: MPV_RENDER_PARAM_INVALID,
+                    data: ptr::null_mut(),
+                },
+            ];
+            unsafe { mpv_render_context_render(self.render, params.as_mut_ptr()) }
+        };
+
+        let code = try_render(&fmt_rgba, &mut self.sw_rgba, &mut stride);
+        if code < 0 {
+            // rgb0: 4 bytes/pixel with unused alpha — write into a scratch then pack.
+            let pad_stride = ((w as usize * 4 + 63) / 64) * 64;
+            let mut scratch = vec![0u8; pad_stride * h as usize];
+            let mut st = pad_stride;
+            if try_render(&fmt_rgb0, &mut scratch, &mut st) < 0 {
+                self.frame_dirty.store(true, Ordering::Release);
+                return None;
+            }
+            for y in 0..h as usize {
+                let src = &scratch[y * st..y * st + w as usize * 4];
+                let dst = &mut self.sw_rgba[y * w as usize * 4..(y + 1) * w as usize * 4];
+                for (d, s) in dst.chunks_exact_mut(4).zip(src.chunks_exact(4)) {
+                    d[0] = s[0];
+                    d[1] = s[1];
+                    d[2] = s[2];
+                    d[3] = 255;
+                }
             }
         }
-        Some(rgba)
+
+        self.sw_w = w;
+        self.sw_h = h;
+        self.force_render = false;
+        // One memcpy into a fresh Vec owned by iced's ImageHandle.
+        Some(self.sw_rgba.clone())
     }
 
     fn free_render(&mut self) {

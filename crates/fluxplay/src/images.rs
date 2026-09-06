@@ -27,7 +27,7 @@ impl ImageCache {
 
     /// Try disk before scheduling a network fetch.
     pub fn request(&mut self, url: &str) -> RequestOutcome {
-        if url.is_empty() || self.failed.contains(url) {
+        if url.is_empty() || !is_fetchable_image_url(url) || self.failed.contains(url) {
             return RequestOutcome::Skip;
         }
         if self.handles.contains_key(url) {
@@ -115,7 +115,30 @@ fn shared_http() -> &'static reqwest::Client {
     })
 }
 
+/// Reject incomplete CDN roots (e.g. TMDB size path without poster id → HTTP 404).
+pub fn is_fetchable_image_url(url: &str) -> bool {
+    let url = url.trim();
+    if !(url.starts_with("http://") || url.starts_with("https://")) {
+        return false;
+    }
+    if let Some(rest) = url.split("/t/p/").nth(1) {
+        let segs: Vec<_> = rest
+            .trim_matches('/')
+            .split('/')
+            .filter(|s| !s.is_empty())
+            .collect();
+        // Need size token + file id: /t/p/w600_…/abc.jpg
+        if segs.len() < 2 {
+            return false;
+        }
+    }
+    true
+}
+
 pub async fn fetch_image_bytes(url: String) -> Result<(String, Vec<u8>), (String, String)> {
+    if !is_fetchable_image_url(&url) {
+        return Err((url, "invalid image url".into()));
+    }
     // Second chance disk (race with another task).
     if let Some(path) = disk_path_for(&url) {
         if let Ok(bytes) = std::fs::read(&path) {
@@ -125,6 +148,8 @@ pub async fn fetch_image_bytes(url: String) -> Result<(String, Vec<u8>), (String
             }
         }
     }
+    let t0 = std::time::Instant::now();
+    tracing::info!(target: "fluxplay::net", method = "GET", kind = "image", url = %url, "net.request");
     let resp = shared_http()
         .get(&url)
         .send()
@@ -133,9 +158,18 @@ pub async fn fetch_image_bytes(url: String) -> Result<(String, Vec<u8>), (String
             warn!(%url, error = %e, "image HTTP send failed");
             (url.clone(), e.to_string())
         })?;
-    if !resp.status().is_success() {
-        warn!(%url, status = %resp.status(), "image HTTP status");
-        return Err((url, format!("HTTP {}", resp.status())));
+    let status = resp.status();
+    tracing::info!(
+        target: "fluxplay::net",
+        method = "GET",
+        kind = "image",
+        status = status.as_u16(),
+        elapsed_ms = format!("{:.1}", t0.elapsed().as_secs_f64() * 1000.0),
+        "net.response"
+    );
+    if !status.is_success() {
+        warn!(%url, status = %status, "image HTTP status");
+        return Err((url, format!("HTTP {status}")));
     }
     let bytes = resp
         .bytes()
@@ -189,6 +223,6 @@ pub fn pick_art(
         .into_iter()
         .flatten()
         .map(str::trim)
-        .find(|u| u.starts_with("http://") || u.starts_with("https://"))
+        .find(|u| is_fetchable_image_url(u))
         .map(str::to_string)
 }

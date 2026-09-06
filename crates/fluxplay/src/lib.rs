@@ -4,6 +4,7 @@ mod app;
 mod browser;
 mod catalog_db;
 mod demo;
+mod icons;
 mod images;
 mod metadata;
 mod player_ui;
@@ -40,11 +41,22 @@ pub fn run_android(android_app: android_activity::AndroidApp) -> iced::Result {
 }
 
 fn init_tracing() {
+    // FLUXPLAY_VERBOSE seeds a richer RUST_LOG when the user did not set one.
+    if fluxplay_player::verbose_master() && std::env::var_os("RUST_LOG").is_none() {
+        // iced_* at info catches window/resize/wgpu surface issues without drowning in TRACE.
+        std::env::set_var(
+            "RUST_LOG",
+            "fluxplay=debug,fluxplay_core=debug,fluxplay_providers=debug,\
+             fluxplay_player=debug,fluxplay::ui=debug,fluxplay::net=debug,\
+             iced=info,iced_winit=info,iced_wgpu=warn,iced_runtime=info",
+        );
+    }
     let _ = tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| {
             fluxplay_core::DEFAULT_ENV_FILTER.into()
         }))
         .try_init();
+    fluxplay_player::log_native_verbosity_banner();
 }
 
 #[cfg(target_os = "android")]

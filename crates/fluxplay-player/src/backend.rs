@@ -1,4 +1,5 @@
-//! Native playback backends — **libmpv in-process** (preferred) and optional CLI mpv/ffplay.
+//! Native playback backends — **libmpv** / **libav* FFmpeg** in-process (embedded RGBA),
+//! plus optional CLI mpv/ffplay fallback.
 //! Inspired by IPTVnator embedded MPV and Kodi's FFmpeg pipeline.
 
 use std::io::Write;
@@ -31,7 +32,7 @@ impl BackendId {
     pub fn label(self) -> &'static str {
         match self {
             Self::Mpv => "libmpv (natif)",
-            Self::Ffmpeg => "FFmpeg / ffplay",
+            Self::Ffmpeg => "FFmpeg (natif)",
             Self::External => "Lecteur système",
             Self::ExoPlayer => "ExoPlayer (Android)",
             Self::AvPlayer => "AVPlayer (iOS)",
@@ -166,19 +167,31 @@ pub fn detect_backends() -> Vec<BackendInfo> {
         });
     }
 
-    let ffplay = which("ffplay").or_else(|| which("ffmpeg"));
-    out.push(BackendInfo {
-        id: BackendId::Ffmpeg,
-        available: ffplay.is_some(),
-        path: ffplay.clone(),
-        detail: if which("ffplay").is_some() {
-            "ffplay — FFmpeg fenêtre (optionnel)".into()
-        } else if which("ffmpeg").is_some() {
-            "ffmpeg présent (ffplay recommandé pour GUI)".into()
-        } else {
-            "ffplay optionnel (libmpv suffit)".into()
-        },
-    });
+    #[cfg(all(feature = "native-ffmpeg", fluxplay_has_ffmpeg))]
+    {
+        out.push(BackendInfo {
+            id: BackendId::Ffmpeg,
+            available: true,
+            path: Some("libav*".into()),
+            detail: "FFmpeg natif (libav*) — RGBA embarqué dans iced".into(),
+        });
+    }
+    #[cfg(not(all(feature = "native-ffmpeg", fluxplay_has_ffmpeg)))]
+    {
+        let ffplay = which("ffplay").or_else(|| which("ffmpeg"));
+        out.push(BackendInfo {
+            id: BackendId::Ffmpeg,
+            available: ffplay.is_some(),
+            path: ffplay.clone(),
+            detail: if which("ffplay").is_some() {
+                "ffplay CLI — fenêtre OS (pas d’embed; recompilez avec native-ffmpeg)".into()
+            } else if which("ffmpeg").is_some() {
+                "ffmpeg présent (installez ffmpeg-devel pour l’embed natif)".into()
+            } else {
+                "FFmpeg optionnel (libmpv suffit)".into()
+            },
+        });
+    }
 
     out.push(BackendInfo {
         id: BackendId::External,
@@ -418,11 +431,13 @@ fn pick_backend(pref: PlayerBackendPref) -> Result<BackendId> {
     result
 }
 
-/// Controls native playback (in-process libmpv, optional CLI child).
+/// Controls native playback (in-process libmpv / FFmpeg, optional CLI child).
 pub struct NativePlayer {
     backend: Option<BackendId>,
     #[cfg(all(feature = "native-mpv", fluxplay_has_libmpv))]
     libmpv: Option<crate::mpv_ffi::LibMpv>,
+    #[cfg(all(feature = "native-ffmpeg", fluxplay_has_ffmpeg))]
+    libffmpeg: Option<crate::ffmpeg_ffi::LibFfmpeg>,
     child: Option<Child>,
     ipc_path: Option<PathBuf>,
     opts: PlayOptions,
@@ -449,6 +464,8 @@ impl NativePlayer {
             backend: None,
             #[cfg(all(feature = "native-mpv", fluxplay_has_libmpv))]
             libmpv: None,
+            #[cfg(all(feature = "native-ffmpeg", fluxplay_has_ffmpeg))]
+            libffmpeg: None,
             child: None,
             ipc_path: None,
             opts,
@@ -479,32 +496,48 @@ impl NativePlayer {
         self.video_rect
     }
 
-    /// Pull an RGBA frame for the iced stage (embedded libmpv software render).
+    /// Pull an RGBA frame for the iced stage (embedded libmpv / FFmpeg software render).
+    /// Returns `None` when there is no new frame — keep the previous ImageHandle.
     pub fn pull_video_frame(&mut self, w: u32, h: u32) -> Option<(u32, u32, Vec<u8>)> {
+        let rw = (w.clamp(2, 3840) & !1).max(2);
+        let rh = (h.clamp(2, 2160) & !1).max(2);
         #[cfg(all(feature = "native-mpv", fluxplay_has_libmpv))]
-        {
-            let mpv = self.libmpv.as_mut()?;
-            let rw = w.clamp(2, 1920);
-            let rh = h.clamp(2, 1080);
+        if let Some(mpv) = self.libmpv.as_mut() {
             let pixels = mpv.render_sw_rgba(rw, rh)?;
             return Some((rw, rh, pixels));
         }
-        #[cfg(not(all(feature = "native-mpv", fluxplay_has_libmpv)))]
-        {
-            let _ = (w, h);
-            None
+        #[cfg(all(feature = "native-ffmpeg", fluxplay_has_ffmpeg))]
+        if let Some(ff) = self.libffmpeg.as_ref() {
+            let pixels = ff.pull_rgba(rw, rh)?;
+            return Some((rw, rh, pixels));
         }
+        let _ = (rw, rh);
+        None
+    }
+
+    /// True when embedded backend has a newer frame than the last successful pull.
+    pub fn frame_needs_redraw(&self) -> bool {
+        #[cfg(all(feature = "native-mpv", fluxplay_has_libmpv))]
+        if let Some(mpv) = &self.libmpv {
+            return mpv.frame_needs_redraw();
+        }
+        #[cfg(all(feature = "native-ffmpeg", fluxplay_has_ffmpeg))]
+        if let Some(ff) = &self.libffmpeg {
+            return ff.has_frame();
+        }
+        false
     }
 
     pub fn has_embedded_video(&self) -> bool {
         #[cfg(all(feature = "native-mpv", fluxplay_has_libmpv))]
-        {
-            return self.libmpv.is_some();
+        if self.libmpv.is_some() {
+            return true;
         }
-        #[cfg(not(all(feature = "native-mpv", fluxplay_has_libmpv)))]
-        {
-            false
+        #[cfg(all(feature = "native-ffmpeg", fluxplay_has_ffmpeg))]
+        if self.libffmpeg.is_some() {
+            return true;
         }
+        false
     }
 
     fn apply_video_geometry(&mut self) {
@@ -536,6 +569,12 @@ impl NativePlayer {
                 return true;
             }
         }
+        #[cfg(all(feature = "native-ffmpeg", fluxplay_has_ffmpeg))]
+        {
+            if let Some(ff) = &self.libffmpeg {
+                return ff.is_alive();
+            }
+        }
         match &mut self.child {
             Some(c) => matches!(c.try_wait(), Ok(None)),
             None => false,
@@ -554,7 +593,7 @@ impl NativePlayer {
         let attempt = |this: &mut Self, backend: BackendId, url: &str| -> Result<()> {
             match backend {
                 BackendId::Mpv => this.start_mpv(url),
-                BackendId::Ffmpeg => this.start_ffplay(url),
+                BackendId::Ffmpeg => this.start_ffmpeg(url),
                 BackendId::External => {
                     open::that(url).map_err(|e| PlayerError::Backend(e.to_string()))
                 }
@@ -617,6 +656,13 @@ impl NativePlayer {
                 mpv.shutdown();
             }
         }
+        #[cfg(all(feature = "native-ffmpeg", fluxplay_has_ffmpeg))]
+        {
+            if let Some(ff) = self.libffmpeg.take() {
+                debug!("NativePlayer::stop libffmpeg shutdown");
+                ff.shutdown();
+            }
+        }
         if let Some(path) = self.ipc_path.take() {
             debug!(ipc = %path.display(), "NativePlayer::stop ipc quit");
             let _ = mpv_cmd(&path, &["quit"]);
@@ -641,6 +687,11 @@ impl NativePlayer {
         if let Some(mpv) = &self.libmpv {
             return mpv.set_property("pause", if paused { "yes" } else { "no" });
         }
+        #[cfg(all(feature = "native-ffmpeg", fluxplay_has_ffmpeg))]
+        if let Some(ff) = &self.libffmpeg {
+            ff.pause(paused);
+            return Ok(());
+        }
         if let Some(path) = &self.ipc_path {
             mpv_cmd(path, &["set_property", "pause", if paused { "true" } else { "false" }])?;
             return Ok(());
@@ -659,6 +710,11 @@ impl NativePlayer {
         if let Some(mpv) = &self.libmpv {
             return mpv.set_property("volume", &format!("{v:.0}"));
         }
+        #[cfg(all(feature = "native-ffmpeg", fluxplay_has_ffmpeg))]
+        if let Some(ff) = &self.libffmpeg {
+            ff.set_volume(self.opts.volume);
+            return Ok(());
+        }
         if let Some(path) = &self.ipc_path {
             mpv_cmd(path, &["set_property", "volume", &format!("{v:.0}")])?;
             return Ok(());
@@ -675,6 +731,11 @@ impl NativePlayer {
         #[cfg(all(feature = "native-mpv", fluxplay_has_libmpv))]
         if let Some(mpv) = &self.libmpv {
             return mpv.set_property("mute", if muted { "yes" } else { "no" });
+        }
+        #[cfg(all(feature = "native-ffmpeg", fluxplay_has_ffmpeg))]
+        if let Some(ff) = &self.libffmpeg {
+            ff.set_volume(if muted { 0.0 } else { self.opts.volume });
+            return Ok(());
         }
         if let Some(path) = &self.ipc_path {
             mpv_cmd(path, &["set_property", "mute", if muted { "yes" } else { "no" }])?;
@@ -693,6 +754,12 @@ impl NativePlayer {
         #[cfg(all(feature = "native-mpv", fluxplay_has_libmpv))]
         if let Some(mpv) = &self.libmpv {
             return mpv.command(&["seek", &format!("{secs}"), "relative"]);
+        }
+        #[cfg(all(feature = "native-ffmpeg", fluxplay_has_ffmpeg))]
+        if let Some(ff) = &self.libffmpeg {
+            let target = (ff.position_secs() + secs).max(0.0);
+            ff.seek(target);
+            return Ok(());
         }
         if let Some(path) = &self.ipc_path {
             return mpv_cmd(path, &["seek", &format!("{secs}"), "relative"]);
@@ -718,6 +785,14 @@ impl NativePlayer {
         #[cfg(all(feature = "native-mpv", fluxplay_has_libmpv))]
         if let Some(mpv) = &self.libmpv {
             return mpv.command(&["seek", &format!("{pct}"), "absolute-percent"]);
+        }
+        #[cfg(all(feature = "native-ffmpeg", fluxplay_has_ffmpeg))]
+        if let Some(ff) = &self.libffmpeg {
+            let dur = ff.duration_secs();
+            if dur > 0.0 {
+                ff.seek(dur * pct / 100.0);
+            }
+            return Ok(());
         }
         if let Some(path) = &self.ipc_path {
             return mpv_cmd(
@@ -813,6 +888,13 @@ impl NativePlayer {
             let pos = mpv.get_property_f64("time-pos")?;
             let dur = mpv.get_property_f64("duration").unwrap_or(0.0);
             trace!(pos, dur, "playback_times libmpv");
+            return Some((pos, dur));
+        }
+        #[cfg(all(feature = "native-ffmpeg", fluxplay_has_ffmpeg))]
+        if let Some(ff) = &self.libffmpeg {
+            let pos = ff.position_secs();
+            let dur = ff.duration_secs();
+            trace!(pos, dur, "playback_times libffmpeg");
             return Some((pos, dur));
         }
         let path = self.ipc_path.as_ref()?;
@@ -917,6 +999,11 @@ impl NativePlayer {
     pub fn seek_absolute(&mut self, secs: f64) -> Result<()> {
         let secs = secs.max(0.0);
         debug!(secs, "NativePlayer::seek_absolute");
+        #[cfg(all(feature = "native-ffmpeg", fluxplay_has_ffmpeg))]
+        if let Some(ff) = &self.libffmpeg {
+            ff.seek(secs);
+            return Ok(());
+        }
         self.run_cmd(&["seek", &format!("{secs}"), "absolute"])
     }
 
@@ -1057,7 +1144,20 @@ impl NativePlayer {
         let mut mpv = crate::mpv_ffi::LibMpv::create()?;
         // Embedded path: vo=libmpv + software render → frames drawn into iced (no OS video window).
         mpv.set_option("config", "no")?;
-        mpv.set_option("terminal", "no")?;
+        // Quiet by default; FLUXPLAY_VERBOSE / FLUXPLAY_MPV_LOG → stderr + log-file.
+        if let Some(level) = crate::native_log::mpv_msg_level() {
+            let log_path = crate::native_log::mpv_verbose_log_path();
+            soft_set(&mpv, "terminal", "yes");
+            soft_set(&mpv, "msg-level", level);
+            soft_set(&mpv, "log-file", &log_path.to_string_lossy());
+            info!(
+                msg_level = level,
+                log = %log_path.display(),
+                "libmpv verbose logging enabled"
+            );
+        } else {
+            mpv.set_option("terminal", "no")?;
+        }
         mpv.set_option("idle", "yes")?;
         mpv.set_option("vo", "libmpv")?;
         mpv.set_option("force-window", "no")?;
@@ -1090,10 +1190,22 @@ impl NativePlayer {
         }
 
         if self.opts.hwdec {
-            soft_set(&mpv, "hwdec", "auto-safe");
+            // Homebrew libmpv often lacks NVDEC; auto-copy still helps on VAAPI builds.
+            soft_set(&mpv, "hwdec", "auto-copy");
+            soft_set(&mpv, "hwdec-codecs", "all");
         } else {
             soft_set(&mpv, "hwdec", "no");
         }
+        // Fast filters for CPU soft-render path (stage already matches window size).
+        soft_set(&mpv, "scale", "bilinear");
+        soft_set(&mpv, "cscale", "bilinear");
+        soft_set(&mpv, "dscale", "bilinear");
+        soft_set(&mpv, "correct-downscaling", "no");
+        soft_set(&mpv, "sigmoid-upscaling", "no");
+        soft_set(&mpv, "interpolation", "no");
+        soft_set(&mpv, "video-sync", "audio");
+        soft_set(&mpv, "framedrop", "vo");
+        soft_set(&mpv, "vd-lavc-threads", "0");
 
         if self.opts.low_latency && !mpeg_ts && !vod {
             soft_set(&mpv, "profile", "low-latency");
@@ -1123,8 +1235,16 @@ impl NativePlayer {
         mpv.initialize()?;
         mpv.init_sw_render()?;
         mpv.command(&["loadfile", url, "replace"])?;
+        // Give demuxer a beat then log active hwdec (helps verify NVDEC on RTX).
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let hw = mpv
+            .get_property_string("hwdec-current")
+            .unwrap_or_else(|| "none".into());
+        let vo = mpv
+            .get_property_string("current-vo")
+            .unwrap_or_else(|| "?".into());
         self.libmpv = Some(mpv);
-        info!(%endpoint, "libmpv embedded loadfile ok");
+        info!(%endpoint, %hw, %vo, "libmpv embedded loadfile ok");
         Ok(())
     }
 
@@ -1242,6 +1362,20 @@ impl NativePlayer {
 
         args.push(url.into());
 
+        if let Some(level) = crate::native_log::mpv_msg_level() {
+            args.push(format!("--msg-level={level}"));
+            // `-v` stacks; for debug/trace add a second bump.
+            if level.contains("debug") || level.contains("trace") {
+                args.push("-v".into());
+                args.push("-v".into());
+            } else {
+                args.push("-v".into());
+            }
+            let vlog = crate::native_log::mpv_verbose_log_path();
+            args.push(format!("--log-file={}", vlog.display()));
+            info!(msg_level = level, log = %vlog.display(), "mpv CLI verbose logging enabled");
+        }
+
         let log = std::env::temp_dir().join("fluxplay-mpv.log");
         let err_file = std::fs::File::create(&log).ok();
 
@@ -1260,75 +1394,169 @@ impl NativePlayer {
         Ok(())
     }
 
+    fn start_ffmpeg(&mut self, url: &str) -> Result<()> {
+        let endpoint = url_endpoint(url);
+        debug!(%endpoint, "start_ffmpeg");
+        #[cfg(all(feature = "native-ffmpeg", fluxplay_has_ffmpeg))]
+        {
+            match self.start_libffmpeg(url) {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    warn!(error = %e, "libffmpeg start failed — trying ffplay CLI fallback");
+                    #[cfg(not(feature = "cli-player"))]
+                    {
+                        return Err(e);
+                    }
+                }
+            }
+        }
+        #[cfg(feature = "cli-player")]
+        {
+            return self.start_ffplay(url);
+        }
+        #[cfg(not(feature = "cli-player"))]
+        {
+            Err(PlayerError::Backend(
+                "Aucun backend FFmpeg (activez native-ffmpeg ou cli-player)".into(),
+            ))
+        }
+    }
+
+    #[cfg(all(feature = "native-ffmpeg", fluxplay_has_ffmpeg))]
+    fn start_libffmpeg(&mut self, url: &str) -> Result<()> {
+        let _prof = Stopwatch::start("start_libffmpeg");
+        let endpoint = url_endpoint(url);
+        debug!(%endpoint, "start_libffmpeg embedded");
+        let ff = crate::ffmpeg_ffi::LibFfmpeg::open(
+            url,
+            self.opts.user_agent.as_deref(),
+            self.opts.referer.as_deref(),
+            self.opts.low_latency,
+        )?;
+        ff.set_volume(self.opts.volume);
+        if let Some(rect) = self.video_rect.filter(|r| r.is_usable()) {
+            ff.set_output_size(rect.w.max(2), rect.h.max(2));
+        }
+        self.libffmpeg = Some(ff);
+        info!(%endpoint, "libffmpeg embedded open ok");
+        Ok(())
+    }
+
+    #[cfg(feature = "cli-player")]
     fn start_ffplay(&mut self, url: &str) -> Result<()> {
         let _prof = Stopwatch::start("start_ffplay");
         let endpoint = url_endpoint(url);
-        // Prefer ffplay window; fall back to ffplay-less environments with mpv-less ffmpeg tip.
         let bin = which("ffplay").ok_or_else(|| {
-            PlayerError::Backend(
-                "ffplay required for FFmpeg GUI playback (package ffmpeg)".into(),
-            )
+            if which("ffmpeg").is_some() {
+                PlayerError::Backend(
+                    "ffmpeg trouvé mais pas ffplay — installez le paquet ffplay (souvent `ffmpeg`) pour la lecture GUI".into(),
+                )
+            } else {
+                PlayerError::Backend(
+                    "ffplay introuvable — installez ffmpeg/ffplay, ou choisissez libmpv".into(),
+                )
+            }
         })?;
-        debug!(%endpoint, %bin, "start_ffplay");
+        info!(%endpoint, %bin, "start_ffplay");
 
-        let mut cmd = Command::new(&bin);
-        cmd.arg("-hide_banner")
-            .arg("-loglevel")
-            .arg("warning")
-            .arg("-alwaysontop")
-            .arg("-window_title")
-            .arg(FFPLAY_WINDOW_TITLE)
-            .arg("-infbuf")
-            // IPTV reconnect — same idea as Smarters resilient players
-            .arg("-reconnect")
-            .arg("1")
-            .arg("-reconnect_streamed")
-            .arg("1")
-            .arg("-reconnect_delay_max")
-            .arg("5");
-
-        if let Some(ua) = &self.opts.user_agent {
-            cmd.arg("-user_agent").arg(ua);
-        } else {
-            cmd.arg("-user_agent").arg("IPTVSmartersPlayer");
-        }
-        if let Some(ref_r) = &self.opts.referer {
-            cmd.arg("-headers").arg(format!("Referer: {ref_r}\r\n"));
-        }
-        if self.opts.hwdec {
-            // Best-effort; ignored if unsupported.
-            cmd.arg("-hwaccel").arg("auto");
-        }
-        let mpeg_ts = looks_like_mpeg_ts(url);
-        let is_hls = url.to_ascii_lowercase().contains(".m3u8");
-        // Always give lavf enough probe room for HEVC IPTV / VOD containers.
-        cmd.arg("-probesize").arg("5M");
-        cmd.arg("-analyzeduration").arg("3000000");
-        if self.opts.low_latency && !mpeg_ts && !is_hls {
-            cmd.arg("-fflags").arg("nobuffer");
-            cmd.arg("-flags").arg("low_delay");
-            cmd.arg("-framedrop");
-        } else {
-            cmd.arg("-fflags").arg("+genpts+discardcorrupt");
-            cmd.arg("-sync").arg("ext");
-        }
-
-        cmd.arg("-i").arg(url);
-        cmd.arg("-x").arg("1280").arg("-y").arg("720");
-
-        // Keep a small log for diagnosis (tail when spawn fails).
         let log = std::env::temp_dir().join("fluxplay-ffplay.log");
-        let err_file = std::fs::File::create(&log).ok();
+        let ff_loglevel = match crate::native_log::ffmpeg_av_log_level() {
+            Some(48..=i32::MAX) => "debug", // AV_LOG_DEBUG+
+            Some(40..) => "verbose",
+            Some(_) => "info",
+            None => "info",
+        };
+        let try_spawn = |extra_compat: bool| -> Result<std::process::Child> {
+            let mut cmd = Command::new(&bin);
+            cmd.arg("-hide_banner")
+                .arg("-loglevel")
+                .arg(ff_loglevel)
+                .arg("-window_title")
+                .arg(FFPLAY_WINDOW_TITLE)
+                .arg("-autoexit")
+                .arg("-x")
+                .arg("1280")
+                .arg("-y")
+                .arg("720");
 
-        let child = cmd
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(err_file.map(Stdio::from).unwrap_or_else(Stdio::null))
-            .spawn()
-            .map_err(|e| PlayerError::Backend(format!("ffplay spawn: {e}")))?;
+            if let Some(ua) = &self.opts.user_agent {
+                cmd.arg("-user_agent").arg(ua);
+            } else {
+                cmd.arg("-user_agent").arg("IPTVSmartersPlayer");
+            }
+            if let Some(ref_r) = &self.opts.referer {
+                cmd.arg("-headers").arg(format!("Referer: {ref_r}\r\n"));
+            }
+
+            // Probe room for HEVC IPTV / VOD (before -i).
+            cmd.arg("-probesize").arg("8M");
+            cmd.arg("-analyzeduration").arg("5000000");
+            cmd.arg("-fflags").arg("+genpts+discardcorrupt");
+
+            if !extra_compat {
+                // Optional resilience — some older ffplay builds reject these.
+                cmd.arg("-infbuf");
+                if self.opts.hwdec {
+                    cmd.arg("-hwaccel").arg("auto");
+                }
+                let mpeg_ts = looks_like_mpeg_ts(url);
+                let is_hls = url.to_ascii_lowercase().contains(".m3u8");
+                if self.opts.low_latency && !mpeg_ts && !is_hls {
+                    cmd.arg("-fflags").arg("nobuffer");
+                    cmd.arg("-flags").arg("low_delay");
+                    cmd.arg("-framedrop");
+                } else {
+                    cmd.arg("-sync").arg("ext");
+                }
+                // HTTP reconnect (input options; ignored if unsupported).
+                cmd.arg("-reconnect").arg("1");
+                cmd.arg("-reconnect_streamed").arg("1");
+                cmd.arg("-reconnect_delay_max").arg("5");
+            }
+
+            cmd.arg("-i").arg(url);
+
+            let err_file = std::fs::File::create(&log).ok();
+            debug!(%endpoint, compat = extra_compat, log = %log.display(), "ffplay spawn");
+            cmd.stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(err_file.map(Stdio::from).unwrap_or_else(Stdio::null))
+                .spawn()
+                .map_err(|e| PlayerError::Backend(format!("ffplay spawn: {e}")))
+        };
+
+        let mut child = try_spawn(false)?;
+        // Detect instant death from unsupported flags → retry minimal args.
+        std::thread::sleep(std::time::Duration::from_millis(350));
+        if let Ok(Some(status)) = child.try_wait() {
+            warn!(%status, %endpoint, "ffplay exited with full args — retrying compatible mode");
+            let hint = std::fs::read_to_string(&log).unwrap_or_default();
+            if !hint.trim().is_empty() {
+                warn!(ffplay_log = %hint.chars().take(800).collect::<String>(), "ffplay stderr");
+            }
+            child = try_spawn(true)?;
+            std::thread::sleep(std::time::Duration::from_millis(400));
+            if let Ok(Some(status)) = child.try_wait() {
+                let hint = std::fs::read_to_string(&log).unwrap_or_default();
+                error!(%status, %endpoint, "ffplay failed in compatible mode");
+                return Err(PlayerError::Backend(format!(
+                    "ffplay fermé aussitôt (code {status}). {}",
+                    if hint.trim().is_empty() {
+                        "Voir /tmp/fluxplay-ffplay.log".into()
+                    } else {
+                        hint.chars().take(400).collect::<String>()
+                    }
+                )));
+            }
+        }
 
         self.child = Some(child);
-        info!(%endpoint, %bin, "ffplay spawned");
+        info!(
+            %endpoint,
+            %bin,
+            log = %log.display(),
+            "ffplay spawned (external window — not embedded in iced)"
+        );
         Ok(())
     }
 }

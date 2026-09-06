@@ -43,20 +43,24 @@ impl UiTheme {
         )
     }
 
-    pub fn shell(self) -> Color {
-        if self.day {
-            // M3 surface dim — canvas behind elevated panes
-            Color::from_rgb8(0xE4, 0xEA, 0xF2)
-        } else {
-            Color::from_rgb8(0x05, 0x08, 0x0E)
-        }
+    // --- Primary (accent) ---
+    pub fn accent(self) -> Color {
+        self.primary()
     }
 
-    pub fn accent(self) -> Color {
+    pub fn primary(self) -> Color {
         if self.day {
             self.accent.primary_day()
         } else {
             self.accent.primary_night()
+        }
+    }
+
+    pub fn on_primary(self) -> Color {
+        if self.day {
+            Color::from_rgb8(0xFF, 0xFF, 0xFF)
+        } else {
+            self.accent.on_primary_night()
         }
     }
 
@@ -76,6 +80,122 @@ impl UiTheme {
         }
     }
 
+    // --- Secondary (selection / nav / chips) ---
+    pub fn secondary(self) -> Color {
+        let p = self.primary();
+        if self.day {
+            Color::from_rgb(
+                (p.r * 0.35 + 0.25).min(1.0),
+                (p.g * 0.35 + 0.28).min(1.0),
+                (p.b * 0.35 + 0.32).min(1.0),
+            )
+        } else {
+            Color::from_rgb(
+                (p.r * 0.55 + 0.35).min(1.0),
+                (p.g * 0.55 + 0.38).min(1.0),
+                (p.b * 0.55 + 0.42).min(1.0),
+            )
+        }
+    }
+
+    pub fn on_secondary(self) -> Color {
+        self.on_primary()
+    }
+
+    pub fn secondary_container(self) -> Color {
+        let p = self.primary();
+        if self.day {
+            Color::from_rgba(p.r, p.g, p.b, 0.18)
+        } else {
+            // Opaque enough for onSecondaryContainer contrast on dark shell.
+            Color::from_rgb(
+                (p.r * 0.35 + 0.08).min(1.0),
+                (p.g * 0.28 + 0.07).min(1.0),
+                (p.b * 0.22 + 0.06).min(1.0),
+            )
+        }
+    }
+
+    pub fn on_secondary_container(self) -> Color {
+        if self.day {
+            self.ink()
+        } else {
+            Color::from_rgba(self.ink().r, self.ink().g, self.ink().b, 0.92)
+        }
+    }
+
+    // --- Tertiary (favorites / soft badges) ---
+    pub fn tertiary(self) -> Color {
+        self.favorite()
+    }
+
+    pub fn on_tertiary(self) -> Color {
+        if self.day {
+            Color::from_rgb8(0x3A, 0x2A, 0x00)
+        } else {
+            Color::from_rgb8(0x2A, 0x1E, 0x00)
+        }
+    }
+
+    pub fn tertiary_container(self) -> Color {
+        let t = self.favorite();
+        Color::from_rgba(t.r, t.g, t.b, if self.day { 0.22 } else { 0.28 })
+    }
+
+    pub fn on_tertiary_container(self) -> Color {
+        self.on_tertiary()
+    }
+
+    // --- Error / LIVE ---
+    pub fn error(self) -> Color {
+        self.live()
+    }
+
+    pub fn on_error(self) -> Color {
+        Color::from_rgb8(0xFF, 0xFF, 0xFF)
+    }
+
+    pub fn error_container(self) -> Color {
+        let e = self.live();
+        Color::from_rgba(e.r, e.g, e.b, if self.day { 0.18 } else { 0.28 })
+    }
+
+    pub fn on_error_container(self) -> Color {
+        self.live()
+    }
+
+    /// LIVE badge / recording indicator (`error` role).
+    pub fn live(self) -> Color {
+        if self.day {
+            Color::from_rgb8(0xBA, 0x1A, 0x1A)
+        } else {
+            Color::from_rgb8(0xFF, 0xB4, 0xAB)
+        }
+    }
+
+    /// Favorite star (`tertiary`).
+    pub fn favorite(self) -> Color {
+        if self.day {
+            Color::from_rgb8(0xC9, 0x8A, 0x00)
+        } else {
+            Color::from_rgb8(0xF5, 0xC5, 0x42)
+        }
+    }
+
+    // --- Surfaces ---
+    /// M3 `surfaceDim` — shell canvas behind panes / nav.
+    pub fn shell(self) -> Color {
+        self.surface_dim()
+    }
+
+    pub fn surface_dim(self) -> Color {
+        if self.day {
+            Color::from_rgb8(0xE4, 0xEA, 0xF2)
+        } else {
+            Color::from_rgb8(0x05, 0x08, 0x0E)
+        }
+    }
+
     pub fn surface(self) -> Color {
         if self.day {
             Color::from_rgb8(0xFF, 0xFF, 0xFF)
@@ -84,36 +204,20 @@ impl UiTheme {
         }
     }
 
-    pub fn surface_muted(self) -> Color {
+    pub fn surface_bright(self) -> Color {
         if self.day {
-            Color::from_rgb8(0xE2, 0xE9, 0xF1)
-        } else {
-            Color::from_rgb8(0x18, 0x1F, 0x2C)
-        }
-    }
-
-    pub fn surface_elevated(self) -> Color {
-        if self.day {
-            Color::from_rgb8(0xF7, 0xF9, 0xFC)
+            Color::from_rgb8(0xFF, 0xFF, 0xFF)
         } else {
             Color::from_rgb8(0x1C, 0x25, 0x34)
         }
     }
 
-    pub fn outline(self) -> Color {
-        if self.day {
-            Color::from_rgba8(0x0F, 0x17, 0x22, 0.10)
-        } else {
-            Color::from_rgba8(0xE8, 0xEF, 0xF6, 0.10)
-        }
+    pub fn on_surface(self) -> Color {
+        self.ink()
     }
 
-    pub fn on_primary(self) -> Color {
-        if self.day {
-            Color::from_rgb8(0xFF, 0xFF, 0xFF)
-        } else {
-            self.accent.on_primary_night()
-        }
+    pub fn on_surface_variant(self) -> Color {
+        self.ink_muted()
     }
 
     pub fn ink(self) -> Color {
@@ -132,71 +236,14 @@ impl UiTheme {
         }
     }
 
-    /// Player / bottom chrome surface (slightly lifted from shell).
-    pub fn chrome_surface(self) -> Color {
+    pub fn surface_container_lowest(self) -> Color {
         if self.day {
-            Color::from_rgb8(0xF2, 0xF6, 0xFA)
+            Color::from_rgb8(0xFF, 0xFF, 0xFF)
         } else {
-            Color::from_rgb8(0x12, 0x18, 0x22)
+            Color::from_rgb8(0x08, 0x0B, 0x12)
         }
     }
 
-    /// Selected row / category fill (M3 primary-container feel).
-    pub fn selection_fill(self) -> Color {
-        if self.day {
-            Color::from_rgba(
-                self.primary_container().r,
-                self.primary_container().g,
-                self.primary_container().b,
-                0.55,
-            )
-        } else {
-            Color::from_rgba(
-                self.primary_container().r,
-                self.primary_container().g,
-                self.primary_container().b,
-                0.45,
-            )
-        }
-    }
-
-    /// LIVE badge / recording indicator.
-    pub fn live(self) -> Color {
-        if self.day {
-            Color::from_rgb8(0xC4, 0x14, 0x3A)
-        } else {
-            Color::from_rgb8(0xFF, 0x5A, 0x7A)
-        }
-    }
-
-    /// Favorite star.
-    pub fn favorite(self) -> Color {
-        if self.day {
-            Color::from_rgb8(0xC9, 0x8A, 0x00)
-        } else {
-            Color::from_rgb8(0xF5, 0xC5, 0x42)
-        }
-    }
-
-    /// Hairline divider between chrome regions.
-    pub fn divider(self) -> Color {
-        if self.day {
-            Color::from_rgba8(0x0F, 0x17, 0x22, 0.08)
-        } else {
-            Color::from_rgba8(0xE8, 0xEF, 0xF6, 0.08)
-        }
-    }
-
-    /// M3 `outlineVariant` — softer borders for chips / fields.
-    pub fn outline_variant(self) -> Color {
-        if self.day {
-            Color::from_rgba8(0x0F, 0x17, 0x22, 0.14)
-        } else {
-            Color::from_rgba8(0xE8, 0xEF, 0xF6, 0.16)
-        }
-    }
-
-    /// M3 `surfaceContainerLow` — nested lists / mosaic canvas.
     pub fn surface_container_low(self) -> Color {
         if self.day {
             Color::from_rgb8(0xF0, 0xF4, 0xF8)
@@ -205,7 +252,15 @@ impl UiTheme {
         }
     }
 
-    /// M3 `surfaceContainerHigh` — selected / hovered containment.
+    /// Default nav / chrome container (`surfaceContainer`).
+    pub fn surface_container(self) -> Color {
+        if self.day {
+            Color::from_rgb8(0xEA, 0xF0, 0xF6)
+        } else {
+            Color::from_rgb8(0x14, 0x1A, 0x24)
+        }
+    }
+
     pub fn surface_container_high(self) -> Color {
         if self.day {
             Color::from_rgb8(0xE6, 0xEC, 0xF3)
@@ -214,26 +269,81 @@ impl UiTheme {
         }
     }
 
-    /// Secondary tonal fill for inactive chips (Expressive FilterChip).
-    pub fn secondary_container(self) -> Color {
+    pub fn surface_container_highest(self) -> Color {
         if self.day {
-            Color::from_rgba(
-                self.accent().r,
-                self.accent().g,
-                self.accent().b,
-                0.12,
-            )
+            Color::from_rgb8(0xDE, 0xE5, 0xEE)
         } else {
-            Color::from_rgba(
-                self.accent().r,
-                self.accent().g,
-                self.accent().b,
-                0.18,
-            )
+            Color::from_rgb8(0x22, 0x2B, 0x3A)
         }
     }
 
-    /// Inverse / on-accent for filled chips & FAB labels.
+    /// Alias — nested / muted surface.
+    pub fn surface_muted(self) -> Color {
+        self.surface_container_low()
+    }
+
+    pub fn surface_elevated(self) -> Color {
+        self.surface_container_high()
+    }
+
+    /// Nav / top bar chrome — always `surfaceContainer` (stable across breakpoints).
+    pub fn chrome_surface(self) -> Color {
+        self.surface_container()
+    }
+
+    /// Selected row fill (`primaryContainer` soft).
+    pub fn selection_fill(self) -> Color {
+        let c = self.primary_container();
+        Color::from_rgba(c.r, c.g, c.b, if self.day { 0.55 } else { 0.45 })
+    }
+
+    // --- Outline ---
+    pub fn outline(self) -> Color {
+        if self.day {
+            Color::from_rgba8(0x0F, 0x17, 0x22, 0.38)
+        } else {
+            Color::from_rgba8(0xE8, 0xEF, 0xF6, 0.38)
+        }
+    }
+
+    pub fn outline_variant(self) -> Color {
+        if self.day {
+            Color::from_rgba8(0x0F, 0x17, 0x22, 0.14)
+        } else {
+            Color::from_rgba8(0xE8, 0xEF, 0xF6, 0.16)
+        }
+    }
+
+    pub fn divider(self) -> Color {
+        self.outline_variant()
+    }
+
+    // --- Inverse (snackbars) ---
+    pub fn inverse_surface(self) -> Color {
+        if self.day {
+            Color::from_rgb8(0x2F, 0x30, 0x33)
+        } else {
+            Color::from_rgb8(0xE3, 0xE2, 0xE6)
+        }
+    }
+
+    pub fn inverse_on_surface(self) -> Color {
+        if self.day {
+            Color::from_rgb8(0xF0, 0xF0, 0xF4)
+        } else {
+            Color::from_rgb8(0x1B, 0x1B, 0x1F)
+        }
+    }
+
+    pub fn inverse_primary(self) -> Color {
+        self.primary_container()
+    }
+
+    /// Modal / sheet scrim @ 32%.
+    pub fn scrim(self) -> Color {
+        Color::from_rgba(0.0, 0.0, 0.0, 0.32)
+    }
+
     pub fn on_accent(self) -> Color {
         self.on_primary()
     }
@@ -339,61 +449,84 @@ fn accent_tokens(preset: AccentPreset) -> AccentTokens {
 }
 
 
-// Prefer `UiTheme` — free helpers kept only for stage black / radii / spacing.
+// Prefer `UiTheme` — free helpers kept for stage black / radii / spacing / type / elev.
 
 pub fn stage_black() -> Color {
     Color::from_rgb8(0x00, 0x00, 0x00)
 }
 
-/// Spacing scale (logical px) — prefer these over magic numbers.
-pub const SPACE_XXS: f32 = 2.0;
-pub const SPACE_XS: f32 = 4.0;
-pub const SPACE_SM: f32 = 8.0;
-pub const SPACE_MD: f32 = 12.0;
-pub const SPACE_LG: f32 = 16.0;
-pub const SPACE_XL: f32 = 24.0;
-pub const SPACE_XXL: f32 = 32.0;
+/// M3 spacing scale (space100 = 8dp baseline).
+pub const SPACE_XXS: f32 = 2.0; // space25
+pub const SPACE_XS: f32 = 4.0; // space50
+pub const SPACE_SM: f32 = 8.0; // space100
+pub const SPACE_MD: f32 = 12.0; // space150
+pub const SPACE_LG: f32 = 16.0; // space200
+pub const SPACE_XL: f32 = 24.0; // space300
+pub const SPACE_XXL: f32 = 32.0; // space400
+pub const SPACE_XXXL: f32 = 48.0; // space600
 
-// M3 Expressive shape scale — mix round + sharp for tension (not uniform radii).
-pub const RADIUS_XS: f32 = 8.0;
-pub const RADIUS_SM: f32 = 12.0;
-pub const RADIUS_MD: f32 = 16.0;
-pub const RADIUS_LG: f32 = 20.0;
-pub const RADIUS_XL: f32 = 28.0; // largeIncreased
-pub const RADIUS_XXL: f32 = 36.0; // extraLargeIncreased
+/// M3 shape corner-radius scale (10 steps).
+pub const RADIUS_NONE: f32 = 0.0;
+pub const RADIUS_EXTRA_SMALL: f32 = 4.0;
+pub const RADIUS_SMALL: f32 = 8.0;
+pub const RADIUS_MEDIUM: f32 = 12.0;
+pub const RADIUS_LARGE: f32 = 16.0;
+pub const RADIUS_LARGE_INCREASED: f32 = 20.0;
+pub const RADIUS_EXTRA_LARGE: f32 = 28.0;
+pub const RADIUS_EXTRA_LARGE_INCREASED: f32 = 32.0;
+pub const RADIUS_EXTRA_EXTRA_LARGE: f32 = 48.0;
 pub const RADIUS_FULL: f32 = 999.0;
+
+// Legacy aliases used across browser / player / app.
+pub const RADIUS_XS: f32 = RADIUS_SMALL;
+pub const RADIUS_SM: f32 = RADIUS_MEDIUM;
+pub const RADIUS_MD: f32 = RADIUS_LARGE;
+pub const RADIUS_LG: f32 = RADIUS_LARGE_INCREASED;
+pub const RADIUS_XL: f32 = RADIUS_EXTRA_LARGE;
+pub const RADIUS_XXL: f32 = RADIUS_EXTRA_LARGE_INCREASED;
+pub const RADIUS_XXXL: f32 = RADIUS_EXTRA_EXTRA_LARGE;
 
 /// Poster tile: softer top, tighter bottom (Expressive image crop).
 pub fn radius_poster() -> iced::border::Radius {
     iced::border::Radius {
-        top_left: 20.0,
-        top_right: 20.0,
-        bottom_right: 12.0,
-        bottom_left: 12.0,
+        top_left: RADIUS_LARGE_INCREASED,
+        top_right: RADIUS_LARGE_INCREASED,
+        bottom_right: RADIUS_MEDIUM,
+        bottom_left: RADIUS_MEDIUM,
     }
 }
 
-/// Docked / floating toolbar — only top corners soft.
+/// Floating toolbar — all corners XXL (Expressive floating).
+pub fn radius_floating_toolbar() -> iced::border::Radius {
+    iced::border::Radius {
+        top_left: RADIUS_EXTRA_EXTRA_LARGE,
+        top_right: RADIUS_EXTRA_EXTRA_LARGE,
+        bottom_right: RADIUS_EXTRA_EXTRA_LARGE,
+        bottom_left: RADIUS_EXTRA_EXTRA_LARGE,
+    }
+}
+
+/// Docked / floating toolbar — only top corners soft (sheets / docked).
 pub fn radius_dock() -> iced::border::Radius {
     iced::border::Radius {
-        top_left: RADIUS_XL,
-        top_right: RADIUS_XL,
+        top_left: RADIUS_EXTRA_LARGE,
+        top_right: RADIUS_EXTRA_LARGE,
         bottom_right: 0.0,
         bottom_left: 0.0,
     }
 }
 
-/// FAB / primary play — near-circle squircle.
+/// Medium FAB — near-circle (Expressive medium FAB ~56–80dp).
 pub fn radius_fab() -> iced::border::Radius {
     iced::border::Radius {
-        top_left: 22.0,
-        top_right: 22.0,
-        bottom_right: 22.0,
-        bottom_left: 22.0,
+        top_left: RADIUS_FULL,
+        top_right: RADIUS_FULL,
+        bottom_right: RADIUS_FULL,
+        bottom_left: RADIUS_FULL,
     }
 }
 
-/// NavigationRail selected indicator capsule.
+/// NavigationRail / filter selected indicator capsule.
 pub fn radius_nav_pill() -> iced::border::Radius {
     iced::border::Radius {
         top_left: RADIUS_FULL,
@@ -403,27 +536,99 @@ pub fn radius_nav_pill() -> iced::border::Radius {
     }
 }
 
-pub const PLAYER_PAD: f32 = 16.0;
+/// List selection morph: unselected = soft outer, selected = 16 all.
+pub fn radius_list_item(selected: bool) -> iced::border::Radius {
+    if selected {
+        RADIUS_LARGE.into()
+    } else {
+        iced::border::Radius {
+            top_left: RADIUS_EXTRA_SMALL,
+            top_right: RADIUS_LARGE,
+            bottom_right: RADIUS_LARGE,
+            bottom_left: RADIUS_EXTRA_SMALL,
+        }
+    }
+}
+
+// --- Typography (baseline sizes; emphasized = weight bump in callers) ---
+pub const TYPE_DISPLAY_L: f32 = 57.0;
+pub const TYPE_DISPLAY_M: f32 = 45.0;
+pub const TYPE_DISPLAY_S: f32 = 36.0;
+pub const TYPE_HEADLINE_L: f32 = 32.0;
+pub const TYPE_HEADLINE_M: f32 = 28.0;
+pub const TYPE_HEADLINE_S: f32 = 24.0;
+pub const TYPE_TITLE_L: f32 = 22.0;
+pub const TYPE_TITLE_M: f32 = 16.0;
+pub const TYPE_TITLE_S: f32 = 14.0;
+pub const TYPE_BODY_L: f32 = 16.0;
+pub const TYPE_BODY_M: f32 = 14.0;
+pub const TYPE_BODY_S: f32 = 12.0;
+pub const TYPE_LABEL_L: f32 = 14.0;
+pub const TYPE_LABEL_M: f32 = 12.0;
+pub const TYPE_LABEL_S: f32 = 11.0;
+
+/// Component measurement tokens (M3 Expressive).
+pub const TOOLBAR_H: f32 = 48.0;
+pub const TOOLBAR_OUTER_PAD: f32 = 12.0;
+pub const TOOLBAR_ITEM_GAP: f32 = 8.0;
+/// Seek track thickness (not hit target).
+pub const SLIDER_S_TRACK: f32 = 6.0;
+pub const SLIDER_S_HEIGHT: f32 = 28.0;
+pub const SLIDER_HANDLE_W: u16 = 4;
+pub const FAB_MEDIUM: f32 = 48.0;
+pub const SEARCH_BAR_H: f32 = 56.0;
+pub const LOADING_SIZE: f32 = 48.0;
+pub const TOUCH_TARGET: f32 = 48.0;
+pub const CARD_RADIUS: f32 = RADIUS_MEDIUM;
+pub const CARD_PAD: f32 = SPACE_LG;
+pub const CARD_GAP: f32 = SPACE_SM;
+
+/// Elevation levels 0–5 → soft desktop shadow (Android: use `Shadow::default()`).
+pub fn elevation_shadow(level: u8, day: bool) -> iced::Shadow {
+    #[cfg(target_os = "android")]
+    {
+        let _ = (level, day);
+        return iced::Shadow::default();
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let (blur, y, a) = match level {
+            0 => return iced::Shadow::default(),
+            1 => (4.0, 1.0, if day { 0.08 } else { 0.35 }),
+            2 => (8.0, 2.0, if day { 0.12 } else { 0.40 }),
+            3 => (12.0, 4.0, if day { 0.16 } else { 0.45 }),
+            4 => (16.0, 6.0, if day { 0.18 } else { 0.50 }),
+            _ => (20.0, 8.0, if day { 0.20 } else { 0.55 }),
+        };
+        iced::Shadow {
+            color: Color::from_rgba(0.0, 0.0, 0.0, a),
+            offset: iced::Vector::new(0.0, y),
+            blur_radius: blur,
+        }
+    }
+}
+
+pub const PLAYER_PAD: f32 = SPACE_LG;
 
 /// Minimum mosaic tile width (logical px) before dropping a column.
 pub const MOSAIC_TILE_MIN: f32 = 120.0;
 pub const MOSAIC_GAP: f32 = 14.0;
 
-/// Screen class from window width — drives chrome density phone → TV.
+/// Screen class from window width — M3 window size classes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Breakpoint {
-    Phone,   // < 600
-    Tablet,  // 600–899
-    Laptop,  // 900–1199
-    Desktop, // 1200–1599
-    Tv,      // ≥ 1600
+    Phone,   // compact < 600
+    Tablet,  // medium 600–839
+    Laptop,  // expanded 840–1199
+    Desktop, // large 1200–1599
+    Tv,      // extra-large ≥ 1600
 }
 
 impl Breakpoint {
     pub fn from_width(w: f32) -> Self {
         if w < 600.0 {
             Self::Phone
-        } else if w < 900.0 {
+        } else if w < 840.0 {
             Self::Tablet
         } else if w < 1200.0 {
             Self::Laptop
@@ -486,14 +691,15 @@ impl LayoutMetrics {
         let pad = if short { 6.0_f32 } else { 8.0_f32 };
         #[cfg(not(target_os = "android"))]
         let pad = match bp {
-            Breakpoint::Phone => 8.0,
-            Breakpoint::Tablet => 10.0,
-            _ => 12.0,
+            Breakpoint::Phone => SPACE_SM,
+            Breakpoint::Tablet => SPACE_MD,
+            Breakpoint::Laptop => SPACE_LG,
+            Breakpoint::Desktop | Breakpoint::Tv => SPACE_XL,
         };
         let gap = match bp {
-            Breakpoint::Phone => if short { 4.0 } else { 6.0 },
-            Breakpoint::Tablet => 8.0,
-            _ => 10.0,
+            Breakpoint::Phone => if short { SPACE_XS } else { SPACE_SM },
+            Breakpoint::Tablet => SPACE_SM,
+            _ => SPACE_MD,
         };
 
         // Compact / phone always uses top tabs + category chips (never side rail).
@@ -537,16 +743,17 @@ impl LayoutMetrics {
 
         let (title_size, body_size, rail_size, thumb, player_chrome_h) = match bp {
             Breakpoint::Phone => (
-                if short { 16.0 } else { 18.0 },
-                if short { 12.0 } else { 13.0 },
-                if short { 12.0 } else { 14.0 },
+                if short { TYPE_TITLE_M } else { TYPE_TITLE_L },
+                if short { TYPE_BODY_S } else { TYPE_BODY_M },
+                if short { TYPE_LABEL_M } else { TYPE_LABEL_L },
                 if short { 36.0 } else { 40.0 },
-                if short { 72.0 } else { 100.0 },
+                // floating toolbar ~48 + seek ~28 + pads
+                if short { 96.0 } else { 108.0 },
             ),
-            Breakpoint::Tablet => (20.0, 13.0, 14.0, 44.0, 104.0),
-            Breakpoint::Laptop => (22.0, 14.0, 15.0, 48.0, 108.0),
-            Breakpoint::Desktop => (22.0, 14.0, 15.0, 52.0, 108.0),
-            Breakpoint::Tv => (26.0, 16.0, 18.0, 64.0, 128.0),
+            Breakpoint::Tablet => (TYPE_TITLE_L, TYPE_BODY_M, TYPE_LABEL_L, 44.0, 112.0),
+            Breakpoint::Laptop => (TYPE_HEADLINE_S, TYPE_BODY_M, TYPE_TITLE_S, 48.0, 116.0),
+            Breakpoint::Desktop => (TYPE_HEADLINE_S, TYPE_BODY_M, TYPE_TITLE_S, 52.0, 116.0),
+            Breakpoint::Tv => (TYPE_HEADLINE_M, TYPE_BODY_L, TYPE_TITLE_M, 64.0, 128.0),
         };
 
         Self {

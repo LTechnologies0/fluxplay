@@ -6,14 +6,18 @@ use iced::widget::{
 };
 use iced::widget::image::Handle;
 use iced::{
-    Alignment, Background, Border, Color, Element, Fill, Length, Padding, Shadow, Theme,
+    Alignment, Background, Border, Color, Element, Fill, Length, Padding, Theme,
 };
 use fluxplay_player::{PlaybackState, StreamSession};
 
 use crate::theme::{
-    radius_fab, stage_black, UiTheme, RADIUS_FULL, RADIUS_LG, SPACE_SM,
+    elevation_shadow, radius_fab, radius_floating_toolbar, stage_black, UiTheme, FAB_MEDIUM,
+    LOADING_SIZE, RADIUS_EXTRA_LARGE, RADIUS_FULL, RADIUS_LG, SLIDER_HANDLE_W, SLIDER_S_HEIGHT,
+    SLIDER_S_TRACK, SPACE_MD, SPACE_SM, SPACE_XS, SPACE_XXS, TOOLBAR_H, TOOLBAR_OUTER_PAD,
+    TYPE_LABEL_L, TYPE_LABEL_M, TYPE_LABEL_S, TYPE_TITLE_M,
 };
 use crate::app::Message;
+use crate::icons::{self, Icon};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PlayerPanel {
@@ -41,13 +45,42 @@ pub struct PlayerChrome<'a> {
     /// When false, only the video stage is shown (pointer idle).
     pub chrome_visible: bool,
     pub fullscreen: bool,
+    /// libmpv / libav* software-render embeds frames in iced; CLI fallback uses an OS window.
+    pub embedded_video: bool,
+    pub backend_label: &'a str,
 }
 
 pub fn player_window(p: PlayerChrome<'_>) -> Element<'_, Message> {
     let stage = stage_panel(&p);
+    let live = p.session.is_live();
 
-    // Full-bleed video; chrome overlays the bottom (mpvEx / Material3 player pattern).
+    // Full-bleed video; ALL chrome is overlay (never reflows the image stage → no flicker).
     let overlay: Element<'_, Message> = if p.chrome_visible || p.panel != PlayerPanel::None {
+        let badge = if live {
+            chip_live(p.ui)
+        } else {
+            soft_chip(p.ui, "VOD")
+        };
+        let title = text(truncate(p.title, 64))
+            .size(TYPE_TITLE_M)
+            .color(Color::from_rgba8(0xFF, 0xFF, 0xFF, 0.95));
+        let fs = if p.fullscreen {
+            soft_chip(p.ui, "Échap pour quitter")
+        } else {
+            Space::new().width(0).into()
+        };
+        let top = container(
+            row![badge, title, Space::new().width(Fill), fs]
+                .spacing(SPACE_MD)
+                .padding(Padding::from([12, 16]))
+                .align_y(Alignment::Center),
+        )
+        .width(Fill)
+        .style(move |_t: &Theme| container::Style {
+            background: Some(Background::Color(Color::from_rgba(0.0, 0.0, 0.0, 0.45))),
+            ..Default::default()
+        });
+
         let sheet: Element<'_, Message> = match p.panel {
             PlayerPanel::None => Space::new().height(0).into(),
             PlayerPanel::More => more_sheet(&p),
@@ -56,15 +89,16 @@ pub fn player_window(p: PlayerChrome<'_>) -> Element<'_, Message> {
         };
         let dock = control_dock(&p);
         container(
-            column![sheet, dock]
+            column![top, Space::new().height(Fill), sheet, dock]
                 .spacing(0)
-                .width(Fill),
+                .width(Fill)
+                .height(Fill),
         )
         .width(Fill)
         .height(Fill)
-        .align_y(Alignment::End)
         .into()
     } else {
+        // Transparent hit target to wake chrome — does not resize the stage.
         mouse_area(Space::new().width(Fill).height(Fill))
             .on_press(Message::PlayerPointerActivity)
             .into()
@@ -75,9 +109,8 @@ pub fn player_window(p: PlayerChrome<'_>) -> Element<'_, Message> {
             .width(Fill)
             .height(Fill),
     )
-    // Do NOT subscribe to on_move: every pixel fires a Message → full iced re-view
-    // (~24–60 Hz while the cursor moves). Enter + press are enough to wake chrome.
-    .on_enter(Message::PlayerPointerActivity)
+    // Avoid on_move (flood). Also skip on_enter spam after autohide: press/wake only
+    // when chrome is already visible; when hidden, overlay Space handles press.
     .on_press(Message::PlayerPointerActivity)
     .into()
 }
@@ -89,7 +122,6 @@ fn stage_panel<'a>(p: &PlayerChrome<'a>) -> Element<'a, Message> {
         session.state,
         PlaybackState::Playing | PlaybackState::Paused | PlaybackState::Buffering
     );
-    let live = session.is_live();
 
     let center: Element<'a, Message> = if let Some(frame) = p.video {
         iced::widget::image(frame)
@@ -97,12 +129,72 @@ fn stage_panel<'a>(p: &PlayerChrome<'a>) -> Element<'a, Message> {
             .height(Fill)
             .content_fit(iced::ContentFit::Contain)
             .into()
-    } else if playing {
+    } else if playing && p.embedded_video {
+        // Contained loader only while buffering / waiting for first VOD frame.
+        // LIVE often has progress≈0 forever — never stick the card on live Playing.
+        // Once Playing with clock advance: keep black stage (no poster fallback) —
+        // flipping art↔frame caused visible scintillement.
+        let live = session.is_live();
+        let waiting = matches!(session.state, PlaybackState::Buffering)
+            || (!live && session.progress_ratio() < 0.000_5);
+        if waiting {
+            let indicator = container(
+                column![
+                    text("◌")
+                        .size(LOADING_SIZE * 0.55)
+                        .color(ui.on_primary_container()),
+                    text("Chargement vidéo…")
+                        .size(TYPE_LABEL_L)
+                        .color(ui.on_primary_container()),
+                    text(p.backend_label)
+                        .size(TYPE_LABEL_M)
+                        .color(ui.on_primary_container()),
+                ]
+                .spacing(SPACE_SM)
+                .align_x(Alignment::Center)
+                .padding(Padding::from([20, 28])),
+            )
+            .style(move |_t: &Theme| container::Style {
+                background: Some(Background::Color(ui.primary_container())),
+                border: Border {
+                    radius: RADIUS_EXTRA_LARGE.into(),
+                    ..Default::default()
+                },
+                shadow: elevation_shadow(2, ui.day),
+                ..Default::default()
+            });
+            indicator.into()
+        } else {
+            // Keep a black stage (not a status flash) while the first GPU allocation lands.
+            Space::new().width(0).height(0).into()
+        }
+    } else if playing && !p.embedded_video {
+        // CLI mpv/ffplay fallback: video is in an external OS window — never spin forever here.
+        let art_block: Element<'a, Message> = if let Some(handle) = p.art {
+            iced::widget::image(handle)
+                .width(Length::Fixed(220.0))
+                .height(Length::Fixed(320.0))
+                .content_fit(iced::ContentFit::Cover)
+                .into()
+        } else {
+            text("▶").size(56).color(ui.accent()).into()
+        };
         column![
-            text("Chargement vidéo…")
+            art_block,
+            text(p.title.to_string())
+                .size(18)
+                .color(Color::WHITE),
+            text(format!("Lecture · {}", p.backend_label))
                 .size(14)
-                .color(Color::from_rgba8(0xFF, 0xFF, 0xFF, 0.45)),
+                .color(ui.accent()),
+            text("La vidéo s’affiche dans la fenêtre lecteur externe.")
+                .size(12)
+                .color(Color::from_rgba8(0xFF, 0xFF, 0xFF, 0.55)),
+            text("Contrôles FluxPlay → xdotool / IPC quand disponible.")
+                .size(11)
+                .color(Color::from_rgba8(0xFF, 0xFF, 0xFF, 0.35)),
         ]
+        .spacing(10)
         .align_x(Alignment::Center)
         .into()
     } else if let Some(handle) = p.art {
@@ -121,191 +213,193 @@ fn stage_panel<'a>(p: &PlayerChrome<'a>) -> Element<'a, Message> {
         .into()
     };
 
-    let top: Element<'a, Message> = if p.chrome_visible || p.panel != PlayerPanel::None {
-        let badge = if live {
-            chip_live(ui)
-        } else {
-            soft_chip(ui, "VOD")
-        };
-        let title = text(truncate(p.title, 64))
-            .size(14)
-            .color(Color::from_rgba8(0xFF, 0xFF, 0xFF, 0.92));
-        let fs = if p.fullscreen {
-            soft_chip(ui, "Échap pour quitter")
-        } else {
-            Space::new().width(0).into()
-        };
-        container(
-            row![badge, title, Space::new().width(Fill), fs]
-                .spacing(10)
-                .padding(Padding::from([12, 16]))
-                .align_y(Alignment::Center),
-        )
+    // Always full-bleed: never put title chrome in this column (it resized the image → flicker).
+    container(center)
         .width(Fill)
+        .height(Fill)
+        .center_x(Fill)
+        .center_y(Fill)
+        .clip(true)
         .style(move |_t: &Theme| container::Style {
-            // Soft top scrim like mpvEx.
-            background: Some(Background::Color(Color::from_rgba(0.0, 0.0, 0.0, 0.45))),
+            background: Some(Background::Color(stage_black())),
             ..Default::default()
         })
         .into()
-    } else {
-        Space::new().height(0).into()
-    };
-
-    container(
-        column![
-            top,
-            container(center)
-                .width(Fill)
-                .height(Fill)
-                .center_x(Fill)
-                .center_y(Fill),
-        ]
-        .height(Fill),
-    )
-    .width(Fill)
-    .height(Fill)
-    .clip(true)
-    .style(move |_t: &Theme| container::Style {
-        background: Some(Background::Color(stage_black())),
-        ..Default::default()
-    })
-    .into()
 }
 
-/// Compact bottom chrome — seek + centered transport (mpvEx Material3 vibe).
+/// Floating vibrant toolbar + seek S (M3 Expressive hero).
 fn control_dock<'a>(p: &PlayerChrome<'a>) -> Element<'a, Message> {
     let ui = p.ui;
     let s = p.session;
     let live = s.is_live();
     let active = p.active;
     let paused = s.state == PlaybackState::Paused || s.state == PlaybackState::Idle;
-    let play_glyph = if paused { "▶" } else { "❚❚" };
+    let play_glyph = if paused { Icon::Play } else { Icon::Pause };
     let can_seek = active && !live;
-    let mute_glyph = if s.muted { "Muet" } else { "Son" };
+    let mute_glyph = if s.muted { Icon::VolumeOff } else { Icon::VolumeUp };
     let progress = s.progress_ratio();
     let time_label = s.elapsed_label();
     let vol = if s.muted { 0.0 } else { s.volume };
+    let on_tb = ui.on_primary_container();
+    let primary = ui.primary();
 
     let scrub: Element<'a, Message> = if !active {
-        text("En attente")
-            .size(11)
-            .color(Color::from_rgba8(0xFF, 0xFF, 0xFF, 0.5))
-            .into()
+        container(
+            text("En attente")
+                .size(TYPE_LABEL_M)
+                .color(Color::from_rgba8(0xFF, 0xFF, 0xFF, 0.55)),
+        )
+        .width(Fill)
+        .height(Length::Fixed(SLIDER_S_HEIGHT))
+        .center_y(Fill)
+        .into()
     } else if live {
-        text(format!("●  Direct · {time_label}"))
-            .size(12)
-            .color(ui.live())
-            .into()
+        container(
+            text(format!("●  Direct · {time_label}"))
+                .size(TYPE_LABEL_L)
+                .color(ui.on_error_container()),
+        )
+        .width(Fill)
+        .height(Length::Fixed(SLIDER_S_HEIGHT))
+        .center_y(Fill)
+        .into()
     } else {
         row![
-            text(time_label.clone())
-                .size(11)
-                .color(Color::from_rgba8(0xFF, 0xFF, 0xFF, 0.65))
-                .width(Length::Fixed(92.0)),
+            container(
+                text(time_label.clone())
+                    .size(TYPE_LABEL_M)
+                    .color(Color::from_rgba8(0xFF, 0xFF, 0xFF, 0.75)),
+            )
+            .width(Length::Fixed(100.0))
+            .height(Length::Fixed(SLIDER_S_HEIGHT))
+            .center_y(Fill),
             slider(0.0..=1.0, progress as f32, |v| Message::SeekPercent(v as f64))
                 .step(0.001)
                 .width(Fill)
+                .height(SLIDER_S_HEIGHT)
                 .style(move |theme: &Theme, status| {
                     let mut st = slider::default(theme, status);
-                    st.rail.backgrounds.0 = Background::Color(ui.accent());
+                    st.rail.backgrounds.0 = Background::Color(primary);
                     st.rail.backgrounds.1 =
-                        Background::Color(Color::from_rgba8(0xFF, 0xFF, 0xFF, 0.22));
-                    st.rail.width = 3.0;
-                    st.handle.background = Background::Color(Color::WHITE);
-                    st.handle.border_color = ui.accent();
-                    st.handle.border_width = 2.0;
-                    st.handle.shape = slider::HandleShape::Circle { radius: 6.0 };
+                        Background::Color(Color::from_rgba8(0xFF, 0xFF, 0xFF, 0.38));
+                    st.rail.width = SLIDER_S_TRACK;
+                    st.handle.background = Background::Color(ui.on_primary());
+                    st.handle.border_color = primary;
+                    st.handle.border_width = 0.0;
+                    st.handle.shape = slider::HandleShape::Rectangle {
+                        width: SLIDER_HANDLE_W,
+                        border_radius: RADIUS_FULL.into(),
+                    };
                     st
                 }),
         ]
-        .spacing(10)
+        .spacing(SPACE_SM)
         .align_y(Alignment::Center)
         .width(Fill)
         .into()
     };
 
-    // Center transport cluster (mpvEx-style).
-    let transport_center = row![
-        icon_btn(ui, "−10", Message::SeekRel(-10), can_seek, false),
+    // Standard button group (−10 / Play / +10) — not connected/segmented.
+    let transport = row![
+        toolbar_svg(ui, Icon::Replay10, Message::SeekRel(-10), can_seek, false),
         play_fab(ui, play_glyph, Message::TogglePause, active),
-        icon_btn(ui, "+10", Message::SeekRel(10), can_seek, false),
+        toolbar_svg(ui, Icon::Forward10, Message::SeekRel(10), can_seek, false),
     ]
-    .spacing(10)
+    .spacing(SPACE_SM)
     .align_y(Alignment::Center);
 
     let left = row![
-        icon_btn(ui, mute_glyph, Message::ToggleMute, true, false),
+        toolbar_svg(ui, mute_glyph, Message::ToggleMute, true, s.muted),
         container(
             slider(0.0..=1.0, vol, Message::VolumeChanged)
                 .step(0.01_f32)
+                .height(32.0)
                 .style(move |theme: &Theme, status| {
                     let mut st = slider::default(theme, status);
-                    st.rail.backgrounds.0 = Background::Color(ui.accent());
-                    st.rail.backgrounds.1 =
-                        Background::Color(Color::from_rgba8(0xFF, 0xFF, 0xFF, 0.2));
-                    st.rail.width = 3.0;
-                    st.handle.background = Background::Color(Color::WHITE);
-                    st.handle.shape = slider::HandleShape::Circle { radius: 5.0 };
+                    st.rail.backgrounds.0 = Background::Color(ui.primary());
+                    st.rail.backgrounds.1 = Background::Color(Color::from_rgba(
+                        on_tb.r,
+                        on_tb.g,
+                        on_tb.b,
+                        0.28,
+                    ));
+                    st.rail.width = 8.0;
+                    st.handle.background = Background::Color(on_tb);
+                    st.handle.shape = slider::HandleShape::Circle { radius: 6.0 };
                     st
                 }),
         )
-        .width(Length::Fixed(88.0)),
+        .width(Length::Fixed(96.0)),
     ]
-    .spacing(6)
+    .spacing(SPACE_SM)
     .align_y(Alignment::Center);
 
     let right = row![
-        icon_btn(
+        toolbar_svg(
             ui,
-            "⋯",
+            Icon::More,
             Message::PlayerPanel(PlayerPanel::More),
             true,
             p.panel == PlayerPanel::More,
         ),
-        icon_btn(ui, "⛶", Message::ToggleFullscreen, true, p.fullscreen),
-        icon_btn(ui, "✕", Message::ClosePlayerWindow, true, false),
+        toolbar_svg(ui, Icon::Fullscreen, Message::ToggleFullscreen, true, p.fullscreen),
+        toolbar_svg(ui, Icon::Close, Message::ClosePlayerWindow, true, false),
     ]
-    .spacing(4)
+    .spacing(SPACE_XS)
     .align_y(Alignment::Center);
 
-    let controls = row![
-        left.width(Length::FillPortion(1)),
-        container(transport_center)
-            .width(Length::FillPortion(1))
-            .center_x(Fill),
-        container(right)
-            .width(Length::FillPortion(1))
-            .align_right(Fill),
+    let toolbar_row = row![
+        left,
+        Space::new().width(Fill),
+        transport,
+        Space::new().width(Fill),
+        right,
     ]
     .align_y(Alignment::Center)
-    .width(Fill);
+    .width(Fill)
+    .height(Length::Fixed(TOOLBAR_H))
+    .padding(Padding::from([0, SPACE_MD as u16]));
 
-    let chrome_h = p.chrome_h.max(96.0).min(120.0);
-    container(
-        column![scrub, controls]
-            .spacing(10)
+    // Compact floating chrome — MUST Shrink or iced stretches the container
+    // to leftover overlay height (huge empty primaryContainer band).
+    let floating = container(
+        column![scrub, toolbar_row]
+            .spacing(SPACE_XXS)
             .padding(Padding {
-                top: 14.0,
-                right: 18.0,
-                bottom: 16.0,
-                left: 18.0,
-            }),
+                top: SPACE_XS,
+                right: SPACE_MD,
+                bottom: SPACE_XS,
+                left: SPACE_MD,
+            })
+            .height(Length::Shrink),
     )
     .width(Fill)
-    .height(Length::Fixed(chrome_h))
+    .height(Length::Shrink)
     .style(move |_t: &Theme| container::Style {
-        // Bottom scrim — no card border (mpvEx overlay).
-        background: Some(Background::Color(Color::from_rgba(0.0, 0.0, 0.0, 0.72))),
+        background: Some(Background::Color(ui.primary_container())),
         border: Border {
             color: Color::TRANSPARENT,
             width: 0.0,
-            radius: 0.0.into(),
+            radius: radius_floating_toolbar(),
         },
-        shadow: Shadow::default(),
+        shadow: elevation_shadow(2, ui.day),
         ..Default::default()
-    })
-    .into()
+    });
+
+    container(floating)
+        .width(Fill)
+        .height(Length::Shrink)
+        .padding(Padding {
+            top: 0.0,
+            right: TOOLBAR_OUTER_PAD,
+            bottom: TOOLBAR_OUTER_PAD,
+            left: TOOLBAR_OUTER_PAD,
+        })
+        .style(move |_t: &Theme| container::Style {
+            background: None,
+            ..Default::default()
+        })
+        .into()
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -572,10 +666,11 @@ fn sheet_scroll<'a>(
     .width(Fill)
     .padding(Padding::from([12, 14]))
     .style(move |_t: &Theme| container::Style {
+        // Modal sheet elev 1 (tonal surface).
         background: Some(Background::Color(ui.surface_container_high())),
         border: Border {
             color: ui.outline_variant(),
-            width: 1.0,
+            width: 0.0,
             radius: iced::border::Radius {
                 top_left: RADIUS_LG,
                 top_right: RADIUS_LG,
@@ -583,26 +678,28 @@ fn sheet_scroll<'a>(
                 bottom_left: 0.0,
             },
         },
+        shadow: elevation_shadow(1, ui.day),
         ..Default::default()
     })
     .into()
 }
 
 fn chip_live(ui: UiTheme) -> Element<'static, Message> {
-    let c = ui.live();
+    let fill = ui.error_container();
+    let ink = ui.on_error_container();
     container(
         row![
-            text("●").size(10).color(c),
-            text(" LIVE").size(11).color(c),
+            text("●").size(TYPE_LABEL_S).color(ink),
+            text(" LIVE").size(TYPE_LABEL_M).color(ink),
         ]
         .align_y(Alignment::Center),
     )
     .padding(Padding::from([6, 12]))
     .style(move |_t: &Theme| container::Style {
-        background: Some(Background::Color(Color::from_rgba(c.r, c.g, c.b, 0.18))),
+        background: Some(Background::Color(fill)),
         border: Border {
-            color: Color::from_rgba(c.r, c.g, c.b, 0.35),
-            width: 1.0,
+            color: Color::TRANSPARENT,
+            width: 0.0,
             radius: RADIUS_FULL.into(),
         },
         ..Default::default()
@@ -656,9 +753,11 @@ fn dock_btn(
     enabled: bool,
     active: bool,
 ) -> Element<'static, Message> {
+    // Sheet actions: tonal round icon-button (L target).
     icon_btn(ui, label, msg, enabled, active)
 }
 
+/// Round / tonal icon button on sheets (surface context).
 fn icon_btn(
     ui: UiTheme,
     label: &str,
@@ -667,28 +766,29 @@ fn icon_btn(
     active: bool,
 ) -> Element<'static, Message> {
     let label = label.to_string();
-    let accent = ui.accent();
-    let btn = button(text(label).size(13))
-        .padding(Padding::from([10, 12]))
+    let radius = if active {
+        RADIUS_LG.into()
+    } else {
+        RADIUS_FULL.into()
+    };
+    let btn = button(text(label).size(TYPE_LABEL_L))
+        .padding(Padding::from([12, 14]))
         .style(move |_theme: &Theme, status| {
             let hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
+            let (bg, ink) = if active {
+                (ui.secondary_container(), ui.on_secondary_container())
+            } else if hovered {
+                (ui.surface_container_highest(), ui.ink())
+            } else {
+                (ui.surface_container(), ui.ink())
+            };
             button::Style {
-                background: Some(Background::Color(if active {
-                    Color::from_rgba(accent.r, accent.g, accent.b, 0.28)
-                } else if hovered {
-                    Color::from_rgba8(0xFF, 0xFF, 0xFF, 0.12)
-                } else {
-                    Color::from_rgba8(0xFF, 0xFF, 0xFF, 0.06)
-                })),
-                text_color: Color::WHITE,
+                background: Some(Background::Color(bg)),
+                text_color: ink,
                 border: Border {
-                    color: if active {
-                        Color::from_rgba(accent.r, accent.g, accent.b, 0.55)
-                    } else {
-                        Color::from_rgba8(0xFF, 0xFF, 0xFF, 0.1)
-                    },
-                    width: 1.0,
-                    radius: RADIUS_FULL.into(),
+                    color: Color::TRANSPARENT,
+                    width: 0.0,
+                    radius,
                 },
                 ..Default::default()
             }
@@ -700,26 +800,122 @@ fn icon_btn(
     }
 }
 
-fn play_fab(ui: UiTheme, label: &str, msg: Message, enabled: bool) -> Element<'static, Message> {
-    let label = label.to_string();
-    let accent = ui.accent();
-    let btn = button(text(label).size(16))
-        .padding(Padding::from([12, 20]))
+/// Icon button on vibrant floating toolbar (`onPrimaryContainer`).
+fn toolbar_svg(
+    ui: UiTheme,
+    kind: Icon,
+    msg: Message,
+    enabled: bool,
+    active: bool,
+) -> Element<'static, Message> {
+    let ink = ui.on_primary_container();
+    let radius = if active {
+        RADIUS_LG.into()
+    } else {
+        RADIUS_FULL.into()
+    };
+    let btn = button(icons::icon(kind, 22.0, ink))
+        .padding(Padding::from([10, 12]))
         .style(move |_theme: &Theme, status| {
             let hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
+            let bg = if active {
+                Color::from_rgba(ink.r, ink.g, ink.b, 0.22)
+            } else if hovered {
+                Color::from_rgba(ink.r, ink.g, ink.b, 0.12)
+            } else {
+                Color::TRANSPARENT
+            };
             button::Style {
-                background: Some(Background::Color(if hovered {
-                    Color::from_rgba(accent.r, accent.g, accent.b, 0.95)
-                } else {
-                    accent
-                })),
-                text_color: Color::WHITE,
+                background: Some(Background::Color(bg)),
+                text_color: ink,
+                border: Border {
+                    color: Color::TRANSPARENT,
+                    width: 0.0,
+                    radius,
+                },
+                ..Default::default()
+            }
+        });
+    if enabled {
+        btn.on_press(msg).into()
+    } else {
+        btn.into()
+    }
+}
+
+/// Icon button on vibrant floating toolbar (`onPrimaryContainer`) — text fallback.
+fn toolbar_icon(
+    ui: UiTheme,
+    label: &str,
+    msg: Message,
+    enabled: bool,
+    active: bool,
+) -> Element<'static, Message> {
+    let label = label.to_string();
+    let ink = ui.on_primary_container();
+    // Expressive morph: unselected full pill → selected squircle.
+    let radius = if active {
+        RADIUS_LG.into()
+    } else {
+        RADIUS_FULL.into()
+    };
+    let btn = button(text(label).size(TYPE_LABEL_L))
+        .padding(Padding::from([10, 12]))
+        .style(move |_theme: &Theme, status| {
+            let hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
+            let bg = if active {
+                Color::from_rgba(ink.r, ink.g, ink.b, 0.22)
+            } else if hovered {
+                Color::from_rgba(ink.r, ink.g, ink.b, 0.12)
+            } else {
+                Color::TRANSPARENT
+            };
+            button::Style {
+                background: Some(Background::Color(bg)),
+                text_color: ink,
+                border: Border {
+                    color: Color::TRANSPARENT,
+                    width: 0.0,
+                    radius,
+                },
+                ..Default::default()
+            }
+        });
+    if enabled {
+        btn.on_press(msg).into()
+    } else {
+        btn.into()
+    }
+}
+
+/// Medium FAB — primary / primaryContainer (never Surface). Elev 3.
+fn play_fab(ui: UiTheme, kind: Icon, msg: Message, enabled: bool) -> Element<'static, Message> {
+    let fill = ui.primary();
+    let ink = ui.on_primary();
+    let inner = container(icons::icon(kind, 28.0, ink))
+        .width(Length::Fixed(FAB_MEDIUM))
+        .height(Length::Fixed(FAB_MEDIUM))
+        .center_x(Fill)
+        .center_y(Fill);
+    let btn = button(inner)
+        .padding(0)
+        .style(move |_theme: &Theme, status| {
+            let hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
+            let (bg, fg) = if hovered {
+                (ui.primary_container(), ui.on_primary_container())
+            } else {
+                (fill, ink)
+            };
+            let _ = fg;
+            button::Style {
+                background: Some(Background::Color(bg)),
+                text_color: ink,
                 border: Border {
                     color: Color::TRANSPARENT,
                     width: 0.0,
                     radius: radius_fab(),
                 },
-                shadow: Shadow::default(),
+                shadow: elevation_shadow(3, ui.day),
                 ..Default::default()
             }
         });

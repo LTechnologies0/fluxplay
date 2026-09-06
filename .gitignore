@@ -4,6 +4,9 @@
 *.swp
 *.log
 
+# Local FFmpeg headers (downloaded for builds without ffmpeg-devel)
+crates/fluxplay-player/vendor/ffmpeg-include/
+
 # Secrets & local config (never commit)
 .env
 .env.*

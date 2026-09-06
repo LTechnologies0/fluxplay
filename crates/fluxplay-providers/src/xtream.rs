@@ -124,6 +124,12 @@ impl XtreamClient {
         );
         let ttl = crate::api_cache::ttl_for_action(action);
         if let Some(cached) = crate::api_cache::get_fresh(&key, ttl) {
+            tracing::info!(
+                target: "fluxplay::net",
+                action = %action_label,
+                portal = %self.portal,
+                "net.cache_hit"
+            );
             return Ok(cached);
         }
 
@@ -138,12 +144,53 @@ impl XtreamClient {
 
         let fetch = || async {
             let client = crate::api_cache::shared_http()?;
+            let t0 = std::time::Instant::now();
+            // Redact credentials from logged URL.
+            let log_url = {
+                let mut u = url.clone();
+                let pairs: Vec<(String, String)> = u
+                    .query_pairs()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect();
+                u.set_query(None);
+                {
+                    let mut q = u.query_pairs_mut();
+                    for (k, v) in pairs {
+                        if k.eq_ignore_ascii_case("password")
+                            || k.eq_ignore_ascii_case("pass")
+                            || k.eq_ignore_ascii_case("token")
+                        {
+                            q.append_pair(&k, "***");
+                        } else {
+                            q.append_pair(&k, &v);
+                        }
+                    }
+                }
+                u.to_string()
+            };
+            tracing::info!(
+                target: "fluxplay::net",
+                method = "GET",
+                action = %action_label,
+                portal = %self.portal,
+                url = %log_url,
+                "net.request"
+            );
             let resp = client
                 .get(url.clone())
                 .header(reqwest::header::USER_AGENT, SMARTERS_UA)
                 .send()
                 .await?;
             let status = resp.status();
+            let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
+            tracing::info!(
+                target: "fluxplay::net",
+                method = "GET",
+                action = %action_label,
+                status = status.as_u16(),
+                elapsed_ms = format!("{elapsed_ms:.1}"),
+                "net.response"
+            );
             if status.as_u16() == 429 {
                 warn!(%action_label, "HTTP 429 from portal");
                 return Err(ProviderError::Message(

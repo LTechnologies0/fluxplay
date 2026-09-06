@@ -314,6 +314,10 @@ impl StreamSession {
         self.native.pull_video_frame(w, h)
     }
 
+    pub fn frame_needs_redraw(&self) -> bool {
+        self.native.frame_needs_redraw()
+    }
+
     pub fn has_embedded_video(&self) -> bool {
         self.native.has_embedded_video()
     }

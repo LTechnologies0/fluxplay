@@ -1859,14 +1859,21 @@ fn run_action<'a, P, C>(
             image::Action::Allocate(handle, sender) => {
                 use core::Renderer as _;
 
-                // TODO: Shared image cache in compositor
-                if let Some((_id, window)) = window_manager.iter_mut().next() {
-                    window.renderer.allocate_image(
-                        &handle,
-                        move |allocation| {
-                            let _ = sender.send(allocation);
-                        },
-                    );
+                // Upload into every window cache. Multi-window UIs (e.g. a
+                // dedicated player) previously only filled the first window's
+                // atlas — drawing the Handle elsewhere still async-loaded and
+                // flickered for animated/video frames.
+                let mut windows = window_manager.iter_mut();
+                if let Some((_id, first)) = windows.next() {
+                    let handle_rest = handle.clone();
+                    first.renderer.allocate_image(&handle, move |allocation| {
+                        let _ = sender.send(allocation);
+                    });
+                    for (_id, window) in windows {
+                        window
+                            .renderer
+                            .allocate_image(&handle_rest, |_| {});
+                    }
                 }
             }
         },

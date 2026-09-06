@@ -12,10 +12,23 @@ use std::time::Instant;
 
 static PROFILE_ENV: OnceLock<bool> = OnceLock::new();
 static FPS_ENV: OnceLock<bool> = OnceLock::new();
+static OVERLAY: OnceLock<bool> = OnceLock::new();
 static RUST_LOG_PROFILER: OnceLock<bool> = OnceLock::new();
 
 fn profile_env() -> bool {
-    *PROFILE_ENV.get_or_init(|| env_truthy("FLUXPLAY_PROFILE"))
+    *PROFILE_ENV.get_or_init(|| {
+        match std::env::var("FLUXPLAY_PROFILE") {
+            Ok(v) => {
+                let v = v.trim();
+                !(v.is_empty()
+                    || v == "0"
+                    || v.eq_ignore_ascii_case("false")
+                    || v.eq_ignore_ascii_case("off"))
+            }
+            // Default OFF — profiling every PlayerTick/view kills 4K smoothness.
+            Err(_) => false,
+        }
+    })
 }
 
 fn fps_env() -> bool {
@@ -45,7 +58,19 @@ pub fn profiling_enabled() -> bool {
 
 /// Show FPS / last-sample overlay in the UI status strip.
 pub fn overlay_enabled() -> bool {
-    profile_env() || fps_env()
+    *OVERLAY.get_or_init(|| {
+        // Explicit FLUXPLAY_PROFILE / FLUXPLAY_FPS only (default profiling stays quiet in UI).
+        fps_env()
+            || std::env::var("FLUXPLAY_PROFILE")
+                .map(|v| {
+                    let v = v.trim();
+                    !(v.is_empty()
+                        || v == "0"
+                        || v.eq_ignore_ascii_case("false")
+                        || v.eq_ignore_ascii_case("off"))
+                })
+                .unwrap_or(false)
+    })
 }
 
 fn env_truthy(key: &str) -> bool {
@@ -169,7 +194,21 @@ impl InteractionSample {
                 || self.name == "async.image"
                 || self.name == "input.pointer"
                 || self.name.starts_with("layout.");
-            if !hot {
+            // Hot path → debug (still visible with profiler=info via trace? no — use info every N)
+            // Emit ALL samples at info so `RUST_LOG` default shows background work.
+            // Cap hot spam: still info but shorter field set is fine for diagnosis.
+            if hot {
+                tracing::debug!(
+                    target: "fluxplay::profile",
+                    kind = self.kind,
+                    name = %self.name,
+                    wall_ms = format!("{:.3}", self.wall_ms),
+                    wall_ns = self.wall_ns,
+                    cpu_pct_core = format!("{:.1}", self.cpu_pct_core),
+                    rss_delta = %format_bytes_signed(self.rss_delta),
+                    "interaction"
+                );
+            } else {
                 tracing::info!(
                     target: "fluxplay::profile",
                     kind = self.kind,

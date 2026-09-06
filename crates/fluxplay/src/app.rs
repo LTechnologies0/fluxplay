@@ -1,7 +1,7 @@
 use chrono::Local;
 use fluxplay_core::models::{
-    AccentPreset, AppSettings, Channel, ContentKind, MediaSource, PlaylistBundle, SeriesItem,
-    SourceKind, ThemeMode, VodItem,
+    AccentPreset, AppSettings, Channel, ContentKind, MediaSource, PlaylistBundle, PlayerBackendPref,
+    SeriesItem, SourceKind, ThemeMode, VodItem,
 };
 use fluxplay_player::{
     detect_backends, target_profile, PlayOptions, PlaybackState, StreamSession, VideoRect,
@@ -9,7 +9,9 @@ use fluxplay_player::{
 use iced::widget::{
     button, column, container, row, text, text_input, Column, Row, Space,
 };
-use iced::widget::image::Handle as ImageHandle;
+use iced::widget::image::{
+    self as iced_image, Allocation as ImageAllocation, Handle as ImageHandle,
+};
 use iced::window;
 use iced::{
     Alignment, Background, Border, Element, Fill, Length, Padding, Point, Size, Subscription, Task,
@@ -20,7 +22,7 @@ use uuid::Uuid;
 use crate::browser::{CAT_PAGE, EPISODE_PAGE, LIST_MAX, LIST_PAGE};
 use crate::player_ui::PlayerPanel;
 use crate::theme::{
-    LayoutMetrics, UiTheme, RADIUS_FULL, RADIUS_MD, PLAYER_PAD,
+    LayoutMetrics, UiTheme, RADIUS_FULL, RADIUS_MD, SPACE_SM,
 };
 use crate::{browser, demo, player_ui, storage};
 use iced::event::{self, Event};
@@ -98,6 +100,19 @@ impl Tab {
         }
     }
 
+    fn icon(self) -> crate::icons::Icon {
+        use crate::icons::Icon;
+        match self {
+            Self::Live => Icon::LiveTv,
+            Self::Favorites => Icon::Favorite,
+            Self::Vod => Icon::Movie,
+            Self::Series => Icon::Series,
+            Self::Epg => Icon::Epg,
+            Self::Sources => Icon::Sources,
+            Self::Settings => Icon::Settings,
+        }
+    }
+
     fn all() -> &'static [Tab] {
         &[
             Tab::Live,
@@ -156,9 +171,13 @@ struct FluxPlay {
     backends_cache: Option<Vec<fluxplay_player::BackendInfo>>,
     /// Last known outer position of the player window (legacy CLI overlay sizing).
     player_pos: Option<Point>,
-    /// Embedded video frame (libmpv software render → iced image).
+    /// Embedded video frame (libffmpeg/libmpv soft RGBA → iced image).
     video_frame: Option<ImageHandle>,
+    /// Pins GPU atlas memory so the displayed frame never async-flickers.
+    video_allocation: Option<ImageAllocation>,
     video_frame_wh: (u32, u32),
+    /// One in-flight `image::allocate` — drop intermediate soft frames.
+    video_upload_busy: bool,
     player_panel: PlayerPanel,
     goto_draft: String,
     sleep_until: Option<std::time::Instant>,
@@ -169,10 +188,14 @@ struct FluxPlay {
     /// Overlay dock / sheets visible (auto-hides on pointer idle).
     player_chrome_visible: bool,
     player_pointer_at: Option<std::time::Instant>,
+    /// Ignore video_rect / soft-size churn while OS fullscreen is settling.
+    player_layout_freeze_until: Option<std::time::Instant>,
     /// Series episode URLs for next-episode prefetch (current index in list).
     series_queue: Vec<(String, String)>,
     series_queue_idx: usize,
     prefetch_armed_for: Option<String>,
+    /// Lazy Xtream `get_vod_info` enrich — never burst at boot (ban risk).
+    xtream_vod_enrich_started: bool,
 }
 
 /// Which text field should receive a clipboard paste.
@@ -214,6 +237,8 @@ pub(crate) enum Message {
     CycleAudio,
     CycleSubtitles,
     PlayerTick,
+    /// Soft-frame GPU upload finished — safe to swap without atlas flicker.
+    VideoFrameAllocated(Result<ImageAllocation, iced_image::Error>),
     CycleTheme,
     CycleAccent,
     SetAccent(AccentPreset),
@@ -407,7 +432,7 @@ impl FluxPlay {
         #[cfg(not(target_os = "android"))]
         let (main_id, open_main) = {
             let (id, open) = window::open(window::Settings {
-                size: Size::new(1280.0, 860.0),
+                size: Size::new(1920.0, 1080.0),
                 position: window::Position::Centered,
                 exit_on_close_request: true,
                 ..Default::default()
@@ -452,12 +477,14 @@ impl FluxPlay {
             #[cfg(target_os = "android")]
             main_size: Size::new(360.0, 720.0),
             #[cfg(not(target_os = "android"))]
-            main_size: Size::new(1280.0, 720.0),
+            main_size: Size::new(1920.0, 1080.0),
             layout_cache: None,
             backends_cache: None,
             player_pos: None,
             video_frame: None,
+            video_allocation: None,
             video_frame_wh: (0, 0),
+            video_upload_busy: false,
             player_panel: PlayerPanel::None,
             goto_draft: String::new(),
             sleep_until: None,
@@ -466,9 +493,11 @@ impl FluxPlay {
             player_fullscreen: false,
             player_chrome_visible: true,
             player_pointer_at: None,
+            player_layout_freeze_until: None,
             series_queue: Vec::new(),
             series_queue_idx: 0,
             prefetch_armed_for: None,
+            xtream_vod_enrich_started: false,
         };
         app.form_omdb_key = app.settings.omdb_api_key.clone();
         crate::metadata::set_omdb_api_key(if app.settings.omdb_api_key.is_empty() {
@@ -489,10 +518,36 @@ impl FluxPlay {
             // Bind to real Activity surface size + force immersive fullscreen.
             boot.push(android_bind_window());
         }
-        if sync_fresh {
+        if sync_fresh && std::env::var_os("FLUXPLAY_AUTO_URL").is_none() {
             boot.push(app.after_catalog_ready_tasks());
         } else if has_real || !app.sources.is_empty() {
-            boot.push(app.reload_all_task());
+            if std::env::var_os("FLUXPLAY_AUTO_URL").is_none() {
+                boot.push(app.reload_all_task());
+            }
+        }
+        if let Ok(url) = std::env::var("FLUXPLAY_AUTO_URL") {
+            let url = url.trim().to_string();
+            if !url.is_empty() {
+                app.autoplay_done = true;
+                let name = std::env::var("FLUXPLAY_AUTO_TITLE")
+                    .unwrap_or_else(|_| "Auto · 4K test".into());
+                let ch = Channel {
+                    id: "fluxplay-auto".into(),
+                    name,
+                    stream_url: url,
+                    logo: None,
+                    group: Some("Local".into()),
+                    tvg_id: None,
+                    tvg_name: None,
+                    tvg_logo: None,
+                    epg_channel_id: None,
+                    scheme: None,
+                    source_id: None,
+                    kind: Default::default(),
+                    catchup: None,
+                };
+                boot.push(Task::done(Message::PlayChannel(ch)));
+            }
         }
         let task = Task::batch(boot);
         tracing::info!(
@@ -634,10 +689,10 @@ impl FluxPlay {
                     self.player_id.is_some()
                 }
             };
-            // Soft-render needs ~15 fps max; chrome/time labels are fine at 4 Hz.
-            // Never arm 24 Hz ticks for paused chrome-only — that re-paints the browser too.
+            // Soft-render: poll often so new frames land ASAP; skip work when !dirty.
+            // ~120 Hz poll matches high-refresh panels; video upload stays at content FPS.
             let period_ms = if soft_video {
-                66u64
+                8u64
             } else if self.sleep_until.is_some() {
                 1000
             } else if playing_like && player_open {
@@ -714,12 +769,34 @@ impl FluxPlay {
         if let Some(p) = position {
             self.player_pos = Some(p);
         }
-        let chrome = LayoutMetrics::compute(size.width, size.height).player_chrome_h;
-        let stage_h = (size.height - chrome).max(160.0);
-        let w = ((size.width - 2.0 * PLAYER_PAD).max(160.0) * scale).round() as u32;
-        let h = ((stage_h - PLAYER_PAD).max(120.0) * scale).round() as u32;
-        // Size only — video is drawn into iced via software render, not an OS overlay.
+        // Soft-render uses the full window — chrome is an overlay and must NOT shrink the
+        // stage (shrinking caused size oscillation / flicker when chrome toggled).
+        let w = ((size.width).max(160.0) * scale).round() as u32;
+        let h = ((size.height).max(120.0) * scale).round() as u32;
+        let w = (w & !1).max(2);
+        let h = (h & !1).max(2);
         let rect = VideoRect::detached(w, h);
+        // Fullscreen settle: compositor emits a burst of sizes — keep stage sticky.
+        if let Some(until) = self.player_layout_freeze_until {
+            if std::time::Instant::now() < until {
+                return;
+            }
+            self.player_layout_freeze_until = None;
+        }
+        // Hysteresis: ignore ±4px noise from compositor / scale rounding.
+        if let Some(prev) = self.session.native.video_rect() {
+            let dw = (prev.w as i32 - w as i32).unsigned_abs();
+            let dh = (prev.h as i32 - h as i32).unsigned_abs();
+            if dw <= 4 && dh <= 4 {
+                return;
+            }
+            // Ignore tiny proportional jitter (<3%) that still causes soft-frame flicker.
+            let pw = prev.w.max(1) as f32;
+            let ph = prev.h.max(1) as f32;
+            if (w as f32 - pw).abs() / pw < 0.03 && (h as f32 - ph).abs() / ph < 0.03 {
+                return;
+            }
+        }
         tracing::debug!(?rect, %scale, "player embed stage size");
         self.session.set_video_rect(rect);
     }
@@ -862,6 +939,13 @@ impl FluxPlay {
                     }
                 }
                 if self.player_id == Some(id) {
+                    // Skip resize storms while fullscreen mode is settling.
+                    if self
+                        .player_layout_freeze_until
+                        .is_some_and(|t| std::time::Instant::now() < t)
+                    {
+                        return Task::none();
+                    }
                     return self.sync_player_layout_task(id);
                 }
             }
@@ -877,7 +961,9 @@ impl FluxPlay {
                     self.player_id = None;
                     self.player_pos = None;
                     self.video_frame = None;
+                    self.video_allocation = None;
                     self.video_frame_wh = (0, 0);
+                    self.video_upload_busy = false;
                     self.player_fullscreen = false;
                     self.player_chrome_visible = true;
                     self.player_panel = PlayerPanel::None;
@@ -918,7 +1004,12 @@ impl FluxPlay {
                 if tab == Tab::Series && self.selected_series_category.is_none() {
                     self.selected_series_category = Some("*".into());
                 }
-                return self.prefetch_visible_art();
+                let mut tasks = vec![self.prefetch_visible_art()];
+                if tab == Tab::Vod && !self.xtream_vod_enrich_started {
+                    self.xtream_vod_enrich_started = true;
+                    tasks.push(self.enrich_xtream_vod_batch_task());
+                }
+                return Task::batch(tasks);
             }
             Message::SearchChanged(s) => {
                 self.search = s;
@@ -1096,7 +1187,9 @@ impl FluxPlay {
             Message::Stop => {
                 self.session.stop();
                 self.video_frame = None;
+                self.video_allocation = None;
                 self.video_frame_wh = (0, 0);
+                self.video_upload_busy = false;
                 self.status = "Arrêté".into();
                 // Defer window close so libmpv teardown finishes cleanly.
                 return Task::perform(
@@ -1143,29 +1236,53 @@ impl FluxPlay {
                 self.status = self.session.status_line();
             }
             Message::ToggleFullscreen => {
-                let Some(id) = self.player_id.or(self.main_id) else {
+                // Never fullscreen the browse window — only the player surface.
+                let Some(id) = self.player_id else {
                     self.status = "Ouvrez d’abord le lecteur".into();
                     return Task::none();
                 };
                 self.player_chrome_visible = true;
                 self.player_pointer_at = Some(std::time::Instant::now());
+                // Freeze soft-stage while the compositor animates mode change (anti-flicker).
+                self.player_layout_freeze_until =
+                    Some(std::time::Instant::now() + std::time::Duration::from_millis(600));
                 if self.player_fullscreen {
                     self.player_fullscreen = false;
                     self.status = "Fenêtre".into();
-                    return window::set_mode(id, window::Mode::Windowed);
+                    return Task::batch([
+                        window::set_mode(id, window::Mode::Windowed),
+                        Task::perform(
+                            async {
+                                tokio::time::sleep(std::time::Duration::from_millis(650)).await;
+                            },
+                            move |_| Message::PlayerLayoutDirty(id),
+                        ),
+                    ]);
                 }
                 self.player_fullscreen = true;
                 self.status = "Plein écran".into();
-                return window::set_mode(id, window::Mode::Fullscreen);
+                return Task::batch([
+                    window::set_mode(id, window::Mode::Fullscreen),
+                    Task::perform(
+                        async {
+                            tokio::time::sleep(std::time::Duration::from_millis(650)).await;
+                        },
+                        move |_| Message::PlayerLayoutDirty(id),
+                    ),
+                ]);
             }
             Message::PlayerPointerActivity => {
-                // Cheap wake: skip if chrome already visible and recently touched.
                 let now = std::time::Instant::now();
-                if self.player_chrome_visible {
+                // After autohide, ignore wake for 700ms (compositor enter/leave flicker loop).
+                if !self.player_chrome_visible {
                     if let Some(at) = self.player_pointer_at {
-                        if now.duration_since(at) < std::time::Duration::from_millis(200) {
+                        if now.duration_since(at) < std::time::Duration::from_millis(700) {
                             return Task::none();
                         }
+                    }
+                } else if let Some(at) = self.player_pointer_at {
+                    if now.duration_since(at) < std::time::Duration::from_millis(250) {
+                        return Task::none();
                     }
                 }
                 self.player_chrome_visible = true;
@@ -1192,32 +1309,66 @@ impl FluxPlay {
                 {
                     self.session.state = PlaybackState::Idle;
                     self.video_frame = None;
+                    self.video_allocation = None;
+                    self.video_upload_busy = false;
                     self.status = "Lecture terminée".into();
                 }
-                // Soft-render frames only while actively playing/buffering — not when paused.
-                if self.session.has_embedded_video()
+                let mut tasks = Vec::new();
+                // Soft-render: pull RGBA, then GPU-allocate BEFORE swapping the
+                // displayed Handle — iced async-uploads otherwise flash black
+                // between unique frame IDs (documented flicker for animated images).
+                if !self.video_upload_busy
+                    && self.session.has_embedded_video()
                     && matches!(
                         self.session.state,
                         PlaybackState::Playing | PlaybackState::Buffering
                     )
+                    && self.session.frame_needs_redraw()
                 {
+                    let frozen = self
+                        .player_layout_freeze_until
+                        .is_some_and(|t| std::time::Instant::now() < t);
                     let (fw, fh) = self
                         .session
                         .native
                         .video_rect()
                         .map(|r| (r.w, r.h))
-                        .unwrap_or((960, 540));
-                    // Cap CPU: render at most ~720px wide (~15 fps budget).
-                    let scale = if fw > 720 {
-                        720.0 / fw as f32
+                        .unwrap_or((1280, 720));
+                    let uhd = std::env::var_os("FLUXPLAY_SOFT_UHD").is_some();
+                    let max_w = if uhd { 3840u32 } else { 1920 };
+                    let max_h = if uhd { 2160u32 } else { 1080 };
+                    let scale = (max_w as f32 / fw.max(1) as f32)
+                        .min(max_h as f32 / fh.max(1) as f32)
+                        .min(1.0);
+                    let rw = ((fw as f32 * scale).round() as u32).max(2) & !1;
+                    let rh = ((fh as f32 * scale).round() as u32).max(2) & !1;
+                    let (rw, rh) = if self.video_frame_wh.0 >= 2 && self.video_frame_wh.1 >= 2 {
+                        let (pw, ph) = self.video_frame_wh;
+                        if frozen {
+                            (pw, ph)
+                        } else {
+                            let dw = (pw as i32 - rw as i32).unsigned_abs();
+                            let dh = (ph as i32 - rh as i32).unsigned_abs();
+                            if dw <= 8 && dh <= 8 {
+                                (pw, ph)
+                            } else if (rw as f32 - pw as f32).abs() / (pw.max(1) as f32) < 0.05
+                                && (rh as f32 - ph as f32).abs() / (ph.max(1) as f32) < 0.05
+                            {
+                                (pw, ph)
+                            } else {
+                                (rw, rh)
+                            }
+                        }
                     } else {
-                        1.0
+                        (rw, rh)
                     };
-                    let rw = ((fw as f32 * scale).round() as u32).max(2);
-                    let rh = ((fh as f32 * scale).round() as u32).max(2);
                     if let Some((w, h, rgba)) = self.session.pull_video_frame(rw, rh) {
-                        self.video_frame = Some(ImageHandle::from_rgba(w, h, rgba));
                         self.video_frame_wh = (w, h);
+                        self.video_upload_busy = true;
+                        let handle = ImageHandle::from_rgba(w, h, rgba);
+                        tasks.push(
+                            iced_image::allocate(handle).map(Message::VideoFrameAllocated),
+                        );
                     }
                 }
                 if let Some(deadline) = self.sleep_until {
@@ -1229,12 +1380,23 @@ impl FluxPlay {
                     }
                 }
                 self.maybe_autohide_player_chrome();
-                let mut tasks = Vec::new();
                 if let Some(prefetch) = self.maybe_prefetch_next_episode() {
                     tasks.push(prefetch);
                 }
                 if !tasks.is_empty() {
                     return Task::batch(tasks);
+                }
+            }
+            Message::VideoFrameAllocated(result) => {
+                self.video_upload_busy = false;
+                match result {
+                    Ok(allocation) => {
+                        self.video_frame = Some(allocation.handle().clone());
+                        self.video_allocation = Some(allocation);
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "video frame GPU allocate failed");
+                    }
                 }
             }
             Message::PlayerPanel(panel) => {
@@ -2338,11 +2500,12 @@ impl FluxPlay {
         )
     }
 
-    /// After catalog load/reload: art + Xtream vod_info + OMDb/TVMaze in parallel.
+    /// After catalog load/reload: visible art + light meta.
+    /// Xtream `get_vod_info` batch is deferred to first VOD tab open (portal ban risk).
     fn after_catalog_ready_tasks(&mut self) -> Task<Message> {
+        self.xtream_vod_enrich_started = false;
         Task::batch([
             self.prefetch_catalog_art(),
-            self.enrich_xtream_vod_batch_task(),
             self.enrich_metadata_task(),
         ])
     }
@@ -2461,6 +2624,7 @@ impl FluxPlay {
     }
 
     /// Parallel Xtream `get_vod_info` for movies missing plot/cast/director/poster.
+    /// Kept small + low concurrency — portals ban aggressive parallel scrapes.
     fn enrich_xtream_vod_batch_task(&self) -> Task<Message> {
         let mut jobs: Vec<(MediaSource, String)> = Vec::new();
         for v in self
@@ -2468,7 +2632,7 @@ impl FluxPlay {
             .vod
             .iter()
             .filter(|v| crate::metadata::needs_vod_enrich(v))
-            .take(48)
+            .take(12)
         {
             let src = v
                 .source_id
@@ -2494,7 +2658,7 @@ impl FluxPlay {
             async move {
                 let mut out = Vec::new();
                 let mut set = tokio::task::JoinSet::new();
-                const PARALLEL: usize = 6;
+                const PARALLEL: usize = 2;
                 let mut i = 0usize;
                 while i < jobs.len() || !set.is_empty() {
                     while set.len() < PARALLEL && i < jobs.len() {
@@ -2986,7 +3150,7 @@ impl FluxPlay {
             } else {
                 t.label()
             };
-            (label, Message::Tab(*t), self.tab == *t)
+            (t.icon(), label, Message::Tab(*t), self.tab == *t)
         });
 
         let body = match self.tab {
@@ -3029,20 +3193,23 @@ impl FluxPlay {
         });
 
         let main_row: Element<'_, Message> = if m.top_nav || m.rail_w <= 1.0 {
+            // Compact (<600 / short): flexible NavigationBar under content.
+            // Never pair with player floating toolbar (player is a separate window).
             column![
-                browser::mode_top_nav_ex(ui, m.rail_size, m.nav_strip, tab_items),
                 container(body)
                     .width(Fill)
                     .height(Fill)
                     .align_x(Alignment::Start)
                     .align_y(Alignment::Start)
                     .clip(true),
+                browser::mode_top_nav_ex(ui, m.rail_size, m.nav_strip, tab_items),
             ]
             .spacing(m.gap)
             .width(Fill)
             .height(Fill)
             .into()
         } else {
+            // Medium+ (≥600): collapsed NavigationRail; stable surfaceContainer chrome.
             row![
                 browser::mode_rail(ui, m.rail_w, m.rail_size, tab_items),
                 container(body)
@@ -3059,6 +3226,7 @@ impl FluxPlay {
             .into()
         };
 
+        // Shell: canvas surfaceDim; nav/status = surfaceContainer (M3 pairing).
         container(
             column![main_row, status_bar]
             .spacing(m.gap)
@@ -3103,6 +3271,12 @@ impl FluxPlay {
         });
         let active = !matches!(self.session.state, PlaybackState::Idle)
             || self.session.channel.is_some();
+        let embedded_video = self.session.has_embedded_video();
+        let backend_label = self
+            .session
+            .backend
+            .map(|b| b.label())
+            .unwrap_or("—");
 
         player_ui::player_window(player_ui::PlayerChrome {
             ui,
@@ -3120,6 +3294,8 @@ impl FluxPlay {
             chrome_h: self.layout_metrics().player_chrome_h,
             chrome_visible: self.player_chrome_visible,
             fullscreen: self.player_fullscreen,
+            embedded_video,
+            backend_label,
         })
     }
 
@@ -3143,8 +3319,13 @@ impl FluxPlay {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(2500);
-        if at.elapsed() >= std::time::Duration::from_millis(idle_ms) {
+        if at.elapsed() >= std::time::Duration::from_millis(idle_ms)
+            && self.player_chrome_visible
+        {
             self.player_chrome_visible = false;
+            // Stamp hide time so wake events right after hide are ignored (Wayland
+            // enter/leave spam when the overlay tree changes).
+            self.player_pointer_at = Some(std::time::Instant::now());
         }
     }
 
@@ -3937,7 +4118,7 @@ impl FluxPlay {
                 "Désentrelacement, upscaling, format, zoom : panneau ⋯ → Avancé dans le lecteur.",
             ),
             text(
-                "Astuce : RUST_LOG=fluxplay::ui=info,fluxplay_player=info cargo run — logs de chaque bouton.",
+                "Astuce : FLUXPLAY_VERBOSE=1 cargo run — logs mpv/FFmpeg/iced. Ou RUST_LOG=fluxplay::ui=debug,fluxplay_player=debug.",
             )
             .size(11)
             .color(ui.ink_muted()),
@@ -4111,9 +4292,34 @@ impl FluxPlay {
                 ui,
             ),
             row![
-                pill_button(text("Ajouter"), Message::AddSource, ui, true),
-                pill_button(text("Fichier M3U…"), Message::PickPlaylistFile, ui, false),
-                pill_button(text("Diagnostiquer"), Message::DiagnosePortals, ui, false),
+                pill_button(
+                    crate::icons::icon_label(crate::icons::Icon::Add, "Ajouter", 14.0, ui.on_primary()),
+                    Message::AddSource,
+                    ui,
+                    true,
+                ),
+                pill_button(
+                    crate::icons::icon_label(
+                        crate::icons::Icon::FolderOpen,
+                        "Fichier M3U…",
+                        14.0,
+                        ui.accent(),
+                    ),
+                    Message::PickPlaylistFile,
+                    ui,
+                    false,
+                ),
+                pill_button(
+                    crate::icons::icon_label(
+                        crate::icons::Icon::Diagnose,
+                        "Diagnostiquer",
+                        14.0,
+                        ui.accent(),
+                    ),
+                    Message::DiagnosePortals,
+                    ui,
+                    false,
+                ),
             ]
             .spacing(8)
             .wrap(),
@@ -4136,31 +4342,25 @@ impl FluxPlay {
         ]
         .spacing(8);
 
-        let mut list = Column::new().spacing(6).width(Fill);
+        let mut list = Column::new().spacing(SPACE_SM).width(Fill);
         for s in &self.sources {
             let state = if s.enabled { "actif" } else { "désactivé" };
             let meta = format!("{} · {} · {}", s.kind.label(), state, redact_endpoint(&s.endpoint));
-            list = list.push(
-                row![
-                    browser::media_row(
-                        s.name.clone(),
-                        meta,
-                        Message::ReloadSource(s.id),
-                        None,
-                        ui,
-                        s.enabled,
-                        None,
-                        m.thumb,
-                    ),
-                    pill_button(text("↻"), Message::ReloadSource(s.id), ui, false),
-                    pill_button(text("✕"), Message::RemoveSource(s.id), ui, false),
-                ]
-                .spacing(6)
-                .align_y(Alignment::Center)
-                .width(Fill)
-                .wrap(),
-            );
+            list = list.push(browser::source_card(
+                s.name.clone(),
+                meta,
+                Message::ReloadSource(s.id),
+                Message::ReloadSource(s.id),
+                Message::RemoveSource(s.id),
+                ui,
+            ));
         }
+
+        let list_block = if self.sources.is_empty() {
+            browser::empty_hint(ui, "Aucune source — ajoutez un portail ou une playlist.")
+        } else {
+            browser::soft_scroll_fit(ui, list.width(Fill))
+        };
 
         browser::pane(
             ui,
@@ -4169,15 +4369,19 @@ impl FluxPlay {
                 browser::content_header(
                     ui,
                     "Sources".into(),
-                    format!("{} enregistrées", self.sources.len()),
+                    format!(
+                        "{} enregistrée{}",
+                        self.sources.len(),
+                        if self.sources.len() == 1 { "" } else { "s" }
+                    ),
                     &self.search,
                     m.search_w,
                     m.title_size,
                     m.stack_header,
                 ),
                 form,
-                text("Sources enregistrées").size(14),
-                browser::soft_scroll(ui, list.width(Fill)),
+                text("Sources enregistrées").size(14).color(ui.on_surface_variant()),
+                list_block,
             ]
             .spacing(m.gap)
             .width(Fill)
@@ -4230,6 +4434,17 @@ fn pick_default_live_group(bundle: &PlaylistBundle) -> Option<String> {
 }
 
 fn play_options_from(settings: &AppSettings) -> PlayOptions {
+    let preferred = match std::env::var("FLUXPLAY_BACKEND")
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "mpv" | "libmpv" => PlayerBackendPref::Mpv,
+        "ffmpeg" | "ffplay" => PlayerBackendPref::Ffmpeg,
+        "auto" => PlayerBackendPref::Auto,
+        "external" => PlayerBackendPref::External,
+        _ => settings.player_backend,
+    };
     PlayOptions {
         user_agent: Some("IPTVSmartersPlayer".into()),
         referer: None,
@@ -4239,7 +4454,7 @@ fn play_options_from(settings: &AppSettings) -> PlayOptions {
         demux_secs: settings.demux_secs,
         volume: settings.volume,
         low_latency: settings.low_latency,
-        preferred: settings.player_backend,
+        preferred,
     }
 }
 
@@ -4386,6 +4601,7 @@ fn redact_endpoint(endpoint: &str) -> String {
 fn profile_message_label(message: &Message) -> &'static str {
     match message {
         Message::PlayerTick => "tick.player",
+        Message::VideoFrameAllocated(_) => "tick.video_frame",
         Message::PlayerChromeTick => "tick.chrome",
         Message::ImageLoaded(_) => "async.image",
         Message::MetaEnriched { .. } => "async.meta",
@@ -4413,7 +4629,10 @@ fn profile_message_label(message: &Message) -> &'static str {
 
 fn ui_action_label(message: &Message) -> Option<&'static str> {
     Some(match message {
-        Message::PlayerTick | Message::ImageLoaded(_) | Message::MetaEnriched { .. } => {
+        Message::PlayerTick
+        | Message::VideoFrameAllocated(_)
+        | Message::ImageLoaded(_)
+        | Message::MetaEnriched { .. } => {
             return None;
         }
         Message::PlayerLayout { .. } | Message::PlayerLayoutDirty(_) | Message::WindowResized { .. } => {
@@ -4577,7 +4796,12 @@ fn field<'a>(
     let input_row: Element<'a, Message> = if let Some(target) = paste {
         row![
             container(input).width(Fill),
-            pill_button(text("Coller"), Message::PasteInto(target), ui, false),
+            pill_button(
+                crate::icons::icon_label(crate::icons::Icon::Paste, "Coller", 13.0, ui.accent()),
+                Message::PasteInto(target),
+                ui,
+                false,
+            ),
         ]
         .spacing(8)
         .align_y(Alignment::Center)

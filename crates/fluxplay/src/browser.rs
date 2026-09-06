@@ -10,12 +10,14 @@ use iced::widget::{
 };
 use iced::widget::image::Handle;
 use iced::{
-    Alignment, Background, Border, Color, Element, Fill, Length, Padding, Shadow, Theme,
+    Alignment, Background, Border, Color, Element, Fill, Length, Padding, Theme,
 };
 
 use crate::theme::{
-    radius_fab, radius_nav_pill, radius_poster, UiTheme, MOSAIC_GAP, RADIUS_FULL, RADIUS_LG,
-    RADIUS_MD, RADIUS_XXL, SPACE_MD, SPACE_SM, SPACE_XL, SPACE_XS, SPACE_XXS,
+    elevation_shadow, radius_fab, radius_list_item, radius_nav_pill, radius_poster, UiTheme,
+    MOSAIC_GAP, CARD_RADIUS, RADIUS_FULL, RADIUS_LG, RADIUS_MD, RADIUS_XL, RADIUS_XXL, SPACE_MD,
+    SPACE_SM, SPACE_XL, SPACE_XS, SPACE_XXS, TYPE_DISPLAY_S, TYPE_HEADLINE_S, TYPE_BODY_M,
+    TYPE_LABEL_L, TYPE_LABEL_M, TYPE_TITLE_M,
 };
 use crate::app::Message;
 
@@ -27,7 +29,8 @@ pub const LIST_MAX: usize = 96;
 pub const EPISODE_PAGE: usize = 40;
 
 pub fn shell_background(ui: UiTheme) -> Color {
-    ui.shell()
+    // Body canvas = surfaceDim; navigation panes use surfaceContainer separately.
+    ui.surface_dim()
 }
 
 /// Thin, muted scrollbar — media-center feel (not OS-fat defaults).
@@ -38,8 +41,8 @@ pub fn soft_scroll<'a>(
     scrollable(body)
         .direction(scrollable::Direction::Vertical(
             scrollable::Scrollbar::new()
-                .width(5)
-                .scroller_width(5)
+                .width(8)
+                .scroller_width(8)
                 .margin(2),
         ))
         .style(move |theme: &Theme, status| {
@@ -64,6 +67,39 @@ pub fn soft_scroll<'a>(
         .into()
 }
 
+/// Scroll when needed, but do not steal leftover column height (avoids empty “grey bar”).
+pub fn soft_scroll_fit<'a>(
+    ui: UiTheme,
+    body: impl Into<Element<'a, Message>>,
+) -> Element<'a, Message> {
+    scrollable(body)
+        .direction(scrollable::Direction::Vertical(
+            scrollable::Scrollbar::new()
+                .width(8)
+                .scroller_width(8)
+                .margin(2),
+        ))
+        .style(move |theme: &Theme, status| {
+            let mut s = scrollable::default(theme, status);
+            let rail = Background::Color(ui.surface_muted());
+            let thumb = Background::Color(Color::from_rgba(
+                ui.accent().r,
+                ui.accent().g,
+                ui.accent().b,
+                if ui.day { 0.35 } else { 0.45 },
+            ));
+            s.vertical_rail.background = Some(rail);
+            s.vertical_rail.border.radius = RADIUS_FULL.into();
+            s.vertical_rail.scroller.background = thumb;
+            s.vertical_rail.scroller.border.radius = RADIUS_FULL.into();
+            s.horizontal_rail.background = Some(rail);
+            s.horizontal_rail.scroller.background = thumb;
+            s
+        })
+        .width(Fill)
+        .into()
+}
+
 pub fn pane<'a>(
     ui: UiTheme,
     width: Length,
@@ -78,21 +114,12 @@ pub fn pane_sized<'a>(
     height: Length,
     body: impl Into<Element<'a, Message>>,
 ) -> Element<'a, Message> {
-    // Soft blur shadows tear / ghost on GLES (Android). Keep a flat elevated surface.
-    #[cfg(target_os = "android")]
-    let shadow = Shadow::default();
-    #[cfg(not(target_os = "android"))]
-    let shadow = Shadow {
-        color: Color::from_rgba(0.0, 0.0, 0.0, if ui.day { 0.04 } else { 0.28 }),
-        offset: iced::Vector::new(0.0, 6.0),
-        blur_radius: 18.0,
-    };
-    #[cfg(target_os = "android")]
-    let _ = RADIUS_XXL; // keep scale symbol linked on all targets
+    // Elev 0 tonal panes; soft elev 1 only on desktop (Android: flat).
+    let shadow = elevation_shadow(0, ui.day);
     let radius = if cfg!(target_os = "android") {
         RADIUS_LG
     } else {
-        RADIUS_XXL // extraLargeIncreased — expressive pane
+        RADIUS_XXL
     };
     #[cfg(target_os = "android")]
     let pad = SPACE_SM as u16;
@@ -119,134 +146,218 @@ pub fn pane_sized<'a>(
         .into()
 }
 
+/// Navigation region — always `surfaceContainer` (M3 pairing, stable breakpoints).
+pub fn nav_pane_sized<'a>(
+    ui: UiTheme,
+    width: Length,
+    height: Length,
+    body: impl Into<Element<'a, Message>>,
+) -> Element<'a, Message> {
+    let radius = if cfg!(target_os = "android") {
+        RADIUS_LG
+    } else {
+        RADIUS_XXL
+    };
+    let pad = SPACE_SM as u16;
+    container(body)
+        .width(width)
+        .height(height)
+        .padding(pad)
+        .align_x(Alignment::Start)
+        .align_y(Alignment::Start)
+        .clip(true)
+        .style(move |_t: &Theme| container::Style {
+            background: Some(Background::Color(ui.surface_container())),
+            border: Border {
+                color: ui.outline_variant(),
+                width: 1.0,
+                radius: radius.into(),
+            },
+            shadow: elevation_shadow(0, ui.day),
+            ..Default::default()
+        })
+        .into()
+}
+
 pub fn mode_rail<'a>(
     ui: UiTheme,
     width: f32,
     label_size: f32,
-    items: impl IntoIterator<Item = (&'a str, Message, bool)>,
+    items: impl IntoIterator<Item = (crate::icons::Icon, &'a str, Message, bool)>,
 ) -> Element<'a, Message> {
     let mut nav = Column::new().spacing(SPACE_XS).width(Fill);
+    // Brand: displaySmall emphasized (scaled to rail).
+    let brand_size = (label_size + 10.0).min(TYPE_DISPLAY_S * 0.55).max(label_size + 6.0);
     nav = nav.push(
         column![
-            // Emphasized brand (M3 titleLargeEmphasized analogue)
-            text("FluxPlay").size(label_size + 6.0).color(ui.accent()),
+            text("FluxPlay")
+                .size(brand_size)
+                .color(ui.primary()),
             text("Media center")
-                .size((label_size * 0.68).max(10.0))
-                .color(ui.ink_muted()),
+                .size(TYPE_LABEL_M)
+                .color(ui.on_surface_variant()),
         ]
         .spacing(SPACE_XXS)
-        .padding(Padding::from([0, 4])),
+        .padding(Padding::from([4, 8])),
     );
     nav = nav.push(Space::new().height(SPACE_MD));
-    for (label, msg, active) in items {
-        let fg = if active { ui.accent() } else { ui.ink() };
-        // NavigationRail: tall pill indicator (shape tension vs square pane).
-        // Text stays outside styled containers (GLES-safe).
-        let bar: Element<'a, Message> = container(Space::new().width(if active { 5.0 } else { 3.0 }).height(label_size + 10.0))
+    for (ic, label, msg, active) in items {
+        // Active: secondaryContainer fill + onSecondaryContainer ink (readable contrast).
+        let fg = if active {
+            ui.on_secondary_container()
+        } else {
+            ui.on_surface_variant()
+        };
+        let bg = if active {
+            ui.secondary_container()
+        } else {
+            Color::TRANSPARENT
+        };
+        let indicator = container(Space::new().width(4.0).height(label_size + 14.0))
             .style(move |_t: &Theme| container::Style {
                 background: Some(Background::Color(if active {
-                    ui.accent()
+                    ui.secondary()
                 } else {
-                    ui.outline_variant()
+                    Color::TRANSPARENT
                 })),
                 border: Border {
                     radius: radius_nav_pill(),
                     ..Default::default()
                 },
                 ..Default::default()
-            })
-            .into();
-        let hit = row![
-            bar,
-            Space::new().width(SPACE_SM),
-            text(label).size(if active { label_size + 1.0 } else { label_size }).color(fg).width(Fill),
-        ]
-        .align_y(Alignment::Center)
+            });
+        let hit = container(
+            row![
+                indicator,
+                Space::new().width(SPACE_SM),
+                crate::icons::icon(ic, 22.0, fg),
+                Space::new().width(SPACE_SM),
+                text(label)
+                    .size(if active { label_size + 1.0 } else { label_size })
+                    .color(fg)
+                    .width(Fill),
+            ]
+            .align_y(Alignment::Center)
+            .width(Fill)
+            .padding(Padding::from([12, 10])),
+        )
         .width(Fill)
-        .padding(Padding::from([9, 4]));
+        .style(move |_t: &Theme| container::Style {
+            background: Some(Background::Color(bg)),
+            border: Border {
+                radius: RADIUS_XL.into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
         nav = nav.push(mouse_area(hit).on_press(msg));
     }
-    pane_sized(ui, Length::Fixed(width.max(100.0)), Fill, nav)
+    nav_pane_sized(ui, Length::Fixed(width.max(100.0)), Fill, nav)
 }
 
 /// Phone / narrow: compact two-column tab grid (Row+mouse_area drops siblings on GLES).
 pub fn mode_top_nav<'a>(
     ui: UiTheme,
     label_size: f32,
-    items: impl IntoIterator<Item = (&'a str, Message, bool)>,
+    items: impl IntoIterator<Item = (crate::icons::Icon, &'a str, Message, bool)>,
 ) -> Element<'a, Message> {
     mode_top_nav_ex(ui, label_size, false, items)
 }
 
-/// Phone landscape: horizontal chip strip (saves vertical space).
+/// Phone / narrow: M3 NavigationBar — equal destinations with active indicator.
 pub fn mode_top_nav_ex<'a>(
     ui: UiTheme,
     label_size: f32,
     landscape_strip: bool,
-    items: impl IntoIterator<Item = (&'a str, Message, bool)>,
+    items: impl IntoIterator<Item = (crate::icons::Icon, &'a str, Message, bool)>,
 ) -> Element<'a, Message> {
     let collected: Vec<_> = items.into_iter().collect();
-    if landscape_strip {
-        let mut strip = Row::new().spacing(SPACE_SM).align_y(Alignment::Center);
-        strip = strip.push(text("FluxPlay").size(label_size + 1.0).color(ui.accent()));
-        for (label, msg, active) in collected {
-            let fg = if active { ui.on_accent() } else { ui.ink() };
-            let bg = if active {
-                ui.accent()
-            } else {
-                ui.secondary_container()
-            };
-            let chip = container(text(label).size(label_size).color(fg))
-                .padding(Padding::from([8, 12]))
-                .style(move |_t: &Theme| container::Style {
-                    background: Some(Background::Color(bg)),
-                    border: Border {
-                        color: if active {
-                            ui.accent()
-                        } else {
-                            ui.outline_variant()
-                        },
-                        width: 1.0,
-                        radius: RADIUS_FULL.into(),
-                    },
-                    ..Default::default()
-                });
-            strip = strip.push(mouse_area(chip).on_press(msg));
-        }
-        return scrollable(strip.padding(Padding::from([2, 0])))
-            .direction(scrollable::Direction::Horizontal(
-                scrollable::Scrollbar::new().width(0).scroller_width(0),
-            ))
-            .width(Fill)
-            .into();
-    }
+    // Brand row above the bar (M3: brand stays visible, destinations in bar).
+    let brand = text("FluxPlay")
+        .size(if landscape_strip {
+            label_size + 2.0
+        } else {
+            (label_size + 8.0).min(TYPE_HEADLINE_S)
+        })
+        .color(ui.primary());
 
-    let mid = collected.len().div_ceil(2).max(1);
-    let mut left = Column::new().spacing(SPACE_XS).width(Fill);
-    let mut right = Column::new().spacing(SPACE_XS).width(Fill);
-    for (i, (label, msg, active)) in collected.into_iter().enumerate() {
-        let fg = if active { ui.accent() } else { ui.ink() };
-        let line = format!("{}  {label}", if active { "▸" } else { "·" });
+    let mut bar = Row::new().spacing(SPACE_XXS).align_y(Alignment::Center).width(Fill);
+    for (ic, label, msg, active) in collected {
+        let fg = if active {
+            ui.on_secondary_container()
+        } else {
+            ui.on_surface_variant()
+        };
+        let pill_bg = if active {
+            ui.secondary_container()
+        } else {
+            Color::TRANSPARENT
+        };
+        let indicator = container(Space::new().width(if active { 28.0 } else { 0.0 }).height(4.0))
+            .style(move |_t: &Theme| container::Style {
+                background: Some(Background::Color(if active {
+                    ui.secondary()
+                } else {
+                    Color::TRANSPARENT
+                })),
+                border: Border {
+                    radius: RADIUS_FULL.into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            });
         let cell = mouse_area(
-            container(text(line).size(label_size).color(fg).width(Fill))
-                .padding(Padding::from([10, 6]))
+            container(
+                column![
+                    indicator,
+                    Space::new().height(4.0),
+                    crate::icons::icon(ic, 20.0, fg),
+                    text(label)
+                        .size(if active {
+                            label_size + 0.5
+                        } else {
+                            label_size
+                        })
+                        .color(fg),
+                ]
+                .spacing(2)
+                .align_x(Alignment::Center)
                 .width(Fill),
+            )
+            .padding(Padding::from([8, 4]))
+            .width(Fill)
+            .center_x(Fill)
+            .style(move |_t: &Theme| container::Style {
+                background: Some(Background::Color(pill_bg)),
+                border: Border {
+                    radius: RADIUS_XL.into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
         )
         .on_press(msg);
-        if i < mid {
-            left = left.push(cell);
-        } else {
-            right = right.push(cell);
-        }
+        bar = bar.push(cell);
     }
-    column![
-        text("FluxPlay").size(label_size + 2.0).color(ui.accent()),
-        row![left, right].spacing(SPACE_MD).width(Fill),
-    ]
-    .spacing(SPACE_SM)
-    .width(Fill)
-    .padding(Padding::from([4, 2]))
-    .into()
+
+    let chrome = container(bar)
+        .padding(Padding::from([6, 8]))
+        .width(Fill)
+        .style(move |_t: &Theme| container::Style {
+            background: Some(Background::Color(ui.surface_container())),
+            border: Border {
+                color: ui.outline_variant(),
+                width: 1.0,
+                radius: RADIUS_XXL.into(),
+            },
+            ..Default::default()
+        });
+
+    column![brand, chrome]
+        .spacing(SPACE_SM)
+        .width(Fill)
+        .padding(Padding::from([2, 0]))
+        .into()
 }
 
 pub fn category_sidebar<'a>(
@@ -310,10 +421,11 @@ pub fn category_chips<'a>(
         .on_input(Message::CatFilterChanged)
         .padding(SPACE_SM as u16)
         .size(13)
-        .width(Length::Fixed(100.0))
+        .width(Length::Fixed(112.0))
         .style(move |theme: &Theme, status| {
             let mut s = text_input::default(theme, status);
             s.border.radius = RADIUS_FULL.into();
+            s.border.color = ui.outline_variant();
             s.background = Background::Color(ui.surface_container_low());
             s
         });
@@ -326,12 +438,34 @@ pub fn category_chips<'a>(
         } else {
             name.replace(';', " · ")
         };
-        // FilterChip analogue — selected gets accent + filled marker
-        let fg = if active { ui.accent() } else { ui.ink() };
-        let line = format!("{}{label}", if active { "● " } else { "○ " });
-        chips = chips.push(
-            mouse_area(text(line).size(12.0).color(fg)).on_press(Message::SelectBrowseCategory(id)),
-        );
+        // M3 FilterChip: selected = secondaryContainer + squircle; unselected = full pill.
+        let fg = if active {
+            ui.on_secondary_container()
+        } else {
+            ui.on_surface()
+        };
+        let bg = if active {
+            ui.secondary_container()
+        } else {
+            ui.surface_container_low()
+        };
+        let radius = if active { RADIUS_MD } else { RADIUS_FULL };
+        let chip = container(text(label).size(TYPE_LABEL_L).color(fg))
+            .padding(Padding::from([10, 14]))
+            .style(move |_t: &Theme| container::Style {
+                background: Some(Background::Color(bg)),
+                border: Border {
+                    color: if active {
+                        Color::TRANSPARENT
+                    } else {
+                        ui.outline_variant()
+                    },
+                    width: if active { 0.0 } else { 1.0 },
+                    radius: radius.into(),
+                },
+                ..Default::default()
+            });
+        chips = chips.push(mouse_area(chip).on_press(Message::SelectBrowseCategory(id)));
     }
 
     scrollable(chips)
@@ -342,12 +476,20 @@ pub fn category_chips<'a>(
 }
 
 fn cat_row(label: String, msg: Message, ui: UiTheme, active: bool) -> Element<'static, Message> {
-    let fg = if active { ui.accent() } else { ui.ink() };
-    // NavigationDrawer item: active = thick pill marker + emphasized label.
-    let bar = container(Space::new().width(if active { 5.0 } else { 3.0 }).height(20.0))
+    let fg = if active {
+        ui.on_secondary_container()
+    } else {
+        ui.on_surface()
+    };
+    let bg = if active {
+        ui.secondary_container()
+    } else {
+        Color::TRANSPARENT
+    };
+    let bar = container(Space::new().width(if active { 4.0 } else { 0.0 }).height(22.0))
         .style(move |_t: &Theme| container::Style {
             background: Some(Background::Color(if active {
-                ui.accent()
+                ui.secondary()
             } else {
                 Color::TRANSPARENT
             })),
@@ -358,17 +500,32 @@ fn cat_row(label: String, msg: Message, ui: UiTheme, active: bool) -> Element<'s
             ..Default::default()
         });
     mouse_area(
-        row![
-            bar,
-            Space::new().width(SPACE_SM),
-            text(label)
-                .size(if active { 14.0 } else { 13.0 })
-                .color(fg)
-                .width(Fill),
-        ]
-        .align_y(Alignment::Center)
+        container(
+            row![
+                bar,
+                Space::new().width(SPACE_SM),
+                text(label)
+                    .size(if active { TYPE_LABEL_L + 1.0 } else { TYPE_LABEL_L })
+                    .color(fg)
+                    .width(Fill),
+            ]
+            .align_y(Alignment::Center)
+            .width(Fill)
+            .padding(Padding::from([12, 10])),
+        )
         .width(Fill)
-        .padding(Padding::from([10, 6])),
+        .style(move |_t: &Theme| container::Style {
+            background: Some(Background::Color(bg)),
+            border: Border {
+                radius: if active {
+                    RADIUS_LG.into()
+                } else {
+                    RADIUS_XL.into()
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        }),
     )
     .on_press(msg)
     .into()
@@ -384,28 +541,32 @@ pub fn content_header<'a>(
     stack: bool,
 ) -> Element<'a, Message> {
     let titles = column![
-        text(title).size(title_size).color(ui.ink()),
+        text(title).size(title_size.max(TYPE_TITLE_M)).color(ui.on_surface()),
         text(subtitle)
-            .size((title_size * 0.52).max(11.0))
-            .color(ui.ink_muted()),
+            .size(TYPE_LABEL_M)
+            .color(ui.on_surface_variant()),
     ]
     .spacing(SPACE_XXS)
     .width(Fill);
 
     let search_el = text_input("Rechercher…", search)
         .on_input(Message::SearchChanged)
-        .padding(if stack { 10 } else { 12 })
-        .size(14)
+        .padding(if stack { 12 } else { 14 })
+        .size(TYPE_BODY_M)
         .width(if stack {
             Fill
         } else {
-            Length::Fixed(search_width.clamp(100.0, 420.0))
+            Length::Fixed(search_width.clamp(100.0, 720.0))
         })
         .style(move |theme: &Theme, status| {
             let mut s = text_input::default(theme, status);
             s.border.radius = RADIUS_FULL.into();
-            s.border.color = ui.outline_variant();
-            s.background = Background::Color(ui.surface_container_low());
+            s.border.color = if matches!(status, text_input::Status::Focused { .. }) {
+                ui.outline()
+            } else {
+                ui.outline_variant()
+            };
+            s.background = Background::Color(ui.surface_container_highest());
             s
         });
 
@@ -433,7 +594,18 @@ pub fn media_row<'a>(
     thumb: Option<&'a Handle>,
     thumb_size: f32,
 ) -> Element<'a, Message> {
-    let title_c = if active { ui.accent() } else { ui.ink() };
+    let title_c = if active {
+        ui.on_primary_container()
+    } else {
+        ui.on_surface()
+    };
+    let row_bg = if active {
+        // Soft primaryContainer — full vibrant fill was overpowering on lists.
+        let c = ui.primary_container();
+        Color::from_rgba(c.r, c.g, c.b, if ui.day { 0.55 } else { 0.42 })
+    } else {
+        Color::TRANSPARENT
+    };
     let ts = thumb_size.clamp(32.0, 72.0);
 
     let thumb_el: Element<'a, Message> = if let Some(handle) = thumb {
@@ -446,32 +618,43 @@ pub fn media_row<'a>(
         .width(Length::Fixed(ts))
         .height(Length::Fixed(ts))
         .style(move |_t: &Theme| container::Style {
-            background: Some(Background::Color(ui.surface_muted())),
+            background: Some(Background::Color(ui.surface_container_low())),
             border: Border {
-                radius: RADIUS_MD.into(),
+                radius: CARD_RADIUS.into(),
                 ..Default::default()
             },
             ..Default::default()
         })
         .into()
     } else {
-        container(Space::new().width(ts).height(ts))
-            .width(Length::Fixed(ts))
-            .height(Length::Fixed(ts))
-            .style(move |_t: &Theme| container::Style {
-                background: Some(Background::Color(ui.surface_muted())),
-                border: Border {
-                    radius: RADIUS_MD.into(),
-                    ..Default::default()
-                },
+        let glyph = title
+            .chars()
+            .find(|c| c.is_ascii_alphanumeric())
+            .map(|c| c.to_ascii_uppercase())
+            .unwrap_or('#');
+        container(
+            text(glyph.to_string())
+                .size((ts * 0.42).clamp(14.0, 28.0))
+                .color(ui.on_surface_variant()),
+        )
+        .width(Length::Fixed(ts))
+        .height(Length::Fixed(ts))
+        .center_x(Fill)
+        .center_y(Fill)
+        .style(move |_t: &Theme| container::Style {
+            background: Some(Background::Color(ui.surface_container_highest())),
+            border: Border {
+                radius: CARD_RADIUS.into(),
                 ..Default::default()
-            })
-            .into()
+            },
+            ..Default::default()
+        })
+        .into()
     };
 
     let labels = column![
-        text(title).size(15).color(title_c),
-        text(subtitle).size(12).color(ui.ink_muted()),
+        text(title).size(TYPE_TITLE_M).color(title_c),
+        text(subtitle).size(TYPE_LABEL_M).color(ui.on_surface_variant()),
     ]
     .spacing(SPACE_XXS)
     .width(Fill);
@@ -479,7 +662,7 @@ pub fn media_row<'a>(
     let mark = container(Space::new().width(3).height(ts.max(28.0)))
         .style(move |_t: &Theme| container::Style {
             background: Some(Background::Color(if active {
-                ui.accent()
+                ui.primary()
             } else {
                 Color::TRANSPARENT
             })),
@@ -495,17 +678,16 @@ pub fn media_row<'a>(
             .spacing(SPACE_SM)
             .align_y(Alignment::Center)
             .width(Fill)
-            .padding(Padding::from([6, 4])),
+            .padding(Padding::from([10, 8])),
     )
     .on_press(on_open);
 
-    if let Some((is_fav, fav_msg)) = on_fav {
+    let row_body: Element<'a, Message> = if let Some((is_fav, fav_msg)) = on_fav {
         let star = if is_fav { "★" } else { "☆" };
-        let fav_c = ui.favorite();
+        let fav_c = ui.tertiary();
         row![
             open_hit,
-            mouse_area(text(star).size(16).color(fav_c))
-                .on_press(fav_msg),
+            mouse_area(text(star).size(TYPE_TITLE_M).color(fav_c)).on_press(fav_msg),
         ]
         .spacing(SPACE_SM)
         .align_y(Alignment::Center)
@@ -513,7 +695,99 @@ pub fn media_row<'a>(
         .into()
     } else {
         open_hit.into()
-    }
+    };
+
+    // Expressive list selection: soft primaryContainer + morph corners.
+    container(row_body)
+        .width(Fill)
+        .style(move |_t: &Theme| container::Style {
+            background: Some(Background::Color(row_bg)),
+            border: Border {
+                radius: radius_list_item(active),
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .into()
+}
+
+/// Registered source card — full-width list item with trailing icon actions (M3).
+pub fn source_card<'a>(
+    title: String,
+    subtitle: String,
+    on_open: Message,
+    on_reload: Message,
+    on_remove: Message,
+    ui: UiTheme,
+) -> Element<'a, Message> {
+    use crate::icons::{self, Icon};
+
+    let labels = column![
+        text(title).size(TYPE_TITLE_M).color(ui.on_surface()),
+        text(subtitle).size(TYPE_LABEL_M).color(ui.on_surface_variant()),
+    ]
+    .spacing(SPACE_XXS)
+    .width(Fill);
+
+    let open = mouse_area(
+        row![
+            icons::icon(Icon::Sources, 28.0, ui.primary()),
+            Space::new().width(SPACE_MD),
+            labels,
+        ]
+        .align_y(Alignment::Center)
+        .width(Fill)
+        .padding(Padding::from([4, 0])),
+    )
+    .on_press(on_open);
+
+    let reload = mouse_area(
+        container(icons::icon(Icon::Refresh, 22.0, ui.on_surface_variant()))
+            .padding(10)
+            .style(move |_t: &Theme| container::Style {
+                background: Some(Background::Color(ui.surface_container_highest())),
+                border: Border {
+                    radius: RADIUS_FULL.into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+    )
+    .on_press(on_reload);
+
+    let remove = mouse_area(
+        container(icons::icon(Icon::Delete, 22.0, ui.error()))
+            .padding(10)
+            .style(move |_t: &Theme| container::Style {
+                background: Some(Background::Color(ui.error_container())),
+                border: Border {
+                    radius: RADIUS_FULL.into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+    )
+    .on_press(on_remove);
+
+    container(
+        row![open, reload, remove]
+            .spacing(SPACE_SM)
+            .align_y(Alignment::Center)
+            .width(Fill)
+            .padding(Padding::from([14, 16])),
+    )
+    .width(Fill)
+    .style(move |_t: &Theme| container::Style {
+        background: Some(Background::Color(ui.surface_container_high())),
+        border: Border {
+            radius: RADIUS_XL.into(),
+            width: 1.0,
+            color: ui.outline_variant(),
+        },
+        shadow: elevation_shadow(1, ui.day),
+        ..Default::default()
+    })
+    .into()
 }
 
 pub fn empty_hint(ui: UiTheme, msg: impl Into<String>) -> Element<'static, Message> {
@@ -532,22 +806,22 @@ pub fn empty_hint(ui: UiTheme, msg: impl Into<String>) -> Element<'static, Messa
 }
 
 pub fn load_more_btn(ui: UiTheme, remaining: Option<usize>) -> Element<'static, Message> {
-    // OutlinedButton + pill — M3 Expressive “show more” pattern
+    // Outlined / tonal L pill — M3 Expressive “show more”.
     let label = match remaining {
         Some(n) if n > 0 => format!("Afficher plus (+{n})"),
         _ => "Afficher plus".into(),
     };
-    button(text(label).size(13))
+    button(text(label).size(TYPE_LABEL_L))
         .on_press(Message::LoadMore)
-        .padding(Padding::from([14, 20]))
+        .padding(Padding::from([16, 24]))
         .width(Fill)
         .style(move |theme: &Theme, status| {
             let mut s = button::secondary(theme, status);
             s.border.radius = RADIUS_FULL.into();
-            s.border.color = ui.outline_variant();
-            s.border.width = 1.5;
-            s.background = Some(Background::Color(ui.secondary_container()));
-            s.text_color = ui.accent();
+            s.border.color = ui.outline();
+            s.border.width = 1.0;
+            s.background = Some(Background::Color(Color::TRANSPARENT));
+            s.text_color = ui.primary();
             s
         })
         .into()
@@ -587,29 +861,67 @@ pub fn mosaic_tile<'a>(
         })
         .into()
     } else {
-        container(Space::new().width(w).height(h))
-            .width(Length::Fixed(w))
-            .height(Length::Fixed(h))
-            .style(move |_t: &Theme| container::Style {
-                background: Some(Background::Color(ui.surface_container_high())),
-                border: Border {
-                    radius: radius_poster(),
-                    ..Default::default()
-                },
-                ..Default::default()
-            })
-            .into()
+        container(
+            column![
+                text("▣")
+                    .size((w * 0.22).clamp(18.0, 36.0))
+                    .color(ui.ink_muted()),
+                text("Jaquette")
+                    .size(11.0)
+                    .color(ui.ink_muted()),
+            ]
+            .spacing(SPACE_XS)
+            .align_x(Alignment::Center),
+        )
+        .width(Length::Fixed(w))
+        .height(Length::Fixed(h))
+        .center_x(Fill)
+        .center_y(Fill)
+        .style(move |_t: &Theme| container::Style {
+            background: Some(Background::Color(ui.surface_container_high())),
+            border: Border {
+                color: ui.outline_variant(),
+                width: 1.0,
+                radius: radius_poster(),
+            },
+            ..Default::default()
+        })
+        .into()
     };
 
-    // Title emphasized vs label meta (Expressive type hierarchy)
-    let title_el = text(title).size(13).color(ui.ink());
-    let meta_el = text(meta_line).size(11).color(ui.ink_muted());
-
-    let body = column![poster, title_el, meta_el]
-        .spacing(SPACE_SM)
+    // Title/meta clipped to tile width — prevent mosaic text bleed into neighbors.
+    let max_chars = ((w / 7.2).floor() as usize).clamp(10, 48);
+    let title_el = text(truncate_ui(&title, max_chars))
+        .size(TYPE_LABEL_L)
+        .color(ui.on_surface())
+        .width(Length::Fixed(w));
+    let meta_el = text(truncate_ui(&meta_line, max_chars + 4))
+        .size(TYPE_LABEL_M)
+        .color(ui.on_surface_variant())
         .width(Length::Fixed(w));
 
+    let body = container(
+        column![poster, title_el, meta_el]
+            .spacing(SPACE_SM)
+            .width(Length::Fixed(w)),
+    )
+    .padding(Padding::from([0, 2]))
+    .width(Length::Fixed(w))
+    .clip(true);
+
     mouse_area(body).on_press(on_open).into()
+}
+
+fn truncate_ui(s: &str, max: usize) -> String {
+    let mut t = String::new();
+    for (i, ch) in s.chars().enumerate() {
+        if i >= max {
+            t.push('…');
+            break;
+        }
+        t.push(ch);
+    }
+    t
 }
 
 pub fn mosaic_grid<'a>(tiles: Vec<Element<'a, Message>>, cols: usize) -> Element<'a, Message> {

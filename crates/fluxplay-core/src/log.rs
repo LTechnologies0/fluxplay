@@ -9,14 +9,24 @@
 //! - **ERROR** — hard failures
 
 /// EnvFilter default when `RUST_LOG` is unset.
-/// All workspace crates at `info`; profiler off until explicitly enabled.
+/// Keep hot paths quiet — enable `FLUXPLAY_PROFILE=1` / `profiler=info` when measuring.
+///
+/// Verbose native backends (libmpv / libav*):
+/// ```text
+/// FLUXPLAY_VERBOSE=1 cargo run -p fluxplay
+/// # or fine-grained:
+/// FLUXPLAY_MPV_LOG=debug FLUXPLAY_FFMPEG_LOG=debug \
+///   RUST_LOG=fluxplay=debug,fluxplay_player=debug,iced=info,iced_winit=info \
+///   cargo run -p fluxplay
+/// ```
+/// Logs: stderr + `/tmp/fluxplay-mpv-verbose.log` (libmpv/CLI when verbose).
 pub const DEFAULT_ENV_FILTER: &str = concat!(
     "fluxplay=info,",
     "fluxplay_core=info,",
     "fluxplay_providers=info,",
     "fluxplay_player=info,",
     "fluxplay_ffi=info,",
-    "profiler=off"
+    "fluxplay::net=info"
 );
 
 /// Emit a **profiler** line (TRACE on target `profiler`).

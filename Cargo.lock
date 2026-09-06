@@ -1377,7 +1377,7 @@ checksum = "98de4bbd547a563b716d8dfa9aad1cb19bfab00f4fa09a6a4ed21dbcf44ce9c4"
 
 [[package]]
 name = "fluxplay"
-version = "0.2.2"
+version = "0.2.4"
 dependencies = [
  "android-activity",
  "android_logger",
@@ -1410,7 +1410,7 @@ dependencies = [
 
 [[package]]
 name = "fluxplay-android"
-version = "0.2.2"
+version = "0.2.4"
 dependencies = [
  "android-activity",
  "fluxplay",
@@ -1419,7 +1419,7 @@ dependencies = [
 
 [[package]]
 name = "fluxplay-core"
-version = "0.2.2"
+version = "0.2.4"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1436,7 +1436,7 @@ dependencies = [
 
 [[package]]
 name = "fluxplay-ffi"
-version = "0.2.2"
+version = "0.2.4"
 dependencies = [
  "fluxplay-core",
  "fluxplay-player",
@@ -1446,9 +1446,10 @@ dependencies = [
 
 [[package]]
 name = "fluxplay-player"
-version = "0.2.2"
+version = "0.2.4"
 dependencies = [
  "anyhow",
+ "cc",
  "chrono",
  "fluxplay-core",
  "open",
@@ -1458,12 +1459,13 @@ dependencies = [
  "thiserror 2.0.20",
  "tokio",
  "tracing",
+ "tracing-subscriber",
  "url",
 ]
 
 [[package]]
 name = "fluxplay-providers"
-version = "0.2.2"
+version = "0.2.4"
 dependencies = [
  "anyhow",
  "base64",

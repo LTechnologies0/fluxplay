@@ -1,11 +1,14 @@
 //! FluxPlay player — protocol routing + native backends (libmpv / FFmpeg / platform).
 //!
-//! Desktop: **libmpv in-process** (static or shared link), optional CLI `mpv`/`ffplay` fallback.
+//! Desktop: **libmpv** and **libav* FFmpeg** in-process (RGBA into iced), optional CLI fallback.
 //! Mobile: core logic + FFI; decode via ExoPlayer (Android) / AVPlayer (iOS).
 
 mod backend;
+#[cfg(all(feature = "native-ffmpeg", fluxplay_has_ffmpeg))]
+mod ffmpeg_ffi;
 #[cfg(all(feature = "native-mpv", fluxplay_has_libmpv))]
 mod mpv_ffi;
+mod native_log;
 mod platform;
 mod session;
 
@@ -18,6 +21,10 @@ use tracing::{debug, info, trace, warn};
 
 pub use backend::{
     detect_backends, BackendId, BackendInfo, NativePlayer, PlayOptions, PlayerEvent, VideoRect,
+};
+pub use native_log::{
+    ffmpeg_av_log_level, log_native_verbosity_banner, mpv_msg_level, mpv_verbose_log_path,
+    verbose_master,
 };
 pub use platform::{target_profile, Platform, TargetProfile};
 pub use session::{
@@ -70,6 +77,8 @@ pub fn support_matrix() -> Vec<ProtocolSupport> {
     let native = !detect_backends().is_empty();
     let decode_note = if cfg!(all(feature = "native-mpv", fluxplay_has_libmpv)) {
         "libmpv natif lié dans le binaire"
+    } else if cfg!(all(feature = "native-ffmpeg", fluxplay_has_ffmpeg)) {
+        "FFmpeg libav* natif lié dans le binaire"
     } else if native {
         "native decode via mpv/FFmpeg when available"
     } else {

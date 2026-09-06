@@ -6,14 +6,16 @@ license.workspace = true
 description = "Protocol router and stream session manager for FluxPlay"
 
 [features]
-default = ["native-mpv", "cli-player", "bundle-rpath"]
+default = ["native-mpv", "native-ffmpeg", "cli-player", "bundle-rpath"]
 # In-process libmpv FFI (standalone — no `mpv` binary required at runtime).
 native-mpv = []
+# In-process FFmpeg (libav*) demux/decode → RGBA embedded in iced (like libmpv SW).
+native-ffmpeg = []
 # Prefer linking `libmpv.a` (+ optional FLUXPLAY_MPV_STATIC_DEPS).
 static-link = ["native-mpv"]
 # Embed `$ORIGIN/lib` rpath so a bundled `lib/libmpv.so` resolves next to the binary.
 bundle-rpath = ["native-mpv"]
-# Keep spawning system `mpv`/`ffplay` as fallback (FFmpeg backend + emergency).
+# Keep spawning system `mpv`/`ffplay` as fallback (emergency only when native FFmpeg missing).
 cli-player = []
 
 [dependencies]
@@ -28,3 +30,9 @@ reqwest = { workspace = true, features = ["blocking"] }
 tracing.workspace = true
 chrono.workspace = true
 open.workspace = true
+
+[dev-dependencies]
+tracing-subscriber.workspace = true
+
+[build-dependencies]
+cc = "1"
