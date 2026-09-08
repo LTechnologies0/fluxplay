@@ -2,8 +2,9 @@
 //! Inspired by M3 Expressive and IPTV clients (TiviMate / MYTV / Smarters).
 
 use fluxplay_core::models::AccentPreset;
+use iced::font::{Family, Weight};
 use iced::theme::{Palette, Theme};
-use iced::Color;
+use iced::{Color, Font};
 
 /// Resolved palette for one paint pass (Copy — cheap to pass through views).
 #[derive(Debug, Clone, Copy)]
@@ -38,7 +39,7 @@ impl UiTheme {
                 primary,
                 success: Color::from_rgb8(0x1B, 0x8A, 0x3E),
                 warning: Color::from_rgb8(0xC4, 0x6B, 0x00),
-                danger: Color::from_rgb8(0xBA, 0x1A, 0x1A),
+                danger: self.error(),
             },
         )
     }
@@ -58,7 +59,7 @@ impl UiTheme {
 
     pub fn on_primary(self) -> Color {
         if self.day {
-            Color::from_rgb8(0xFF, 0xFF, 0xFF)
+            self.accent.on_primary_day()
         } else {
             self.accent.on_primary_night()
         }
@@ -80,40 +81,35 @@ impl UiTheme {
         }
     }
 
-    // --- Secondary (selection / nav / chips) ---
+    // --- Secondary (selection / nav / chips) — distinct hue family per accent ---
     pub fn secondary(self) -> Color {
-        let p = self.primary();
-        if self.day {
-            Color::from_rgb(
-                (p.r * 0.35 + 0.25).min(1.0),
-                (p.g * 0.35 + 0.28).min(1.0),
-                (p.b * 0.35 + 0.32).min(1.0),
-            )
+        let t = accent_tokens(self.accent);
+        let (r, g, b) = if self.day {
+            t.secondary_day
         } else {
-            Color::from_rgb(
-                (p.r * 0.55 + 0.35).min(1.0),
-                (p.g * 0.55 + 0.38).min(1.0),
-                (p.b * 0.55 + 0.42).min(1.0),
-            )
-        }
+            t.secondary_night
+        };
+        Color::from_rgb8(r, g, b)
     }
 
     pub fn on_secondary(self) -> Color {
-        self.on_primary()
+        if self.day {
+            let (r, g, b) = accent_tokens(self.accent).on_secondary;
+            Color::from_rgb8(r, g, b)
+        } else {
+            // Night secondary is a light pastel → dark ink.
+            Color::from_rgb8(0x1A, 0x1C, 0x22)
+        }
     }
 
     pub fn secondary_container(self) -> Color {
-        let p = self.primary();
-        if self.day {
-            Color::from_rgba(p.r, p.g, p.b, 0.18)
+        let t = accent_tokens(self.accent);
+        let (r, g, b) = if self.day {
+            t.secondary_container_day
         } else {
-            // Opaque enough for onSecondaryContainer contrast on dark shell.
-            Color::from_rgb(
-                (p.r * 0.35 + 0.08).min(1.0),
-                (p.g * 0.28 + 0.07).min(1.0),
-                (p.b * 0.22 + 0.06).min(1.0),
-            )
-        }
+            t.secondary_container_night
+        };
+        Color::from_rgb8(r, g, b)
     }
 
     pub fn on_secondary_container(self) -> Color {
@@ -138,33 +134,56 @@ impl UiTheme {
     }
 
     pub fn tertiary_container(self) -> Color {
+        // Opaque blend of favorite gold into surface (no alpha wash).
         let t = self.favorite();
-        Color::from_rgba(t.r, t.g, t.b, if self.day { 0.22 } else { 0.28 })
+        let s = self.surface();
+        let w = if self.day { 0.28 } else { 0.34 };
+        Color::from_rgb(
+            t.r * w + s.r * (1.0 - w),
+            t.g * w + s.g * (1.0 - w),
+            t.b * w + s.b * (1.0 - w),
+        )
     }
 
     pub fn on_tertiary_container(self) -> Color {
         self.on_tertiary()
     }
 
-    // --- Error / LIVE ---
+    // --- Error (distinct from LIVE) ---
     pub fn error(self) -> Color {
-        self.live()
+        if self.day {
+            Color::from_rgb8(0xBA, 0x1A, 0x1A)
+        } else {
+            Color::from_rgb8(0xF2, 0xB8, 0xB5)
+        }
     }
 
     pub fn on_error(self) -> Color {
-        Color::from_rgb8(0xFF, 0xFF, 0xFF)
+        if self.day {
+            Color::from_rgb8(0xFF, 0xFF, 0xFF)
+        } else {
+            Color::from_rgb8(0x60, 0x14, 0x10)
+        }
     }
 
     pub fn error_container(self) -> Color {
-        let e = self.live();
-        Color::from_rgba(e.r, e.g, e.b, if self.day { 0.18 } else { 0.28 })
+        // Opaque-ish tonal containers (not alpha washes).
+        if self.day {
+            Color::from_rgb8(0xF9, 0xDE, 0xDC)
+        } else {
+            Color::from_rgb8(0x8C, 0x1D, 0x18)
+        }
     }
 
     pub fn on_error_container(self) -> Color {
-        self.live()
+        if self.day {
+            Color::from_rgb8(0x41, 0x0E, 0x0B)
+        } else {
+            Color::from_rgb8(0xF9, 0xDE, 0xDC)
+        }
     }
 
-    /// LIVE badge / recording indicator (`error` role).
+    /// LIVE badge / recording indicator (kept separate from `error`).
     pub fn live(self) -> Color {
         if self.day {
             Color::from_rgb8(0xBA, 0x1A, 0x1A)
@@ -198,7 +217,7 @@ impl UiTheme {
 
     pub fn surface(self) -> Color {
         if self.day {
-            Color::from_rgb8(0xFF, 0xFF, 0xFF)
+            Color::from_rgb8(0xF7, 0xF9, 0xFC)
         } else {
             Color::from_rgb8(0x11, 0x16, 0x1F)
         }
@@ -238,7 +257,8 @@ impl UiTheme {
 
     pub fn surface_container_lowest(self) -> Color {
         if self.day {
-            Color::from_rgb8(0xFF, 0xFF, 0xFF)
+            // Slightly off-white (not pure #FFF).
+            Color::from_rgb8(0xFA, 0xFB, 0xFD)
         } else {
             Color::from_rgb8(0x08, 0x0B, 0x12)
         }
@@ -297,20 +317,66 @@ impl UiTheme {
         Color::from_rgba(c.r, c.g, c.b, if self.day { 0.55 } else { 0.45 })
     }
 
-    // --- Outline ---
+    /// Android tonal elevation step; desktop collapses ≥1 to `surface_elevated`.
+    pub fn elevated_fill(self, level: u8) -> Color {
+        #[cfg(target_os = "android")]
+        {
+            match level {
+                0 => self.surface(),
+                1 => self.surface_container_low(),
+                2 => self.surface_container(),
+                3 => self.surface_container_high(),
+                _ => self.surface_container_highest(),
+            }
+        }
+        #[cfg(not(target_os = "android"))]
+        {
+            if level == 0 {
+                self.surface()
+            } else {
+                self.surface_elevated()
+            }
+        }
+    }
+
+    /// Pane chrome: Android tonal fill + 1px outline; desktop surface + shadow.
+    pub fn elevated_style(self, level: u8) -> (Color, iced::Border, iced::Shadow) {
+        #[cfg(target_os = "android")]
+        {
+            (
+                self.elevated_fill(level),
+                iced::Border {
+                    color: self.outline_variant(),
+                    width: 1.0,
+                    radius: 0.0.into(),
+                },
+                iced::Shadow::default(),
+            )
+        }
+        #[cfg(not(target_os = "android"))]
+        {
+            (
+                self.surface(),
+                iced::Border::default(),
+                elevation_shadow(level, self.day),
+            )
+        }
+    }
+
+    // --- Outline (chromatic pairs, not ink-alpha alone) ---
     pub fn outline(self) -> Color {
         if self.day {
-            Color::from_rgba8(0x0F, 0x17, 0x22, 0.38)
+            Color::from_rgb8(0x70, 0x78, 0x84)
         } else {
-            Color::from_rgba8(0xE8, 0xEF, 0xF6, 0.38)
+            Color::from_rgb8(0x8A, 0x91, 0x9C)
         }
     }
 
     pub fn outline_variant(self) -> Color {
         if self.day {
-            Color::from_rgba8(0x0F, 0x17, 0x22, 0.14)
+            Color::from_rgb8(0xC0, 0xC7, 0xD0)
         } else {
-            Color::from_rgba8(0xE8, 0xEF, 0xF6, 0.16)
+            Color::from_rgb8(0x40, 0x48, 0x52)
         }
     }
 
@@ -336,12 +402,22 @@ impl UiTheme {
     }
 
     pub fn inverse_primary(self) -> Color {
-        self.primary_container()
+        // True inverse: night primary when day, day primary when night.
+        if self.day {
+            self.accent.primary_night()
+        } else {
+            self.accent.primary_day()
+        }
     }
 
     /// Modal / sheet scrim @ 32%.
     pub fn scrim(self) -> Color {
         Color::from_rgba(0.0, 0.0, 0.0, 0.32)
+    }
+
+    /// Player overlay scrim @ 45%.
+    pub fn scrim_heavy(self) -> Color {
+        Color::from_rgba(0.0, 0.0, 0.0, 0.45)
     }
 
     pub fn on_accent(self) -> Color {
@@ -356,6 +432,7 @@ trait AccentColors {
     fn container_night(self) -> Color;
     fn on_container_day(self) -> Color;
     fn on_container_night(self) -> Color;
+    fn on_primary_day(self) -> Color;
     fn on_primary_night(self) -> Color;
 }
 
@@ -389,6 +466,11 @@ impl AccentColors for AccentPreset {
         self.primary_night()
     }
 
+    fn on_primary_day(self) -> Color {
+        let (r, g, b) = accent_tokens(self).on_primary_day;
+        Color::from_rgb8(r, g, b)
+    }
+
     fn on_primary_night(self) -> Color {
         let (r, g, b) = accent_tokens(self).on_primary_night;
         Color::from_rgb8(r, g, b)
@@ -401,18 +483,92 @@ struct AccentTokens {
     container_day: (u8, u8, u8),
     container_night: (u8, u8, u8),
     on_day: (u8, u8, u8),
+    on_primary_day: (u8, u8, u8),
     on_primary_night: (u8, u8, u8),
+    secondary_day: (u8, u8, u8),
+    secondary_night: (u8, u8, u8),
+    secondary_container_day: (u8, u8, u8),
+    secondary_container_night: (u8, u8, u8),
+    on_secondary: (u8, u8, u8),
+}
+
+/// Complementary secondary family keyed by accent group (opaque containers).
+fn secondary_tokens(
+    preset: AccentPreset,
+) -> (
+    (u8, u8, u8),
+    (u8, u8, u8),
+    (u8, u8, u8),
+    (u8, u8, u8),
+    (u8, u8, u8),
+) {
+    use AccentPreset::*;
+    // (day, night, container_day, container_night, on_day)
+    match preset {
+        // Greens / teals → violet-slate secondary
+        Teal | Mint | Jade | Forest | Olive | Neon | Lime => (
+            (0x4A, 0x56, 0x8A),
+            (0xB8, 0xC0, 0xE8),
+            (0xDE, 0xE2, 0xF5),
+            (0x2A, 0x32, 0x55),
+            (0xFF, 0xFF, 0xFF),
+        ),
+        // Blues → warm amber secondary
+        Ocean | Sky | Azure | Indigo | Cyan | Ice | Slate | Charcoal => (
+            (0x9A, 0x5B, 0x00),
+            (0xFF, 0xC0, 0x6E),
+            (0xFF, 0xE4, 0xC2),
+            (0x5A, 0x34, 0x00),
+            (0xFF, 0xFF, 0xFF),
+        ),
+        // Warm reds / pinks → teal secondary
+        Ember | Coral | Scarlet | Crimson | Wine | Rose | HotPink | Magenta | Peach => (
+            (0x00, 0x6A, 0x6E),
+            (0x6D, 0xD6, 0xDA),
+            (0xB8, 0xEC, 0xEE),
+            (0x00, 0x3F, 0x42),
+            (0xFF, 0xFF, 0xFF),
+        ),
+        // Purples → teal-cyan secondary
+        Violet | Grape => (
+            (0x00, 0x6E, 0x7A),
+            (0x5C, 0xD7, 0xE5),
+            (0xB0, 0xEB, 0xF2),
+            (0x00, 0x42, 0x4A),
+            (0xFF, 0xFF, 0xFF),
+        ),
+        // Golds / earth → blue-slate secondary
+        Gold | Amber | Sand | Chocolate => (
+            (0x3D, 0x5A, 0x80),
+            (0xA8, 0xC0, 0xE0),
+            (0xD6, 0xE4, 0xF5),
+            (0x22, 0x36, 0x50),
+            (0xFF, 0xFF, 0xFF),
+        ),
+    }
 }
 
 fn accent_tokens(preset: AccentPreset) -> AccentTokens {
     use AccentPreset::*;
+    let on_primary_day = match preset {
+        // Light accents need dark ink on primary (not white).
+        Gold | Amber | Peach | Lime | Neon => (0x3A, 0x2A, 0x00),
+        _ => (0xFF, 0xFF, 0xFF),
+    };
+    let (sd, sn, scd, scn, os) = secondary_tokens(preset);
     let t = |day, night, cd, cn, od, opn| AccentTokens {
         day,
         night,
         container_day: cd,
         container_night: cn,
         on_day: od,
+        on_primary_day,
         on_primary_night: opn,
+        secondary_day: sd,
+        secondary_night: sn,
+        secondary_container_day: scd,
+        secondary_container_night: scn,
+        on_secondary: os,
     };
     match preset {
         Teal => t((0x00,0x6A,0x62),(0x4F,0xDB,0xC8),(0x9A,0xF2,0xE6),(0x00,0x4F,0x49),(0x00,0x2A,0x27),(0x00,0x33,0x2F)),
@@ -478,8 +634,8 @@ pub const RADIUS_EXTRA_EXTRA_LARGE: f32 = 48.0;
 pub const RADIUS_FULL: f32 = 999.0;
 
 // Legacy aliases used across browser / player / app.
-pub const RADIUS_XS: f32 = RADIUS_SMALL;
-pub const RADIUS_SM: f32 = RADIUS_MEDIUM;
+pub const RADIUS_XS: f32 = RADIUS_EXTRA_SMALL;
+pub const RADIUS_SM: f32 = RADIUS_SMALL;
 pub const RADIUS_MD: f32 = RADIUS_LARGE;
 pub const RADIUS_LG: f32 = RADIUS_LARGE_INCREASED;
 pub const RADIUS_XL: f32 = RADIUS_EXTRA_LARGE;
@@ -516,13 +672,13 @@ pub fn radius_dock() -> iced::border::Radius {
     }
 }
 
-/// Medium FAB — near-circle (Expressive medium FAB ~56–80dp).
+/// Medium FAB — Expressive medium FAB corners (28dp), not full pill.
 pub fn radius_fab() -> iced::border::Radius {
     iced::border::Radius {
-        top_left: RADIUS_FULL,
-        top_right: RADIUS_FULL,
-        bottom_right: RADIUS_FULL,
-        bottom_left: RADIUS_FULL,
+        top_left: RADIUS_EXTRA_LARGE,
+        top_right: RADIUS_EXTRA_LARGE,
+        bottom_right: RADIUS_EXTRA_LARGE,
+        bottom_left: RADIUS_EXTRA_LARGE,
     }
 }
 
@@ -567,6 +723,58 @@ pub const TYPE_LABEL_L: f32 = 14.0;
 pub const TYPE_LABEL_M: f32 = 12.0;
 pub const TYPE_LABEL_S: f32 = 11.0;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TypeRole {
+    DisplayS,
+    HeadlineL,
+    HeadlineM,
+    HeadlineS,
+    TitleL,
+    TitleM,
+    TitleS,
+    BodyL,
+    BodyM,
+    BodyS,
+    LabelL,
+    LabelM,
+    LabelS,
+}
+
+pub fn type_size(role: TypeRole) -> f32 {
+    match role {
+        TypeRole::DisplayS => TYPE_DISPLAY_S,
+        TypeRole::HeadlineL => TYPE_HEADLINE_L,
+        TypeRole::HeadlineM => TYPE_HEADLINE_M,
+        TypeRole::HeadlineS => TYPE_HEADLINE_S,
+        TypeRole::TitleL => TYPE_TITLE_L,
+        TypeRole::TitleM => TYPE_TITLE_M,
+        TypeRole::TitleS => TYPE_TITLE_S,
+        TypeRole::BodyL => TYPE_BODY_L,
+        TypeRole::BodyM => TYPE_BODY_M,
+        TypeRole::BodyS => TYPE_BODY_S,
+        TypeRole::LabelL => TYPE_LABEL_L,
+        TypeRole::LabelM => TYPE_LABEL_M,
+        TypeRole::LabelS => TYPE_LABEL_S,
+    }
+}
+
+pub fn type_font(emphasized: bool) -> Font {
+    Font {
+        family: Family::SansSerif,
+        weight: if emphasized {
+            Weight::Bold
+        } else {
+            Weight::Medium
+        },
+        ..Font::DEFAULT
+    }
+}
+
+/// Convenience: (size, font)
+pub fn type_style(role: TypeRole, emphasized: bool) -> (f32, Font) {
+    (type_size(role), type_font(emphasized))
+}
+
 /// Component measurement tokens (M3 Expressive).
 pub const TOOLBAR_H: f32 = 48.0;
 pub const TOOLBAR_OUTER_PAD: f32 = 12.0;
@@ -579,9 +787,14 @@ pub const FAB_MEDIUM: f32 = 48.0;
 pub const SEARCH_BAR_H: f32 = 56.0;
 pub const LOADING_SIZE: f32 = 48.0;
 pub const TOUCH_TARGET: f32 = 48.0;
-pub const CARD_RADIUS: f32 = RADIUS_MEDIUM;
+pub const CARD_RADIUS: f32 = RADIUS_LARGE;
 pub const CARD_PAD: f32 = SPACE_LG;
 pub const CARD_GAP: f32 = SPACE_SM;
+
+/// Motion stubs (duration / coast).
+pub const MOTION_SHORT_MS: u64 = 120;
+pub const MOTION_MED_MS: u64 = 200;
+pub const MOTION_COAST_FRICTION: f32 = 0.88;
 
 /// Elevation levels 0–5 → soft desktop shadow (Android: use `Shadow::default()`).
 pub fn elevation_shadow(level: u8, day: bool) -> iced::Shadow {
@@ -741,19 +954,20 @@ impl LayoutMetrics {
             _ => (content_w * 0.34).clamp(100.0, 380.0),
         };
 
+        // Type ladder: Phone / Tablet / Desktop / Tv (Laptop shares Desktop).
         let (title_size, body_size, rail_size, thumb, player_chrome_h) = match bp {
             Breakpoint::Phone => (
-                if short { TYPE_TITLE_M } else { TYPE_TITLE_L },
-                if short { TYPE_BODY_S } else { TYPE_BODY_M },
-                if short { TYPE_LABEL_M } else { TYPE_LABEL_L },
+                TYPE_TITLE_L,
+                TYPE_BODY_M,
+                TYPE_LABEL_M,
                 if short { 36.0 } else { 40.0 },
-                // floating toolbar ~48 + seek ~28 + pads
                 if short { 96.0 } else { 108.0 },
             ),
-            Breakpoint::Tablet => (TYPE_TITLE_L, TYPE_BODY_M, TYPE_LABEL_L, 44.0, 112.0),
-            Breakpoint::Laptop => (TYPE_HEADLINE_S, TYPE_BODY_M, TYPE_TITLE_S, 48.0, 116.0),
-            Breakpoint::Desktop => (TYPE_HEADLINE_S, TYPE_BODY_M, TYPE_TITLE_S, 52.0, 116.0),
-            Breakpoint::Tv => (TYPE_HEADLINE_M, TYPE_BODY_L, TYPE_TITLE_M, 64.0, 128.0),
+            Breakpoint::Tablet => (TYPE_HEADLINE_S, TYPE_BODY_M, TYPE_LABEL_L, 44.0, 112.0),
+            Breakpoint::Laptop | Breakpoint::Desktop => {
+                (TYPE_HEADLINE_M, TYPE_BODY_L, TYPE_TITLE_M, if matches!(bp, Breakpoint::Desktop) { 52.0 } else { 48.0 }, 116.0)
+            }
+            Breakpoint::Tv => (TYPE_DISPLAY_S, TYPE_BODY_L, TYPE_LABEL_L, 64.0, 128.0),
         };
 
         Self {

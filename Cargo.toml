@@ -11,7 +11,7 @@ members = [
 default-members = ["crates/fluxplay"]
 
 [workspace.package]
-version = "0.2.4"
+version = "0.2.5"
 edition = "2021"
 license = "MIT"
 authors = ["FluxPlay"]
@@ -30,7 +30,8 @@ serde_json = "1"
 url = "2"
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["v4", "serde"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "gzip", "cookies"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "gzip", "cookies", "socks"] }
+hickory-resolver = { version = "0.25", default-features = false, features = ["tokio", "system-config", "tls-ring", "https-ring", "webpki-roots"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "fs"] }
 quick-xml = { version = "0.37", features = ["serialize"] }
 tracing = "0.1"
@@ -44,10 +45,13 @@ dirs = "6"
 rfd = "0.15"
 open = "5"
 rusqlite = { version = "0.32", features = ["bundled"] }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp"] }
+zip = "2"
 
 [patch.crates-io]
 iced = { path = "vendor/iced" }
 iced_winit = { path = "vendor/iced_winit" }
+iced_widget = { path = "vendor/iced_widget" }
 
 # ── Release binaries: max opt, dead-code elimination, stripped ──────────────
 # Default: `cargo build --release` / `cargo install`

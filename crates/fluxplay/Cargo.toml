@@ -43,17 +43,25 @@ url.workspace = true
 rusqlite.workspace = true
 sha2.workspace = true
 hex.workspace = true
+image.workspace = true
+zip.workspace = true
 
 [target.'cfg(not(target_os = "android"))'.dependencies]
 iced = { workspace = true, features = ["x11", "wayland", "linux-theme-detection", "tiny-skia"] }
 rfd.workspace = true
 dark-light = "2"
+# Userspace WireGuard → local SOCKS5 (app-only tunnel, no system routes).
+wg-socks = "0.1.1"
 
 [target.'cfg(target_os = "android")'.dependencies]
-iced = { workspace = true, features = ["android-native-activity", "fira-sans"] }
+# advanced-shaping: iced docs — Auto uses Basic for ASCII (no font fallback),
+# which paints empty pills on Android GLES; Advanced is the correct default.
+iced = { workspace = true, features = ["android-native-activity", "fira-sans", "advanced-shaping"] }
 android-activity = { version = "0.6", features = ["native-activity"] }
 android_logger = "0.14"
 log = "0.4"
 tracing-log = "0.2"
 jni = "0.21"
 ndk-context = "0.1"
+# Same userspace WG → SOCKS as desktop (no VpnService required for app-scoped egress).
+wg-socks = "0.1.1"

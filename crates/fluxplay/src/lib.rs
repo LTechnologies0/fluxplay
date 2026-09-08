@@ -1,18 +1,25 @@
 //! FluxPlay desktop UI (iced) — also the Android / Android TV shell.
 
 mod app;
+mod async_jobs;
 mod browser;
 mod catalog_db;
 mod demo;
+mod display_caps;
 mod icons;
 mod images;
 mod metadata;
+mod network;
+mod wg_tunnel;
 mod player_ui;
+mod profile_io;
 mod storage;
 mod theme;
 
 #[cfg(target_os = "android")]
 mod android_intent;
+#[cfg(target_os = "android")]
+mod android_bridge;
 
 use tracing_subscriber::EnvFilter;
 
@@ -67,10 +74,28 @@ fn init_tracing_android() {
             .with_tag("FluxPlay"),
     );
     let _ = tracing_log::LogTracer::init();
+
+    // Bridge tracing → android logcat (fmt→sink hid all player/libmpv diagnostics).
+    use std::io::Write;
+    struct AndroidLogWriter;
+    impl Write for AndroidLogWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if let Ok(s) = std::str::from_utf8(buf) {
+                for line in s.lines().filter(|l| !l.is_empty()) {
+                    log::info!("{line}");
+                }
+            }
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
     let _ = tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-            "fluxplay=info,fluxplay_player=info,iced_wgpu=warn".into()
+            "fluxplay=info,fluxplay_player=info,fluxplay_core=warn,iced_wgpu=warn".into()
         }))
-        .with_writer(std::io::sink)
+        .with_ansi(false)
+        .with_writer(|| AndroidLogWriter)
         .try_init();
 }

@@ -1,15 +1,16 @@
-//! Metadata enrichment — TVMaze (series, no key) + OMDb/IMDb (`OMDB_API_KEY`).
+//! Metadata enrichment — multi-provider, rate-limited.
 //!
-//! OMDb is the public gateway to IMDb title data (no official IMDb API for apps).
-//! Endpoints used:
-//! - `?t=Title&type=movie|series&plot=full` — lookup by name
-//! - `?i=tt…&plot=full` — lookup by IMDb id
-//! - `?s=query` — search (available; used when exact title miss)
+//! Order (film/série):
+//! 1. OMDb / IMDb (`OMDB_API_KEY`) — plot, cast, poster
+//! 2. iTunes Search API (no key) — artwork + year
+//! 3. TVMaze (series, no key) — gated + 429 backoff
+//! 4. Wikipedia REST summary — plot fallback
 //!
-//! Fields: Plot, Actors, Director, Writer, Runtime, Rated, Genre, Year,
-//! Awards, Language, Country, Poster, imdbRating, imdbID.
+//! IPTV portals are **not** queried here (see Xtream `get_vod_info`).
 
 use std::sync::OnceLock;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use fluxplay_core::models::{SeriesItem, VodItem};
 use serde::{Deserialize, Serialize};
@@ -455,16 +456,96 @@ impl MetaPatch {
     }
 }
 
-fn http() -> &'static reqwest::Client {
-    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
-    CLIENT.get_or_init(|| {
-        reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(14))
-            .user_agent("FluxPlay/0.2 (+https://github.com/fluxplay/fluxplay)")
-            .pool_max_idle_per_host(4)
-            .build()
-            .expect("metadata HTTP client")
-    })
+fn http() -> reqwest::Client {
+    fluxplay_providers::app_http("FluxPlay/0.2 (+metadata; public APIs only)", 14).unwrap_or_else(
+        |_| {
+            reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(14))
+                .user_agent("FluxPlay/0.2 (+metadata; public APIs only)")
+                .build()
+                .expect("metadata HTTP client")
+        },
+    )
+}
+
+/// Shared throttle for a single public API host (min interval + 429 cooldown).
+struct ApiGate {
+    name: &'static str,
+    min_interval: Duration,
+    last: Mutex<Option<Instant>>,
+    cooldown_until: Mutex<Option<Instant>>,
+}
+
+impl ApiGate {
+    fn new(name: &'static str, min_interval_ms: u64) -> Self {
+        Self {
+            name,
+            min_interval: Duration::from_millis(min_interval_ms),
+            last: Mutex::new(None),
+            cooldown_until: Mutex::new(None),
+        }
+    }
+
+    fn blocked(&self) -> bool {
+        let Ok(g) = self.cooldown_until.lock() else {
+            return false;
+        };
+        matches!(*g, Some(t) if Instant::now() < t)
+    }
+
+    async fn wait_turn(&self) {
+        let cooldown_wait = match self.cooldown_until.lock() {
+            Ok(g) => (*g).and_then(|until| {
+                let now = Instant::now();
+                if until > now {
+                    Some(until - now)
+                } else {
+                    None
+                }
+            }),
+            Err(_) => None,
+        };
+        if let Some(wait) = cooldown_wait {
+            debug!(api = self.name, ?wait, "api cooldown");
+            tokio::time::sleep(wait).await;
+        }
+        let sleep_for = match self.last.lock() {
+            Ok(mut last) => {
+                let now = Instant::now();
+                let wait = last
+                    .map(|t| self.min_interval.saturating_sub(now.saturating_duration_since(t)))
+                    .unwrap_or(Duration::ZERO);
+                *last = Some(now + wait);
+                wait
+            }
+            Err(_) => Duration::ZERO,
+        };
+        if !sleep_for.is_zero() {
+            tokio::time::sleep(sleep_for).await;
+        }
+    }
+
+    fn trip_429(&self, secs: u64) {
+        if let Ok(mut g) = self.cooldown_until.lock() {
+            *g = Some(Instant::now() + Duration::from_secs(secs));
+        }
+        warn!(api = self.name, secs, "rate limited — cooling down");
+    }
+}
+
+fn tvmaze_gate() -> &'static ApiGate {
+    static G: OnceLock<ApiGate> = OnceLock::new();
+    G.get_or_init(|| ApiGate::new("tvmaze", 750))
+}
+
+fn omdb_gate() -> &'static ApiGate {
+    static G: OnceLock<ApiGate> = OnceLock::new();
+    G.get_or_init(|| ApiGate::new("omdb", 280))
+}
+
+fn itunes_gate() -> &'static ApiGate {
+    static G: OnceLock<ApiGate> = OnceLock::new();
+    G.get_or_init(|| ApiGate::new("itunes", 200))
 }
 
 pub fn imdb_title_url(imdb_id: &str) -> String {
@@ -481,8 +562,18 @@ pub async fn enrich_series(name: &str) -> Option<MetaPatch> {
         .await
         .unwrap_or_default();
     let q = parse_title_query(name);
-    if patch.actors.is_none() || patch.plot.is_none() {
+    if needs_full_credits(patch.actors.as_deref(), patch.plot.as_deref()) {
         if let Some(p) = tvmaze_show(&q.title).await {
+            patch.merge(p);
+        }
+    }
+    if patch.poster.is_none() || patch.year.is_none() {
+        if let Some(p) = itunes_lookup(&q, true).await {
+            patch.merge(p);
+        }
+    }
+    if patch.plot.as_ref().map(|p| p.len() < 40).unwrap_or(true) {
+        if let Some(p) = wikipedia_summary(&q.title).await {
             patch.merge(p);
         }
     }
@@ -494,15 +585,35 @@ pub async fn enrich_series(name: &str) -> Option<MetaPatch> {
 }
 
 pub async fn enrich_vod(name: &str) -> Option<MetaPatch> {
-    enrich_title_full(name, "movie", None).await
+    let mut patch = enrich_title_full(name, "movie", None)
+        .await
+        .unwrap_or_default();
+    if patch.poster.is_none() || patch.year.is_none() {
+        let q = parse_title_query(name);
+        if let Some(p) = itunes_lookup(&q, false).await {
+            patch.merge(p);
+        }
+    }
+    if patch.plot.as_ref().map(|p| p.len() < 40).unwrap_or(true) {
+        let q = parse_title_query(name);
+        if let Some(p) = wikipedia_summary(&q.title).await {
+            patch.merge(p);
+        }
+    }
+    if patch.is_empty() {
+        None
+    } else {
+        Some(patch)
+    }
 }
 
 /// Full IMDb-via-OMDb detail for the media page (synopsis + cast). Prefer `i=tt…`.
 ///
-/// Strategy (official OMDb REST — not HTML scraping):
-/// 1. `i=` by known IMDb id → full plot + actors
-/// 2. `t=` exact title (+ year + type)
-/// 3. `s=` search → pick best hit by year/title → `i=` full fetch
+/// Strategy:
+/// 1. OMDb `i=` / `t=` / `s=` (rate-gated)
+/// 2. iTunes Search (poster/year)
+/// 3. TVMaze (series cast/plot)
+/// 4. Wikipedia summary (plot)
 pub async fn enrich_title_full(
     name: &str,
     kind: &str,
@@ -548,8 +659,20 @@ pub async fn enrich_title_full(
     }
 
     // Series cast fallback when OMDb has no Actors field.
-    if kind == "series" && patch.actors.is_none() {
+    if kind == "series" && needs_full_credits(patch.actors.as_deref(), patch.plot.as_deref()) {
         if let Some(p) = tvmaze_show(&q.title).await {
+            patch.merge(p);
+        }
+    }
+
+    if patch.poster.is_none() {
+        if let Some(p) = itunes_lookup(&q, kind == "series").await {
+            patch.merge(p);
+        }
+    }
+
+    if patch.plot.as_ref().map(|p| p.len() < 40).unwrap_or(true) {
+        if let Some(p) = wikipedia_summary(&q.title).await {
             patch.merge(p);
         }
     }
@@ -622,16 +745,25 @@ pub fn needs_full_credits(actors: Option<&str>, plot: Option<&str>) -> bool {
 }
 
 async fn tvmaze_show(name: &str) -> Option<MetaPatch> {
+    let gate = tvmaze_gate();
+    if gate.blocked() {
+        trace!(%name, "tvmaze skipped (cooldown)");
+        return None;
+    }
+    gate.wait_turn().await;
     let url = format!(
         "https://api.tvmaze.com/singlesearch/shows?q={}",
         urlencoding_lite(name)
     );
     let resp = http().get(&url).send().await.ok()?;
-    if !resp.status().is_success() {
-        if resp.status().as_u16() == 404 {
+    let status = resp.status();
+    if !status.is_success() {
+        if status.as_u16() == 429 {
+            gate.trip_429(90);
+        } else if status.as_u16() == 404 {
             trace!(%name, "tvmaze miss");
         } else {
-            warn!(%name, status = %resp.status(), "tvmaze HTTP");
+            warn!(%name, status = %status, "tvmaze HTTP");
         }
         return None;
     }
@@ -659,7 +791,6 @@ async fn tvmaze_show(name: &str) -> Option<MetaPatch> {
     let poster = show.image.and_then(|i| i.medium.or(i.original));
     let rating = show.rating.and_then(|r| r.average).map(|a| format!("{a:.1}"));
     let imdb_id = show.externals.and_then(|e| e.imdb).filter(|id| !id.is_empty());
-    // Optional cast embed path via show id
     let actors = if let Some(id) = show.id {
         tvmaze_cast(id).await
     } else {
@@ -679,8 +810,17 @@ async fn tvmaze_show(name: &str) -> Option<MetaPatch> {
 }
 
 async fn tvmaze_cast(show_id: u64) -> Option<String> {
+    let gate = tvmaze_gate();
+    if gate.blocked() {
+        return None;
+    }
+    gate.wait_turn().await;
     let url = format!("https://api.tvmaze.com/shows/{show_id}/cast");
     let resp = http().get(&url).send().await.ok()?;
+    if resp.status().as_u16() == 429 {
+        gate.trip_429(90);
+        return None;
+    }
     if !resp.status().is_success() {
         return None;
     }
@@ -698,11 +838,20 @@ async fn tvmaze_cast(show_id: u64) -> Option<String> {
 }
 
 async fn tvmaze_episodes(name: &str) -> Option<Vec<TvMazeEpisode>> {
+    let gate = tvmaze_gate();
+    if gate.blocked() {
+        return None;
+    }
+    gate.wait_turn().await;
     let url = format!(
         "https://api.tvmaze.com/singlesearch/shows?q={}&embed=episodes",
         urlencoding_lite(name)
     );
     let resp = http().get(&url).send().await.ok()?;
+    if resp.status().as_u16() == 429 {
+        gate.trip_429(90);
+        return None;
+    }
     if !resp.status().is_success() {
         return None;
     }
@@ -847,8 +996,6 @@ async fn omdb_search_best(q: &TitleQuery, kind: &str) -> Option<MetaPatch> {
     })
 }
 
-use std::sync::Mutex;
-
 static OMDB_KEY_RUNTIME: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 
 /// Push the settings / UI key so OMDb works without restarting for env alone.
@@ -883,9 +1030,19 @@ fn omdb_key() -> Option<String> {
 }
 
 async fn omdb_get(url: &str, label: &str) -> Option<MetaPatch> {
+    let gate = omdb_gate();
+    if gate.blocked() {
+        return None;
+    }
+    gate.wait_turn().await;
     let resp = http().get(url).send().await.ok()?;
-    if !resp.status().is_success() {
-        warn!(%label, status = %resp.status(), "omdb HTTP");
+    let status = resp.status();
+    if !status.is_success() {
+        if status.as_u16() == 429 {
+            gate.trip_429(60);
+        } else {
+            warn!(%label, status = %status, "omdb HTTP");
+        }
         return None;
     }
     let body: OmdbResp = match resp.json().await {
@@ -922,6 +1079,106 @@ async fn omdb_get(url: &str, label: &str) -> Option<MetaPatch> {
         awards: na(body.awards),
         language: na(body.language),
         country: na(body.country),
+    })
+}
+
+/// Free iTunes Search — artwork + year when OMDb/TVMaze miss.
+async fn itunes_lookup(q: &TitleQuery, series: bool) -> Option<MetaPatch> {
+    let gate = itunes_gate();
+    if gate.blocked() {
+        return None;
+    }
+    gate.wait_turn().await;
+    let entity = if series { "tvSeason" } else { "movie" };
+    let mut url = format!(
+        "https://itunes.apple.com/search?term={}&entity={}&limit=5",
+        urlencoding_lite(&q.title),
+        entity
+    );
+    if let Some(y) = &q.year {
+        url.push_str("&year=");
+        url.push_str(y);
+    }
+    let resp = http().get(&url).send().await.ok()?;
+    if resp.status().as_u16() == 429 {
+        gate.trip_429(45);
+        return None;
+    }
+    if !resp.status().is_success() {
+        return None;
+    }
+    let body: ItunesSearchResp = resp.json().await.ok()?;
+    let results = body.results?;
+    let want = q.title.to_ascii_lowercase();
+    let best = results.into_iter().max_by_key(|r| {
+        let name = r
+            .track_name
+            .as_deref()
+            .or(r.collection_name.as_deref())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        let mut score = 0i32;
+        if name == want {
+            score += 100;
+        } else if name.contains(&want) || want.contains(&name) {
+            score += 40;
+        }
+        if let (Some(y), Some(ry)) = (q.year.as_deref(), r.release_date.as_deref()) {
+            if ry.starts_with(y) {
+                score += 30;
+            }
+        }
+        score
+    })?;
+    let poster = best.artwork_url_100.as_ref().map(|u| {
+        u.replace("100x100bb", "600x600bb")
+    });
+    let year = best
+        .release_date
+        .as_deref()
+        .and_then(|d| d.get(0..4))
+        .map(str::to_string)
+        .or_else(|| q.year.clone());
+    let plot = best.long_description.or(best.short_description);
+    debug!(title = %q.title, ?year, has_poster = poster.is_some(), "itunes hit");
+    Some(MetaPatch {
+        year,
+        plot,
+        poster,
+        ..Default::default()
+    })
+}
+
+/// Wikipedia REST summary — plot-only fallback (no key).
+async fn wikipedia_summary(title: &str) -> Option<MetaPatch> {
+    let t = title.trim();
+    if t.len() < 2 {
+        return None;
+    }
+    let url = format!(
+        "https://en.wikipedia.org/api/rest_v1/page/summary/{}",
+        urlencoding_lite(t).replace('+', "_")
+    );
+    let resp = http()
+        .get(&url)
+        .header("Api-User-Agent", "FluxPlay/0.2 (metadata fallback)")
+        .send()
+        .await
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let body: WikiSummary = resp.json().await.ok()?;
+    if body.typ.as_deref() == Some("disambiguation") {
+        return None;
+    }
+    let plot = body.extract.filter(|s| s.len() >= 40)?;
+    let poster = body.thumbnail.and_then(|t| t.source);
+    debug!(%title, plot_len = plot.len(), "wikipedia hit");
+    Some(MetaPatch {
+        plot: Some(plot),
+        poster,
+        ..Default::default()
     })
 }
 
@@ -1018,6 +1275,40 @@ struct TvMazeCastEntry {
 #[derive(Debug, Deserialize)]
 struct TvMazePerson {
     name: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ItunesSearchResp {
+    results: Option<Vec<ItunesResult>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ItunesResult {
+    #[serde(rename = "trackName")]
+    track_name: Option<String>,
+    #[serde(rename = "collectionName")]
+    collection_name: Option<String>,
+    #[serde(rename = "releaseDate")]
+    release_date: Option<String>,
+    #[serde(rename = "artworkUrl100")]
+    artwork_url_100: Option<String>,
+    #[serde(rename = "longDescription")]
+    long_description: Option<String>,
+    #[serde(rename = "shortDescription")]
+    short_description: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WikiSummary {
+    #[serde(rename = "type")]
+    typ: Option<String>,
+    extract: Option<String>,
+    thumbnail: Option<WikiThumb>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WikiThumb {
+    source: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

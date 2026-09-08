@@ -12,7 +12,7 @@ name = "fluxplay_android"
 path = "src/lib.rs"
 
 [dependencies]
-fluxplay = { path = "../fluxplay", default-features = false }
+fluxplay = { path = "../fluxplay", default-features = false, features = ["native-player"] }
 log = "0.4"
 
 [target.'cfg(target_os = "android")'.dependencies]
@@ -25,7 +25,11 @@ android-activity = { version = "0.6", features = ["native-activity"] }
 [package.metadata.android]
 package = "app.fluxplay.android"
 apk_name = "FluxPlay"
-build_targets = ["x86_64-linux-android", "aarch64-linux-android"]
+build_targets = ["aarch64-linux-android", "x86_64-linux-android"]
+# Pack vendored libmpv.so (media-kit) into the APK for in-process embed.
+runtime_libs = "../../vendor/android-native"
+resources = "res"
+icon = "@mipmap/ic_launcher"
 
 [package.metadata.android.sdk]
 min_sdk_version = 26
@@ -37,6 +41,15 @@ name = "android.permission.INTERNET"
 [[package.metadata.android.uses_permission]]
 name = "android.permission.ACCESS_NETWORK_STATE"
 
+[[package.metadata.android.uses_permission]]
+name = "android.permission.WAKE_LOCK"
+
+[[package.metadata.android.uses_permission]]
+name = "android.permission.FOREGROUND_SERVICE"
+
+[[package.metadata.android.uses_permission]]
+name = "android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK"
+
 [[package.metadata.android.uses_feature]]
 name = "android.hardware.touchscreen"
 required = false
@@ -45,12 +58,30 @@ required = false
 name = "android.software.leanback"
 required = false
 
+# Package visibility (API 31+) for VIEW / SAF document intents.
+[[package.metadata.android.queries.intent]]
+actions = ["android.intent.action.VIEW"]
+
+[[package.metadata.android.queries.intent]]
+actions = ["android.intent.action.OPEN_DOCUMENT"]
+
+[[package.metadata.android.queries.intent]]
+actions = ["android.intent.action.CREATE_DOCUMENT"]
+
 [package.metadata.android.application]
 label = "FluxPlay"
+icon = "@mipmap/ic_launcher"
+# TV leanback row image (also under resources/drawable/banner.png).
 theme = "@android:style/Theme.DeviceDefault.NoActionBar.Fullscreen"
-debuggable = true
+# Prefer false for store/release; local debug builds can still use adb jdwp via NDK.
+debuggable = false
+uses_cleartext_traffic = true
+# Java subclass (SAF / PiP / insets) — inject classes.dex via scripts/inject-android-java.sh
+has_code = true
 
-# Use the Android debug keystore so `cargo apk build --release` works locally / Waydroid.
+# cargo-apk does not expand ~ or $HOME in path. Machine-local debug keystore for local builds.
+# Prefer CI overrides: CARGO_APK_RELEASE_CI_KEYSTORE (+ _PASSWORD), or inject script
+# FLUXPLAY_ANDROID_KS / FLUXPLAY_ANDROID_KS_PASS / FLUXPLAY_ANDROID_KEY_ALIAS / FLUXPLAY_ANDROID_KEY_PASS.
 [package.metadata.android.signing.release]
 path = "/home/user/.android/debug.keystore"
 keystore_password = "android"
@@ -64,13 +95,18 @@ key_alias = "androiddebugkey"
 key_password = "android"
 
 [package.metadata.android.application.activity]
-name = "android.app.NativeActivity"
+name = "app.fluxplay.android.FluxPlayNativeActivity"
 exported = true
-config_changes = "orientation|screenSize|screenLayout|keyboardHidden|uiMode"
+config_changes = "orientation|screenSize|screenLayout|keyboardHidden|uiMode|density|smallestScreenSize|keyboard|layoutDirection"
 orientation = "unspecified"
 launch_mode = "singleTop"
 resizeable_activity = true
 always_retain_task_state = true
+# supportsPictureInPicture not in cargo-apk Activity schema — patched by scripts/inject-android-java.sh
+
+[[package.metadata.android.application.activity.meta_data]]
+name = "android.app.lib_name"
+value = "fluxplay_android"
 
 [[package.metadata.android.application.activity.intent_filter]]
 actions = ["android.intent.action.MAIN"]

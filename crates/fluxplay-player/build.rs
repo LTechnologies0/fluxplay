@@ -20,11 +20,18 @@ fn main() {
     println!("cargo:rustc-check-cfg=cfg(fluxplay_has_libmpv)");
     println!("cargo:rustc-check-cfg=cfg(fluxplay_has_ffmpeg)");
 
+    let target = env::var("TARGET").unwrap_or_default();
+    let is_android = target.contains("android");
+
     if env::var_os("CARGO_FEATURE_NATIVE_MPV").is_some() {
         setup_libmpv();
     }
-    if env::var_os("CARGO_FEATURE_NATIVE_FFMPEG").is_some() {
+    // FFmpeg C embed needs separate libav* — not shipped in media-kit libmpv.so.
+    // On Android we rely on libmpv (which embeds codecs) for soft RGBA.
+    if env::var_os("CARGO_FEATURE_NATIVE_FFMPEG").is_some() && !is_android {
         setup_ffmpeg();
+    } else if is_android && env::var_os("CARGO_FEATURE_NATIVE_FFMPEG").is_some() {
+        println!("cargo:warning=Android: native-ffmpeg skipped (use libmpv embed)");
     }
 }
 
@@ -40,7 +47,8 @@ fn setup_libmpv() {
     let want_static = env::var_os("CARGO_FEATURE_STATIC_LINK").is_some()
         || env::var("FLUXPLAY_STATIC_MPV").ok().as_deref() == Some("1");
     let require = env::var("FLUXPLAY_REQUIRE_LIBMPV").ok().as_deref() == Some("1")
-        || env::var_os("CARGO_FEATURE_STATIC_LINK").is_some();
+        || env::var_os("CARGO_FEATURE_STATIC_LINK").is_some()
+        || env::var("TARGET").unwrap_or_default().contains("android");
 
     let lib_dir = discover_mpv_lib_dir();
     let include_dir = discover_mpv_include_dir(&lib_dir);
@@ -108,14 +116,17 @@ fn setup_libmpv() {
 
     let bundle_rpath = env::var("FLUXPLAY_BUNDLE_RPATH").ok().as_deref() == Some("1")
         || env::var_os("CARGO_FEATURE_BUNDLE_RPATH").is_some();
-    if bundle_rpath {
+    let target = env::var("TARGET").unwrap_or_default();
+    let cross_android = target.contains("android");
+    if bundle_rpath && !cross_android {
         if cfg!(target_os = "linux") {
             println!("cargo:rustc-link-arg=-Wl,-rpath,$ORIGIN/lib");
         } else if cfg!(target_os = "macos") {
             println!("cargo:rustc-link-arg=-Wl,-rpath,@loader_path/lib");
         }
     }
-    if cfg!(target_os = "linux") || cfg!(target_os = "macos") {
+    // Never inject host rpath when cross-compiling for Android.
+    if !cross_android && (cfg!(target_os = "linux") || cfg!(target_os = "macos")) {
         println!("cargo:rustc-link-arg=-Wl,-rpath,{}", lib_dir.display());
     }
 
@@ -219,6 +230,30 @@ fn discover_mpv_lib_dir() -> Option<PathBuf> {
             return Some(lib);
         }
     }
+    // Android NDK: vendored media-kit libmpv (self-contained .so).
+    let target = env::var("TARGET").unwrap_or_default();
+    if target.contains("android") {
+        let manifest = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap_or_default());
+        let abi = if target.contains("aarch64") {
+            "arm64-v8a"
+        } else if target.contains("armv7") {
+            "armeabi-v7a"
+        } else if target.contains("x86_64") {
+            "x86_64"
+        } else {
+            "x86"
+        };
+        let vendored = manifest
+            .join("../../vendor/android-native")
+            .join(abi);
+        if vendored.join("libmpv.so").is_file() {
+            println!(
+                "cargo:warning=using vendored Android libmpv ({})",
+                vendored.display()
+            );
+            return Some(vendored);
+        }
+    }
     if is_apple_darwin_arch_cross() {
         println!(
             "cargo:warning=skipping host Homebrew libmpv (TARGET≠HOST on apple-darwin); \
@@ -266,6 +301,14 @@ fn discover_mpv_include_dir(lib_dir: &Option<PathBuf>) -> Option<PathBuf> {
         let inc = PathBuf::from(prefix).join("include");
         if inc.join("mpv").join("client.h").is_file() {
             return Some(inc);
+        }
+    }
+    let target = env::var("TARGET").unwrap_or_default();
+    if target.contains("android") {
+        let manifest = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap_or_default());
+        let vendored = manifest.join("../../vendor/android-native/include");
+        if vendored.join("mpv").join("client.h").is_file() {
+            return Some(vendored);
         }
     }
     if let Some(lib) = lib_dir {

@@ -466,6 +466,93 @@ impl AccentPreset {
     }
 }
 
+/// How FluxPlay resolves hostnames for catalog / metadata / art HTTP.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DnsMode {
+    /// OS resolver (default).
+    #[default]
+    System,
+    /// Classic DNS (UDP/TCP) to the listed servers.
+    Custom,
+    /// DNS over HTTPS (RFC 8484).
+    Doh,
+    /// DNS over TLS (RFC 7858).
+    Dot,
+}
+
+impl DnsMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::System => "Système",
+            Self::Custom => "DNS classique",
+            Self::Doh => "DNS over HTTPS",
+            Self::Dot => "DNS over TLS",
+        }
+    }
+
+    pub fn cycle(self) -> Self {
+        match self {
+            Self::System => Self::Custom,
+            Self::Custom => Self::Doh,
+            Self::Doh => Self::Dot,
+            Self::Dot => Self::System,
+        }
+    }
+}
+
+/// App-scoped network prefs (HTTP DNS + optional WireGuard profile).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NetworkSettings {
+    #[serde(default)]
+    pub dns_mode: DnsMode,
+    /// Comma/space separated hosts, e.g. `1.1.1.1, 9.9.9.9` or `1.1.1.1:53`.
+    #[serde(default)]
+    pub dns_servers: String,
+    /// DoH endpoint, e.g. `https://cloudflare-dns.com/dns-query`.
+    #[serde(default = "default_doh_url")]
+    pub doh_url: String,
+    /// DoT host or `host:853`, e.g. `1.1.1.1` / `dns.google`.
+    #[serde(default = "default_dot_server")]
+    pub dot_server: String,
+    /// Use the imported WireGuard profile for this app (app-scoped SOCKS tunnel).
+    #[serde(default)]
+    pub wireguard_enabled: bool,
+    /// Absolute path to the active `.conf` (copied under the FluxPlay config dir).
+    #[serde(default)]
+    pub wireguard_profile_path: String,
+    /// Display name from the last imported profile.
+    #[serde(default)]
+    pub wireguard_profile_name: String,
+    /// `DNS=` from the WG profile — used only to resolve the peer Endpoint before the tunnel is up.
+    /// Never used as the app's day-to-day resolver (that is `dns_mode` / `dns_servers` / DoH / DoT).
+    #[serde(default)]
+    pub wireguard_bootstrap_dns: String,
+}
+
+fn default_doh_url() -> String {
+    "https://cloudflare-dns.com/dns-query".into()
+}
+
+fn default_dot_server() -> String {
+    "1.1.1.1".into()
+}
+
+impl Default for NetworkSettings {
+    fn default() -> Self {
+        Self {
+            dns_mode: DnsMode::System,
+            dns_servers: "1.1.1.1, 9.9.9.9".into(),
+            doh_url: default_doh_url(),
+            dot_server: default_dot_server(),
+            wireguard_enabled: false,
+            wireguard_profile_path: String::new(),
+            wireguard_profile_name: String::new(),
+            wireguard_bootstrap_dns: String::new(),
+        }
+    }
+}
+
 /// Preferred native decode engine (desktop).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -497,6 +584,71 @@ impl PlayerBackendPref {
     }
 }
 
+/// User FPS ceiling for GUI timers / soft video present.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FpsCapPref {
+    /// Derive from monitor Hz + GPU tier (+ content FPS for video).
+    #[default]
+    Auto,
+    Hz30,
+    Hz60,
+    Hz90,
+    Hz120,
+}
+
+impl FpsCapPref {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "Auto",
+            Self::Hz30 => "30",
+            Self::Hz60 => "60",
+            Self::Hz90 => "90",
+            Self::Hz120 => "120",
+        }
+    }
+
+    pub fn fixed_hz(self) -> Option<u32> {
+        match self {
+            Self::Auto => None,
+            Self::Hz30 => Some(30),
+            Self::Hz60 => Some(60),
+            Self::Hz90 => Some(90),
+            Self::Hz120 => Some(120),
+        }
+    }
+
+    pub fn cycle(self) -> Self {
+        match self {
+            Self::Auto => Self::Hz30,
+            Self::Hz30 => Self::Hz60,
+            Self::Hz60 => Self::Hz90,
+            Self::Hz90 => Self::Hz120,
+            Self::Hz120 => Self::Auto,
+        }
+    }
+}
+
+/// GPU class used only as a soft-budget hint (not a hard FPS oracle).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GpuTier {
+    #[default]
+    Unknown,
+    Integrated,
+    Discrete,
+}
+
+impl GpuTier {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Unknown => "inconnu",
+            Self::Integrated => "intégré",
+            Self::Discrete => "dédié",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppSettings {
     pub theme: ThemeMode,
@@ -518,6 +670,12 @@ pub struct AppSettings {
     /// After ~75% of a series episode, prefetch the next episode to disk.
     #[serde(default = "default_true")]
     pub prefetch_next_episode: bool,
+    /// Cap for GUI periodic work (chrome autohide, prefetch pacing).
+    #[serde(default)]
+    pub fps_gui: FpsCapPref,
+    /// Cap for embedded video present (PlayerTick soft-frame pulls).
+    #[serde(default)]
+    pub fps_video: FpsCapPref,
     #[serde(default)]
     pub favorites: Vec<String>,
     #[serde(default)]
@@ -525,6 +683,9 @@ pub struct AppSettings {
     /// OMDb API key (IMDb gateway). Env `OMDB_API_KEY` overrides when set.
     #[serde(default)]
     pub omdb_api_key: String,
+    /// DNS / WireGuard prefs for app HTTP (catalog, art, metadata).
+    #[serde(default)]
+    pub network: NetworkSettings,
 }
 
 fn default_true() -> bool {
@@ -559,9 +720,12 @@ impl Default for AppSettings {
             demux_secs: 8.0,
             low_latency: false,
             prefetch_next_episode: true,
+            fps_gui: FpsCapPref::Auto,
+            fps_video: FpsCapPref::Auto,
             favorites: Vec::new(),
             recent: Vec::new(),
             omdb_api_key: String::new(),
+            network: NetworkSettings::default(),
         }
     }
 }
@@ -596,3 +760,4 @@ impl AppSettings {
         self.recent.truncate(30);
     }
 }
+

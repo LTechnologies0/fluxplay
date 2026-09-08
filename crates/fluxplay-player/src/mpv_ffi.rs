@@ -148,9 +148,25 @@ impl LibMpv {
     }
 
     pub fn set_option(&self, name: &str, value: &str) -> Result<()> {
-        let name = CString::new(name).map_err(|e| PlayerError::Backend(e.to_string()))?;
-        let value = CString::new(value).map_err(|e| PlayerError::Backend(e.to_string()))?;
-        mpv_err(unsafe { mpv_set_option_string(self.ctx, name.as_ptr(), value.as_ptr()) })
+        let c_name = CString::new(name).map_err(|e| PlayerError::Backend(e.to_string()))?;
+        let c_value = CString::new(value).map_err(|e| PlayerError::Backend(e.to_string()))?;
+        let code = unsafe { mpv_set_option_string(self.ctx, c_name.as_ptr(), c_value.as_ptr()) };
+        if code >= 0 {
+            return Ok(());
+        }
+        let msg = unsafe {
+            let p = mpv_error_string(code);
+            if p.is_null() {
+                format!("libmpv error {code}")
+            } else {
+                CStr::from_ptr(p).to_string_lossy().into_owned()
+            }
+        };
+        // Soft callers use debug; hard callers surface this string.
+        debug!(%name, %value, code, %msg, "libmpv set_option failed");
+        Err(PlayerError::Backend(format!(
+            "libmpv option {name}={value}: {msg}"
+        )))
     }
 
     pub fn initialize(&self) -> Result<()> {

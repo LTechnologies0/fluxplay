@@ -61,6 +61,9 @@ pub struct PlayOptions {
     pub volume: f32,
     pub low_latency: bool,
     pub preferred: PlayerBackendPref,
+    /// App-scoped proxy (e.g. `socks5h://127.0.0.1:PORT` from WireGuard userspace).
+    #[serde(default)]
+    pub http_proxy: Option<String>,
 }
 
 /// Screen-space rectangle for the mpv video surface.
@@ -124,6 +127,7 @@ impl Default for PlayOptions {
             volume: 0.85,
             low_latency: false,
             preferred: PlayerBackendPref::Auto,
+            http_proxy: None,
         }
     }
 }
@@ -176,7 +180,29 @@ pub fn detect_backends() -> Vec<BackendInfo> {
             detail: "FFmpeg natif (libav*) — RGBA embarqué dans iced".into(),
         });
     }
-    #[cfg(not(all(feature = "native-ffmpeg", fluxplay_has_ffmpeg)))]
+    #[cfg(all(
+        not(all(feature = "native-ffmpeg", fluxplay_has_ffmpeg)),
+        target_os = "android",
+        feature = "native-mpv",
+        fluxplay_has_libmpv
+    ))]
+    {
+        // media-kit libmpv embeds lavc — no separate libav* on Android.
+        out.push(BackendInfo {
+            id: BackendId::Ffmpeg,
+            available: true,
+            path: Some("libmpv/lavc".into()),
+            detail: "FFmpeg codecs via libmpv (pas de libav* séparé)".into(),
+        });
+    }
+    #[cfg(all(
+        not(all(feature = "native-ffmpeg", fluxplay_has_ffmpeg)),
+        not(all(
+            target_os = "android",
+            feature = "native-mpv",
+            fluxplay_has_libmpv
+        ))
+    ))]
     {
         let ffplay = which("ffplay").or_else(|| which("ffmpeg"));
         out.push(BackendInfo {
@@ -197,15 +223,11 @@ pub fn detect_backends() -> Vec<BackendInfo> {
         id: BackendId::External,
         available: true,
         path: None,
-        detail: "OS default handler / VLC / IINA".into(),
-    });
-
-    #[cfg(target_os = "android")]
-    out.push(BackendInfo {
-        id: BackendId::ExoPlayer,
-        available: true,
-        path: None,
-        detail: "Media3 ExoPlayer via JNI shell".into(),
+        detail: if cfg!(target_os = "android") {
+            "ACTION_VIEW Intent".into()
+        } else {
+            "OS default handler / VLC / IINA".into()
+        },
     });
 
     #[cfg(target_os = "ios")]
@@ -416,6 +438,13 @@ fn pick_backend(pref: PlayerBackendPref) -> Result<BackendId> {
             }
         }
         PlayerBackendPref::Ffmpeg => {
+            // Android: no separate libav* — libmpv (media-kit) embeds lavc.
+            #[cfg(all(target_os = "android", feature = "native-mpv", fluxplay_has_libmpv))]
+            {
+                if choose(BackendId::Mpv) {
+                    return Ok(BackendId::Mpv);
+                }
+            }
             if choose(BackendId::Ffmpeg) {
                 Ok(BackendId::Ffmpeg)
             } else {
@@ -565,7 +594,18 @@ impl NativePlayer {
     pub fn is_running(&mut self) -> bool {
         #[cfg(all(feature = "native-mpv", fluxplay_has_libmpv))]
         {
-            if self.libmpv.is_some() {
+            if let Some(mpv) = &self.libmpv {
+                // EOF / quit: idle-active or no path means playback ended.
+                if let Some(idle) = mpv.get_property_string("idle-active") {
+                    if idle == "yes" || idle == "true" {
+                        return false;
+                    }
+                }
+                if let Some(eof) = mpv.get_property_string("eof-reached") {
+                    if eof == "yes" || eof == "true" {
+                        return false;
+                    }
+                }
                 return true;
             }
         }
@@ -587,7 +627,11 @@ impl NativePlayer {
         debug!(%endpoint, preferred = ?self.opts.preferred, "NativePlayer::play");
         self.stop();
         // Panels with max_connections=1 need a beat to release the CDN slot.
-        std::thread::sleep(std::time::Duration::from_millis(650));
+        // Never sleep on Android UI/NativeActivity thread (ANR).
+        #[cfg(not(target_os = "android"))]
+        {
+            std::thread::sleep(std::time::Duration::from_millis(650));
+        }
 
         let backend = pick_backend(self.opts.preferred)?;
         let attempt = |this: &mut Self, backend: BackendId, url: &str| -> Result<()> {
@@ -595,7 +639,17 @@ impl NativePlayer {
                 BackendId::Mpv => this.start_mpv(url),
                 BackendId::Ffmpeg => this.start_ffmpeg(url),
                 BackendId::External => {
-                    open::that(url).map_err(|e| PlayerError::Backend(e.to_string()))
+                    // Android: app layer must use JNI ACTION_VIEW (android_intent).
+                    // fluxplay-player must not depend on the iced app crate.
+                    #[cfg(target_os = "android")]
+                    {
+                        let _ = url;
+                        Err(PlayerError::Backend("EXTERNAL_NEEDS_INTENT".into()))
+                    }
+                    #[cfg(not(target_os = "android"))]
+                    {
+                        open::that(url).map_err(|e| PlayerError::Backend(e.to_string()))
+                    }
                 }
                 BackendId::ExoPlayer | BackendId::AvPlayer => Err(PlayerError::Backend(
                     "Mobile decode is handled by the native shell (ExoPlayer/AVPlayer)".into(),
@@ -609,6 +663,8 @@ impl NativePlayer {
         }
 
         // Reap immediate crash so UI can surface the error; one retry after another pause.
+        // CLI child only (desktop); libmpv embed has no child to poll.
+        #[cfg(not(target_os = "android"))]
         if let Some(child) = &mut self.child {
             let wait_ms = if looks_like_vod_container(url) { 900 } else { 450 };
             std::thread::sleep(std::time::Duration::from_millis(wait_ms));
@@ -904,6 +960,32 @@ impl NativePlayer {
         Some((pos, dur))
     }
 
+    /// Estimated content frame rate (VOD/HLS). Used to avoid over-presenting soft frames.
+    pub fn content_fps(&self) -> Option<f64> {
+        #[cfg(all(feature = "native-mpv", fluxplay_has_libmpv))]
+        if let Some(mpv) = &self.libmpv {
+            let fps = mpv
+                .get_property_f64("estimated-vf-fps")
+                .filter(|f| *f > 1.0 && f.is_finite())
+                .or_else(|| {
+                    mpv.get_property_f64("container-fps")
+                        .filter(|f| *f > 1.0 && f.is_finite())
+                });
+            return fps;
+        }
+        #[cfg(all(feature = "native-ffmpeg", fluxplay_has_ffmpeg))]
+        if self.libffmpeg.is_some() {
+            // Soft FFmpeg path presents decoded frames as available — no container clock here.
+            return None;
+        }
+        let path = self.ipc_path.as_ref()?;
+        mpv_get_number(path, "estimated-vf-fps")
+            .filter(|f| *f > 1.0 && f.is_finite())
+            .or_else(|| {
+                mpv_get_number(path, "container-fps").filter(|f| *f > 1.0 && f.is_finite())
+            })
+    }
+
     fn set_prop(&self, name: &str, value: &str) -> Result<()> {
         debug!(%name, %value, "NativePlayer::set_prop");
         #[cfg(all(feature = "native-mpv", fluxplay_has_libmpv))]
@@ -1106,19 +1188,33 @@ impl NativePlayer {
             match self.start_libmpv(url) {
                 Ok(()) => return Ok(()),
                 Err(e) => {
-                    warn!(error = %e, "libmpv start failed — trying CLI fallback");
-                    #[cfg(not(feature = "cli-player"))]
+                    #[cfg(target_os = "android")]
                     {
+                        warn!(error = %e, "libmpv start failed (Android — no CLI fallback)");
                         return Err(e);
+                    }
+                    #[cfg(not(target_os = "android"))]
+                    {
+                        warn!(error = %e, "libmpv start failed — trying CLI fallback");
+                        #[cfg(not(feature = "cli-player"))]
+                        {
+                            return Err(e);
+                        }
                     }
                 }
             }
         }
-        #[cfg(feature = "cli-player")]
+        #[cfg(target_os = "android")]
         {
-            return self.start_mpv_cli(url);
+            Err(PlayerError::Backend(
+                "libmpv indisponible — vérifiez vendor/android-native libmpv.so".into(),
+            ))
         }
-        #[cfg(not(feature = "cli-player"))]
+        #[cfg(all(not(target_os = "android"), feature = "cli-player"))]
+        {
+            self.start_mpv_cli(url)
+        }
+        #[cfg(all(not(target_os = "android"), not(feature = "cli-player")))]
         {
             Err(PlayerError::Backend(
                 "Aucun backend mpv (activez native-mpv ou cli-player)".into(),
@@ -1132,19 +1228,21 @@ impl NativePlayer {
         let endpoint = url_endpoint(url);
         let mpeg_ts = looks_like_mpeg_ts(url);
         let vod = looks_like_vod_container(url);
-        let cache_secs = if vod {
+        let demux_cache = if vod {
             self.opts.demux_secs.max(20.0)
         } else if mpeg_ts {
             self.opts.demux_secs.max(8.0)
         } else {
             self.opts.demux_secs.max(4.0)
         };
-        debug!(%endpoint, mpeg_ts, vod, cache_secs, "start_libmpv embedded");
+        // Prefer the larger of demux readahead and settings cache_ms.
+        let cache_secs = demux_cache.max(self.opts.cache_ms as f32 / 1000.0);
+        debug!(%endpoint, mpeg_ts, vod, cache_secs, cache_ms = self.opts.cache_ms, "start_libmpv embedded");
 
         let mut mpv = crate::mpv_ffi::LibMpv::create()?;
         // Embedded path: vo=libmpv + software render → frames drawn into iced (no OS video window).
-        mpv.set_option("config", "no")?;
-        // Quiet by default; FLUXPLAY_VERBOSE / FLUXPLAY_MPV_LOG → stderr + log-file.
+        // media-kit Android builds omit some desktop options — soft_set those, hard-require vo.
+        soft_set(&mpv, "config", "no");
         if let Some(level) = crate::native_log::mpv_msg_level() {
             let log_path = crate::native_log::mpv_verbose_log_path();
             soft_set(&mpv, "terminal", "yes");
@@ -1156,25 +1254,41 @@ impl NativePlayer {
                 "libmpv verbose logging enabled"
             );
         } else {
-            mpv.set_option("terminal", "no")?;
+            soft_set(&mpv, "terminal", "no");
         }
-        mpv.set_option("idle", "yes")?;
-        mpv.set_option("vo", "libmpv")?;
-        mpv.set_option("force-window", "no")?;
-        mpv.set_option("keep-open", "yes")?;
-        mpv.set_option("ytdl", "no")?;
-        mpv.set_option("title", "FluxPlay")?;
+        soft_set(&mpv, "idle", "yes");
+        // vo=libmpv is required for mpv_render SW → iced RGBA. Fail clearly if missing.
+        mpv.set_option("vo", "libmpv").map_err(|e| {
+            PlayerError::Backend(format!(
+                "{e} — libmpv Android sans vo=libmpv (media-kit incomplet?)"
+            ))
+        })?;
+        soft_set(&mpv, "force-window", "no");
+        soft_set(&mpv, "keep-open", "yes");
+        soft_set(&mpv, "ytdl", "no");
+        soft_set(&mpv, "title", "FluxPlay");
         soft_set(&mpv, "osc", "no");
         soft_set(&mpv, "osd-level", "0");
         soft_set(&mpv, "input-default-bindings", "no");
         soft_set(&mpv, "input-vo-keyboard", "no");
         soft_set(&mpv, "video-timing-offset", "0");
-        mpv.set_option("volume", &format!("{}", (self.opts.volume * 100.0) as u32))?;
-        mpv.set_option("cache-secs", &format!("{cache_secs}"))?;
-        mpv.set_option(
+        // Android NativeActivity: OpenSLES audio; soft RGBA present (vo=libmpv).
+        #[cfg(target_os = "android")]
+        {
+            soft_set(&mpv, "ao", "opensles");
+            soft_set(&mpv, "audio-device", "auto");
+        }
+        soft_set(
+            &mpv,
+            "volume",
+            &format!("{}", (self.opts.volume * 100.0) as u32),
+        );
+        soft_set(&mpv, "cache-secs", &format!("{cache_secs}"));
+        soft_set(
+            &mpv,
             "demuxer-readahead-secs",
             &format!("{}", if vod { 12.0 } else if mpeg_ts { 4.0 } else { 2.0 }),
-        )?;
+        );
         soft_set(&mpv, "cache", "yes");
         soft_set(
             &mpv,
@@ -1190,9 +1304,18 @@ impl NativePlayer {
         }
 
         if self.opts.hwdec {
-            // Homebrew libmpv often lacks NVDEC; auto-copy still helps on VAAPI builds.
-            soft_set(&mpv, "hwdec", "auto-copy");
-            soft_set(&mpv, "hwdec-codecs", "all");
+            #[cfg(target_os = "android")]
+            {
+                // media-kit: MediaCodec → system RAM for vo=libmpv SW present.
+                soft_set(&mpv, "hwdec", "mediacodec-copy");
+                soft_set(&mpv, "hwdec-codecs", "all");
+            }
+            #[cfg(not(target_os = "android"))]
+            {
+                // Homebrew libmpv often lacks NVDEC; auto-copy still helps on VAAPI builds.
+                soft_set(&mpv, "hwdec", "auto-copy");
+                soft_set(&mpv, "hwdec-codecs", "all");
+            }
         } else {
             soft_set(&mpv, "hwdec", "no");
         }
@@ -1214,9 +1337,14 @@ impl NativePlayer {
         }
 
         if let Some(ua) = &self.opts.user_agent {
-            mpv.set_option("user-agent", ua)?;
+            soft_set(&mpv, "user-agent", ua);
         } else {
             soft_set(&mpv, "user-agent", "IPTVSmartersPlayer");
+        }
+        if let Some(proxy) = &self.opts.http_proxy {
+            // FFmpeg lavf accepts socks5h:// for HTTP(S) streams when built with it.
+            soft_set(&mpv, "http-proxy", proxy);
+            soft_set(&mpv, "ytdl-raw-options", &format!("proxy={proxy}"));
         }
         if let Some(ref_r) = &self.opts.referer {
             soft_set(&mpv, "referrer", ref_r);
@@ -1235,7 +1363,9 @@ impl NativePlayer {
         mpv.initialize()?;
         mpv.init_sw_render()?;
         mpv.command(&["loadfile", url, "replace"])?;
-        // Give demuxer a beat then log active hwdec (helps verify NVDEC on RTX).
+        // Desktop only: brief settle so hwdec-current is meaningful. Never sleep on
+        // Android UI thread (ANR / frozen NativeActivity).
+        #[cfg(not(target_os = "android"))]
         std::thread::sleep(std::time::Duration::from_millis(200));
         let hw = mpv
             .get_property_string("hwdec-current")
@@ -1261,13 +1391,14 @@ impl NativePlayer {
         let ipc = ipc_socket_path();
         let mpeg_ts = looks_like_mpeg_ts(url);
         let vod = looks_like_vod_container(url);
-        let cache_secs = if vod {
+        let demux_cache = if vod {
             self.opts.demux_secs.max(20.0)
         } else if mpeg_ts {
             self.opts.demux_secs.max(8.0)
         } else {
             self.opts.demux_secs.max(4.0)
         };
+        let cache_secs = demux_cache.max(self.opts.cache_ms as f32 / 1000.0);
         let mut args = vec![
             "--force-window=yes".into(),
             "--keep-open=yes".into(),
@@ -1299,6 +1430,9 @@ impl NativePlayer {
                     .unwrap_or("IPTVSmartersPlayer")
             ),
         ];
+        if let Some(proxy) = &self.opts.http_proxy {
+            args.push(format!("--http-proxy={proxy}"));
+        }
         if let Some(rect) = self.video_rect.filter(|r| r.is_usable()) {
             args.push(format!("--geometry={}", rect.to_geometry()));
             if rect.anchored {

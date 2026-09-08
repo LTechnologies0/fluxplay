@@ -60,11 +60,11 @@ where
         let state = State::new(program, id, &window, system_theme);
         let surface_size = state.physical_size();
         let surface_version = state.surface_version();
-        let surface = compositor.create_surface(
+        let surface = Some(compositor.create_surface(
             window.clone(),
             surface_size.width,
             surface_size.height,
-        );
+        ));
         let renderer = compositor.create_renderer();
 
         let _ = self.aliases.insert(window.id(), id);
@@ -167,7 +167,8 @@ where
     pub state: State<P>,
     pub exit_on_close_request: bool,
     pub mouse_interaction: mouse::Interaction,
-    pub surface: C::Surface,
+    /// `None` after Android `Suspended` (NativeWindow destroyed) until `Resumed`.
+    pub surface: Option<C::Surface>,
     pub surface_version: u64,
     pub renderer: P::Renderer,
     pub redraw_at: Option<Instant>,

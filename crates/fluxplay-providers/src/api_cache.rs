@@ -13,38 +13,16 @@ use tracing::{debug, error, trace, warn};
 
 use crate::{ProviderError, Result};
 
+pub use crate::http_client::{
+    app_http, apply_network_settings, current_network_settings, probe_dns, set_socks_proxy,
+    shared_http, socks_proxy,
+};
+
 /// Max simultaneous portal HTTP calls (auth + catalog + EPG share this).
 /// 2 unlocks real overlap for `tokio::join!` dumps while staying panel-friendly.
 const PORTAL_CONCURRENCY: usize = 2;
 
-static HTTP: OnceLock<reqwest::Client> = OnceLock::new();
 static PORTAL_SEM: OnceLock<Semaphore> = OnceLock::new();
-
-pub fn shared_http() -> Result<reqwest::Client> {
-    if let Some(c) = HTTP.get() {
-        return Ok(c.clone());
-    }
-    let built = reqwest::Client::builder()
-        .user_agent(crate::xtream::SMARTERS_UA)
-        .timeout(Duration::from_secs(120))
-        .connect_timeout(Duration::from_secs(20))
-        .redirect(reqwest::redirect::Policy::limited(8))
-        .gzip(true)
-        .pool_max_idle_per_host(4)
-        .build();
-    match built {
-        Ok(client) => {
-            debug!("shared HTTP client initialized");
-            Ok(HTTP.get_or_init(|| client).clone())
-        }
-        Err(e) => {
-            error!(error = %e, "HTTP client build failed");
-            Err(ProviderError::Message(format!(
-                "http client build failed: {e}"
-            )))
-        }
-    }
-}
 
 fn portal_sem() -> &'static Semaphore {
     PORTAL_SEM.get_or_init(|| {
@@ -72,8 +50,18 @@ where
 }
 
 fn cache_root() -> PathBuf {
+    if let Some(over) = CACHE_ROOT_OVERRIDE.get() {
+        return over.clone();
+    }
     let base = dirs::cache_dir().unwrap_or_else(std::env::temp_dir);
     base.join("fluxplay").join("xtream-api")
+}
+
+static CACHE_ROOT_OVERRIDE: OnceLock<PathBuf> = OnceLock::new();
+
+/// Point Xtream disk cache at app-private storage (Android `internal_data`).
+pub fn set_cache_root(path: PathBuf) {
+    let _ = CACHE_ROOT_OVERRIDE.set(path);
 }
 
 fn hash_key(parts: &[&str]) -> String {

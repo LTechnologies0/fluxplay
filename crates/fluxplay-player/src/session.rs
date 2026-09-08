@@ -706,6 +706,10 @@ impl StreamSession {
         }
     }
 
+    pub fn content_fps(&self) -> Option<f64> {
+        self.native.content_fps()
+    }
+
     pub fn elapsed_label(&self) -> String {
         if let (Some(start), true) = (self.started_at, self.is_live()) {
             let secs = (Utc::now() - start).num_seconds().max(0) as u64;

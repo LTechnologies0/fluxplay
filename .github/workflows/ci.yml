@@ -87,3 +87,76 @@ jobs:
           rustup target add aarch64-linux-android
           cargo build -p fluxplay-ffi --target aarch64-linux-android
         continue-on-error: true
+
+  # Full APK needs SDK + NDK + cargo-apk; check is the required gate.
+  android-apk:
+    name: android-apk
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-linux-android
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: android-x86_64-linux-android
+
+      - name: Android check
+        run: |
+          rustup target add x86_64-linux-android
+          cargo check -p fluxplay --target x86_64-linux-android
+
+      - name: Setup Android NDK (optional APK)
+        id: setup-ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r28c
+          link-to-sdk: true
+        continue-on-error: true
+
+      - name: Setup Android SDK cmdline-tools (optional APK)
+        if: steps.setup-ndk.outcome == 'success'
+        uses: android-actions/setup-android@v3
+        continue-on-error: true
+
+      - name: Install cargo-apk (optional)
+        if: steps.setup-ndk.outcome == 'success'
+        run: cargo install cargo-apk --locked
+        continue-on-error: true
+
+      - name: Build APK x86_64 (optional)
+        if: steps.setup-ndk.outcome == 'success'
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+          ANDROID_HOME: ${{ env.ANDROID_HOME }}
+        run: |
+          chmod +x scripts/build-android-apk.sh scripts/inject-android-java.sh
+          # Debug keystore for CI signing metadata in cargo-apk config.
+          mkdir -p "$HOME/.android"
+          if [[ ! -f "$HOME/.android/debug.keystore" ]]; then
+            keytool -genkeypair -v \
+              -keystore "$HOME/.android/debug.keystore" \
+              -storepass android -alias androiddebugkey \
+              -keypass android -keyalg RSA -keysize 2048 -validity 10000 \
+              -dname "CN=Android Debug,O=Android,C=US"
+          fi
+          ./scripts/build-android-apk.sh --target x86_64-linux-android
+        continue-on-error: true
+
+      - name: Upload APK artifact (if built)
+        if: success() || failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fluxplay-android-x86_64
+          path: |
+            target/**/apk/FluxPlay.apk
+          if-no-files-found: ignore
+        continue-on-error: true

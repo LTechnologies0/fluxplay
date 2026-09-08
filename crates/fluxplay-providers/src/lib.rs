@@ -2,6 +2,7 @@
 
 pub mod api_cache;
 pub mod health;
+pub mod http_client;
 pub mod m3u_source;
 pub mod stalker;
 pub mod user_agents;
@@ -16,6 +17,10 @@ use thiserror::Error;
 use tracing::{debug, info, warn};
 
 pub use health::{check_xtream_portal, format_health, PortalHealth};
+pub use http_client::{
+    app_http, apply_network_settings, bootstrap_lookup_ip, current_network_settings, probe_dns,
+    set_socks_proxy, shared_http, socks_proxy,
+};
 pub use m3u_source::load_m3u_source;
 pub use stalker::StalkerClient;
 pub use xtream::XtreamClient;
@@ -205,16 +210,20 @@ pub async fn load_source(source: &MediaSource) -> Result<PlaylistBundle> {
                 return Ok(PlaylistBundle::default());
             }
             let text = String::from_utf8_lossy(&bytes).into_owned();
-            match xmltv::parse_xmltv(&text) {
-                Ok(epg) => {
+            match tokio::task::spawn_blocking(move || xmltv::parse_xmltv(&text)).await {
+                Ok(Ok(epg)) => {
                     info!(programmes = epg.len(), "XMLTV source parsed");
                     Ok(PlaylistBundle {
                         epg,
                         ..Default::default()
                     })
                 }
-                Err(e) => {
+                Ok(Err(e)) => {
                     warn!(error = %e, "XMLTV parse failed — empty EPG");
+                    Ok(PlaylistBundle::default())
+                }
+                Err(e) => {
+                    warn!(error = %e, "XMLTV parse join failed — empty EPG");
                     Ok(PlaylistBundle::default())
                 }
             }

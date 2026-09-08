@@ -413,32 +413,10 @@ impl XtreamClient {
 
         let mut channels = Vec::new();
         if let Value::Array(arr) = live {
-            channels.reserve(arr.len());
-            for item in arr {
-                let Ok(s) = serde_json::from_value::<XcLiveStream>(item) else {
-                    continue;
-                };
-                let ext = self.media_ext(s.container_extension.as_deref());
-                let url = if let Some(ds) = s.direct_source.filter(|d| !d.is_empty()) {
-                    ds
-                } else {
-                    self.live_stream_url(&s.stream_id, ext)
-                };
-                channels.push(Channel {
-                    id: s.stream_id.clone(),
-                    name: s.name,
-                    stream_url: url,
-                    logo: s.stream_icon,
-                    group: s.category_id.clone(),
-                    tvg_id: s.epg_channel_id.clone(),
-                    tvg_name: None,
-                    tvg_logo: None,
-                    epg_channel_id: s.epg_channel_id,
-                    scheme: Some(StreamScheme::Http),
-                    source_id: Some(self.source_id),
-                    kind: ContentKind::Live,
-                    catchup: None,
-                });
+            let client = self.clone();
+            match tokio::task::spawn_blocking(move || client.map_live_streams(arr)).await {
+                Ok(mapped) => channels = mapped,
+                Err(e) => warn!(error = %e, "live streams map join failed"),
             }
         }
 
@@ -543,6 +521,37 @@ impl XtreamClient {
         (vod, series)
     }
 
+    fn map_live_streams(&self, arr: Vec<Value>) -> Vec<Channel> {
+        let mut channels = Vec::with_capacity(arr.len());
+        for item in arr {
+            let Ok(s) = serde_json::from_value::<XcLiveStream>(item) else {
+                continue;
+            };
+            let ext = self.media_ext(s.container_extension.as_deref());
+            let url = if let Some(ds) = s.direct_source.filter(|d| !d.is_empty()) {
+                ds
+            } else {
+                self.live_stream_url(&s.stream_id, ext)
+            };
+            channels.push(Channel {
+                id: s.stream_id.clone(),
+                name: s.name,
+                stream_url: url,
+                logo: s.stream_icon,
+                group: s.category_id.clone(),
+                tvg_id: s.epg_channel_id.clone(),
+                tvg_name: None,
+                tvg_logo: None,
+                epg_channel_id: s.epg_channel_id,
+                scheme: Some(StreamScheme::Http),
+                source_id: Some(self.source_id),
+                kind: ContentKind::Live,
+                catchup: None,
+            });
+        }
+        channels
+    }
+
     async fn try_load_all_vod(&self) -> Option<Vec<VodItem>> {
         let value = self.get_json(Some("get_vod_streams")).await.ok()?;
         let Value::Array(arr) = value else {
@@ -552,6 +561,22 @@ impl XtreamClient {
             // Tiny payloads often mean "need category_id".
             return None;
         }
+        let client = self.clone();
+        match tokio::task::spawn_blocking(move || client.map_vod_dump(arr)).await {
+            Ok(out) => {
+                if let Some(n) = out.as_ref().map(|v| v.len()) {
+                    info!(n, "VOD full dump loaded");
+                }
+                out
+            }
+            Err(e) => {
+                warn!(error = %e, "VOD dump map join failed");
+                None
+            }
+        }
+    }
+
+    fn map_vod_dump(&self, arr: Vec<Value>) -> Option<Vec<VodItem>> {
         let mut out = Vec::with_capacity(arr.len());
         for item in arr {
             let Ok(s) = serde_json::from_value::<XcVodStream>(item) else {
@@ -585,7 +610,6 @@ impl XtreamClient {
                 source_id: Some(self.source_id),
             });
         }
-        info!(n = out.len(), "VOD full dump loaded");
         Some(out)
     }
 
@@ -597,6 +621,22 @@ impl XtreamClient {
         if arr.is_empty() || arr.len() < 8 {
             return None;
         }
+        let client = self.clone();
+        match tokio::task::spawn_blocking(move || client.map_series_dump(arr)).await {
+            Ok(out) => {
+                if let Some(n) = out.as_ref().map(|v| v.len()) {
+                    info!(n, "series full dump loaded");
+                }
+                out
+            }
+            Err(e) => {
+                warn!(error = %e, "series dump map join failed");
+                None
+            }
+        }
+    }
+
+    fn map_series_dump(&self, arr: Vec<Value>) -> Option<Vec<SeriesItem>> {
         let mut out = Vec::with_capacity(arr.len());
         for item in arr {
             let Ok(s) = serde_json::from_value::<XcSeries>(item) else {
@@ -625,7 +665,6 @@ impl XtreamClient {
                 category_id: s.category_id,
             });
         }
-        info!(n = out.len(), "Series full dump loaded");
         Some(out)
     }
 

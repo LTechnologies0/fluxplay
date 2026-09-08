@@ -241,6 +241,7 @@ where
 
             #[cfg(target_os = "android")]
             {
+                android::set_foreground(true);
                 self.android_resumed = true;
                 if let Some(control) = self.pending_create.take() {
                     log::info!("Android resumed — flushing deferred window create");
@@ -252,6 +253,25 @@ where
                         )),
                     );
                 }
+                // Recreate wgpu surfaces after NativeWindow is valid again.
+                log::info!("Android resumed — recreating render surfaces");
+                self.process_event(event_loop, Event::AndroidResumeSurfaces);
+            }
+        }
+
+        fn suspended(&mut self, event_loop: &winit::event_loop::ActiveEventLoop) {
+            #[cfg(target_os = "android")]
+            {
+                // Signal apps before surfaces drop so media can pause.
+                android::set_foreground(false);
+                // winit: must drop all render surfaces before this callback returns.
+                log::info!("Android suspended — dropping render surfaces");
+                self.android_resumed = false;
+                self.process_event(event_loop, Event::AndroidSuspendSurfaces);
+            }
+            #[cfg(not(target_os = "android"))]
+            {
+                let _ = event_loop;
             }
         }
 
@@ -569,6 +589,12 @@ enum Event<Message: 'static> {
         on_open: oneshot::Sender<window::Id>,
     },
     EventLoopAwakened(winit::event::Event<Message>),
+    /// Android: NativeWindow gone — drop wgpu/EGL surfaces before callback returns.
+    #[cfg(target_os = "android")]
+    AndroidSuspendSurfaces,
+    /// Android: NativeWindow back — recreate surfaces and redraw.
+    #[cfg(target_os = "android")]
+    AndroidResumeSurfaces,
     Exit,
 }
 
@@ -613,6 +639,8 @@ async fn run_instance<P>(
     let mut events = Vec::new();
     let mut messages = Vec::new();
     let mut actions = 0;
+    #[cfg(target_os = "android")]
+    let mut android_recreate_surfaces = false;
 
     let mut ui_caches = FxHashMap::default();
     let mut user_interfaces = ManuallyDrop::new(FxHashMap::default());
@@ -666,6 +694,24 @@ async fn run_instance<P>(
         };
 
         match event {
+            #[cfg(target_os = "android")]
+            Event::AndroidSuspendSurfaces => {
+                for (_id, window) in window_manager.iter_mut() {
+                    if window.surface.take().is_some() {
+                        log::debug!("Dropped Android render surface");
+                    }
+                }
+                continue;
+            }
+            #[cfg(target_os = "android")]
+            Event::AndroidResumeSurfaces => {
+                // Defer recreate until RedrawRequested (compositor type is known).
+                android_recreate_surfaces = true;
+                for (_id, window) in window_manager.iter_mut() {
+                    window.raw.request_redraw();
+                }
+                continue;
+            }
             Event::WindowCreated {
                 id,
                 window,
@@ -869,6 +915,46 @@ async fn run_instance<P>(
                             continue;
                         };
 
+                        #[cfg(target_os = "android")]
+                        if android_recreate_surfaces {
+                            let mut any_created = false;
+                            if !android::has_native_window() {
+                                // Sticky: wait for InitWindow / next resume redraw.
+                                // Creating now panics: RawHandle(Unavailable).
+                                continue;
+                            }
+                            for (_id, win) in window_manager.iter_mut() {
+                                let physical_size = win.state.physical_size();
+                                if physical_size.width == 0
+                                    || physical_size.height == 0
+                                {
+                                    // Sticky flag stays set; no per-frame redraw spin.
+                                    continue;
+                                }
+                                win.surface = None;
+                                win.surface =
+                                    Some(current_compositor.create_surface(
+                                        win.raw.clone(),
+                                        physical_size.width,
+                                        physical_size.height,
+                                    ));
+                                win.surface_version =
+                                    win.state.surface_version();
+                                win.raw.request_redraw();
+                                any_created = true;
+                                log::info!(
+                                    "Android surface recreated {}x{}",
+                                    physical_size.width,
+                                    physical_size.height
+                                );
+                            }
+                            if any_created {
+                                android_recreate_surfaces = false;
+                            }
+                            // If still 0×0, keep the sticky flag and wait for the
+                            // next system redraw/resize — do not spin request_redraw.
+                        }
+
                         let Some((id, mut window)) =
                             window_manager.get_mut_alias(id)
                         else {
@@ -898,14 +984,21 @@ async fn run_instance<P>(
                             );
                             layout_span.finish();
 
-                            current_compositor.configure_surface(
-                                &mut window.surface,
-                                physical_size.width,
-                                physical_size.height,
-                            );
+                            if let Some(surface) = window.surface.as_mut() {
+                                current_compositor.configure_surface(
+                                    surface,
+                                    physical_size.width,
+                                    physical_size.height,
+                                );
+                            }
 
                             window.surface_version =
                                 window.state.surface_version();
+                        }
+
+                        if window.surface.is_none() {
+                            // Android suspended — no NativeWindow yet.
+                            continue;
                         }
 
                         let redraw_event = core::Event::Window(
@@ -1074,10 +1167,14 @@ async fn run_instance<P>(
 
                         window.draw_preedit();
 
+                        let Some(surface) = window.surface.as_mut() else {
+                            continue;
+                        };
+
                         let present_span = debug::present(id);
                         match current_compositor.present(
                             &mut window.renderer,
-                            &mut window.surface,
+                            surface,
                             window.state.viewport(),
                             window.state.background_color(),
                             || window.raw.pre_present_notify(),
@@ -1099,15 +1196,37 @@ async fn run_instance<P>(
                                         window.state.physical_size();
 
                                     if error == compositor::SurfaceError::Lost {
-                                        window.surface = current_compositor
-                                            .create_surface(
-                                                window.raw.clone(),
-                                                physical_size.width,
-                                                physical_size.height,
+                                        #[cfg(target_os = "android")]
+                                        let can_recreate =
+                                            physical_size.width > 0
+                                                && physical_size.height > 0
+                                                && android::has_native_window();
+                                        #[cfg(not(target_os = "android"))]
+                                        let can_recreate = physical_size
+                                            .width
+                                            > 0
+                                            && physical_size.height > 0;
+                                        if can_recreate {
+                                            window.surface = Some(
+                                                current_compositor
+                                                    .create_surface(
+                                                        window.raw.clone(),
+                                                        physical_size.width,
+                                                        physical_size.height,
+                                                    ),
                                             );
-                                    } else {
+                                        } else {
+                                            #[cfg(target_os = "android")]
+                                            {
+                                                android_recreate_surfaces =
+                                                    true;
+                                            }
+                                        }
+                                    } else if let Some(surface) =
+                                        window.surface.as_mut()
+                                    {
                                         current_compositor.configure_surface(
-                                            &mut window.surface,
+                                            surface,
                                             physical_size.width,
                                             physical_size.height,
                                         );

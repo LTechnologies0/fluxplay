@@ -1,7 +1,7 @@
 //! Dedicated video player — full-bleed stage + mpvEx-inspired overlay chrome.
 
 use iced::widget::{
-    button, column, container, mouse_area, row, scrollable, slider, stack, text, text_input, Row,
+    column, container, mouse_area, row, scrollable, slider, stack, text, text_input, Row,
     Space,
 };
 use iced::widget::image::Handle;
@@ -11,10 +11,10 @@ use iced::{
 use fluxplay_player::{PlaybackState, StreamSession};
 
 use crate::theme::{
-    elevation_shadow, radius_fab, radius_floating_toolbar, stage_black, UiTheme, FAB_MEDIUM,
-    LOADING_SIZE, RADIUS_EXTRA_LARGE, RADIUS_FULL, RADIUS_LG, SLIDER_HANDLE_W, SLIDER_S_HEIGHT,
-    SLIDER_S_TRACK, SPACE_MD, SPACE_SM, SPACE_XS, SPACE_XXS, TOOLBAR_H, TOOLBAR_OUTER_PAD,
-    TYPE_LABEL_L, TYPE_LABEL_M, TYPE_LABEL_S, TYPE_TITLE_M,
+    elevation_shadow, radius_dock, radius_fab, stage_black, UiTheme, FAB_MEDIUM, LOADING_SIZE,
+    RADIUS_EXTRA_LARGE, RADIUS_FULL, RADIUS_LG, SLIDER_HANDLE_W, SLIDER_S_HEIGHT, SLIDER_S_TRACK,
+    SPACE_MD, SPACE_SM, SPACE_XS, SPACE_XXS, TOOLBAR_H, TOOLBAR_OUTER_PAD, TYPE_LABEL_L,
+    TYPE_LABEL_M, TYPE_LABEL_S, TYPE_TITLE_M,
 };
 use crate::app::Message;
 use crate::icons::{self, Icon};
@@ -42,8 +42,10 @@ pub struct PlayerChrome<'a> {
     pub sleep_mins: Option<u32>,
     pub pip: bool,
     pub chrome_h: f32,
-    /// When false, only the video stage is shown (pointer idle).
+    /// When false, chrome is fading out / hidden (see `chrome_alpha`).
     pub chrome_visible: bool,
+    /// Soft fade 0..=1 for overlay backgrounds (interactive if > 0.05).
+    pub chrome_alpha: f32,
     pub fullscreen: bool,
     /// libmpv / libav* software-render embeds frames in iced; CLI fallback uses an OS window.
     pub embedded_video: bool,
@@ -53,19 +55,30 @@ pub struct PlayerChrome<'a> {
 pub fn player_window(p: PlayerChrome<'_>) -> Element<'_, Message> {
     let stage = stage_panel(&p);
     let live = p.session.is_live();
+    let alpha = p.chrome_alpha.clamp(0.0, 1.0);
+    let interactive = alpha > 0.05 || p.panel != PlayerPanel::None;
 
     // Full-bleed video; ALL chrome is overlay (never reflows the image stage → no flicker).
-    let overlay: Element<'_, Message> = if p.chrome_visible || p.panel != PlayerPanel::None {
+    let overlay: Element<'_, Message> = if interactive {
         let badge = if live {
             chip_live(p.ui)
         } else {
             soft_chip(p.ui, "VOD")
         };
+        let mut title_ink = p.ui.inverse_on_surface();
+        title_ink.a *= alpha;
         let title = text(truncate(p.title, 64))
             .size(TYPE_TITLE_M)
-            .color(Color::from_rgba8(0xFF, 0xFF, 0xFF, 0.95));
+            .color(title_ink);
         let fs = if p.fullscreen {
-            soft_chip(p.ui, "Échap pour quitter")
+            #[cfg(target_os = "android")]
+            {
+                soft_chip(p.ui, "Retour pour quitter")
+            }
+            #[cfg(not(target_os = "android"))]
+            {
+                soft_chip(p.ui, "Échap pour quitter")
+            }
         } else {
             Space::new().width(0).into()
         };
@@ -77,7 +90,13 @@ pub fn player_window(p: PlayerChrome<'_>) -> Element<'_, Message> {
         )
         .width(Fill)
         .style(move |_t: &Theme| container::Style {
-            background: Some(Background::Color(Color::from_rgba(0.0, 0.0, 0.0, 0.45))),
+            background: Some(Background::Color({
+                let mut c = p.ui.inverse_surface();
+                // Soft dim over video; keep readable inverse ink.
+                c.a = 0.82 * alpha;
+                c
+            })),
+            text_color: Some(p.ui.inverse_on_surface()),
             ..Default::default()
         });
 
@@ -87,9 +106,33 @@ pub fn player_window(p: PlayerChrome<'_>) -> Element<'_, Message> {
             PlayerPanel::Advanced => advanced_sheet(&p),
             PlayerPanel::Goto => goto_sheet(p.ui, p.goto_draft),
         };
-        let dock = control_dock(&p);
+        let middle: Element<'_, Message> = if p.panel != PlayerPanel::None {
+            // Scrim fills space above the sheet; sheet sits at the bottom of this band.
+            stack![
+                container(Space::new().width(Fill).height(Fill))
+                    .width(Fill)
+                    .height(Fill)
+                    .style(move |_t: &Theme| {
+                        let mut bg = p.ui.scrim();
+                        bg.a *= alpha;
+                        container::Style {
+                            background: Some(Background::Color(bg)),
+                            ..Default::default()
+                        }
+                    }),
+                column![Space::new().height(Fill), sheet]
+                    .width(Fill)
+                    .height(Fill),
+            ]
+            .width(Fill)
+            .height(Fill)
+            .into()
+        } else {
+            Space::new().height(Fill).into()
+        };
+        let dock = control_dock(&p, alpha);
         container(
-            column![top, Space::new().height(Fill), sheet, dock]
+            column![top, middle, dock]
                 .spacing(0)
                 .width(Fill)
                 .height(Fill),
@@ -183,16 +226,26 @@ fn stage_panel<'a>(p: &PlayerChrome<'a>) -> Element<'a, Message> {
             art_block,
             text(p.title.to_string())
                 .size(18)
-                .color(Color::WHITE),
+                .color(ui.inverse_on_surface()),
             text(format!("Lecture · {}", p.backend_label))
                 .size(14)
                 .color(ui.accent()),
             text("La vidéo s’affiche dans la fenêtre lecteur externe.")
                 .size(12)
-                .color(Color::from_rgba8(0xFF, 0xFF, 0xFF, 0.55)),
+                .color(Color::from_rgba(
+                    ui.inverse_on_surface().r,
+                    ui.inverse_on_surface().g,
+                    ui.inverse_on_surface().b,
+                    0.55,
+                )),
             text("Contrôles FluxPlay → xdotool / IPC quand disponible.")
                 .size(11)
-                .color(Color::from_rgba8(0xFF, 0xFF, 0xFF, 0.35)),
+                .color(Color::from_rgba(
+                    ui.inverse_on_surface().r,
+                    ui.inverse_on_surface().g,
+                    ui.inverse_on_surface().b,
+                    0.35,
+                )),
         ]
         .spacing(10)
         .align_x(Alignment::Center)
@@ -206,7 +259,9 @@ fn stage_panel<'a>(p: &PlayerChrome<'a>) -> Element<'a, Message> {
     } else {
         column![
             text("▶").size(48).color(ui.accent()),
-            text(p.title.to_string()).size(18).color(Color::WHITE),
+            text(p.title.to_string())
+                .size(18)
+                .color(ui.inverse_on_surface()),
         ]
         .spacing(10)
         .align_x(Alignment::Center)
@@ -228,7 +283,7 @@ fn stage_panel<'a>(p: &PlayerChrome<'a>) -> Element<'a, Message> {
 }
 
 /// Floating vibrant toolbar + seek S (M3 Expressive hero).
-fn control_dock<'a>(p: &PlayerChrome<'a>) -> Element<'a, Message> {
+fn control_dock<'a>(p: &PlayerChrome<'a>, chrome_alpha: f32) -> Element<'a, Message> {
     let ui = p.ui;
     let s = p.session;
     let live = s.is_live();
@@ -242,12 +297,18 @@ fn control_dock<'a>(p: &PlayerChrome<'a>) -> Element<'a, Message> {
     let vol = if s.muted { 0.0 } else { s.volume };
     let on_tb = ui.on_primary_container();
     let primary = ui.primary();
+    let alpha = chrome_alpha.clamp(0.0, 1.0);
 
     let scrub: Element<'a, Message> = if !active {
         container(
             text("En attente")
                 .size(TYPE_LABEL_M)
-                .color(Color::from_rgba8(0xFF, 0xFF, 0xFF, 0.55)),
+                .color(Color::from_rgba(
+                    ui.inverse_on_surface().r,
+                    ui.inverse_on_surface().g,
+                    ui.inverse_on_surface().b,
+                    0.55,
+                )),
         )
         .width(Fill)
         .height(Length::Fixed(SLIDER_S_HEIGHT))
@@ -264,11 +325,23 @@ fn control_dock<'a>(p: &PlayerChrome<'a>) -> Element<'a, Message> {
         .center_y(Fill)
         .into()
     } else {
+        let muted_on = Color::from_rgba(
+            ui.inverse_on_surface().r,
+            ui.inverse_on_surface().g,
+            ui.inverse_on_surface().b,
+            0.75,
+        );
+        let rail_rest = Color::from_rgba(
+            ui.inverse_on_surface().r,
+            ui.inverse_on_surface().g,
+            ui.inverse_on_surface().b,
+            0.38,
+        );
         row![
             container(
                 text(time_label.clone())
                     .size(TYPE_LABEL_M)
-                    .color(Color::from_rgba8(0xFF, 0xFF, 0xFF, 0.75)),
+                    .color(muted_on),
             )
             .width(Length::Fixed(100.0))
             .height(Length::Fixed(SLIDER_S_HEIGHT))
@@ -280,8 +353,7 @@ fn control_dock<'a>(p: &PlayerChrome<'a>) -> Element<'a, Message> {
                 .style(move |theme: &Theme, status| {
                     let mut st = slider::default(theme, status);
                     st.rail.backgrounds.0 = Background::Color(primary);
-                    st.rail.backgrounds.1 =
-                        Background::Color(Color::from_rgba8(0xFF, 0xFF, 0xFF, 0.38));
+                    st.rail.backgrounds.1 = Background::Color(rail_rest);
                     st.rail.width = SLIDER_S_TRACK;
                     st.handle.background = Background::Color(ui.on_primary());
                     st.handle.border_color = primary;
@@ -299,14 +371,31 @@ fn control_dock<'a>(p: &PlayerChrome<'a>) -> Element<'a, Message> {
         .into()
     };
 
-    // Standard button group (−10 / Play / +10) — not connected/segmented.
-    let transport = row![
-        toolbar_svg(ui, Icon::Replay10, Message::SeekRel(-10), can_seek, false),
-        play_fab(ui, play_glyph, Message::TogglePause, active),
-        toolbar_svg(ui, Icon::Forward10, Message::SeekRel(10), can_seek, false),
-    ]
-    .spacing(SPACE_SM)
-    .align_y(Alignment::Center);
+    // Connected transport segment (−10 | Play FAB | +10), gap 0, shared soft shell.
+    let transport = container(
+        row![
+            toolbar_svg(ui, Icon::Replay10, Message::SeekRel(-10), can_seek, false),
+            play_fab(ui, play_glyph, Message::TogglePause, active),
+            toolbar_svg(ui, Icon::Forward10, Message::SeekRel(10), can_seek, false),
+        ]
+        .spacing(0)
+        .align_y(Alignment::Center),
+    )
+    .padding(Padding::from([2, 2]))
+    .style(move |_t: &Theme| container::Style {
+        background: Some(Background::Color(Color::from_rgba(
+            on_tb.r,
+            on_tb.g,
+            on_tb.b,
+            0.12,
+        ))),
+        border: Border {
+            color: Color::TRANSPARENT,
+            width: 0.0,
+            radius: RADIUS_EXTRA_LARGE.into(),
+        },
+        ..Default::default()
+    });
 
     let left = row![
         toolbar_svg(ui, mute_glyph, Message::ToggleMute, true, s.muted),
@@ -375,15 +464,36 @@ fn control_dock<'a>(p: &PlayerChrome<'a>) -> Element<'a, Message> {
     )
     .width(Fill)
     .height(Length::Shrink)
-    .style(move |_t: &Theme| container::Style {
-        background: Some(Background::Color(ui.primary_container())),
-        border: Border {
-            color: Color::TRANSPARENT,
-            width: 0.0,
-            radius: radius_floating_toolbar(),
-        },
-        shadow: elevation_shadow(2, ui.day),
-        ..Default::default()
+    .style(move |_t: &Theme| {
+        let mut fill = ui.primary_container();
+        fill.a *= alpha;
+        #[cfg(target_os = "android")]
+        {
+            // GLES: primary_container fill + outline for depth (no desktop elev shadows).
+            container::Style {
+                background: Some(Background::Color(fill)),
+                border: Border {
+                    color: ui.outline_variant(),
+                    width: 1.0,
+                    radius: radius_dock(),
+                },
+                shadow: Default::default(),
+                ..Default::default()
+            }
+        }
+        #[cfg(not(target_os = "android"))]
+        {
+            container::Style {
+                background: Some(Background::Color(fill)),
+                border: Border {
+                    color: Color::TRANSPARENT,
+                    width: 0.0,
+                    radius: radius_dock(),
+                },
+                shadow: elevation_shadow(2, ui.day),
+                ..Default::default()
+            }
+        }
     });
 
     container(floating)
@@ -424,6 +534,7 @@ fn more_sheet<'a>(p: &PlayerChrome<'a>) -> Element<'a, Message> {
     } else {
         "Boucle fichier : off"
     };
+    #[cfg(not(target_os = "android"))]
     let ontop_l = if s.ontop {
         "Toujours au-dessus : ON"
     } else {
@@ -439,7 +550,14 @@ fn more_sheet<'a>(p: &PlayerChrome<'a>) -> Element<'a, Message> {
         None => "Minuterie veille : off".into(),
     };
     let fs_l = if p.fullscreen {
-        "Quitter plein écran (Échap)"
+        #[cfg(target_os = "android")]
+        {
+            "Quitter plein écran (Retour)"
+        }
+        #[cfg(not(target_os = "android"))]
+        {
+            "Quitter plein écran (Échap)"
+        }
     } else {
         "Plein écran"
     };
@@ -475,12 +593,22 @@ fn more_sheet<'a>(p: &PlayerChrome<'a>) -> Element<'a, Message> {
             chip_btn(ui, s.aspect.label(), Message::CycleAspect, active),
         ]),
         hdr("Fenêtre"),
-        chip_row(vec![
-            chip_btn(ui, ontop_l, Message::ToggleOntop, true),
-            chip_btn(ui, pip_l, Message::TogglePip, true),
-            chip_btn(ui, fs_l, Message::ToggleFullscreen, true),
-            chip_btn(ui, "Ouvrir dans un lecteur externe", Message::OpenExternal, active),
-        ]),
+        chip_row({
+            let mut chips = Vec::new();
+            #[cfg(not(target_os = "android"))]
+            {
+                chips.push(chip_btn(ui, ontop_l, Message::ToggleOntop, true));
+            }
+            chips.push(chip_btn(ui, pip_l, Message::TogglePip, true));
+            chips.push(chip_btn(ui, fs_l, Message::ToggleFullscreen, true));
+            chips.push(chip_btn(
+                ui,
+                "Ouvrir dans un lecteur externe",
+                Message::OpenExternal,
+                active,
+            ));
+            chips
+        }),
         hdr("Navigation & outils"),
         chip_row(vec![
             chip_btn(ui, "Chapitre précédent", Message::ChapterStep(-1), active && !s.is_live()),
@@ -707,13 +835,15 @@ fn chip_live(ui: UiTheme) -> Element<'static, Message> {
     .into()
 }
 
-fn soft_chip(_ui: UiTheme, label: &str) -> Element<'static, Message> {
-    container(text(label.to_string()).size(11).color(Color::from_rgba8(0xFF, 0xFF, 0xFF, 0.85)))
+fn soft_chip(ui: UiTheme, label: &str) -> Element<'static, Message> {
+    let fill = ui.surface_container_highest();
+    let ink = ui.on_surface();
+    container(text(label.to_string()).size(11).color(ink))
         .padding(Padding::from([6, 12]))
         .style(move |_t: &Theme| container::Style {
-            background: Some(Background::Color(Color::from_rgba(0.0, 0.0, 0.0, 0.4))),
+            background: Some(Background::Color(fill)),
             border: Border {
-                color: Color::from_rgba8(0xFF, 0xFF, 0xFF, 0.12),
+                color: ui.outline_variant(),
                 width: 1.0,
                 radius: RADIUS_FULL.into(),
             },
@@ -729,20 +859,21 @@ fn chip_btn(
     enabled: bool,
 ) -> Element<'static, Message> {
     let label = label.to_string();
-    let btn = button(text(label).size(12))
+    let body = container(text(label).size(12).color(ui.ink()))
         .padding(Padding::from([8, 12]))
-        .style(move |theme: &Theme, status| {
-            let mut s = button::secondary(theme, status);
-            s.border.radius = RADIUS_FULL.into();
-            s.border.color = ui.outline_variant();
-            s.background = Some(Background::Color(ui.secondary_container()));
-            s.text_color = ui.ink();
-            s
+        .style(move |_t: &Theme| container::Style {
+            background: Some(Background::Color(ui.secondary_container())),
+            border: Border {
+                radius: RADIUS_FULL.into(),
+                color: ui.outline_variant(),
+                width: 1.0,
+            },
+            ..Default::default()
         });
     if enabled {
-        btn.on_press(msg).into()
+        mouse_area(body).on_press(msg).into()
     } else {
-        btn.into()
+        body.into()
     }
 }
 
@@ -771,32 +902,26 @@ fn icon_btn(
     } else {
         RADIUS_FULL.into()
     };
-    let btn = button(text(label).size(TYPE_LABEL_L))
+    let (bg, ink) = if active {
+        (ui.secondary_container(), ui.on_secondary_container())
+    } else {
+        (ui.surface_container(), ui.ink())
+    };
+    let body = container(text(label).size(TYPE_LABEL_L).color(ink))
         .padding(Padding::from([12, 14]))
-        .style(move |_theme: &Theme, status| {
-            let hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
-            let (bg, ink) = if active {
-                (ui.secondary_container(), ui.on_secondary_container())
-            } else if hovered {
-                (ui.surface_container_highest(), ui.ink())
-            } else {
-                (ui.surface_container(), ui.ink())
-            };
-            button::Style {
-                background: Some(Background::Color(bg)),
-                text_color: ink,
-                border: Border {
-                    color: Color::TRANSPARENT,
-                    width: 0.0,
-                    radius,
-                },
-                ..Default::default()
-            }
+        .style(move |_t: &Theme| container::Style {
+            background: Some(Background::Color(bg)),
+            border: Border {
+                color: Color::TRANSPARENT,
+                width: 0.0,
+                radius,
+            },
+            ..Default::default()
         });
     if enabled {
-        btn.on_press(msg).into()
+        mouse_area(body).on_press(msg).into()
     } else {
-        btn.into()
+        body.into()
     }
 }
 
@@ -814,32 +939,26 @@ fn toolbar_svg(
     } else {
         RADIUS_FULL.into()
     };
-    let btn = button(icons::icon(kind, 22.0, ink))
+    let bg = if active {
+        Color::from_rgba(ink.r, ink.g, ink.b, 0.22)
+    } else {
+        Color::TRANSPARENT
+    };
+    let body = container(icons::icon(kind, 22.0, ink))
         .padding(Padding::from([10, 12]))
-        .style(move |_theme: &Theme, status| {
-            let hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
-            let bg = if active {
-                Color::from_rgba(ink.r, ink.g, ink.b, 0.22)
-            } else if hovered {
-                Color::from_rgba(ink.r, ink.g, ink.b, 0.12)
-            } else {
-                Color::TRANSPARENT
-            };
-            button::Style {
-                background: Some(Background::Color(bg)),
-                text_color: ink,
-                border: Border {
-                    color: Color::TRANSPARENT,
-                    width: 0.0,
-                    radius,
-                },
-                ..Default::default()
-            }
+        .style(move |_t: &Theme| container::Style {
+            background: Some(Background::Color(bg)),
+            border: Border {
+                color: Color::TRANSPARENT,
+                width: 0.0,
+                radius,
+            },
+            ..Default::default()
         });
     if enabled {
-        btn.on_press(msg).into()
+        mouse_area(body).on_press(msg).into()
     } else {
-        btn.into()
+        body.into()
     }
 }
 
@@ -859,32 +978,26 @@ fn toolbar_icon(
     } else {
         RADIUS_FULL.into()
     };
-    let btn = button(text(label).size(TYPE_LABEL_L))
+    let bg = if active {
+        Color::from_rgba(ink.r, ink.g, ink.b, 0.22)
+    } else {
+        Color::TRANSPARENT
+    };
+    let body = container(text(label).size(TYPE_LABEL_L).color(ink))
         .padding(Padding::from([10, 12]))
-        .style(move |_theme: &Theme, status| {
-            let hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
-            let bg = if active {
-                Color::from_rgba(ink.r, ink.g, ink.b, 0.22)
-            } else if hovered {
-                Color::from_rgba(ink.r, ink.g, ink.b, 0.12)
-            } else {
-                Color::TRANSPARENT
-            };
-            button::Style {
-                background: Some(Background::Color(bg)),
-                text_color: ink,
-                border: Border {
-                    color: Color::TRANSPARENT,
-                    width: 0.0,
-                    radius,
-                },
-                ..Default::default()
-            }
+        .style(move |_t: &Theme| container::Style {
+            background: Some(Background::Color(bg)),
+            border: Border {
+                color: Color::TRANSPARENT,
+                width: 0.0,
+                radius,
+            },
+            ..Default::default()
         });
     if enabled {
-        btn.on_press(msg).into()
+        mouse_area(body).on_press(msg).into()
     } else {
-        btn.into()
+        body.into()
     }
 }
 
@@ -892,36 +1005,24 @@ fn toolbar_icon(
 fn play_fab(ui: UiTheme, kind: Icon, msg: Message, enabled: bool) -> Element<'static, Message> {
     let fill = ui.primary();
     let ink = ui.on_primary();
-    let inner = container(icons::icon(kind, 28.0, ink))
+    let body = container(icons::icon(kind, 28.0, ink))
         .width(Length::Fixed(FAB_MEDIUM))
         .height(Length::Fixed(FAB_MEDIUM))
         .center_x(Fill)
-        .center_y(Fill);
-    let btn = button(inner)
-        .padding(0)
-        .style(move |_theme: &Theme, status| {
-            let hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
-            let (bg, fg) = if hovered {
-                (ui.primary_container(), ui.on_primary_container())
-            } else {
-                (fill, ink)
-            };
-            let _ = fg;
-            button::Style {
-                background: Some(Background::Color(bg)),
-                text_color: ink,
-                border: Border {
-                    color: Color::TRANSPARENT,
-                    width: 0.0,
-                    radius: radius_fab(),
-                },
-                shadow: elevation_shadow(3, ui.day),
-                ..Default::default()
-            }
+        .center_y(Fill)
+        .style(move |_t: &Theme| container::Style {
+            background: Some(Background::Color(fill)),
+            border: Border {
+                color: Color::TRANSPARENT,
+                width: 0.0,
+                radius: radius_fab(),
+            },
+            shadow: elevation_shadow(3, ui.day),
+            ..Default::default()
         });
     if enabled {
-        btn.on_press(msg).into()
+        mouse_area(body).on_press(msg).into()
     } else {
-        btn.into()
+        body.into()
     }
 }

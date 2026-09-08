@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# Build FluxPlay Android APK (cargo-apk) then inject Java bridge (SAF / PiP / insets).
+set -euo pipefail
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$ROOT"
+
+export ANDROID_HOME="${ANDROID_HOME:-$HOME/Android/Sdk}"
+# Prefer ANDROID_HOME; some toolchains still read ANDROID_SDK_ROOT.
+export ANDROID_SDK_ROOT="${ANDROID_SDK_ROOT:-$ANDROID_HOME}"
+
+cargo apk build -p fluxplay-android --profile release-ci "$@"
+
+APK=""
+# Prefer newest FluxPlay.apk under target/*/apk/ (profile or triple layout).
+APK="$(find "$ROOT/target" -type f -path '*/apk/FluxPlay.apk' -printf '%T@\t%p\n' 2>/dev/null | sort -nr | head -n 1 | cut -f2- || true)"
+
+if [[ -z "$APK" || ! -f "$APK" ]]; then
+  echo "ERROR: FluxPlay.apk not found under target/*/apk/" >&2
+  exit 1
+fi
+
+echo "built: $APK"
+"$ROOT/scripts/inject-android-java.sh" "$APK"
+
+if ! unzip -l "$APK" | grep -E 'classes\.dex$' >/dev/null; then
+  echo "ERROR: classes.dex missing after inject: $APK" >&2
+  exit 1
+fi
+
+echo "ready: $APK"
