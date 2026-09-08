@@ -1,44 +1,91 @@
 //! Android Intent / Activity helpers (ACTION_VIEW, keep-screen-on).
+//!
+//! `ndk_context` may be `Application` — never call `Activity.getWindow()` on it.
+//! Prefer `FluxPlayNativeActivity` static helpers (see `android_bridge`).
 
-use jni::objects::{JObject, JValue};
+use jni::objects::{JClass, JObject, JValue};
+use jni::JNIEnv;
 use jni::JavaVM;
 use tracing::{debug, error, info, warn};
 
-/// FLAG_KEEP_SCREEN_ON — keep display awake while playback is active.
-const FLAG_KEEP_SCREEN_ON: i32 = 0x0000_0080;
+const FLUXPLAY_ACTIVITY_JNI: &str = "app/fluxplay/android/FluxPlayNativeActivity";
+const FLUXPLAY_ACTIVITY_DOT: &str = "app.fluxplay.android.FluxPlayNativeActivity";
 
-/// Toggle Activity window keep-screen-on (playback).
+fn clear_ex(env: &mut JNIEnv<'_>) {
+    if env.exception_check().unwrap_or(false) {
+        let _ = env.exception_clear();
+    }
+}
+
+fn fluxplay_activity_class<'a>(
+    env: &mut JNIEnv<'a>,
+    context: jni::sys::jobject,
+) -> Option<JClass<'a>> {
+    clear_ex(env);
+    if context.is_null() {
+        return None;
+    }
+    let ctx = unsafe { JObject::from_raw(context) };
+    if let Ok(cl_v) = env.call_method(&ctx, "getClassLoader", "()Ljava/lang/ClassLoader;", &[]) {
+        if let Ok(cl) = cl_v.l() {
+            if let Ok(name) = env.new_string(FLUXPLAY_ACTIVITY_DOT) {
+                if let Ok(v) = env.call_method(
+                    &cl,
+                    "loadClass",
+                    "(Ljava/lang/String;)Ljava/lang/Class;",
+                    &[JValue::Object(&name)],
+                ) {
+                    if let Ok(obj) = v.l() {
+                        return Some(JClass::from(obj));
+                    }
+                }
+                clear_ex(env);
+            } else {
+                clear_ex(env);
+            }
+        } else {
+            clear_ex(env);
+        }
+    } else {
+        clear_ex(env);
+    }
+    match env.find_class(FLUXPLAY_ACTIVITY_JNI) {
+        Ok(cls) => Some(cls),
+        Err(_) => {
+            clear_ex(env);
+            None
+        }
+    }
+}
+
+/// Toggle Activity window keep-screen-on (playback) via FluxPlayNativeActivity.
 pub fn set_keep_screen_on(enable: bool) {
     let ctx = ndk_context::android_context();
     let Ok(vm) = (unsafe { JavaVM::from_raw(ctx.vm().cast()) }) else {
         return;
     };
-    let activity = ctx.context() as jni::sys::jobject;
+    let context = ctx.context() as jni::sys::jobject;
     let Ok(mut env) = vm.attach_current_thread() else {
         return;
     };
-    let activity_obj = unsafe { JObject::from_raw(activity) };
-    let Ok(window) = env.call_method(&activity_obj, "getWindow", "()Landroid/view/Window;", &[])
-    else {
+    let Some(cls) = fluxplay_activity_class(&mut env, context) else {
+        warn!("keep_screen_on: FluxPlayNativeActivity class missing");
         return;
     };
-    let Ok(window) = window.l() else {
+    if env
+        .call_static_method(
+            cls,
+            "setKeepScreenOn",
+            "(Z)V",
+            &[JValue::Bool(u8::from(enable))],
+        )
+        .is_err()
+    {
+        clear_ex(&mut env);
+        warn!("keep_screen_on: setKeepScreenOn JNI failed");
         return;
-    };
-    let method = if enable {
-        "addFlags"
-    } else {
-        "clearFlags"
-    };
-    match env.call_method(
-        &window,
-        method,
-        "(I)V",
-        &[JValue::Int(FLAG_KEEP_SCREEN_ON)],
-    ) {
-        Ok(_) => debug!(enable, "keep_screen_on"),
-        Err(e) => warn!(error = %e, "keep_screen_on failed"),
     }
+    debug!(enable, "keep_screen_on");
 }
 
 /// Launch ACTION_VIEW for `url`. When `mime` is `Some`, uses `setDataAndType`.
@@ -62,8 +109,9 @@ pub fn open_url(url: &str, mime: Option<&str>) -> Result<(), String> {
     info!(%url, mime = ?mime, "android ACTION_VIEW");
     let ctx = ndk_context::android_context();
     let vm = unsafe { JavaVM::from_raw(ctx.vm().cast()) }.map_err(|e| e.to_string())?;
-    let activity = ctx.context() as jni::sys::jobject;
+    let context = ctx.context() as jni::sys::jobject;
     let mut env = vm.attach_current_thread().map_err(|e| e.to_string())?;
+    clear_ex(&mut env);
 
     let action = env
         .new_string("android.intent.action.VIEW")
@@ -72,7 +120,10 @@ pub fn open_url(url: &str, mime: Option<&str>) -> Result<(), String> {
 
     let uri_class = env
         .find_class("android/net/Uri")
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| {
+            clear_ex(&mut env);
+            e.to_string()
+        })?;
     let uri = env
         .call_static_method(
             uri_class,
@@ -80,41 +131,64 @@ pub fn open_url(url: &str, mime: Option<&str>) -> Result<(), String> {
             "(Ljava/lang/String;)Landroid/net/Uri;",
             &[JValue::Object(&url_j)],
         )
-        .map_err(|e| e.to_string())?
+        .map_err(|e| {
+            clear_ex(&mut env);
+            e.to_string()
+        })?
         .l()
         .map_err(|e| e.to_string())?;
 
     let intent_class = env
         .find_class("android/content/Intent")
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| {
+            clear_ex(&mut env);
+            e.to_string()
+        })?;
     let intent = env
         .new_object(
             &intent_class,
             "(Ljava/lang/String;Landroid/net/Uri;)V",
             &[JValue::Object(&action), JValue::Object(&uri)],
         )
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| {
+            clear_ex(&mut env);
+            e.to_string()
+        })?;
 
     if let Some(mime_str) = mime {
         let mime_j = env.new_string(mime_str).map_err(|e| e.to_string())?;
-        let _ = env.call_method(
-            &intent,
-            "setDataAndType",
-            "(Landroid/net/Uri;Ljava/lang/String;)Landroid/content/Intent;",
-            &[JValue::Object(&uri), JValue::Object(&mime_j)],
-        );
+        if env
+            .call_method(
+                &intent,
+                "setDataAndType",
+                "(Landroid/net/Uri;Ljava/lang/String;)Landroid/content/Intent;",
+                &[JValue::Object(&uri), JValue::Object(&mime_j)],
+            )
+            .is_err()
+        {
+            clear_ex(&mut env);
+        }
     }
 
-    let _ = env.call_method(
-        &intent,
-        "addFlags",
-        "(I)Landroid/content/Intent;",
-        &[JValue::Int(0x1000_0000)],
-    );
+    // NEW_TASK required when starting from Application context.
+    const FLAG_ACTIVITY_NEW_TASK: i32 = 0x1000_0000;
+    if env
+        .call_method(
+            &intent,
+            "addFlags",
+            "(I)Landroid/content/Intent;",
+            &[JValue::Int(FLAG_ACTIVITY_NEW_TASK)],
+        )
+        .is_err()
+    {
+        clear_ex(&mut env);
+    }
 
-    let activity_obj = unsafe { JObject::from_raw(activity) };
+    // Prefer Activity.startActivity via sInstance (static finishActivity-style helpers).
+    // FluxPlayNativeActivity has no openUrl helper — start from context with NEW_TASK.
+    let context_obj = unsafe { JObject::from_raw(context) };
     match env.call_method(
-        &activity_obj,
+        &context_obj,
         "startActivity",
         "(Landroid/content/Intent;)V",
         &[JValue::Object(&intent)],
@@ -124,6 +198,7 @@ pub fn open_url(url: &str, mime: Option<&str>) -> Result<(), String> {
             Ok(())
         }
         Err(e) => {
+            clear_ex(&mut env);
             error!(error = %e, "startActivity failed");
             warn!("Install VLC / a video player if no handler is registered");
             Err(format!("startActivity: {e}"))

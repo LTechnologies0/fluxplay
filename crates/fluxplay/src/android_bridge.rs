@@ -1,9 +1,11 @@
 //! Android JNI bridge: SAF inbox, system insets, OS PiP, keep-screen-on,
 //! theme/TV probes, audio focus, immersive chrome, finish Activity.
 //!
-//! App classes must NOT be resolved with `FindClass` from arbitrary native
-//! threads (boot ClassLoader → ClassNotFound + pending exception → ART abort).
-//! Resolve via the Activity jobject's runtime class instead.
+//! `ndk_context::android_context().context()` is often the **Application**, not
+//! `FluxPlayNativeActivity`. Never use `get_object_class(context)` for static
+//! helpers — that yields `Landroid/app/Application;` and ART aborts when a
+//! pending `getWindow()` / `NoSuchMethodError` collides with the next lookup.
+//! Resolve `app.fluxplay.android.FluxPlayNativeActivity` via the app ClassLoader.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -15,6 +17,10 @@ use serde::Deserialize;
 use tracing::{debug, info, warn};
 
 static SAF_PENDING: AtomicBool = AtomicBool::new(false);
+
+/// JNI slash name for the NativeActivity subclass that owns our static helpers.
+const FLUXPLAY_ACTIVITY_JNI: &str = "app/fluxplay/android/FluxPlayNativeActivity";
+const FLUXPLAY_ACTIVITY_DOT: &str = "app.fluxplay.android.FluxPlayNativeActivity";
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct SafInbox {
@@ -41,19 +47,55 @@ fn clear_ex(env: &mut JNIEnv<'_>) {
     }
 }
 
-fn activity_class<'a>(
+/// Load `FluxPlayNativeActivity` (where `requestAudioFocus`, SAF, PiP, … live).
+fn fluxplay_activity_class<'a>(
     env: &mut JNIEnv<'a>,
-    activity: jni::sys::jobject,
+    context: jni::sys::jobject,
 ) -> Option<JClass<'a>> {
-    if activity.is_null() {
+    // Always clear first — a stale pending exception turns the next Get*MethodID
+    // into an ART abort (`AssertNoPendingExceptionForNewException`).
+    clear_ex(env);
+    if context.is_null() {
         return None;
     }
-    let obj = unsafe { JObject::from_raw(activity) };
-    match env.get_object_class(&obj) {
+    let ctx = unsafe { JObject::from_raw(context) };
+
+    // Preferred: Application/Activity ClassLoader (works from any attached thread).
+    if let Ok(cl_v) = env.call_method(&ctx, "getClassLoader", "()Ljava/lang/ClassLoader;", &[]) {
+        if let Ok(cl) = cl_v.l() {
+            if let Ok(name) = env.new_string(FLUXPLAY_ACTIVITY_DOT) {
+                match env.call_method(
+                    &cl,
+                    "loadClass",
+                    "(Ljava/lang/String;)Ljava/lang/Class;",
+                    &[JValue::Object(&name)],
+                ) {
+                    Ok(v) => {
+                        if let Ok(obj) = v.l() {
+                            return Some(JClass::from(obj));
+                        }
+                    }
+                    Err(e) => {
+                        clear_ex(env);
+                        debug!(error = %e, "ClassLoader.loadClass(FluxPlayNativeActivity) failed");
+                    }
+                }
+            } else {
+                clear_ex(env);
+            }
+        } else {
+            clear_ex(env);
+        }
+    } else {
+        clear_ex(env);
+    }
+
+    // Fallback: FindClass (often fails off the main thread / boot ClassLoader).
+    match env.find_class(FLUXPLAY_ACTIVITY_JNI) {
         Ok(cls) => Some(cls),
         Err(e) => {
             clear_ex(env);
-            warn!(error = %e, "get_object_class(activity) failed");
+            warn!(error = %e, "FindClass(FluxPlayNativeActivity) failed");
             None
         }
     }
@@ -66,7 +108,7 @@ fn call_static_bool(name: &str) -> bool {
     let Ok(mut env) = vm.attach_current_thread() else {
         return false;
     };
-    let Some(cls) = activity_class(&mut env, activity) else {
+    let Some(cls) = fluxplay_activity_class(&mut env, activity) else {
         return false;
     };
     match env.call_static_method(cls, name, "()Z", &[]) {
@@ -86,7 +128,7 @@ fn call_static_void_bool(name: &str, arg: bool) {
     let Ok(mut env) = vm.attach_current_thread() else {
         return;
     };
-    let Some(cls) = activity_class(&mut env, activity) else {
+    let Some(cls) = fluxplay_activity_class(&mut env, activity) else {
         return;
     };
     if env
@@ -104,7 +146,7 @@ fn call_static_void(name: &str) {
     let Ok(mut env) = vm.attach_current_thread() else {
         return;
     };
-    let Some(cls) = activity_class(&mut env, activity) else {
+    let Some(cls) = fluxplay_activity_class(&mut env, activity) else {
         return;
     };
     if env.call_static_method(cls, name, "()V", &[]).is_err() {
@@ -156,7 +198,7 @@ fn call_start_saf(mode: &str, mime: &str, source: &str) {
     let Ok(mut env) = vm.attach_current_thread() else {
         return;
     };
-    let Some(cls) = activity_class(&mut env, activity) else {
+    let Some(cls) = fluxplay_activity_class(&mut env, activity) else {
         warn!("FluxPlayNativeActivity class missing — run scripts/build-android-apk.sh");
         SAF_PENDING.store(false, Ordering::SeqCst);
         return;
@@ -270,7 +312,7 @@ pub fn system_insets_dp() -> (f32, f32, f32, f32) {
     let Ok(mut env) = vm.attach_current_thread() else {
         return fallback;
     };
-    let Some(cls) = activity_class(&mut env, activity) else {
+    let Some(cls) = fluxplay_activity_class(&mut env, activity) else {
         return content_rect_insets_dp();
     };
     let Ok(arr) = env.call_static_method(cls, "systemInsetsPx", "()[I", &[]) else {
@@ -320,7 +362,7 @@ pub fn enter_pip(width: i32, height: i32) {
     let Ok(mut env) = vm.attach_current_thread() else {
         return;
     };
-    let Some(cls) = activity_class(&mut env, activity) else {
+    let Some(cls) = fluxplay_activity_class(&mut env, activity) else {
         warn!("enter_pip: activity class missing");
         return;
     };
@@ -341,7 +383,7 @@ pub fn enter_pip(width: i32, height: i32) {
 pub fn set_keep_screen_on(enable: bool) {
     if let Some((vm, activity)) = vm_activity() {
         if let Ok(mut env) = vm.attach_current_thread() {
-            if let Some(cls) = activity_class(&mut env, activity) {
+            if let Some(cls) = fluxplay_activity_class(&mut env, activity) {
                 if env
                     .call_static_method(
                         cls,
