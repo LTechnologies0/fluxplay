@@ -541,8 +541,19 @@ static void *decode_thread(void *arg) {
     int want_h = 1080;
 
     AVDictionary *opts = NULL;
-    if (p->user_agent) av_dict_set(&opts, "user_agent", p->user_agent, 0);
-    else av_dict_set(&opts, "user_agent", "IPTVSmartersPlayer", 0);
+    if (p->user_agent) {
+        char safe_ua[512];
+        size_t i, j = 0;
+        for (i = 0; p->user_agent[i] && j + 1 < sizeof(safe_ua); i++) {
+            unsigned char c = (unsigned char)p->user_agent[i];
+            if (c == '\r' || c == '\n') continue;
+            safe_ua[j++] = (char)c;
+        }
+        safe_ua[j] = 0;
+        av_dict_set(&opts, "user_agent", safe_ua[0] ? safe_ua : "IPTVSmartersPlayer", 0);
+    } else {
+        av_dict_set(&opts, "user_agent", "IPTVSmartersPlayer", 0);
+    }
     if (p->referer) {
         char hdr[1024];
         char safe[768];
@@ -560,8 +571,19 @@ static void *decode_thread(void *arg) {
         }
     }
     if (p->http_proxy && p->http_proxy[0]) {
-        av_dict_set(&opts, "http_proxy", p->http_proxy, 0);
+        char safe_px[768];
+        size_t i, j = 0;
+        for (i = 0; p->http_proxy[i] && j + 1 < sizeof(safe_px); i++) {
+            unsigned char c = (unsigned char)p->http_proxy[i];
+            if (c == '\r' || c == '\n') continue;
+            safe_px[j++] = (char)c;
+        }
+        safe_px[j] = 0;
+        if (safe_px[0]) av_dict_set(&opts, "http_proxy", safe_px, 0);
     }
+    /* Block nested playlist URLs from opening file:/concat:/crypto: etc. */
+    av_dict_set(&opts, "protocol_whitelist",
+                "file,http,https,tcp,tls,rtmp,rtmps,rtsp,rtsps,rtp,udp,srt,crypto,data", 0);
     av_dict_set(&opts, "reconnect", "1", 0);
     av_dict_set(&opts, "reconnect_streamed", "1", 0);
     av_dict_set(&opts, "reconnect_delay_max", "5", 0);

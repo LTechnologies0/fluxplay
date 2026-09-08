@@ -37,6 +37,8 @@ public class FluxPlayNativeActivity extends NativeActivity {
 
     private static FluxPlayNativeActivity sInstance;
     private static volatile boolean sInPip = false;
+    /** Cached system insets [L,T,R,B,dpi] — updated on UI thread only. */
+    private static final int[] sInsetsPx = new int[] {0, 0, 0, 0, 160};
 
     private String pendingCreateSource;
     private String pendingMime = "*/*";
@@ -47,6 +49,21 @@ public class FluxPlayNativeActivity extends NativeActivity {
     protected void onCreate(Bundle savedInstanceState) {
         sInstance = this;
         super.onCreate(savedInstanceState);
+        try {
+            View decor = getWindow().getDecorView();
+            DisplayMetrics dm = getResources().getDisplayMetrics();
+            synchronized (sInsetsPx) {
+                sInsetsPx[4] = dm.densityDpi;
+            }
+            if (Build.VERSION.SDK_INT >= 20) {
+                decor.setOnApplyWindowInsetsListener((v, insets) -> {
+                    cacheInsetsFrom(insets);
+                    return v.onApplyWindowInsets(insets);
+                });
+            }
+        } catch (Exception e) {
+            Log.e(TAG, "onCreate insets listener", e);
+        }
     }
 
     @Override
@@ -74,14 +91,16 @@ public class FluxPlayNativeActivity extends NativeActivity {
         writePipFlag(isInPictureInPictureMode);
     }
 
-    /** Called from Rust via JNI. mode open|create; mime e.g. text/plain or star/star. */
-    public static void startSaf(String mode, String mime, String createSourcePath) {
+    /** Called from Rust via JNI. mode open|create; mime e.g. text/plain or star/star.
+     * @return false if Activity not ready (Rust must clear SAF_PENDING). */
+    public static boolean startSaf(String mode, String mime, String createSourcePath) {
         FluxPlayNativeActivity a = sInstance;
         if (a == null) {
             Log.w(TAG, "startSaf: no activity");
-            return;
+            return false;
         }
         a.runOnUiThread(() -> a.launchSaf(mode, mime, createSourcePath));
+        return true;
     }
 
     private void launchSaf(String mode, String mime, String createSourcePath) {
@@ -111,6 +130,9 @@ public class FluxPlayNativeActivity extends NativeActivity {
     @Override
     protected void onActivityResult(int requestCode, int resultCode, Intent data) {
         super.onActivityResult(requestCode, resultCode, data);
+        if (requestCode != REQ_OPEN && requestCode != REQ_CREATE) {
+            return;
+        }
         if (resultCode != Activity.RESULT_OK || data == null || data.getData() == null) {
             writeInboxMeta("cancel", null, null, null);
             return;
@@ -181,42 +203,50 @@ public class FluxPlayNativeActivity extends NativeActivity {
         return type == Configuration.UI_MODE_TYPE_TELEVISION;
     }
 
+    private static void cacheInsetsFrom(WindowInsets insets) {
+        if (insets == null) {
+            return;
+        }
+        int left = 0, top = 0, right = 0, bottom = 0;
+        if (Build.VERSION.SDK_INT >= 30) {
+            int types = WindowInsets.Type.systemBars()
+                    | WindowInsets.Type.displayCutout()
+                    | WindowInsets.Type.ime();
+            android.graphics.Insets bars = insets.getInsets(types);
+            left = bars.left;
+            top = bars.top;
+            right = bars.right;
+            bottom = bars.bottom;
+        } else {
+            left = insets.getSystemWindowInsetLeft();
+            top = insets.getSystemWindowInsetTop();
+            right = insets.getSystemWindowInsetRight();
+            bottom = insets.getSystemWindowInsetBottom();
+        }
+        synchronized (sInsetsPx) {
+            sInsetsPx[0] = left;
+            sInsetsPx[1] = top;
+            sInsetsPx[2] = right;
+            sInsetsPx[3] = bottom;
+        }
+    }
+
     /**
      * Returns insets in px: [left, top, right, bottom, densityDpi].
-     * API 30+: systemBars | displayCutout | ime (ime folded into bottom).
-     * No fake 56dp fallback — bottom is 0 when the system reports none.
+     * Safe from any thread — reads UI-thread cache (no Window access off-UI).
      */
     public static int[] systemInsetsPx() {
         FluxPlayNativeActivity a = sInstance;
-        if (a == null) {
-            return new int[] {0, 0, 0, 0, 160};
-        }
-        View decor = a.getWindow().getDecorView();
-        int left = 0, top = 0, right = 0, bottom = 0;
-        WindowInsets insets = null;
-        if (Build.VERSION.SDK_INT >= 23) {
-            insets = decor.getRootWindowInsets();
-        }
-        if (insets != null) {
-            if (Build.VERSION.SDK_INT >= 30) {
-                int types = WindowInsets.Type.systemBars()
-                        | WindowInsets.Type.displayCutout()
-                        | WindowInsets.Type.ime();
-                android.graphics.Insets bars = insets.getInsets(types);
-                left = bars.left;
-                top = bars.top;
-                right = bars.right;
-                bottom = bars.bottom;
-            } else {
-                left = insets.getSystemWindowInsetLeft();
-                top = insets.getSystemWindowInsetTop();
-                right = insets.getSystemWindowInsetRight();
-                bottom = insets.getSystemWindowInsetBottom();
+        int dpi = 160;
+        if (a != null) {
+            try {
+                dpi = a.getResources().getDisplayMetrics().densityDpi;
+            } catch (Exception ignored) {
             }
         }
-        DisplayMetrics dm = a.getResources().getDisplayMetrics();
-        int dpi = dm.densityDpi;
-        return new int[] {left, top, right, bottom, dpi};
+        synchronized (sInsetsPx) {
+            return new int[] {sInsetsPx[0], sInsetsPx[1], sInsetsPx[2], sInsetsPx[3], dpi};
+        }
     }
 
     public static void setKeepScreenOn(boolean enable) {
@@ -413,7 +443,24 @@ public class FluxPlayNativeActivity extends NativeActivity {
     }
 
     private static String esc(String s) {
-        return s.replace("\\", "\\\\").replace("\"", "\\\"");
+        StringBuilder b = new StringBuilder(s.length() + 8);
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            switch (c) {
+                case '\\': b.append("\\\\"); break;
+                case '"': b.append("\\\""); break;
+                case '\n': b.append("\\n"); break;
+                case '\r': b.append("\\r"); break;
+                case '\t': b.append("\\t"); break;
+                default:
+                    if (c < 0x20) {
+                        b.append(String.format("\\u%04x", (int) c));
+                    } else {
+                        b.append(c);
+                    }
+            }
+        }
+        return b.toString();
     }
 
     private String queryDisplayName(Uri uri) {

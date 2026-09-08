@@ -3680,6 +3680,17 @@ impl FluxPlay {
                     }
                     #[cfg(not(target_os = "android"))]
                     {
+                        let tunnel_up = crate::wg_tunnel::tunnel_is_up()
+                            || fluxplay_providers::socks_proxy().is_some();
+                        if tunnel_up {
+                            let allow = std::env::var("FLUXPLAY_ALLOW_CLEARNET_EXTERNAL")
+                                .map(|v| v == "1")
+                                .unwrap_or(false);
+                            if !allow {
+                                self.status = "Lecteur externe bloqué — tunnel SOCKS actif (FLUXPLAY_ALLOW_CLEARNET_EXTERNAL=1 pour forcer)".into();
+                                return Task::none();
+                            }
+                        }
                         let _ = open::that(&ch.stream_url);
                         self.status = "Ouvert dans le lecteur externe".into();
                     }

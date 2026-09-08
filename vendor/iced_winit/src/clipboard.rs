@@ -144,8 +144,20 @@ mod android_clipboard {
     use jni::objects::{JObject, JString, JValue};
     use jni::JavaVM;
 
+    fn clear_ex(env: &mut jni::JNIEnv<'_>) {
+        if env.exception_check().unwrap_or(false) {
+            let _ = env.exception_clear();
+        }
+    }
+
     pub fn read_text() -> Option<String> {
-        read_text_inner().ok().flatten()
+        match read_text_inner() {
+            Ok(v) => v,
+            Err(e) => {
+                log::debug!("android clipboard read: {e}");
+                None
+            }
+        }
     }
 
     fn read_text_inner() -> Result<Option<String>, String> {
@@ -154,88 +166,107 @@ mod android_clipboard {
             unsafe { JavaVM::from_raw(ctx.vm().cast()) }.map_err(|e| e.to_string())?;
         let activity_ptr = ctx.context() as jni::sys::jobject;
         let mut env = vm.attach_current_thread().map_err(|e| e.to_string())?;
+        clear_ex(&mut env);
         let activity = unsafe { JObject::from_raw(activity_ptr) };
 
         let service = env
             .new_string("clipboard")
-            .map_err(|e| e.to_string())?;
-        let mgr = env
-            .call_method(
-                &activity,
-                "getSystemService",
-                "(Ljava/lang/String;)Ljava/lang/Object;",
-                &[JValue::Object(&service)],
-            )
-            .map_err(|e| e.to_string())?
-            .l()
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| {
+                clear_ex(&mut env);
+                e.to_string()
+            })?;
+        let mgr = match env.call_method(
+            &activity,
+            "getSystemService",
+            "(Ljava/lang/String;)Ljava/lang/Object;",
+            &[JValue::Object(&service)],
+        ) {
+            Ok(v) => v.l().map_err(|e| e.to_string())?,
+            Err(e) => {
+                clear_ex(&mut env);
+                return Err(e.to_string());
+            }
+        };
         if mgr.is_null() {
             return Ok(None);
         }
 
-        let has = env
-            .call_method(&mgr, "hasPrimaryClip", "()Z", &[])
-            .map_err(|e| e.to_string())?
-            .z()
-            .map_err(|e| e.to_string())?;
+        let has = match env.call_method(&mgr, "hasPrimaryClip", "()Z", &[]) {
+            Ok(v) => v.z().map_err(|e| e.to_string())?,
+            Err(e) => {
+                clear_ex(&mut env);
+                return Err(e.to_string());
+            }
+        };
         if !has {
             return Ok(None);
         }
 
-        let clip = env
-            .call_method(
-                &mgr,
-                "getPrimaryClip",
-                "()Landroid/content/ClipData;",
-                &[],
-            )
-            .map_err(|e| e.to_string())?
-            .l()
-            .map_err(|e| e.to_string())?;
+        let clip = match env.call_method(
+            &mgr,
+            "getPrimaryClip",
+            "()Landroid/content/ClipData;",
+            &[],
+        ) {
+            Ok(v) => v.l().map_err(|e| e.to_string())?,
+            Err(e) => {
+                clear_ex(&mut env);
+                return Err(e.to_string());
+            }
+        };
         if clip.is_null() {
             return Ok(None);
         }
 
-        let item = env
-            .call_method(
-                &clip,
-                "getItemAt",
-                "(I)Landroid/content/ClipData$Item;",
-                &[JValue::Int(0)],
-            )
-            .map_err(|e| e.to_string())?
-            .l()
-            .map_err(|e| e.to_string())?;
+        let item = match env.call_method(
+            &clip,
+            "getItemAt",
+            "(I)Landroid/content/ClipData$Item;",
+            &[JValue::Int(0)],
+        ) {
+            Ok(v) => v.l().map_err(|e| e.to_string())?,
+            Err(e) => {
+                clear_ex(&mut env);
+                return Err(e.to_string());
+            }
+        };
         if item.is_null() {
             return Ok(None);
         }
 
-        let coerced = env
-            .call_method(
-                &item,
-                "coerceToText",
-                "(Landroid/content/Context;)Ljava/lang/CharSequence;",
-                &[JValue::Object(&activity)],
-            )
-            .map_err(|e| e.to_string())?
-            .l()
-            .map_err(|e| e.to_string())?;
+        let coerced = match env.call_method(
+            &item,
+            "coerceToText",
+            "(Landroid/content/Context;)Ljava/lang/CharSequence;",
+            &[JValue::Object(&activity)],
+        ) {
+            Ok(v) => v.l().map_err(|e| e.to_string())?,
+            Err(e) => {
+                clear_ex(&mut env);
+                return Err(e.to_string());
+            }
+        };
         if coerced.is_null() {
             return Ok(None);
         }
 
-        let jstr = env
-            .call_method(&coerced, "toString", "()Ljava/lang/String;", &[])
-            .map_err(|e| e.to_string())?
-            .l()
-            .map_err(|e| e.to_string())?;
+        let jstr = match env.call_method(&coerced, "toString", "()Ljava/lang/String;", &[]) {
+            Ok(v) => v.l().map_err(|e| e.to_string())?,
+            Err(e) => {
+                clear_ex(&mut env);
+                return Err(e.to_string());
+            }
+        };
         if jstr.is_null() {
             return Ok(None);
         }
         let jstring = JString::from(jstr);
         let s: String = env
             .get_string(&jstring)
-            .map_err(|e| e.to_string())?
+            .map_err(|e| {
+                clear_ex(&mut env);
+                e.to_string()
+            })?
             .into();
         Ok(Some(s))
     }
@@ -246,48 +277,67 @@ mod android_clipboard {
             unsafe { JavaVM::from_raw(ctx.vm().cast()) }.map_err(|e| e.to_string())?;
         let activity_ptr = ctx.context() as jni::sys::jobject;
         let mut env = vm.attach_current_thread().map_err(|e| e.to_string())?;
+        clear_ex(&mut env);
         let activity = unsafe { JObject::from_raw(activity_ptr) };
 
         let service = env
             .new_string("clipboard")
-            .map_err(|e| e.to_string())?;
-        let mgr = env
-            .call_method(
-                &activity,
-                "getSystemService",
-                "(Ljava/lang/String;)Ljava/lang/Object;",
-                &[JValue::Object(&service)],
-            )
-            .map_err(|e| e.to_string())?
-            .l()
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| {
+                clear_ex(&mut env);
+                e.to_string()
+            })?;
+        let mgr = match env.call_method(
+            &activity,
+            "getSystemService",
+            "(Ljava/lang/String;)Ljava/lang/Object;",
+            &[JValue::Object(&service)],
+        ) {
+            Ok(v) => v.l().map_err(|e| e.to_string())?,
+            Err(e) => {
+                clear_ex(&mut env);
+                return Err(e.to_string());
+            }
+        };
         if mgr.is_null() {
             return Err("ClipboardManager null".into());
         }
 
-        let label = env.new_string("FluxPlay").map_err(|e| e.to_string())?;
-        let text = env.new_string(contents).map_err(|e| e.to_string())?;
-        let clip_class = env
-            .find_class("android/content/ClipData")
-            .map_err(|e| e.to_string())?;
-        let clip = env
-            .call_static_method(
-                clip_class,
-                "newPlainText",
-                "(Ljava/lang/CharSequence;Ljava/lang/CharSequence;)Landroid/content/ClipData;",
-                &[JValue::Object(&label), JValue::Object(&text)],
-            )
-            .map_err(|e| e.to_string())?
-            .l()
-            .map_err(|e| e.to_string())?;
-        let _ = env
+        let label = env.new_string("FluxPlay").map_err(|e| {
+            clear_ex(&mut env);
+            e.to_string()
+        })?;
+        let text = env.new_string(contents).map_err(|e| {
+            clear_ex(&mut env);
+            e.to_string()
+        })?;
+        let clip_class = env.find_class("android/content/ClipData").map_err(|e| {
+            clear_ex(&mut env);
+            e.to_string()
+        })?;
+        let clip = match env.call_static_method(
+            clip_class,
+            "newPlainText",
+            "(Ljava/lang/CharSequence;Ljava/lang/CharSequence;)Landroid/content/ClipData;",
+            &[JValue::Object(&label), JValue::Object(&text)],
+        ) {
+            Ok(v) => v.l().map_err(|e| e.to_string())?,
+            Err(e) => {
+                clear_ex(&mut env);
+                return Err(e.to_string());
+            }
+        };
+        if env
             .call_method(
                 &mgr,
                 "setPrimaryClip",
                 "(Landroid/content/ClipData;)V",
                 &[JValue::Object(&clip)],
             )
-            .map_err(|e| e.to_string())?;
+            .is_err()
+        {
+            clear_ex(&mut env);
+            return Err("setPrimaryClip failed".into());
+        }
         Ok(())
     }
 }

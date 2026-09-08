@@ -1646,14 +1646,28 @@ impl NativePlayer {
         }
 
         if let Some(ua) = &self.opts.user_agent {
-            soft_set(&mpv, "user-agent", ua);
+            soft_set(&mpv, "user-agent", &sanitize_http_field(ua));
         } else {
             soft_set(&mpv, "user-agent", "IPTVSmartersPlayer");
         }
         if let Some(proxy) = &self.opts.http_proxy {
-            // FFmpeg lavf accepts socks5h:// for HTTP(S) streams when built with it.
-            soft_set(&mpv, "http-proxy", proxy);
-            soft_set(&mpv, "ytdl-raw-options", &format!("proxy={proxy}"));
+            // Tunnel / SOCKS must apply — soft_set can silently skip on some builds.
+            let safe = sanitize_http_field(proxy);
+            mpv.set_option("http-proxy", &safe).map_err(|e| {
+                PlayerError::Backend(format!("http-proxy: {e} — tunnel would leak to clearnet"))
+            })?;
+            let _ = soft_set(&mpv, "ytdl-raw-options", &format!("proxy={safe}"));
+            let _ = soft_set(
+                &mpv,
+                "stream-lavf-o",
+                "protocol_whitelist=file,http,https,tcp,tls,rtmp,rtmps,rtsp,rtsps,rtp,udp,srt,crypto,data",
+            );
+        } else {
+            let _ = soft_set(
+                &mpv,
+                "stream-lavf-o",
+                "protocol_whitelist=file,http,https,tcp,tls,rtmp,rtmps,rtsp,rtsps,rtp,udp,srt,crypto,data",
+            );
         }
         if let Some(ref_r) = &self.opts.referer {
             let safe = sanitize_http_field(ref_r);
@@ -2056,7 +2070,6 @@ fn ipc_socket_path() -> PathBuf {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis())
         .unwrap_or(0);
-    let dir = std::env::temp_dir();
     #[cfg(windows)]
     {
         // mpv on Windows uses named pipes: \\.\pipe\name
@@ -2064,7 +2077,23 @@ fn ipc_socket_path() -> PathBuf {
     }
     #[cfg(not(windows))]
     {
-        dir.join(format!("fluxplay-mpv-{ts}-{n}.sock"))
+        let dir = std::env::var_os("XDG_RUNTIME_DIR")
+            .map(PathBuf::from)
+            .filter(|p| p.is_dir())
+            .unwrap_or_else(std::env::temp_dir);
+        let path = dir.join(format!("fluxplay-mpv-{ts}-{n}.sock"));
+        // Restrict to owner before mpv binds (best-effort; race is narrow).
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            let _ = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&path)
+                .and_then(|_| std::fs::remove_file(&path));
+        }
+        path
     }
 }
 

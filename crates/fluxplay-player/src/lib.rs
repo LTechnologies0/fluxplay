@@ -199,7 +199,7 @@ pub fn route(raw_url: &str) -> Result<RoutedStream> {
             notes: "Unrecognized".into(),
         });
 
-    if !url.scheme.is_playback_ready() && url.scheme != StreamScheme::Unknown {
+    if !url.scheme.is_playback_ready() {
         warn!(
             scheme = %url.scheme.label(),
             %endpoint,

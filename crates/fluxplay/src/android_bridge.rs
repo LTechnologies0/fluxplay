@@ -9,14 +9,18 @@
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::OnceLock;
 
-use jni::objects::{JClass, JObject, JValue};
+use jni::objects::{GlobalRef, JClass, JObject, JValue};
 use jni::JNIEnv;
 use jni::JavaVM;
 use serde::Deserialize;
 use tracing::{debug, info, warn};
 
 static SAF_PENDING: AtomicBool = AtomicBool::new(false);
+/// Cached `FluxPlayNativeActivity` class — avoids per-tick `loadClass` local refs
+/// on the permanently attached `android_main` thread (local-ref table overflow).
+static FP_ACTIVITY_CLASS: OnceLock<GlobalRef> = OnceLock::new();
 
 /// JNI slash name for the NativeActivity subclass that owns our static helpers.
 const FLUXPLAY_ACTIVITY_JNI: &str = "app/fluxplay/android/FluxPlayNativeActivity";
@@ -47,8 +51,26 @@ fn clear_ex(env: &mut JNIEnv<'_>) {
     }
 }
 
+/// Resolve (and cache) `FluxPlayNativeActivity` class as a GlobalRef.
+fn fp_activity_global<'a>(
+    env: &mut JNIEnv<'a>,
+    context: jni::sys::jobject,
+) -> Option<&'static GlobalRef> {
+    if let Some(g) = FP_ACTIVITY_CLASS.get() {
+        return Some(g);
+    }
+    let local = fluxplay_activity_class_local(env, context)?;
+    let global = env.new_global_ref(local).ok()?;
+    let _ = FP_ACTIVITY_CLASS.set(global);
+    FP_ACTIVITY_CLASS.get()
+}
+
+fn fp_class_obj<'a>(env: &mut JNIEnv<'a>, context: jni::sys::jobject) -> Option<&'static GlobalRef> {
+    fp_activity_global(env, context)
+}
+
 /// Load `FluxPlayNativeActivity` (where `requestAudioFocus`, SAF, PiP, … live).
-fn fluxplay_activity_class<'a>(
+fn fluxplay_activity_class_local<'a>(
     env: &mut JNIEnv<'a>,
     context: jni::sys::jobject,
 ) -> Option<JClass<'a>> {
@@ -108,7 +130,7 @@ fn call_static_bool(name: &str) -> bool {
     let Ok(mut env) = vm.attach_current_thread() else {
         return false;
     };
-    let Some(cls) = fluxplay_activity_class(&mut env, activity) else {
+    let Some(cls) = fp_class_obj(&mut env, activity) else {
         return false;
     };
     match env.call_static_method(cls, name, "()Z", &[]) {
@@ -128,7 +150,7 @@ fn call_static_void_bool(name: &str, arg: bool) {
     let Ok(mut env) = vm.attach_current_thread() else {
         return;
     };
-    let Some(cls) = fluxplay_activity_class(&mut env, activity) else {
+    let Some(cls) = fp_class_obj(&mut env, activity) else {
         return;
     };
     if env
@@ -146,7 +168,7 @@ fn call_static_void(name: &str) {
     let Ok(mut env) = vm.attach_current_thread() else {
         return;
     };
-    let Some(cls) = fluxplay_activity_class(&mut env, activity) else {
+    let Some(cls) = fp_class_obj(&mut env, activity) else {
         return;
     };
     if env.call_static_method(cls, name, "()V", &[]).is_err() {
@@ -196,36 +218,48 @@ fn call_start_saf(mode: &str, mime: &str, source: &str) {
         return;
     };
     let Ok(mut env) = vm.attach_current_thread() else {
+        SAF_PENDING.store(false, Ordering::SeqCst);
         return;
     };
-    let Some(cls) = fluxplay_activity_class(&mut env, activity) else {
+    let Some(cls) = fp_class_obj(&mut env, activity) else {
         warn!("FluxPlayNativeActivity class missing — run scripts/build-android-apk.sh");
         SAF_PENDING.store(false, Ordering::SeqCst);
         return;
     };
     let Ok(jmode) = env.new_string(mode) else {
         clear_ex(&mut env);
+        SAF_PENDING.store(false, Ordering::SeqCst);
         return;
     };
     let Ok(jmime) = env.new_string(mime) else {
         clear_ex(&mut env);
+        SAF_PENDING.store(false, Ordering::SeqCst);
         return;
     };
     let Ok(jsrc) = env.new_string(source) else {
         clear_ex(&mut env);
+        SAF_PENDING.store(false, Ordering::SeqCst);
         return;
     };
     match env.call_static_method(
         cls,
         "startSaf",
-        "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V",
+        "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)Z",
         &[
             JValue::Object(&jmode),
             JValue::Object(&jmime),
             JValue::Object(&jsrc),
         ],
     ) {
-        Ok(_) => info!(%mode, %mime, "SAF launched"),
+        Ok(v) => {
+            let ok = v.z().unwrap_or(false);
+            if ok {
+                info!(%mode, %mime, "SAF launched");
+            } else {
+                warn!(%mode, "startSaf returned false (no activity?)");
+                SAF_PENDING.store(false, Ordering::SeqCst);
+            }
+        }
         Err(e) => {
             clear_ex(&mut env);
             warn!(error = %e, "startSaf JNI failed");
@@ -312,7 +346,7 @@ pub fn system_insets_dp() -> (f32, f32, f32, f32) {
     let Ok(mut env) = vm.attach_current_thread() else {
         return fallback;
     };
-    let Some(cls) = fluxplay_activity_class(&mut env, activity) else {
+    let Some(cls) = fp_class_obj(&mut env, activity) else {
         return content_rect_insets_dp();
     };
     let Ok(arr) = env.call_static_method(cls, "systemInsetsPx", "()[I", &[]) else {
@@ -362,7 +396,7 @@ pub fn enter_pip(width: i32, height: i32) {
     let Ok(mut env) = vm.attach_current_thread() else {
         return;
     };
-    let Some(cls) = fluxplay_activity_class(&mut env, activity) else {
+    let Some(cls) = fp_class_obj(&mut env, activity) else {
         warn!("enter_pip: activity class missing");
         return;
     };
@@ -383,7 +417,7 @@ pub fn enter_pip(width: i32, height: i32) {
 pub fn set_keep_screen_on(enable: bool) {
     if let Some((vm, activity)) = vm_activity() {
         if let Ok(mut env) = vm.attach_current_thread() {
-            if let Some(cls) = fluxplay_activity_class(&mut env, activity) {
+            if let Some(cls) = fp_class_obj(&mut env, activity) {
                 if env
                     .call_static_method(
                         cls,
