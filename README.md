@@ -1,6 +1,6 @@
 # FluxPlay
 
-Lecteur IPTV cross-platform en **Rust** — UI Material Expressive (jour/nuit), parsers + providers purs Rust, lecture native **mpv / FFmpeg** (desktop) et **ExoPlayer / AVPlayer** (mobile).
+Lecteur IPTV cross-platform en **Rust** — UI Material Expressive (jour/nuit), parsers + providers purs Rust, lecture native **mpv / FFmpeg** (desktop) et **libmpv / Intent** (Android iced).
 
 Inspiré de **IPTVnator** (M3U/Xtream/Stalker, EPG, favoris, User-Agent, catch-up) et **Kodi** (pipeline FFmpeg, HW accel, buffers IPTV, reconnect).
 
@@ -11,10 +11,10 @@ Inspiré de **IPTVnator** (M3U/Xtream/Stalker, EPG, favoris, User-Agent, catch-u
 | **Linux** | iced | libmpv / libav* → CLI → externe | ✅ app desktop |
 | **macOS** | iced | libmpv / libav* (VideoToolbox) → CLI → IINA | ✅ |
 | **Windows** | iced | libmpv / libav* (D3D11VA) → CLI → VLC | ✅ |
-| **Android** | Kotlin shell | Media3 ExoPlayer | ✅ cœur FFI (`fluxplay-ffi`) |
-| **iOS** | SwiftUI shell | AVPlayer | ✅ cœur FFI |
+| **Android** | iced NativeActivity (`fluxplay-android`) | vendored libmpv RGBA + ACTION_VIEW | ✅ APK via `scripts/build-android-apk.sh` |
+| **iOS** | SwiftUI shell | AVPlayer | 🧪 FFI expérimental |
 
-Voir [`mobile/README.md`](mobile/README.md) pour le bridge JNI/Swift.
+Voir [`crates/fluxplay-android/README.md`](crates/fluxplay-android/README.md) pour l’APK iced. `mobile/` + `fluxplay-ffi` restent expérimentaux.
 
 ## Lancer (desktop)
 

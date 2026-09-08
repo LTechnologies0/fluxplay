@@ -411,6 +411,7 @@ fn ffmpeg_link_specs(lib_dir: &Path) -> Option<Vec<String>> {
         ("avformat", "libavformat"),
         ("avutil", "libavutil"),
         ("swscale", "libswscale"),
+        ("swresample", "libswresample"),
     ];
     let mut out = Vec::with_capacity(NEEDED.len());
     for &(short, stem) in NEEDED {

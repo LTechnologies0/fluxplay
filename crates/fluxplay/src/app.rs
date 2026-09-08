@@ -966,6 +966,17 @@ impl FluxPlay {
         Task::done(Message::BrowseScrollBy(vy))
     }
 
+    /// One-shot: after a mosaic fling, the next tile `on_release` must not open.
+    /// Returns true when the open should be skipped (and clears the sticky flag).
+    fn consume_browse_drag_suppress(&mut self) -> bool {
+        if self.browse_drag_moved {
+            self.browse_drag_moved = false;
+            true
+        } else {
+            false
+        }
+    }
+
     fn ui_theme(&self) -> UiTheme {
         UiTheme::new(self.is_day(), self.settings.accent)
     }
@@ -1451,6 +1462,8 @@ impl FluxPlay {
             Message::Tab(tab) => {
                 tracing::debug!(?tab, "tab");
                 self.tab = tab;
+                self.browse_drag_moved = false;
+                self.browse_dragging = false;
                 self.cat_filter.clear();
                 self.list_limit = LIST_PAGE;
                 self.series_detail = None;
@@ -1616,8 +1629,9 @@ impl FluxPlay {
             Message::BrowseDragEnd => {
                 self.browse_dragging = false;
                 self.browse_drag_last_y = None;
-                // Keep browse_drag_moved until after sibling on_release messages
-                // in this frame are processed — cleared on next BrowseDragStart.
+                // Keep browse_drag_moved so the sibling mosaic on_release in this
+                // frame is suppressed; open handlers *consume* the flag (one-shot)
+                // so PlayVod / detail FABs are not stuck forever after a fling.
                 let coast = self.browse_drag_last_dy * 10.0;
                 self.browse_drag_last_dy = 0.0;
                 if self.browse_drag_moved && coast.abs() > 8.0 {
@@ -1710,7 +1724,7 @@ impl FluxPlay {
                 ]);
             }
             Message::PlayChannelId(id) => {
-                if self.browse_drag_moved {
+                if self.consume_browse_drag_suppress() {
                     return Task::none();
                 }
                 let Some(ch) = self.bundle.channels.iter().find(|c| c.id == id).cloned() else {
@@ -1720,7 +1734,7 @@ impl FluxPlay {
                 return Task::done(Message::PlayChannel(ch));
             }
             Message::PlayChannel(ch) => {
-                if self.browse_drag_moved {
+                if self.consume_browse_drag_suppress() {
                     return Task::none();
                 }
                 tracing::info!(id = %ch.id, name = %ch.name, "play channel");
@@ -1832,10 +1846,20 @@ impl FluxPlay {
                 kind,
                 poster,
             } => {
-                if self.browse_drag_moved {
+                // Detail FAB / episode rows must always work; mosaic fling only
+                // suppresses the accidental tile release that follows a drag.
+                if self.series_detail.is_none()
+                    && self.vod_detail.is_none()
+                    && self.consume_browse_drag_suppress()
+                {
                     return Task::none();
                 }
+                self.browse_drag_moved = false;
                 self.status = format!("Ouverture — {name}…");
+                if url.trim().is_empty() {
+                    self.status = format!("URL vide — {name}");
+                    return Task::none();
+                }
                 let art_url = poster.clone();
                 if kind == ContentKind::Series {
                     self.arm_series_queue_for_url(&url);
@@ -3602,22 +3626,40 @@ impl FluxPlay {
             }
             Message::OpenSeries(id) => {
                 self.pressed_mosaic = None;
-                if self.browse_drag_moved {
+                if self.consume_browse_drag_suppress() {
                     return Task::none();
                 }
                 self.vod_detail = None;
                 self.detail_meta_loading = false;
                 self.browse_scroll_y = 0.0;
+                self.browse_view_h = 0.0;
                 if let Some(existing) = self.bundle.series.iter().find(|s| s.id == id) {
                     self.series_detail = Some(existing.clone());
                     self.rebuild_episode_flat();
                 }
                 self.status = "Chargement épisodes…".into();
+                let wanted = self
+                    .bundle
+                    .series
+                    .iter()
+                    .find(|s| s.id == id)
+                    .and_then(|s| s.source_id);
                 let src = self
                     .sources
                     .iter()
-                    .find(|s| s.enabled && s.kind == SourceKind::Xtream)
-                    .cloned();
+                    .find(|s| s.enabled && wanted.map(|w| w == s.id).unwrap_or(false))
+                    .cloned()
+                    .or_else(|| {
+                        self.sources
+                            .iter()
+                            .find(|s| {
+                                s.enabled
+                                    && (s.kind == SourceKind::Xtream
+                                        || fluxplay_providers::parse_xtream_get_php(&s.endpoint)
+                                            .is_some())
+                            })
+                            .cloned()
+                    });
                 let Some(src) = src else {
                     self.status = "Aucune source Xtream pour les séries".into();
                     if self.series_detail.is_some() {
@@ -3693,10 +3735,12 @@ impl FluxPlay {
             }
             Message::OpenVodDetail(id) => {
                 self.pressed_mosaic = None;
-                if self.browse_drag_moved {
+                if self.consume_browse_drag_suppress() {
                     return Task::none();
                 }
                 self.series_detail = None;
+                self.browse_scroll_y = 0.0;
+                self.browse_view_h = 0.0;
                 let Some(item) = self.bundle.vod.iter().find(|v| v.id == id).cloned() else {
                     self.status = "Film introuvable".into();
                     return Task::none();
@@ -3704,12 +3748,24 @@ impl FluxPlay {
                 self.detail_meta_loading = true;
                 self.status = format!("{} — fiche", item.name);
                 let vod_id = item.id.clone();
+                let wanted = item.source_id;
                 self.vod_detail = Some(item);
                 let src = self
                     .sources
                     .iter()
-                    .find(|s| s.enabled && s.kind == SourceKind::Xtream)
-                    .cloned();
+                    .find(|s| s.enabled && wanted.map(|w| w == s.id).unwrap_or(false))
+                    .cloned()
+                    .or_else(|| {
+                        self.sources
+                            .iter()
+                            .find(|s| {
+                                s.enabled
+                                    && (s.kind == SourceKind::Xtream
+                                        || fluxplay_providers::parse_xtream_get_php(&s.endpoint)
+                                            .is_some())
+                            })
+                            .cloned()
+                    });
                 let xtream = if let Some(src) = src {
                     Task::perform(
                         async move {
@@ -5900,14 +5956,9 @@ impl FluxPlay {
         let episodes = if detail.seasons.is_empty() {
             None
         } else {
-            #[cfg(target_os = "android")]
-            {
-                Some(Column::with_children(eps_rows).spacing(4).width(Fill).into())
-            }
-            #[cfg(not(target_os = "android"))]
-            {
-                Some(browser::virtual_column(slice, eps_rows).into())
-            }
+            // Always mount virtual spacers so scroll height matches the full episode
+            // list (Android previously omitted spacers → blank / truncated pane).
+            Some(browser::virtual_column(slice, eps_rows).into())
         };
 
         let imdb_query = detail

@@ -352,8 +352,11 @@ impl StreamSession {
                         self.channel = Some(channel);
                         self.started_at = Some(Utc::now());
                         self.state = PlaybackState::Playing;
-                        let vol = if self.muted { 0.0 } else { self.volume };
-                        let _ = self.native.set_volume(vol);
+                        if self.muted {
+                            let _ = self.native.set_mute(true);
+                        } else {
+                            let _ = self.native.set_volume(self.volume);
+                        }
                         info!(?backend, "StreamSession playing");
                         Ok(())
                     }

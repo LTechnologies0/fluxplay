@@ -1,15 +1,17 @@
 /* Embedded FFmpeg player — demux + decode video to RGBA for iced software stage.
- * Audio is decoded and discarded for now (video embed priority); volume/pause still tracked.
+ * Audio is decoded, resampled to S16LE stereo, and played via pw-play/pacat.
  */
 #include "ffmpeg_embed.h"
 
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
 #include <libavutil/avutil.h>
+#include <libavutil/channel_layout.h>
 #include <libavutil/hwcontext.h>
 #include <libavutil/imgutils.h>
 #include <libavutil/opt.h>
 #include <libavutil/time.h>
+#include <libswresample/swresample.h>
 #include <libswscale/swscale.h>
 
 #include <math.h>
@@ -329,13 +331,176 @@ static int try_init_hw(FluxFfmpegPlayer *p, const AVCodec *codec, AVCodecContext
     return 0;
 }
 
+enum { FLUX_AUDIO_RATE = 48000, FLUX_AUDIO_CH = 2 };
+
+static FILE *open_audio_sink(int rate, int channels) {
+    char cmd[320];
+    FILE *f = NULL;
+    if (access("/usr/bin/pw-play", X_OK) == 0) {
+        snprintf(cmd, sizeof(cmd),
+                 "exec pw-play -a --format s16 --rate %d --channels %d - 2>/dev/null",
+                 rate, channels);
+        f = popen(cmd, "w");
+        if (f) {
+            fprintf(stderr, "flux_ffmpeg: audio sink pw-play %d Hz / %d ch\n", rate, channels);
+            setvbuf(f, NULL, _IONBF, 0);
+            return f;
+        }
+    }
+    if (access("/usr/bin/pacat", X_OK) == 0) {
+        snprintf(cmd, sizeof(cmd),
+                 "exec pacat --raw --format=s16le --rate=%d --channels=%d 2>/dev/null",
+                 rate, channels);
+        f = popen(cmd, "w");
+        if (f) {
+            fprintf(stderr, "flux_ffmpeg: audio sink pacat %d Hz / %d ch\n", rate, channels);
+            setvbuf(f, NULL, _IONBF, 0);
+            return f;
+        }
+    }
+    if (access("/usr/bin/aplay", X_OK) == 0) {
+        snprintf(cmd, sizeof(cmd),
+                 "exec aplay -q -t raw -f S16_LE -r %d -c %d 2>/dev/null",
+                 rate, channels);
+        f = popen(cmd, "w");
+        if (f) {
+            fprintf(stderr, "flux_ffmpeg: audio sink aplay %d Hz / %d ch\n", rate, channels);
+            setvbuf(f, NULL, _IONBF, 0);
+            return f;
+        }
+    }
+    fprintf(stderr, "flux_ffmpeg: no audio sink (install pipewire-utils / pulseaudio-utils)\n");
+    return NULL;
+}
+
+static void apply_volume_s16(int16_t *samples, int n, float volume) {
+    if (volume >= 0.999f) return;
+    if (volume <= 0.001f) {
+        memset(samples, 0, (size_t)n * sizeof(int16_t));
+        return;
+    }
+    for (int i = 0; i < n; i++) {
+        float v = (float)samples[i] * volume;
+        if (v > 32767.f) v = 32767.f;
+        if (v < -32768.f) v = -32768.f;
+        samples[i] = (int16_t)v;
+    }
+}
+
+static int setup_audio(FluxFfmpegPlayer *p, AVFormatContext *fmt, int *aindex_out,
+                       AVCodecContext **actx_out, SwrContext **swr_out, FILE **sink_out) {
+    int aindex = av_find_best_stream(fmt, AVMEDIA_TYPE_AUDIO, -1, -1, NULL, 0);
+    *aindex_out = -1;
+    *actx_out = NULL;
+    *swr_out = NULL;
+    *sink_out = NULL;
+    if (aindex < 0) {
+        fprintf(stderr, "flux_ffmpeg: no audio stream\n");
+        return 0;
+    }
+    AVCodecParameters *apar = fmt->streams[aindex]->codecpar;
+    const AVCodec *acodec = avcodec_find_decoder(apar->codec_id);
+    if (!acodec) {
+        fprintf(stderr, "flux_ffmpeg: audio decoder missing\n");
+        return 0;
+    }
+    AVCodecContext *actx = avcodec_alloc_context3(acodec);
+    if (!actx) return 0;
+    if (avcodec_parameters_to_context(actx, apar) < 0 || avcodec_open2(actx, acodec, NULL) < 0) {
+        avcodec_free_context(&actx);
+        fprintf(stderr, "flux_ffmpeg: audio open failed\n");
+        return 0;
+    }
+
+    AVChannelLayout in_ch = {0};
+    AVChannelLayout out_ch = {0};
+    if (actx->ch_layout.nb_channels > 0) {
+        if (av_channel_layout_copy(&in_ch, &actx->ch_layout) < 0) {
+            av_channel_layout_default(&in_ch, actx->ch_layout.nb_channels);
+        }
+    } else {
+        av_channel_layout_default(&in_ch, 2);
+    }
+    av_channel_layout_default(&out_ch, FLUX_AUDIO_CH);
+
+    int in_rate = actx->sample_rate > 0 ? actx->sample_rate : FLUX_AUDIO_RATE;
+    enum AVSampleFormat in_fmt =
+        actx->sample_fmt != AV_SAMPLE_FMT_NONE ? actx->sample_fmt : AV_SAMPLE_FMT_FLTP;
+
+    SwrContext *swr = NULL;
+    if (swr_alloc_set_opts2(&swr, &out_ch, AV_SAMPLE_FMT_S16, FLUX_AUDIO_RATE, &in_ch, in_fmt,
+                            in_rate, 0, NULL) < 0 ||
+        !swr || swr_init(swr) < 0) {
+        if (swr) swr_free(&swr);
+        av_channel_layout_uninit(&in_ch);
+        av_channel_layout_uninit(&out_ch);
+        avcodec_free_context(&actx);
+        fprintf(stderr, "flux_ffmpeg: swr_init failed\n");
+        return 0;
+    }
+    av_channel_layout_uninit(&in_ch);
+    av_channel_layout_uninit(&out_ch);
+
+    FILE *sink = open_audio_sink(FLUX_AUDIO_RATE, FLUX_AUDIO_CH);
+    if (!sink) {
+        swr_free(&swr);
+        avcodec_free_context(&actx);
+        return 0;
+    }
+
+    *aindex_out = aindex;
+    *actx_out = actx;
+    *swr_out = swr;
+    *sink_out = sink;
+    (void)p;
+    fprintf(stderr, "flux_ffmpeg: audio decode ready (stream %d, %d Hz -> %d)\n", aindex, in_rate,
+            FLUX_AUDIO_RATE);
+    return 1;
+}
+
+static void play_audio_frame(FluxFfmpegPlayer *p, AVCodecContext *actx, SwrContext *swr, FILE *sink,
+                             AVFrame *frame) {
+    if (!swr || !sink || !frame) return;
+    float volume;
+    pthread_mutex_lock(&p->mu);
+    volume = p->volume;
+    pthread_mutex_unlock(&p->mu);
+
+    uint8_t *out_planes[1] = {NULL};
+    int max_out = swr_get_out_samples(swr, frame->nb_samples);
+    if (max_out <= 0) max_out = frame->nb_samples * 4 + 256;
+    int out_linesize = 0;
+    if (av_samples_alloc(out_planes, &out_linesize, FLUX_AUDIO_CH, max_out, AV_SAMPLE_FMT_S16, 0) <
+        0) {
+        return;
+    }
+    int converted = swr_convert(swr, out_planes, max_out, (const uint8_t **)frame->extended_data,
+                                frame->nb_samples);
+    if (converted > 0) {
+        int16_t *pcm = (int16_t *)out_planes[0];
+        apply_volume_s16(pcm, converted * FLUX_AUDIO_CH, volume);
+        size_t bytes = (size_t)converted * (size_t)FLUX_AUDIO_CH * sizeof(int16_t);
+        if (fwrite(pcm, 1, bytes, sink) != bytes) {
+            /* sink died — ignore further writes this session */
+            fprintf(stderr, "flux_ffmpeg: audio sink write failed\n");
+        }
+    }
+    av_freep(&out_planes[0]);
+    (void)actx;
+}
+
 static void *decode_thread(void *arg) {
     FluxFfmpegPlayer *p = (FluxFfmpegPlayer *)arg;
     AVFormatContext *fmt = NULL;
     AVCodecContext *vctx = NULL;
+    AVCodecContext *actx = NULL;
+    SwrContext *swr = NULL;
+    FILE *audio_sink = NULL;
     AVPacket *pkt = NULL;
     AVFrame *frame = NULL;
+    AVFrame *aframe = NULL;
     int vindex = -1;
+    int aindex = -1;
     int want_w = 960;
     int want_h = 540;
 
@@ -421,9 +586,12 @@ static void *decode_thread(void *arg) {
         }
     }
 
+    setup_audio(p, fmt, &aindex, &actx, &swr, &audio_sink);
+
     pkt = av_packet_alloc();
     frame = av_frame_alloc();
-    if (!pkt || !frame) goto done;
+    aframe = av_frame_alloc();
+    if (!pkt || !frame || !aframe) goto done;
 
     fprintf(stderr, "flux_ffmpeg: decode loop start\n");
 
@@ -450,6 +618,8 @@ static void *decode_thread(void *arg) {
             int64_t ts = (int64_t)(seek_secs * AV_TIME_BASE);
             av_seek_frame(fmt, -1, ts, AVSEEK_FLAG_BACKWARD);
             avcodec_flush_buffers(vctx);
+            if (actx) avcodec_flush_buffers(actx);
+            if (swr) swr_convert(swr, NULL, 0, NULL, 0);
             pthread_mutex_lock(&p->mu);
             p->seek_req = 0;
             p->position = seek_secs;
@@ -469,6 +639,22 @@ static void *decode_thread(void *arg) {
         if (r < 0) {
             if (r == AVERROR_EOF) break;
             usleep(10000);
+            continue;
+        }
+
+        if (pkt->stream_index == aindex && actx && swr && audio_sink) {
+            int sret = avcodec_send_packet(actx, pkt);
+            av_packet_unref(pkt);
+            if (sret < 0 && sret != AVERROR(EAGAIN) && sret != AVERROR_EOF) {
+                continue;
+            }
+            while (1) {
+                int rret = avcodec_receive_frame(actx, aframe);
+                if (rret == AVERROR(EAGAIN) || rret == AVERROR_EOF) break;
+                if (rret < 0) break;
+                play_audio_frame(p, actx, swr, audio_sink, aframe);
+                av_frame_unref(aframe);
+            }
             continue;
         }
 
@@ -574,8 +760,12 @@ static void *decode_thread(void *arg) {
 
 done:
     av_dict_free(&opts);
+    if (aframe) av_frame_free(&aframe);
     if (frame) av_frame_free(&frame);
     if (pkt) av_packet_free(&pkt);
+    if (swr) swr_free(&swr);
+    if (actx) avcodec_free_context(&actx);
+    if (audio_sink) pclose(audio_sink);
     if (vctx) avcodec_free_context(&vctx);
     if (fmt) avformat_close_input(&fmt);
 

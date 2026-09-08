@@ -187,13 +187,8 @@ pub fn detect_backends() -> Vec<BackendInfo> {
         fluxplay_has_libmpv
     ))]
     {
-        // media-kit libmpv embeds lavc — no separate libav* on Android.
-        out.push(BackendInfo {
-            id: BackendId::Ffmpeg,
-            available: true,
-            path: Some("libmpv/lavc".into()),
-            detail: "FFmpeg codecs via libmpv (pas de libav* séparé)".into(),
-        });
+        // Do not advertise a separate FFmpeg backend on Android — Pref::Ffmpeg
+        // remaps to libmpv. Listing both confuses settings.
     }
     #[cfg(all(
         not(all(feature = "native-ffmpeg", fluxplay_has_ffmpeg)),
@@ -204,15 +199,17 @@ pub fn detect_backends() -> Vec<BackendInfo> {
         ))
     ))]
     {
-        let ffplay = which("ffplay").or_else(|| which("ffmpeg"));
+        let ffplay = which("ffplay");
+        let ffmpeg_only = ffplay.is_none() && which("ffmpeg").is_some();
         out.push(BackendInfo {
             id: BackendId::Ffmpeg,
+            // CLI path needs ffplay; bare ffmpeg cannot play without native embed.
             available: ffplay.is_some(),
-            path: ffplay.clone(),
-            detail: if which("ffplay").is_some() {
+            path: ffplay.clone().or_else(|| which("ffmpeg")),
+            detail: if ffplay.is_some() {
                 "ffplay CLI — fenêtre OS (pas d’embed; recompilez avec native-ffmpeg)".into()
-            } else if which("ffmpeg").is_some() {
-                "ffmpeg présent (installez ffmpeg-devel pour l’embed natif)".into()
+            } else if ffmpeg_only {
+                "ffmpeg sans ffplay — installez ffplay ou ffmpeg-devel pour l’embed".into()
             } else {
                 "FFmpeg optionnel (libmpv suffit)".into()
             },
@@ -472,6 +469,8 @@ pub struct NativePlayer {
     opts: PlayOptions,
     /// Borderless mpv window locked to the iced player stage.
     video_rect: Option<VideoRect>,
+    /// Last mute state sent to ffplay CLI (`m` is a toggle — keep edge-only).
+    ffplay_muted: bool,
 }
 
 impl Default for NativePlayer {
@@ -499,6 +498,32 @@ impl NativePlayer {
             ipc_path: None,
             opts,
             video_rect: None,
+            ffplay_muted: false,
+        }
+    }
+
+    fn using_ffplay_cli(&self) -> bool {
+        if self.backend != Some(BackendId::Ffmpeg) || self.child.is_none() {
+            return false;
+        }
+        #[cfg(all(feature = "native-ffmpeg", fluxplay_has_ffmpeg))]
+        {
+            return self.libffmpeg.is_none();
+        }
+        #[cfg(not(all(feature = "native-ffmpeg", fluxplay_has_ffmpeg)))]
+        {
+            true
+        }
+    }
+
+    fn using_libffmpeg(&self) -> bool {
+        #[cfg(all(feature = "native-ffmpeg", fluxplay_has_ffmpeg))]
+        {
+            return self.libffmpeg.is_some();
+        }
+        #[cfg(not(all(feature = "native-ffmpeg", fluxplay_has_ffmpeg)))]
+        {
+            false
         }
     }
 
@@ -775,9 +800,9 @@ impl NativePlayer {
             mpv_cmd(path, &["set_property", "volume", &format!("{v:.0}")])?;
             return Ok(());
         }
-        if self.backend == Some(BackendId::Ffmpeg) {
-            ffplay_send_key("m");
-            let _ = vol;
+        if self.using_ffplay_cli() {
+            // Volume is applied at spawn (`-volume`); live change needs restart.
+            return Ok(());
         }
         Ok(())
     }
@@ -797,9 +822,12 @@ impl NativePlayer {
             mpv_cmd(path, &["set_property", "mute", if muted { "yes" } else { "no" }])?;
             return Ok(());
         }
-        if self.backend == Some(BackendId::Ffmpeg) {
-            ffplay_send_key("m");
-            let _ = muted;
+        if self.using_ffplay_cli() {
+            if self.ffplay_muted != muted {
+                ffplay_send_key("m");
+                self.ffplay_muted = muted;
+            }
+            return Ok(());
         }
         Ok(())
     }
@@ -820,7 +848,10 @@ impl NativePlayer {
         if let Some(path) = &self.ipc_path {
             return mpv_cmd(path, &["seek", &format!("{secs}"), "relative"]);
         }
-        if self.backend == Some(BackendId::Ffmpeg) {
+        if self.using_libffmpeg() {
+            return Ok(());
+        }
+        if self.using_ffplay_cli() {
             let key = if secs <= -25.0 {
                 "Down"
             } else if secs < 0.0 {
@@ -868,7 +899,10 @@ impl NativePlayer {
         if let Some(path) = &self.ipc_path {
             return mpv_cmd(path, &["cycle", "fullscreen"]);
         }
-        if self.backend == Some(BackendId::Ffmpeg) {
+        if self.using_libffmpeg() {
+            return Ok(());
+        }
+        if self.using_ffplay_cli() {
             ffplay_send_key("f");
         }
         Ok(())
@@ -883,7 +917,10 @@ impl NativePlayer {
         if let Some(path) = &self.ipc_path {
             return mpv_cmd(path, &["cycle", "audio"]);
         }
-        if self.backend == Some(BackendId::Ffmpeg) {
+        if self.using_libffmpeg() {
+            return Ok(());
+        }
+        if self.using_ffplay_cli() {
             ffplay_send_key("a");
         }
         Ok(())
@@ -898,7 +935,10 @@ impl NativePlayer {
         if let Some(path) = &self.ipc_path {
             return mpv_cmd(path, &["cycle", "sub"]);
         }
-        if self.backend == Some(BackendId::Ffmpeg) {
+        if self.using_libffmpeg() {
+            return Ok(());
+        }
+        if self.using_ffplay_cli() {
             ffplay_send_key("t");
         }
         Ok(())
@@ -931,7 +971,10 @@ impl NativePlayer {
         if let Some(path) = &self.ipc_path {
             return mpv_cmd(path, &["frame-step"]);
         }
-        if self.backend == Some(BackendId::Ffmpeg) {
+        if self.using_libffmpeg() {
+            return Ok(());
+        }
+        if self.using_ffplay_cli() {
             ffplay_send_key("s");
         }
         Ok(())
@@ -1608,6 +1651,8 @@ impl NativePlayer {
                 .arg("-window_title")
                 .arg(FFPLAY_WINDOW_TITLE)
                 .arg("-autoexit")
+                .arg("-volume")
+                .arg(format!("{}", (self.opts.volume.clamp(0.0, 1.0) * 100.0) as u32))
                 .arg("-x")
                 .arg("1280")
                 .arg("-y")
@@ -1640,7 +1685,8 @@ impl NativePlayer {
                     cmd.arg("-flags").arg("low_delay");
                     cmd.arg("-framedrop");
                 } else {
-                    cmd.arg("-sync").arg("ext");
+                    // Sync video to audio (not external clock) so sound stays audible/locked.
+                    cmd.arg("-sync").arg("audio");
                 }
                 // HTTP reconnect (input options; ignored if unsupported).
                 cmd.arg("-reconnect").arg("1");
@@ -1685,6 +1731,7 @@ impl NativePlayer {
         }
 
         self.child = Some(child);
+        self.ffplay_muted = false;
         info!(
             %endpoint,
             %bin,

@@ -100,9 +100,10 @@ pub async fn load_xtream_series_info(
     series_id: &str,
 ) -> Result<fluxplay_core::models::SeriesItem> {
     debug!(source_id = %source.id, %series_id, "load_xtream_series_info");
-    let client = xtream_client_for(source).ok_or_else(|| {
+    let mut client = xtream_client_for(source).ok_or_else(|| {
         ProviderError::Message("source Xtream requise pour les détails série".into())
     })?;
+    client.ensure_stream_base().await?;
     client.series_info(series_id).await
 }
 
@@ -112,9 +113,10 @@ pub async fn load_xtream_vod_info(
     vod_id: &str,
 ) -> Result<fluxplay_core::models::VodItem> {
     debug!(source_id = %source.id, %vod_id, "load_xtream_vod_info");
-    let client = xtream_client_for(source).ok_or_else(|| {
+    let mut client = xtream_client_for(source).ok_or_else(|| {
         ProviderError::Message("source Xtream requise pour les détails VOD".into())
     })?;
+    client.ensure_stream_base().await?;
     client.vod_info(vod_id).await
 }
 

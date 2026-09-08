@@ -37,10 +37,7 @@ pub fn parse_xtream_get_php(endpoint: &str) -> Option<XtreamCredentials> {
     let username = username.filter(|s| !s.is_empty())?;
     let password = password.filter(|s| !s.is_empty())?;
 
-    let mut base = url.clone();
-    base.set_path("");
-    base.set_query(None);
-    base.set_fragment(None);
+    let base = portal_base_from_url(&url);
 
     let creds = XtreamCredentials {
         base: base.as_str().trim_end_matches('/').to_string(),
@@ -54,6 +51,45 @@ pub fn parse_xtream_get_php(endpoint: &str) -> Option<XtreamCredentials> {
         "parsed get.php Xtream credentials"
     );
     Some(creds)
+}
+
+/// Keep `/c` / `/iptv` path prefixes; strip trailing `get.php` / `player_api.php`.
+pub fn portal_base_from_url(url: &Url) -> Url {
+    let mut u = url.clone();
+    u.set_query(None);
+    u.set_fragment(None);
+    let path = u.path().to_string();
+    let lower = path.to_ascii_lowercase();
+    let stripped = if let Some(idx) = lower.rfind("/get.php") {
+        &path[..idx]
+    } else if lower.ends_with("get.php") {
+        path.trim_end_matches("get.php").trim_end_matches('/')
+    } else if let Some(idx) = lower.rfind("/player_api.php") {
+        &path[..idx]
+    } else if lower.ends_with("player_api.php") {
+        path.trim_end_matches("player_api.php")
+            .trim_end_matches('/')
+    } else {
+        path.trim_end_matches('/')
+    };
+    if stripped.is_empty() {
+        u.set_path("");
+    } else {
+        u.set_path(stripped);
+    }
+    u
+}
+
+/// Join a PHP script onto a portal base that may include a directory prefix.
+pub fn join_portal_script(portal: &Url, script: &str) -> Url {
+    let mut u = portal.clone();
+    let base = portal.path().trim_end_matches('/');
+    if base.is_empty() {
+        u.set_path(script);
+    } else {
+        u.set_path(&format!("{base}/{script}"));
+    }
+    u
 }
 
 pub fn http_status_hint(status: u16) -> Option<&'static str> {
@@ -100,5 +136,17 @@ mod tests {
         assert_eq!(c.username, "abc");
         assert_eq!(c.password, "xyz");
         assert!(c.base.starts_with("http://panel.example"));
+    }
+
+    #[test]
+    fn preserves_path_prefix_on_get_php() {
+        let c = parse_xtream_get_php(
+            "http://panel.example/c/get.php?username=abc&password=xyz",
+        )
+        .unwrap();
+        assert_eq!(c.base, "http://panel.example/c");
+        let portal = Url::parse(&c.base).unwrap();
+        let api = join_portal_script(&portal, "player_api.php");
+        assert_eq!(api.path(), "/c/player_api.php");
     }
 }

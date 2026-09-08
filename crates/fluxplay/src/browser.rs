@@ -1230,6 +1230,7 @@ pub fn media_row<'a>(
 
     // Android GLES: text-only row (no nested image). Fav is a sibling mouse_area
     // so titles stay visible; thumb ignored for GLES safety.
+    // Trailing ▶ makes episode / channel launch discoverable (tap row or glyph).
     #[cfg(target_os = "android")]
     {
         let _ = (thumb, thumb_size);
@@ -1266,12 +1267,22 @@ pub fn media_row<'a>(
             },
             ..Default::default()
         };
-        // on_release: soft_scroll_mosaic overlay owns press for drag; open only if not scrolled.
+        let play_w = TOUCH_TARGET;
+        let play_el = mouse_area(
+            container(text("▶").size(TYPE_TITLE_M).color(ui.primary()))
+                .width(Length::Fixed(play_w))
+                .height(Length::Fixed(row_h))
+                .center_x(Fill)
+                .center_y(Fill),
+        )
+        .on_press(on_open.clone());
+        // on_release on title: soft_scroll_mosaic overlay owns press for drag;
+        // detail episode lists have no overlay — press on ▶ still works.
         if let Some((is_fav, fav_msg)) = on_fav {
             let star = if is_fav { "★" } else { "☆" };
             let fav_c = ui.tertiary();
             let fav_w = TOUCH_TARGET;
-            let title_w = (row_w - fav_w).max(64.0);
+            let title_w = (row_w - fav_w - play_w).max(64.0);
             return row![
                 mouse_area(
                     container(text(star).size(TYPE_TITLE_M).color(fav_c))
@@ -1290,20 +1301,27 @@ pub fn media_row<'a>(
                         .style(row_style),
                 )
                 .on_release(on_open),
+                play_el,
             ]
             .align_y(Alignment::Center)
             .width(Length::Fixed(row_w))
             .into();
         }
-        return mouse_area(
-            container(titles)
-                .width(Length::Fixed(row_w))
-                .height(Length::Fixed(row_h))
-                .padding(Padding::from([10, 12]))
-                .align_y(Alignment::Center)
-                .style(row_style),
-        )
-        .on_release(on_open)
+        let title_w = (row_w - play_w).max(64.0);
+        return row![
+            mouse_area(
+                container(titles)
+                    .width(Length::Fixed(title_w))
+                    .height(Length::Fixed(row_h))
+                    .padding(Padding::from([10, 12]))
+                    .align_y(Alignment::Center)
+                    .style(row_style),
+            )
+            .on_release(on_open),
+            play_el,
+        ]
+        .align_y(Alignment::Center)
+        .width(Length::Fixed(row_w))
         .into();
     }
 
@@ -2003,14 +2021,26 @@ pub fn media_detail_page<'a>(
 
     // Header outside the scroll so the page always has a visible chrome
     // (avoids a zero-height scroll-only layout on some window sizes).
-    // Episodes get their own Fill scroll so we can virtualize hundreds of rows
-    // without rebuilding the synopsis widgets on every tick.
+    // Episodes get a guaranteed FillPortion so a tall synopsis cannot steal
+    // the whole column (phone: missing episode rows / play affordance).
     let page: Element<'a, Message> = if let Some(eps) = episodes {
         column![
             back,
-            soft_scroll_fit(ui, body.padding(Padding::from([0, 4])).width(Fill)),
+            container(soft_scroll_fit(
+                ui,
+                body.padding(Padding::from([0, 4])).width(Fill),
+            ))
+            .width(Fill)
+            .height(Length::FillPortion(2)),
             text("Épisodes").size(16),
-            soft_scroll_on(ui, eps, "flux-episodes", Message::BrowseScrolled)
+            container(soft_scroll_on(
+                ui,
+                eps,
+                "flux-episodes",
+                Message::BrowseScrolled,
+            ))
+            .width(Fill)
+            .height(Length::FillPortion(3)),
         ]
         .spacing(SPACE_MD)
         .width(Fill)

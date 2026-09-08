@@ -21,7 +21,7 @@ pub const SMARTERS_UA: &str = "IPTVSmartersPlayer";
 
 #[derive(Debug, Clone)]
 pub struct XtreamClient {
-    /// Portal base used for API calls (may include :8080).
+    /// Portal base used for API calls (may include :8080 and path prefix `/c`).
     pub portal: Url,
     /// Base used for media URLs (from server_info when available).
     pub stream_base: Url,
@@ -29,6 +29,8 @@ pub struct XtreamClient {
     pub password: String,
     pub source_id: uuid::Uuid,
     pub prefer_m3u8: bool,
+    /// True after a successful auth + `apply_server_info`.
+    server_info_loaded: bool,
 }
 
 impl XtreamClient {
@@ -42,11 +44,8 @@ impl XtreamClient {
         if !base.contains("://") {
             base = format!("http://{base}");
         }
-        let mut url = Url::parse(&base).map_err(|e| ProviderError::Message(e.to_string()))?;
-        url.set_path("");
-        url.set_query(None);
-        url.set_fragment(None);
-        // Ensure trailing slash semantics for format!
+        let parsed = Url::parse(&base).map_err(|e| ProviderError::Message(e.to_string()))?;
+        let url = crate::xtream_url::portal_base_from_url(&parsed);
         // Never log password.
         debug!(
             source_id = %source_id,
@@ -61,6 +60,7 @@ impl XtreamClient {
             password,
             source_id,
             prefer_m3u8: true,
+            server_info_loaded: false,
         })
     }
 
@@ -80,8 +80,7 @@ impl XtreamClient {
     }
 
     pub(crate) fn api_url(&self, action: Option<&str>) -> Result<Url> {
-        let mut u = self.portal.clone();
-        u.set_path("player_api.php");
+        let mut u = crate::xtream_url::join_portal_script(&self.portal, "player_api.php");
         {
             let mut q = u.query_pairs_mut();
             q.append_pair("username", &self.username);
@@ -223,6 +222,24 @@ impl XtreamClient {
         }
     }
 
+    /// Auth once so `stream_base` / `prefer_m3u8` match the panel CDN (needed for series/VOD URLs).
+    pub async fn ensure_stream_base(&mut self) -> Result<()> {
+        if self.server_info_loaded {
+            return Ok(());
+        }
+        let auth = self.get_json(None).await?;
+        if auth.pointer("/user_info/auth").and_then(|v| v.as_u64()) == Some(0)
+            || auth.pointer("/user_info/auth").and_then(|v| v.as_i64()) == Some(0)
+        {
+            return Err(ProviderError::Auth(
+                "Xtream auth failed (identifiants ou panel)".into(),
+            ));
+        }
+        self.apply_server_info(&auth);
+        self.server_info_loaded = true;
+        Ok(())
+    }
+
     /// Apply `server_info` like Smarters (host/port/protocol for media paths).
     fn apply_server_info(&mut self, auth: &Value) {
         let Some(si) = auth.get("server_info") else {
@@ -352,6 +369,7 @@ impl XtreamClient {
         }
         debug!(portal = %self.portal, "Xtream auth OK");
         self.apply_server_info(&auth);
+        self.server_info_loaded = true;
 
         // Parallel catalog headers (live streams + all category lists).
         fluxplay_core::profiler!(step = "catalog_headers", "parallel live/vod/series categories");
@@ -873,6 +891,9 @@ impl XtreamClient {
                                     .map(|n| n.to_string())
                             })
                             .unwrap_or_default();
+                        if id.trim().is_empty() {
+                            continue;
+                        }
                         let title = ep
                             .get("title")
                             .and_then(|v| v.as_str())
@@ -880,14 +901,23 @@ impl XtreamClient {
                             .to_string();
                         let episode_num =
                             ep.get("episode_num").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-                        let ext = ep
-                            .get("container_extension")
+                        let ext = self.media_ext(
+                            ep.get("container_extension")
+                                .and_then(|v| v.as_str())
+                                .map(str::trim)
+                                .filter(|s| !s.is_empty()),
+                        );
+                        let stream_url = ep
+                            .get("direct_source")
                             .and_then(|v| v.as_str())
-                            .unwrap_or_else(|| self.media_ext(None));
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                            .map(str::to_string)
+                            .unwrap_or_else(|| self.series_stream_url(&id, ext));
                         list.push(SeriesEpisode {
                             id: id.clone(),
                             title,
-                            stream_url: self.series_stream_url(&id, ext),
+                            stream_url,
                             episode_num,
                             plot: None,
                             rating: None,

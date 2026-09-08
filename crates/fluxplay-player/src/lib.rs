@@ -1,7 +1,8 @@
 //! FluxPlay player — protocol routing + native backends (libmpv / FFmpeg / platform).
 //!
 //! Desktop: **libmpv** and **libav* FFmpeg** in-process (RGBA into iced), optional CLI fallback.
-//! Mobile: core logic + FFI; decode via ExoPlayer (Android) / AVPlayer (iOS).
+//! Android iced (`fluxplay-android`): vendored **libmpv** RGBA embed + `ACTION_VIEW` Intent.
+//! iOS / legacy FFI: AVPlayer (experimental).
 
 mod backend;
 #[cfg(all(feature = "native-ffmpeg", fluxplay_has_ffmpeg))]
