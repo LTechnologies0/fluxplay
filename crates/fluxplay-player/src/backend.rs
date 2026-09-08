@@ -363,6 +363,11 @@ fn soft_set(mpv: &crate::mpv_ffi::LibMpv, name: &str, value: &str) -> bool {
     }
 }
 
+/// Strip CR/LF so referer / header values cannot inject lavf or mpv HTTP headers.
+fn sanitize_http_field(s: &str) -> String {
+    s.chars().filter(|c| *c != '\r' && *c != '\n').collect()
+}
+
 fn tail_player_log() -> String {
     let path = std::env::temp_dir().join("fluxplay-mpv.log");
     std::fs::read_to_string(&path)
@@ -731,6 +736,7 @@ impl NativePlayer {
         }
         #[cfg(all(feature = "native-ffmpeg", fluxplay_has_ffmpeg))]
         if let Some(ff) = self.libffmpeg.as_ref() {
+            let (rw, rh) = crate::ffmpeg_ffi::LibFfmpeg::soft_present_dims(w, h);
             let pixels = ff.pull_rgba(rw, rh)?;
             self.soft_shot_tick = self.soft_shot_tick.wrapping_add(1);
             if self.last_soft_rgba.is_none() || self.soft_shot_tick % 60 == 0 {
@@ -740,6 +746,16 @@ impl NativePlayer {
         }
         let _ = (rw, rh);
         None
+    }
+
+    /// Return a discarded soft RGBA buffer to the embed pool (mpv capacity recycle).
+    pub fn recycle_soft_rgba(&mut self, buf: Vec<u8>) {
+        #[cfg(all(feature = "native-mpv", fluxplay_has_libmpv))]
+        if let Some(mpv) = self.libmpv.as_mut() {
+            mpv.recycle_sw_rgba(buf);
+            return;
+        }
+        let _ = buf;
     }
 
     /// True when embedded backend has a newer frame than the last successful pull.
@@ -974,13 +990,17 @@ impl NativePlayer {
             return Ok(());
         }
         if let Some(path) = &self.ipc_path {
-            mpv_cmd(path, &["set_property", "pause", if paused { "true" } else { "false" }])?;
+            mpv_cmd(path, &["set_property", "pause", if paused { "yes" } else { "no" }])?;
             return Ok(());
         }
         if self.using_ffplay_cli() {
             // SDL `space` toggles — edge-trigger like mute.
             if self.ffplay_paused != paused {
-                ffplay_send_key("space");
+                if !ffplay_send_key("space") {
+                    return Err(PlayerError::Backend(
+                        "ffplay: xdotool pause failed (window introuvable ?)".into(),
+                    ));
+                }
                 self.ffplay_paused = paused;
             }
             return Ok(());
@@ -1033,7 +1053,11 @@ impl NativePlayer {
         }
         if self.using_ffplay_cli() {
             if self.ffplay_muted != muted {
-                ffplay_send_key("m");
+                if !ffplay_send_key("m") {
+                    return Err(PlayerError::Backend(
+                        "ffplay: xdotool mute failed (window introuvable ?)".into(),
+                    ));
+                }
                 self.ffplay_muted = muted;
             }
             return Ok(());
@@ -1072,7 +1096,11 @@ impl NativePlayer {
             } else {
                 "Right"
             };
-            ffplay_send_key(key);
+            if !ffplay_send_key(key) {
+                return Err(PlayerError::Backend(
+                    "ffplay: xdotool seek failed (window introuvable ?)".into(),
+                ));
+            }
         }
         Ok(())
     }
@@ -1111,7 +1139,12 @@ impl NativePlayer {
             return mpv_cmd(path, &["cycle", "fullscreen"]);
         }
         if self.using_ffplay_cli() {
-            ffplay_send_key("f");
+            if !ffplay_send_key("f") {
+                return Err(PlayerError::Backend(
+                    "ffplay: xdotool fullscreen failed".into(),
+                ));
+            }
+            return Ok(());
         }
         Ok(())
     }
@@ -1129,7 +1162,12 @@ impl NativePlayer {
             return Ok(());
         }
         if self.using_ffplay_cli() {
-            ffplay_send_key("a");
+            if !ffplay_send_key("a") {
+                return Err(PlayerError::Backend(
+                    "ffplay: xdotool audio-cycle failed".into(),
+                ));
+            }
+            return Ok(());
         }
         Ok(())
     }
@@ -1147,7 +1185,12 @@ impl NativePlayer {
             return Ok(());
         }
         if self.using_ffplay_cli() {
-            ffplay_send_key("t");
+            if !ffplay_send_key("t") {
+                return Err(PlayerError::Backend(
+                    "ffplay: xdotool subtitle-cycle failed".into(),
+                ));
+            }
+            return Ok(());
         }
         Ok(())
     }
@@ -1183,7 +1226,12 @@ impl NativePlayer {
             return Ok(());
         }
         if self.using_ffplay_cli() {
-            ffplay_send_key("s");
+            if !ffplay_send_key("s") {
+                return Err(PlayerError::Backend(
+                    "ffplay: xdotool frame-step failed".into(),
+                ));
+            }
+            return Ok(());
         }
         Ok(())
     }
@@ -1608,17 +1656,29 @@ impl NativePlayer {
             soft_set(&mpv, "ytdl-raw-options", &format!("proxy={proxy}"));
         }
         if let Some(ref_r) = &self.opts.referer {
-            soft_set(&mpv, "referrer", ref_r);
+            let safe = sanitize_http_field(ref_r);
+            if !safe.is_empty() {
+                soft_set(&mpv, "referrer", &safe);
+            }
         }
         if !self.opts.extra_headers.is_empty() {
             let joined = self
                 .opts
                 .extra_headers
                 .iter()
-                .map(|(k, v)| format!("{k}: {v}"))
+                .map(|(k, v)| {
+                    format!(
+                        "{}: {}",
+                        sanitize_http_field(k),
+                        sanitize_http_field(v)
+                    )
+                })
+                .filter(|line| line.len() > 2)
                 .collect::<Vec<_>>()
                 .join("\r\n");
-            soft_set(&mpv, "http-header-fields", &joined);
+            if !joined.is_empty() {
+                soft_set(&mpv, "http-header-fields", &joined);
+            }
         }
 
         mpv.initialize()?;
@@ -1742,17 +1802,29 @@ impl NativePlayer {
         }
 
         if let Some(ref_r) = &self.opts.referer {
-            args.push(format!("--referrer={ref_r}"));
+            let safe = sanitize_http_field(ref_r);
+            if !safe.is_empty() {
+                args.push(format!("--referrer={safe}"));
+            }
         }
         if !self.opts.extra_headers.is_empty() {
             let joined = self
                 .opts
                 .extra_headers
                 .iter()
-                .map(|(k, v)| format!("{k}: {v}"))
+                .map(|(k, v)| {
+                    format!(
+                        "{}: {}",
+                        sanitize_http_field(k),
+                        sanitize_http_field(v)
+                    )
+                })
+                .filter(|line| line.len() > 2)
                 .collect::<Vec<_>>()
                 .join("\r\n");
-            args.push(format!("--http-header-fields={joined}"));
+            if !joined.is_empty() {
+                args.push(format!("--http-header-fields={joined}"));
+            }
         }
 
         args.push(url.into());
@@ -1832,7 +1904,9 @@ impl NativePlayer {
         )?;
         ff.set_volume(self.opts.volume);
         if let Some(rect) = self.video_rect.filter(|r| r.is_usable()) {
-            ff.set_output_size(rect.w.max(2), rect.h.max(2));
+            // Same soft cap as iced pull — uncapped window size caused mismatch discards.
+            let (rw, rh) = crate::ffmpeg_ffi::LibFfmpeg::soft_present_dims(rect.w, rect.h);
+            ff.set_output_size(rw, rh);
         }
         self.libffmpeg = Some(ff);
         info!(%endpoint, "libffmpeg embedded open ok");
@@ -1884,7 +1958,10 @@ impl NativePlayer {
                 cmd.arg("-user_agent").arg("IPTVSmartersPlayer");
             }
             if let Some(ref_r) = &self.opts.referer {
-                cmd.arg("-headers").arg(format!("Referer: {ref_r}\r\n"));
+                let safe = sanitize_http_field(ref_r);
+                if !safe.is_empty() {
+                    cmd.arg("-headers").arg(format!("Referer: {safe}\r\n"));
+                }
             }
             if let Some(proxy) = &self.opts.http_proxy {
                 cmd.arg("-http_proxy").arg(proxy);
@@ -1994,8 +2071,8 @@ fn ipc_socket_path() -> PathBuf {
 const FFPLAY_WINDOW_TITLE: &str = "FluxPlay Video";
 
 /// Best-effort remote keys into the ffplay SDL window (requires xdotool on PATH).
-fn ffplay_send_key(key: &str) {
-    let _ = Command::new("xdotool")
+fn ffplay_send_key(key: &str) -> bool {
+    Command::new("xdotool")
         .args([
             "search",
             "--name",
@@ -2009,7 +2086,9 @@ fn ffplay_send_key(key: &str) {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .status();
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
 }
 
 fn mpv_get_number(ipc: &Path, prop: &str) -> Option<f64> {
@@ -2057,6 +2136,14 @@ fn mpv_ipc_data(ipc: &Path, line: &str) -> Option<serde_json::Value> {
         let _ = stream.read_to_string(&mut buf);
         for raw in buf.lines() {
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(raw) {
+                if v.get("event").is_some() {
+                    continue;
+                }
+                if let Some(err) = v.get("error").and_then(|e| e.as_str()) {
+                    if err != "success" {
+                        continue;
+                    }
+                }
                 if let Some(data) = v.get("data") {
                     return Some(data.clone());
                 }
@@ -2078,6 +2165,7 @@ fn mpv_cmd(ipc: &Path, parts: &[&str]) -> Result<()> {
 
     #[cfg(unix)]
     {
+        use std::io::Read;
         use std::os::unix::net::UnixStream;
         // Brief retry — mpv may still be starting.
         let mut last = None;
@@ -2087,7 +2175,25 @@ fn mpv_cmd(ipc: &Path, parts: &[&str]) -> Result<()> {
                     stream
                         .write_all(line.as_bytes())
                         .map_err(|e| PlayerError::Backend(e.to_string()))?;
-                    let _ = stream.shutdown(Shutdown::Both);
+                    let _ = stream.shutdown(Shutdown::Write);
+                    let mut buf = String::new();
+                    let _ = stream.read_to_string(&mut buf);
+                    for raw in buf.lines() {
+                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(raw) {
+                            if v.get("event").is_some() {
+                                continue;
+                            }
+                            match v.get("error").and_then(|e| e.as_str()) {
+                                Some("success") | None => return Ok(()),
+                                Some(err) => {
+                                    return Err(PlayerError::Backend(format!(
+                                        "mpv IPC {parts:?}: {err}"
+                                    )));
+                                }
+                            }
+                        }
+                    }
+                    // No reply parsed — treat as soft success (older mpv).
                     return Ok(());
                 }
                 Err(e) => {
@@ -2104,8 +2210,9 @@ fn mpv_cmd(ipc: &Path, parts: &[&str]) -> Result<()> {
     }
     #[cfg(not(unix))]
     {
-        // Named pipe write on Windows — best effort via std::fs after create.
         let _ = (ipc, line);
-        Ok(())
+        Err(PlayerError::Backend(
+            "mpv IPC non supporté sur cette plateforme".into(),
+        ))
     }
 }

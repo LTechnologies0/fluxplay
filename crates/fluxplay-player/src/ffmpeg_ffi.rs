@@ -48,6 +48,8 @@ pub struct LibFfmpeg {
     ptr: *mut FluxFfmpegPlayer,
     /// Keep CStrings alive for the open call (decode thread copies them).
     _keepalive: Vec<CString>,
+    /// Recycled pull destination — avoid `vec![0; w*h*4]` every present.
+    pull_buf: std::sync::Mutex<Vec<u8>>,
 }
 
 unsafe impl Send for LibFfmpeg {}
@@ -111,26 +113,55 @@ impl LibFfmpeg {
         Ok(Self {
             ptr,
             _keepalive: keepalive,
+            pull_buf: std::sync::Mutex::new(Vec::new()),
         })
     }
 
+    /// Soft-present size (even dims, optional UHD). Matches iced pull clamp.
+    pub fn soft_present_dims(w: u32, h: u32) -> (u32, u32) {
+        let uhd = std::env::var_os("FLUXPLAY_SOFT_UHD").is_some();
+        let max_w = if uhd { 3840u32 } else { 1920 };
+        let max_h = if uhd { 2160u32 } else { 1080 };
+        let scale = (max_w as f32 / w.max(1) as f32)
+            .min(max_h as f32 / h.max(1) as f32)
+            .min(1.0);
+        let rw = ((w as f32 * scale).round() as u32).max(2) & !1;
+        let rh = ((h as f32 * scale).round() as u32).max(2) & !1;
+        (rw, rh)
+    }
+
     pub fn set_output_size(&self, w: u32, h: u32) {
-        let w = (w.clamp(2, 3840) & !1).max(2) as c_int;
-        let h = (h.clamp(2, 2160) & !1).max(2) as c_int;
-        unsafe { flux_ffmpeg_set_output_size(self.ptr, w, h) };
+        let (w, h) = Self::soft_present_dims(w, h);
+        unsafe { flux_ffmpeg_set_output_size(self.ptr, w as c_int, h as c_int) };
     }
 
     pub fn pull_rgba(&self, w: u32, h: u32) -> Option<Vec<u8>> {
-        let w = (w.clamp(2, 3840) & !1).max(2);
-        let h = (h.clamp(2, 2160) & !1).max(2);
+        let (w, h) = Self::soft_present_dims(w, h);
+        // Don't pay for a buffer when nothing is ready.
+        if !self.has_frame() {
+            self.set_output_size(w, h);
+            return None;
+        }
         self.set_output_size(w, h);
-        let mut buf = vec![0u8; (w as usize) * (h as usize) * 4];
+        let need = (w as usize).saturating_mul(h as usize).saturating_mul(4);
+        let mut slot = self.pull_buf.lock().ok()?;
+        if slot.capacity() < need {
+            *slot = Vec::with_capacity(need);
+        }
+        // SAFETY: C memcpy writes all `need` bytes on success; on failure we don't expose.
+        unsafe {
+            slot.set_len(need);
+        }
         let ok = unsafe {
-            flux_ffmpeg_pull_rgba(self.ptr, buf.as_mut_ptr(), w as c_int, h as c_int)
+            flux_ffmpeg_pull_rgba(self.ptr, slot.as_mut_ptr(), w as c_int, h as c_int)
         };
         if ok == 1 {
-            Some(buf)
+            // Hand buffer to caller; keep capacity for the next pull (no zero-fill).
+            let out = std::mem::replace(&mut *slot, Vec::with_capacity(need));
+            Some(out)
         } else {
+            // Keep capacity for the next attempt; don't leave a "full" len of stale bytes.
+            slot.clear();
             None
         }
     }

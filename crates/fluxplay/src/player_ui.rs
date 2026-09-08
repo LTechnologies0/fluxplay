@@ -174,44 +174,34 @@ fn stage_panel<'a>(p: &PlayerChrome<'a>) -> Element<'a, Message> {
             .content_fit(iced::ContentFit::Contain)
             .into()
     } else if playing && p.embedded_video {
-        // Contained loader only while buffering / waiting for first VOD frame.
-        // LIVE often has progress≈0 forever — never stick the card on live Playing.
-        // Once Playing with clock advance: keep black stage (no poster fallback) —
-        // flipping art↔frame caused visible scintillement.
-        let live = session.is_live();
-        let waiting = matches!(session.state, PlaybackState::Buffering)
-            || (!live && session.progress_ratio() < 0.000_5);
-        if waiting {
-            let indicator = container(
-                column![
-                    text("◌")
-                        .size(LOADING_SIZE * 0.55)
-                        .color(ui.on_primary_container()),
-                    text("Chargement vidéo…")
-                        .size(TYPE_LABEL_L)
-                        .color(ui.on_primary_container()),
-                    text(p.backend_label)
-                        .size(TYPE_LABEL_M)
-                        .color(ui.on_primary_container()),
-                ]
-                .spacing(SPACE_SM)
-                .align_x(Alignment::Center)
-                .padding(Padding::from([20, 28])),
-            )
-            .style(move |_t: &Theme| container::Style {
-                background: Some(Background::Color(ui.primary_container())),
-                border: Border {
-                    radius: RADIUS_EXTRA_LARGE.into(),
-                    ..Default::default()
-                },
-                shadow: elevation_shadow(2, ui.day),
+        // Loader until first GPU frame — avoid black gap when clock leads video,
+        // and never flip poster↔frame (scintillation).
+        let indicator = container(
+            column![
+                text("◌")
+                    .size(LOADING_SIZE * 0.55)
+                    .color(ui.on_primary_container()),
+                text("Chargement vidéo…")
+                    .size(TYPE_LABEL_L)
+                    .color(ui.on_primary_container()),
+                text(p.backend_label)
+                    .size(TYPE_LABEL_M)
+                    .color(ui.on_primary_container()),
+            ]
+            .spacing(SPACE_SM)
+            .align_x(Alignment::Center)
+            .padding(Padding::from([20, 28])),
+        )
+        .style(move |_t: &Theme| container::Style {
+            background: Some(Background::Color(ui.primary_container())),
+            border: Border {
+                radius: RADIUS_EXTRA_LARGE.into(),
                 ..Default::default()
-            });
-            indicator.into()
-        } else {
-            // Keep a black stage (not a status flash) while the first GPU allocation lands.
-            Space::new().width(0).height(0).into()
-        }
+            },
+            shadow: elevation_shadow(2, ui.day),
+            ..Default::default()
+        });
+        indicator.into()
     } else if playing && !p.embedded_video {
         // CLI mpv/ffplay fallback: video is in an external OS window — never spin forever here.
         let art_block: Element<'a, Message> = if let Some(handle) = p.art {
@@ -296,7 +286,7 @@ fn control_dock<'a>(p: &PlayerChrome<'a>, chrome_alpha: f32) -> Element<'a, Mess
     let mute_glyph = if s.muted { Icon::VolumeOff } else { Icon::VolumeUp };
     let progress = s.progress_ratio();
     let time_label = s.elapsed_label();
-    let vol = if s.muted { 0.0 } else { s.volume };
+    let vol = s.volume;
     let vol_enabled = active && p.caps.volume_live;
     let mute_enabled = active && p.caps.mute;
     let pause_enabled = active && p.caps.pause;

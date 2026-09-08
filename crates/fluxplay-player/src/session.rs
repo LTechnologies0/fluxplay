@@ -314,6 +314,10 @@ impl StreamSession {
         self.native.pull_video_frame(w, h)
     }
 
+    pub fn recycle_soft_rgba(&mut self, buf: Vec<u8>) {
+        self.native.recycle_soft_rgba(buf);
+    }
+
     pub fn frame_needs_redraw(&self) -> bool {
         self.native.frame_needs_redraw()
     }

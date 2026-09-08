@@ -46,6 +46,7 @@ struct FluxFfmpegPlayer {
     int frame_ready;
     int want_w;
     int want_h;
+    int eof_retries;
     struct SwsContext *sws;
     AVBufferRef *hw_device_ctx;
     enum AVPixelFormat hw_pix_fmt;
@@ -84,8 +85,10 @@ FluxFfmpegPlayer *flux_ffmpeg_open(const FluxFfmpegOpenOpts *opts) {
     p->want_hwdec = opts->hwdec ? 1 : 0;
     p->volume = 1.0f;
     p->alive = 1;
-    p->want_w = 960;
-    p->want_h = 540;
+    p->audio_clock = NAN;
+    p->want_w = 1920;
+    p->want_h = 1080;
+    p->eof_retries = 0;
 
     if (pthread_create(&p->thread, NULL, decode_thread, p) != 0) {
         flux_ffmpeg_close(p);
@@ -123,13 +126,12 @@ int flux_ffmpeg_pull_rgba(FluxFfmpegPlayer *p, uint8_t *out, int out_w, int out_
         pthread_mutex_unlock(&p->mu);
         return 0;
     }
-    /* Size mismatch: retarget decode want_* and drop unread frame once so store can
-     * emit at the new size. Do not touch want when already matching the request —
-     * avoids want thrash from UI noise. */
+    /* Size mismatch: retarget decode want_* only. Keep the unread frame so the
+     * iced stage can hold the last GPU texture; has_frame gates on size match
+     * so we don't spin-alloc until store emits the new dims. */
     if (p->frame_w != out_w || p->frame_h != out_h) {
         p->want_w = out_w > 3840 ? 3840 : out_w;
         p->want_h = out_h > 2160 ? 2160 : out_h;
-        p->frame_ready = 0;
         pthread_mutex_unlock(&p->mu);
         return 0;
     }
@@ -159,7 +161,12 @@ int flux_ffmpeg_is_alive(FluxFfmpegPlayer *p) {
 int flux_ffmpeg_has_frame(FluxFfmpegPlayer *p) {
     if (!p) return 0;
     pthread_mutex_lock(&p->mu);
-    int r = p->frame_ready;
+    /* Only report ready when dims match want — avoids pull→mismatch spin.
+     * Decode skip_store also keys on size match so retargets still store. */
+    int r = p->frame_ready
+        && p->frame_rgba
+        && p->frame_w == p->want_w
+        && p->frame_h == p->want_h;
     pthread_mutex_unlock(&p->mu);
     return r;
 }
@@ -530,16 +537,27 @@ static void *decode_thread(void *arg) {
     AVFrame *aframe = NULL;
     int vindex = -1;
     int aindex = -1;
-    int want_w = 960;
-    int want_h = 540;
+    int want_w = 1920;
+    int want_h = 1080;
 
     AVDictionary *opts = NULL;
     if (p->user_agent) av_dict_set(&opts, "user_agent", p->user_agent, 0);
     else av_dict_set(&opts, "user_agent", "IPTVSmartersPlayer", 0);
     if (p->referer) {
         char hdr[1024];
-        snprintf(hdr, sizeof(hdr), "Referer: %s\r\n", p->referer);
-        av_dict_set(&opts, "headers", hdr, 0);
+        char safe[768];
+        size_t i, j = 0;
+        /* Strip CR/LF so a malicious Referer cannot inject lavf HTTP headers. */
+        for (i = 0; p->referer[i] && j + 1 < sizeof(safe); i++) {
+            unsigned char c = (unsigned char)p->referer[i];
+            if (c == '\r' || c == '\n') continue;
+            safe[j++] = (char)c;
+        }
+        safe[j] = 0;
+        if (safe[0]) {
+            snprintf(hdr, sizeof(hdr), "Referer: %s\r\n", safe);
+            av_dict_set(&opts, "headers", hdr, 0);
+        }
     }
     if (p->http_proxy && p->http_proxy[0]) {
         av_dict_set(&opts, "http_proxy", p->http_proxy, 0);
@@ -646,30 +664,42 @@ static void *decode_thread(void *arg) {
         paused = p->paused;
         seek_req = p->seek_req;
         seek_secs = p->seek_secs;
-        want_w = p->want_w >= 2 ? p->want_w : 960;
-        want_h = p->want_h >= 2 ? p->want_h : 540;
+        want_w = p->want_w >= 2 ? p->want_w : 1920;
+        want_h = p->want_h >= 2 ? p->want_h : 1080;
         pthread_mutex_unlock(&p->mu);
         if (stop) break;
 
         if (seek_req) {
             int64_t ts = (int64_t)(seek_secs * AV_TIME_BASE);
-            av_seek_frame(fmt, -1, ts, AVSEEK_FLAG_BACKWARD);
-            avcodec_flush_buffers(vctx);
-            if (actx) avcodec_flush_buffers(actx);
-            if (swr) swr_convert(swr, NULL, 0, NULL, 0);
-            pthread_mutex_lock(&p->mu);
-            p->seek_req = 0;
-            p->position = seek_secs;
-            p->audio_clock = 0.0;
-            pthread_mutex_unlock(&p->mu);
-            pts0 = NAN;
-            clock0 = av_gettime_relative();
+            int sret = av_seek_frame(fmt, -1, ts, AVSEEK_FLAG_BACKWARD);
+            if (sret < 0) {
+                pthread_mutex_lock(&p->mu);
+                p->seek_req = 0;
+                pthread_mutex_unlock(&p->mu);
+            } else {
+                avcodec_flush_buffers(vctx);
+                if (actx) avcodec_flush_buffers(actx);
+                if (swr) swr_convert(swr, NULL, 0, NULL, 0);
+                pthread_mutex_lock(&p->mu);
+                p->seek_req = 0;
+                p->position = seek_secs;
+                p->audio_clock = NAN;
+                p->frame_ready = 0;
+                pthread_mutex_unlock(&p->mu);
+                pts0 = NAN;
+                clock0 = av_gettime_relative();
+                if (audio_sink) {
+                    int16_t z[FLUX_AUDIO_RATE / 5 * FLUX_AUDIO_CH]; /* ~200ms */
+                    memset(z, 0, sizeof(z));
+                    (void)fwrite(z, 1, sizeof(z), audio_sink);
+                }
+            }
         }
 
         if (paused) {
             /* Drain residual PCM in pw-play/pacat buffer so pause is silent. */
             if (audio_sink && !pause_flushed) {
-                int16_t z[FLUX_AUDIO_RATE / 25 * FLUX_AUDIO_CH];
+                int16_t z[FLUX_AUDIO_RATE / 5 * FLUX_AUDIO_CH]; /* ~200ms */
                 memset(z, 0, sizeof(z));
                 (void)fwrite(z, 1, sizeof(z), audio_sink);
                 pause_flushed = 1;
@@ -685,11 +715,17 @@ static void *decode_thread(void *arg) {
         if (r < 0) {
             /* Live/HLS: lavf often returns EOF between playlist reloads — don't die. */
             if (r == AVERROR_EOF) {
+                /* Live/HLS: duration often unknown — retry briefly.
+                 * Hard-cap retries (no mid-stream reset) so duration≤0 VOD cannot spin forever. */
                 int live = fmt->duration <= 0;
-                if (live && !p->stop) {
+                pthread_mutex_lock(&p->mu);
+                int stop = p->stop;
+                if (live && !stop && p->eof_retries++ < 120) { /* ~30s at 250ms */
+                    pthread_mutex_unlock(&p->mu);
                     usleep(250000);
                     continue;
                 }
+                pthread_mutex_unlock(&p->mu);
                 break;
             }
             usleep(10000);
@@ -758,8 +794,15 @@ static void *decode_thread(void *arg) {
                 AVFrame *sw = NULL;
                 int skip_store = 0;
                 pthread_mutex_lock(&p->mu);
-                /* If UI still holds an unread frame, drop this one (keeps realtime). */
-                if (p->frame_ready) skip_store = 1;
+                want_w = p->want_w >= 2 ? p->want_w : 1920;
+                want_h = p->want_h >= 2 ? p->want_h : 1080;
+                /* Overwrite unread RGBA so GPU-busy UI still gets latest on next pull.
+                 * Drop only when video is far behind audio (catch up without pacing). */
+                {
+                    double aclk = p->audio_clock;
+                    if (!isnan(aclk) && aclk - pos > 0.15)
+                        skip_store = 1;
+                }
                 pthread_mutex_unlock(&p->mu);
 
                 if (!skip_store) {
@@ -803,10 +846,12 @@ static void *decode_thread(void *arg) {
                     pthread_mutex_lock(&p->mu);
                     aclk = p->audio_clock;
                     pthread_mutex_unlock(&p->mu);
-                    if (aclk > 0.0) {
+                    if (!isnan(aclk)) {
                         if (pos > aclk + 0.08) {
                             int64_t delay = (int64_t)((pos - aclk) * 1000000.0);
-                            if (delay > 100000) delay = 100000;
+                            /* Cap sleep so demux stays responsive, but allow enough
+                             * headroom to avoid progressive lipsync drift. */
+                            if (delay > 40000) delay = 40000;
                             if (delay > 1000) usleep((useconds_t)delay);
                         }
                     } else if (isnan(pts0)) {

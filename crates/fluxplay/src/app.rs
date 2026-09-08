@@ -197,11 +197,15 @@ struct FluxPlay {
     video_frame_wh: (u32, u32),
     /// One in-flight `image::allocate` — drop intermediate soft frames.
     video_upload_busy: bool,
+    /// Bumped on Stop/close so late `VideoFrameAllocated` cannot resurrect a cleared stage.
+    video_upload_gen: u64,
     /// Latest soft frame waiting while GPU upload is in flight (at most one).
-    video_pending: Option<(u32, u32, Vec<u8>)>,
-    /// Consecutive PlayerTicks where embedded backend reported not running.
-    /// Debounces transient EOF/idle flaps that used to wipe the stage black.
-    playback_ended_streak: u8,
+    video_pending: Option<(u32, u32, Vec<u8>, u64)>,
+    /// First tick Instant when embedded backend looked dead (time debounce, not tick count).
+    playback_ended_since: Option<std::time::Instant>,
+    /// Android AudioManager focus held (edge-trigger request/abandon).
+    #[cfg(target_os = "android")]
+    audio_focus_held: bool,
     player_panel: PlayerPanel,
     goto_draft: String,
     sleep_until: Option<std::time::Instant>,
@@ -376,7 +380,12 @@ pub(crate) enum Message {
         err: Option<String>,
     },
     /// Soft-frame GPU upload finished — safe to swap without atlas flicker.
-    VideoFrameAllocated(Result<ImageAllocation, iced_image::Error>),
+    VideoFrameAllocated {
+        gen: u64,
+        w: u32,
+        h: u32,
+        result: Result<ImageAllocation, iced_image::Error>,
+    },
     CycleTheme,
     CycleAccent,
     SetAccent(AccentPreset),
@@ -698,8 +707,11 @@ impl FluxPlay {
             video_allocation_hold: None,
             video_frame_wh: (0, 0),
             video_upload_busy: false,
+            video_upload_gen: 0,
             video_pending: None,
-            playback_ended_streak: 0,
+            playback_ended_since: None,
+            #[cfg(target_os = "android")]
+            audio_focus_held: false,
             player_panel: PlayerPanel::None,
             goto_draft: String::new(),
             sleep_until: None,
@@ -1331,14 +1343,49 @@ impl FluxPlay {
         (rw, rh)
     }
 
+    fn clear_video_pending(&mut self) {
+        if let Some((_, _, rgba, _)) = self.video_pending.take() {
+            self.session.recycle_soft_rgba(rgba);
+        }
+    }
+
+    /// Invalidate soft present pipeline (Stop / close / channel switch).
+    /// Bumps gen so in-flight `iced_image::allocate` cannot resurrect a stale frame.
+    fn invalidate_soft_stage(&mut self, clear_displayed: bool) {
+        self.video_upload_busy = false;
+        self.video_upload_gen = self.video_upload_gen.wrapping_add(1);
+        self.clear_video_pending();
+        self.playback_ended_since = None;
+        if clear_displayed {
+            self.video_frame = None;
+            self.video_allocation = None;
+            self.video_allocation_hold = None;
+            self.video_frame_wh = (0, 0);
+        }
+        #[cfg(target_os = "android")]
+        {
+            // Abandon focus only when tearing down display (Stop/close), not mid-zap.
+            if clear_displayed && self.audio_focus_held {
+                crate::android_bridge::abandon_audio_focus();
+                self.audio_focus_held = false;
+            }
+        }
+    }
+
     /// Pull one soft frame and start GPU allocate. Caller must ensure `!video_upload_busy`.
     fn enqueue_soft_video_frame(&mut self) -> Option<Task<Message>> {
         let (rw, rh) = self.soft_present_wh();
         let (w, h, rgba) = self.session.pull_video_frame(rw, rh)?;
-        self.video_frame_wh = (w, h);
+        // Keep sticky pull size; only commit WH to layout/caps after GPU Ok.
+        let gen = self.video_upload_gen;
         self.video_upload_busy = true;
         let handle = ImageHandle::from_rgba(w, h, rgba);
-        Some(iced_image::allocate(handle).map(Message::VideoFrameAllocated))
+        Some(iced_image::allocate(handle).map(move |result| Message::VideoFrameAllocated {
+            gen,
+            w,
+            h,
+            result,
+        }))
     }
 
     fn close_player_window(&mut self) -> Task<Message> {
@@ -1347,6 +1394,12 @@ impl FluxPlay {
         self.player_panel = PlayerPanel::None;
         #[cfg(target_os = "android")]
         {
+            crate::android_bridge::set_immersive_mode(false);
+            crate::android_bridge::set_keep_screen_on(false);
+            if self.audio_focus_held {
+                crate::android_bridge::abandon_audio_focus();
+                self.audio_focus_held = false;
+            }
             self.player_embedded = false;
             self.player_id = None;
             return Task::none();
@@ -1459,6 +1512,12 @@ impl FluxPlay {
             }
             Message::PlayerLayoutDirty(id) => {
                 if self.player_id == Some(id) {
+                    if self
+                        .player_layout_freeze_until
+                        .is_some_and(|t| std::time::Instant::now() < t)
+                    {
+                        return Task::none();
+                    }
                     return self.sync_player_layout_task(id);
                 }
             }
@@ -1513,9 +1572,7 @@ impl FluxPlay {
                     self.video_allocation = None;
                     self.video_allocation_hold = None;
                     self.video_frame_wh = (0, 0);
-                    self.video_upload_busy = false;
-                    self.video_pending = None;
-                    self.playback_ended_streak = 0;
+                    self.invalidate_soft_stage(true);
                     self.player_fullscreen = false;
                     self.player_chrome_visible = true;
                     self.player_panel = PlayerPanel::None;
@@ -1534,6 +1591,7 @@ impl FluxPlay {
             Message::ClosePlayerWindow => {
                 // Stop may already have run (e.g. deferred after Message::Stop).
                 self.session.stop();
+                self.invalidate_soft_stage(true);
                 if self.status != "Arrêté" {
                     self.status = "Arrêté".into();
                 }
@@ -1842,6 +1900,8 @@ impl FluxPlay {
                     if prefer_external {
                         match crate::android_intent::open_stream_url(&ch.stream_url) {
                             Ok(()) => {
+                                self.session.stop();
+                                self.invalidate_soft_stage(true);
                                 self.session.channel = Some(ch.clone());
                                 self.session.backend = Some(BackendId::External);
                                 self.session.state = PlaybackState::Playing;
@@ -1866,7 +1926,10 @@ impl FluxPlay {
                     }
                 }
 
-                match self.session.open_channel(ch.clone()) {
+                match {
+                    self.invalidate_soft_stage(false);
+                    self.session.open_channel(ch.clone())
+                } {
                     Ok(()) => {
                         self.status = self.session.status_line();
                         self.persist();
@@ -1875,12 +1938,18 @@ impl FluxPlay {
                             // Prefer in-process libmpv RGBA embed (desktop parity).
                             // Only fall back to ACTION_VIEW when embed is unavailable.
                             if !self.session.has_embedded_video() {
-                                if let Err(e) =
-                                    crate::android_intent::open_stream_url(&ch.stream_url)
-                                {
-                                    self.status = format!("Intent: {e}");
-                                } else {
-                                    self.status = format!("Lecteur système · {}", ch.name);
+                                match crate::android_intent::open_stream_url(&ch.stream_url) {
+                                    Ok(()) => {
+                                        self.session.stop();
+                                        self.invalidate_soft_stage(true);
+                                        self.session.channel = Some(ch.clone());
+                                        self.session.backend = Some(BackendId::External);
+                                        self.session.state = PlaybackState::Playing;
+                                        self.status = format!("Lecteur système · {}", ch.name);
+                                    }
+                                    Err(e) => {
+                                        self.status = format!("Intent: {e}");
+                                    }
                                 }
                             }
                         }
@@ -1897,7 +1966,11 @@ impl FluxPlay {
                             if needs_intent || !self.session.has_embedded_video() {
                                 match crate::android_intent::open_stream_url(&ch.stream_url) {
                                     Ok(()) => {
+                                        self.session.stop();
+                                        self.invalidate_soft_stage(true);
+                                        self.session.channel = Some(ch.clone());
                                         self.session.backend = Some(BackendId::External);
+                                        self.session.state = PlaybackState::Playing;
                                         self.status =
                                             format!("Lecteur système · {}", ch.name);
                                     }
@@ -1977,6 +2050,8 @@ impl FluxPlay {
                     if prefer_external {
                         match crate::android_intent::open_stream_url(&stream_url) {
                             Ok(()) => {
+                                self.session.stop();
+                                self.invalidate_soft_stage(true);
                                 self.session.channel = Some(ch);
                                 self.session.backend = Some(BackendId::External);
                                 self.session.state = PlaybackState::Playing;
@@ -1990,7 +2065,10 @@ impl FluxPlay {
                         }
                     }
                 }
-                match self.session.open_channel(ch) {
+                match {
+                    self.invalidate_soft_stage(false);
+                    self.session.open_channel(ch)
+                } {
                     Ok(()) => {
                         self.status = self.session.status_line();
                         let art = crate::images::pick_art(
@@ -2009,9 +2087,10 @@ impl FluxPlay {
                         {
                             match crate::android_intent::open_stream_url(&stream_url) {
                                 Ok(()) => {
-                                    if e.to_string().contains("EXTERNAL_NEEDS_INTENT") {
-                                        self.session.backend = Some(BackendId::External);
-                                    }
+                                    self.session.stop();
+                                    self.invalidate_soft_stage(true);
+                                    self.session.backend = Some(BackendId::External);
+                                    self.session.state = PlaybackState::Playing;
                                     self.status = format!("Lecteur système · {name}");
                                 }
                                 Err(ie) => {
@@ -2184,13 +2263,7 @@ impl FluxPlay {
             }
             Message::Stop => {
                 self.session.stop();
-                self.video_frame = None;
-                self.video_allocation = None;
-                self.video_allocation_hold = None;
-                self.video_frame_wh = (0, 0);
-                self.video_upload_busy = false;
-                self.video_pending = None;
-                self.playback_ended_streak = 0;
+                self.invalidate_soft_stage(true);
                 self.status = "Arrêté".into();
                 // Defer window close so libmpv teardown finishes cleanly.
                 return Task::perform(
@@ -2248,6 +2321,15 @@ impl FluxPlay {
                     } else {
                         "Fenêtre".into()
                     };
+                    // Catch up soft video_rect after freeze (WindowResized is dropped mid-freeze).
+                    if let Some(id) = self.player_id.or(self.main_id) {
+                        return Task::perform(
+                            async {
+                                tokio::time::sleep(std::time::Duration::from_millis(650)).await;
+                            },
+                            move |_| Message::PlayerLayoutDirty(id),
+                        );
+                    }
                     return Task::none();
                 }
                 #[cfg(not(target_os = "android"))]
@@ -2343,25 +2425,35 @@ impl FluxPlay {
                             self.session.pause();
                             self.lifecycle_paused = true;
                             crate::android_bridge::set_keep_screen_on(false);
-                            crate::android_bridge::abandon_audio_focus();
+                            if self.audio_focus_held {
+                                crate::android_bridge::abandon_audio_focus();
+                                self.audio_focus_held = false;
+                            }
                         }
                     } else if fg && self.lifecycle_paused {
                         self.session.resume();
                         self.lifecycle_paused = false;
                     }
                     let keep = (fg || in_pip)
+                        && !matches!(self.session.backend, Some(BackendId::External))
                         && matches!(
                             self.session.state,
                             PlaybackState::Playing | PlaybackState::Buffering
                         );
                     crate::android_bridge::set_keep_screen_on(keep);
                     if keep {
-                        crate::android_bridge::request_audio_focus();
-                    } else if matches!(
-                        self.session.state,
-                        PlaybackState::Paused | PlaybackState::Idle | PlaybackState::Error
-                    ) {
+                        if !self.audio_focus_held {
+                            crate::android_bridge::request_audio_focus();
+                            self.audio_focus_held = true;
+                        }
+                    } else if self.audio_focus_held
+                        && matches!(
+                            self.session.state,
+                            PlaybackState::Paused | PlaybackState::Idle | PlaybackState::Error
+                        )
+                    {
                         crate::android_bridge::abandon_audio_focus();
+                        self.audio_focus_held = false;
                     }
                 }
                 self.session.refresh_times();
@@ -2372,21 +2464,19 @@ impl FluxPlay {
                     && !self.session.native.is_running()
                     && matches!(
                         self.session.state,
-                        PlaybackState::Playing | PlaybackState::Paused
+                        PlaybackState::Playing | PlaybackState::Paused | PlaybackState::Buffering
                     )
                 {
-                    self.playback_ended_streak = self.playback_ended_streak.saturating_add(1);
-                    // ~0.5–1s at 60–120 Hz — ignore idle/path flaps during seek/remux.
-                    // Keep last GPU frame on stage (no black wipe) when ending.
-                    if self.playback_ended_streak >= 36 {
+                    let since = self.playback_ended_since.get_or_insert_with(std::time::Instant::now);
+                    // Time-based debounce — independent of video_hz (12 ticks @120Hz was ~100ms).
+                    if since.elapsed() >= std::time::Duration::from_millis(400) {
                         self.session.stop();
-                        self.video_upload_busy = false;
-                        self.video_pending = None;
-                        self.playback_ended_streak = 0;
+                        self.invalidate_soft_stage(false);
+                        // Keep last GPU frame on stage (no black wipe).
                         self.status = "Lecture terminée".into();
                     }
                 } else {
-                    self.playback_ended_streak = 0;
+                    self.playback_ended_since = None;
                 }
                 let mut tasks = Vec::new();
                 // Soft-render: pull RGBA only when GPU upload is free. Pulling while busy
@@ -2418,10 +2508,15 @@ impl FluxPlay {
                     return Task::batch(tasks);
                 }
             }
-            Message::VideoFrameAllocated(result) => {
+            Message::VideoFrameAllocated { gen, w, h, result } => {
+                if gen != self.video_upload_gen {
+                    // Stop/close invalidated this upload — do not resurrect the stage.
+                    return Task::none();
+                }
                 self.video_upload_busy = false;
                 match result {
                     Ok(allocation) => {
+                        self.video_frame_wh = (w, h);
                         self.video_frame = Some(allocation.handle().clone());
                         // Keep prior GPU texture one frame so drop never races the draw.
                         self.video_allocation_hold = self.video_allocation.take();
@@ -2433,11 +2528,21 @@ impl FluxPlay {
                 }
                 // Drain latest pending, else pull next dirty frame immediately (present clock
                 // = allocate completion, not only the iced timer).
-                if let Some((w, h, rgba)) = self.video_pending.take() {
-                    self.video_frame_wh = (w, h);
-                    self.video_upload_busy = true;
-                    let handle = ImageHandle::from_rgba(w, h, rgba);
-                    return iced_image::allocate(handle).map(Message::VideoFrameAllocated);
+                if let Some((pw, ph, rgba, pgen)) = self.video_pending.take() {
+                    if pgen == self.video_upload_gen {
+                        self.video_upload_busy = true;
+                        let handle = ImageHandle::from_rgba(pw, ph, rgba);
+                        let gen = self.video_upload_gen;
+                        return iced_image::allocate(handle).map(move |result| {
+                            Message::VideoFrameAllocated {
+                                gen,
+                                w: pw,
+                                h: ph,
+                                result,
+                            }
+                        });
+                    }
+                    self.session.recycle_soft_rgba(rgba);
                 }
                 if self.session.has_embedded_video()
                     && matches!(
@@ -2558,10 +2663,21 @@ impl FluxPlay {
                             (16, 9)
                         };
                         crate::android_bridge::enter_pip(w.max(1) as i32, h.max(1) as i32);
-                        crate::android_bridge::request_audio_focus();
+                        if !self.audio_focus_held {
+                            crate::android_bridge::request_audio_focus();
+                            self.audio_focus_held = true;
+                        }
                         self.status = "PiP système".into();
                     } else {
                         self.status = "PiP off — revenez à FluxPlay".into();
+                    }
+                    if let Some(id) = self.player_id.or(self.main_id) {
+                        return Task::perform(
+                            async {
+                                tokio::time::sleep(std::time::Duration::from_millis(650)).await;
+                            },
+                            move |_| Message::PlayerLayoutDirty(id),
+                        );
                     }
                     return Task::none();
                 }
@@ -2760,10 +2876,14 @@ impl FluxPlay {
                         self.session.seek_relative(30.0)
                     }
                     PlayerHotkey::VolumeUp if self.session.caps().volume_live => {
-                        self.session.volume_delta(0.05)
+                        self.session.volume_delta(0.05);
+                        self.settings.volume = self.session.volume;
+                        self.persist();
                     }
                     PlayerHotkey::VolumeDown if self.session.caps().volume_live => {
-                        self.session.volume_delta(-0.05)
+                        self.session.volume_delta(-0.05);
+                        self.settings.volume = self.session.volume;
+                        self.persist();
                     }
                     PlayerHotkey::Mute if self.session.caps().mute => self.session.toggle_mute(),
                     PlayerHotkey::SeekBack
@@ -2787,13 +2907,13 @@ impl FluxPlay {
                             return Task::none();
                         }
                         self.session.stop();
+                        self.invalidate_soft_stage(true);
                         self.status = "Arrêté".into();
                         return self.close_player_window();
                     }
                     PlayerHotkey::Stop => {
                         if self.session.caps().owned {
-                            self.session.stop();
-                            self.status = "Arrêté".into();
+                            return Task::done(Message::Stop);
                         }
                     }
                     PlayerHotkey::Restart => {
@@ -7468,7 +7588,7 @@ fn redact_endpoint(endpoint: &str) -> String {
 fn profile_message_label(message: &Message) -> &'static str {
     match message {
         Message::PlayerTick => "tick.player",
-        Message::VideoFrameAllocated(_) => "tick.video_frame",
+        Message::VideoFrameAllocated { .. } => "tick.video_frame",
         Message::PlayerChromeTick => "tick.chrome",
         Message::ImageLoaded(_) => "async.image",
         Message::MetaEnriched { .. } => "async.meta",
@@ -7511,7 +7631,7 @@ fn profile_message_label(message: &Message) -> &'static str {
 fn ui_action_label(message: &Message) -> Option<&'static str> {
     Some(match message {
         Message::PlayerTick
-        | Message::VideoFrameAllocated(_)
+        | Message::VideoFrameAllocated { .. }
         | Message::ImageLoaded(_)
         | Message::FlushPendingImages
         | Message::BrowseScrolled(_, _)

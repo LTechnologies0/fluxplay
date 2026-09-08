@@ -118,6 +118,8 @@ pub struct LibMpv {
     sw_rgba: Vec<u8>,
     /// Previous present buffer recycled to avoid alloc+memcpy every frame.
     sw_recycle: Vec<u8>,
+    /// Reused scratch for rgb0 fallback (avoid per-frame padded alloc).
+    sw_rgb0: Vec<u8>,
     sw_w: u32,
     sw_h: u32,
     /// First frame must render even if dirty flag races.
@@ -162,6 +164,7 @@ impl LibMpv {
             frame_dirty: Arc::new(AtomicBool::new(false)),
             sw_rgba: Vec::new(),
             sw_recycle: Vec::new(),
+            sw_rgb0: Vec::new(),
             sw_w: 0,
             sw_h: 0,
             force_render: true,
@@ -295,7 +298,13 @@ impl LibMpv {
 
         let need = (w as usize).saturating_mul(h as usize).saturating_mul(4);
         if self.sw_rgba.len() != need {
-            self.sw_rgba.resize(need, 0);
+            if self.sw_rgba.capacity() < need {
+                self.sw_rgba = Vec::with_capacity(need);
+            }
+            // SAFETY: mpv SW render overwrites every byte before we read.
+            unsafe {
+                self.sw_rgba.set_len(need);
+            }
         }
 
         let mut size = [w as c_int, h as c_int];
@@ -332,16 +341,22 @@ impl LibMpv {
 
         let code = try_render(&fmt_rgba, &mut self.sw_rgba, &mut stride);
         if code < 0 {
-            // rgb0: 4 bytes/pixel with unused alpha — write into a scratch then pack.
+            // rgb0: 4 bytes/pixel with unused alpha — write into reused scratch then pack.
             let pad_stride = ((w as usize * 4 + 63) / 64) * 64;
-            let mut scratch = vec![0u8; pad_stride * h as usize];
+            let need_rgb0 = pad_stride.saturating_mul(h as usize);
+            if self.sw_rgb0.capacity() < need_rgb0 {
+                self.sw_rgb0 = Vec::with_capacity(need_rgb0);
+            }
+            unsafe {
+                self.sw_rgb0.set_len(need_rgb0);
+            }
             let mut st = pad_stride;
-            if try_render(&fmt_rgb0, &mut scratch, &mut st) < 0 {
+            if try_render(&fmt_rgb0, &mut self.sw_rgb0, &mut st) < 0 {
                 self.frame_dirty.store(true, Ordering::Release);
                 return None;
             }
             for y in 0..h as usize {
-                let src = &scratch[y * st..y * st + w as usize * 4];
+                let src = &self.sw_rgb0[y * st..y * st + w as usize * 4];
                 let dst = &mut self.sw_rgba[y * w as usize * 4..(y + 1) * w as usize * 4];
                 for (d, s) in dst.chunks_exact_mut(4).zip(src.chunks_exact(4)) {
                     d[0] = s[0];
@@ -355,14 +370,28 @@ impl LibMpv {
         self.sw_w = w;
         self.sw_h = h;
         self.force_render = false;
-        // Move rendered buffer to caller; keep a same-sized scratch for the next render
-        // (no full-frame clone). iced owns the returned Vec until GPU upload.
-        let out = std::mem::replace(&mut self.sw_rgba, std::mem::take(&mut self.sw_recycle));
-        if self.sw_rgba.len() != need {
-            self.sw_rgba.resize(need, 0);
+        // Hand the rendered buffer to the caller. Prepare the next render scratch
+        // without zero-filling 8MB (mpv overwrites every pixel). Prefer recycling
+        // capacity from `sw_recycle` when available.
+        let out = std::mem::take(&mut self.sw_rgba);
+        let mut next = std::mem::take(&mut self.sw_recycle);
+        if next.capacity() < need {
+            next = Vec::with_capacity(need);
         }
-        self.sw_recycle.clear();
+        // SAFETY: mpv_render SW path writes all `need` bytes before we read them again.
+        unsafe {
+            next.set_len(need);
+        }
+        self.sw_rgba = next;
         Some(out)
+    }
+
+    /// Return a discarded soft RGBA buffer to the render pool (keep capacity).
+    pub fn recycle_sw_rgba(&mut self, mut buf: Vec<u8>) {
+        buf.clear();
+        if buf.capacity() > self.sw_recycle.capacity() {
+            self.sw_recycle = buf;
+        }
     }
 
     fn free_render(&mut self) {
