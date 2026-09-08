@@ -116,6 +116,8 @@ pub struct LibMpv {
     frame_dirty: Arc<AtomicBool>,
     /// Reused tightly-packed RGBA scratch (render target).
     sw_rgba: Vec<u8>,
+    /// Previous present buffer recycled to avoid alloc+memcpy every frame.
+    sw_recycle: Vec<u8>,
     sw_w: u32,
     sw_h: u32,
     /// First frame must render even if dirty flag races.
@@ -128,6 +130,24 @@ unsafe impl Send for LibMpv {}
 impl LibMpv {
     pub fn create() -> Result<Self> {
         debug!("LibMpv::create");
+        // libmpv requires LC_NUMERIC=C for property/option parsing.
+        {
+            use std::sync::Once;
+            static ONCE: Once = Once::new();
+            ONCE.call_once(|| {
+                extern "C" {
+                    fn setlocale(category: i32, locale: *const c_char) -> *mut c_char;
+                }
+                // LC_NUMERIC — 1 on glibc/musl/macOS.
+                const LC_NUMERIC: i32 = 1;
+                let c = CString::new("C").ok();
+                if let Some(c) = c {
+                    unsafe {
+                        setlocale(LC_NUMERIC, c.as_ptr());
+                    }
+                }
+            });
+        }
         let ctx = unsafe { mpv_create() };
         if ctx.is_null() {
             error!("mpv_create returned null");
@@ -141,6 +161,7 @@ impl LibMpv {
             render: ptr::null_mut(),
             frame_dirty: Arc::new(AtomicBool::new(false)),
             sw_rgba: Vec::new(),
+            sw_recycle: Vec::new(),
             sw_w: 0,
             sw_h: 0,
             force_render: true,
@@ -334,8 +355,14 @@ impl LibMpv {
         self.sw_w = w;
         self.sw_h = h;
         self.force_render = false;
-        // One memcpy into a fresh Vec owned by iced's ImageHandle.
-        Some(self.sw_rgba.clone())
+        // Move rendered buffer to caller; keep a same-sized scratch for the next render
+        // (no full-frame clone). iced owns the returned Vec until GPU upload.
+        let out = std::mem::replace(&mut self.sw_rgba, std::mem::take(&mut self.sw_recycle));
+        if self.sw_rgba.len() != need {
+            self.sw_rgba.resize(need, 0);
+        }
+        self.sw_recycle.clear();
+        Some(out)
     }
 
     fn free_render(&mut self) {

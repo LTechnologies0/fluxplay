@@ -192,9 +192,16 @@ struct FluxPlay {
     video_frame: Option<ImageHandle>,
     /// Pins GPU atlas memory so the displayed frame never async-flickers.
     video_allocation: Option<ImageAllocation>,
+    /// Previous atlas entry kept one swap behind so iced never paints a freed texture.
+    video_allocation_hold: Option<ImageAllocation>,
     video_frame_wh: (u32, u32),
     /// One in-flight `image::allocate` — drop intermediate soft frames.
     video_upload_busy: bool,
+    /// Latest soft frame waiting while GPU upload is in flight (at most one).
+    video_pending: Option<(u32, u32, Vec<u8>)>,
+    /// Consecutive PlayerTicks where embedded backend reported not running.
+    /// Debounces transient EOF/idle flaps that used to wipe the stage black.
+    playback_ended_streak: u8,
     player_panel: PlayerPanel,
     goto_draft: String,
     sleep_until: Option<std::time::Instant>,
@@ -688,8 +695,11 @@ impl FluxPlay {
             player_pos: None,
             video_frame: None,
             video_allocation: None,
+            video_allocation_hold: None,
             video_frame_wh: (0, 0),
             video_upload_busy: false,
+            video_pending: None,
+            playback_ended_streak: 0,
             player_panel: PlayerPanel::None,
             goto_draft: String::new(),
             sleep_until: None,
@@ -986,16 +996,13 @@ impl FluxPlay {
             self.display_probe = display_caps::boot_probe();
             self.display_probe_at = std::time::Instant::now();
         }
-        let stage = self
-            .session
-            .native
-            .video_rect()
-            .map(|r| (r.w, r.h))
-            .filter(|(w, h)| *w >= 2 && *h >= 2)
-            .or_else(|| {
-                let (w, h) = self.video_frame_wh;
-                (w >= 2 && h >= 2).then_some((w, h))
-            });
+        // Soft budget must use soft RGBA pixels (≤1080p unless UHD), NOT raw window
+        // size — a 4K stage with 1080p soft present was wrongly forced to 30 fps.
+        let stage = {
+            let (w, h) = self.soft_present_wh();
+            (w >= 2 && h >= 2).then_some((w, h))
+        };
+        let prev_video_hz = self.display_caps.video_hz;
         self.display_caps = display_caps::resolve_caps(
             self.settings.fps_gui,
             self.settings.fps_video,
@@ -1003,6 +1010,14 @@ impl FluxPlay {
             self.session.content_fps(),
             Some(&self.display_probe),
         );
+        // Soft budget cliffs + ±px stage noise — don't flap present period 30↔60↔120.
+        if !force_probe {
+            let a = prev_video_hz as i32;
+            let b = self.display_caps.video_hz as i32;
+            if a > 0 && (a - b).abs() > 0 && (a - b).abs() <= 20 {
+                self.display_caps.video_hz = prev_video_hz;
+            }
+        }
         self.apply_host_tuning();
     }
 
@@ -1095,7 +1110,9 @@ impl FluxPlay {
             let soft_video = self.session.has_embedded_video()
                 && matches!(
                     self.session.state,
-                    PlaybackState::Playing | PlaybackState::Buffering
+                    PlaybackState::Playing
+                        | PlaybackState::Buffering
+                        | PlaybackState::Paused
                 );
             let playing_like = matches!(
                 self.session.state,
@@ -1129,7 +1146,8 @@ impl FluxPlay {
                 Subscription::none()
             }
         };
-        // Chrome autohide + alpha lerp paced by GUI FPS cap (not a second heavy video pull).
+        // Chrome autohide + alpha lerp + caps refresh. Keep alive during soft video even
+        // when chrome is fully hidden — otherwise video_hz/content_fps never update mid-play.
         let chrome_tick = {
             let player_open = {
                 #[cfg(target_os = "android")]
@@ -1141,14 +1159,24 @@ impl FluxPlay {
                     self.player_id.is_some()
                 }
             };
-            // Keep ticking while fading out (visible=false but alpha still > 0).
+            let soft_video = self.session.has_embedded_video()
+                && matches!(
+                    self.session.state,
+                    PlaybackState::Playing
+                        | PlaybackState::Buffering
+                        | PlaybackState::Paused
+                );
             let animating =
                 self.player_chrome_visible || self.chrome_alpha > 0.05 || self.player_panel != PlayerPanel::None;
-            if player_open && animating {
-                iced::time::every(std::time::Duration::from_millis(
-                    self.display_caps.gui_period_ms().max(100),
-                ))
-                .map(|_| Message::PlayerChromeTick)
+            if player_open && (animating || soft_video) {
+                let ms = if soft_video && !animating {
+                    // Caps / prefetch only — don't spin at full GUI Hz on a black overlay.
+                    self.display_caps.gui_period_ms().max(250)
+                } else {
+                    self.display_caps.gui_period_ms().max(100)
+                };
+                iced::time::every(std::time::Duration::from_millis(ms))
+                    .map(|_| Message::PlayerChromeTick)
             } else {
                 Subscription::none()
             }
@@ -1246,22 +1274,71 @@ impl FluxPlay {
             }
             self.player_layout_freeze_until = None;
         }
-        // Hysteresis: ignore ±4px noise from compositor / scale rounding.
+        // Hysteresis: must match soft-pull hysteresis (±16px / 8%) or video_rect drifts
+        // while pull stays sticky → FFmpeg want_w mismatch discards frames (black flashes).
         if let Some(prev) = self.session.native.video_rect() {
             let dw = (prev.w as i32 - w as i32).unsigned_abs();
             let dh = (prev.h as i32 - h as i32).unsigned_abs();
-            if dw <= 4 && dh <= 4 {
+            if dw <= 16 && dh <= 16 {
                 return;
             }
-            // Ignore tiny proportional jitter (<3%) that still causes soft-frame flicker.
+            // Ignore tiny proportional jitter that still causes soft-frame flicker.
             let pw = prev.w.max(1) as f32;
             let ph = prev.h.max(1) as f32;
-            if (w as f32 - pw).abs() / pw < 0.03 && (h as f32 - ph).abs() / ph < 0.03 {
+            if (w as f32 - pw).abs() / pw < 0.08 && (h as f32 - ph).abs() / ph < 0.08 {
                 return;
             }
         }
         tracing::debug!(?rect, %scale, "player embed stage size");
         self.session.set_video_rect(rect);
+    }
+
+    /// Sticky soft RGBA request size (window-scaled, capped, hysteresis vs last frame).
+    fn soft_present_wh(&self) -> (u32, u32) {
+        let frozen = self
+            .player_layout_freeze_until
+            .is_some_and(|t| std::time::Instant::now() < t);
+        let (fw, fh) = self
+            .session
+            .native
+            .video_rect()
+            .map(|r| (r.w, r.h))
+            .unwrap_or((1280, 720));
+        let uhd = std::env::var_os("FLUXPLAY_SOFT_UHD").is_some();
+        let max_w = if uhd { 3840u32 } else { 1920 };
+        let max_h = if uhd { 2160u32 } else { 1080 };
+        let scale = (max_w as f32 / fw.max(1) as f32)
+            .min(max_h as f32 / fh.max(1) as f32)
+            .min(1.0);
+        let rw = ((fw as f32 * scale).round() as u32).max(2) & !1;
+        let rh = ((fh as f32 * scale).round() as u32).max(2) & !1;
+        if self.video_frame_wh.0 >= 2 && self.video_frame_wh.1 >= 2 {
+            let (pw, ph) = self.video_frame_wh;
+            if frozen {
+                return (pw, ph);
+            }
+            let dw = (pw as i32 - rw as i32).unsigned_abs();
+            let dh = (ph as i32 - rh as i32).unsigned_abs();
+            if dw <= 16 && dh <= 16 {
+                return (pw, ph);
+            }
+            if (rw as f32 - pw as f32).abs() / (pw.max(1) as f32) < 0.08
+                && (rh as f32 - ph as f32).abs() / (ph.max(1) as f32) < 0.08
+            {
+                return (pw, ph);
+            }
+        }
+        (rw, rh)
+    }
+
+    /// Pull one soft frame and start GPU allocate. Caller must ensure `!video_upload_busy`.
+    fn enqueue_soft_video_frame(&mut self) -> Option<Task<Message>> {
+        let (rw, rh) = self.soft_present_wh();
+        let (w, h, rgba) = self.session.pull_video_frame(rw, rh)?;
+        self.video_frame_wh = (w, h);
+        self.video_upload_busy = true;
+        let handle = ImageHandle::from_rgba(w, h, rgba);
+        Some(iced_image::allocate(handle).map(Message::VideoFrameAllocated))
     }
 
     fn close_player_window(&mut self) -> Task<Message> {
@@ -1434,8 +1511,11 @@ impl FluxPlay {
                     self.player_pos = None;
                     self.video_frame = None;
                     self.video_allocation = None;
+                    self.video_allocation_hold = None;
                     self.video_frame_wh = (0, 0);
                     self.video_upload_busy = false;
+                    self.video_pending = None;
+                    self.playback_ended_streak = 0;
                     self.player_fullscreen = false;
                     self.player_chrome_visible = true;
                     self.player_panel = PlayerPanel::None;
@@ -2106,8 +2186,11 @@ impl FluxPlay {
                 self.session.stop();
                 self.video_frame = None;
                 self.video_allocation = None;
+                self.video_allocation_hold = None;
                 self.video_frame_wh = (0, 0);
                 self.video_upload_busy = false;
+                self.video_pending = None;
+                self.playback_ended_streak = 0;
                 self.status = "Arrêté".into();
                 // Defer window close so libmpv teardown finishes cleanly.
                 return Task::perform(
@@ -2136,9 +2219,6 @@ impl FluxPlay {
             Message::VolumeChanged(v) => {
                 self.session.set_volume(v);
                 self.settings.volume = self.session.volume;
-                if self.session.muted && v > 0.0 {
-                    self.session.muted = false;
-                }
                 self.persist();
             }
             Message::SeekRel(secs) => {
@@ -2159,6 +2239,9 @@ impl FluxPlay {
                     // Shared NativeActivity surface — never Mode::Fullscreen (Waydroid h=0).
                     self.player_fullscreen = !self.player_fullscreen;
                     self.player_chrome_visible = !self.player_fullscreen;
+                    // Freeze soft size while immersive bounds settle (same class as desktop FS).
+                    self.player_layout_freeze_until =
+                        Some(std::time::Instant::now() + std::time::Duration::from_millis(600));
                     crate::android_bridge::set_immersive_mode(self.player_fullscreen);
                     self.status = if self.player_fullscreen {
                         "Plein écran (chrome masqué)".into()
@@ -2225,18 +2308,28 @@ impl FluxPlay {
             Message::PlayerChromeTick => {
                 self.maybe_autohide_player_chrome();
                 self.lerp_chrome_alpha();
-            }
-            Message::CycleAudio => {
-                self.session.cycle_audio();
-                self.status = "Piste audio suivante".into();
-            }
-            Message::CycleSubtitles => {
-                self.session.cycle_subtitles();
-                self.status = "Sous-titres suivants".into();
-            }
-            Message::PlayerTick => {
+                // Off the soft-video path — theme/caps at GUI rate only.
                 self.refresh_system_dark();
                 self.refresh_display_caps(false);
+                if let Some(prefetch) = self.maybe_prefetch_next_episode() {
+                    return prefetch;
+                }
+            }
+            Message::CycleAudio => {
+                self.status = if self.session.cycle_audio() {
+                    "Piste audio suivante".into()
+                } else {
+                    "Piste audio non supportée".into()
+                };
+            }
+            Message::CycleSubtitles => {
+                self.status = if self.session.cycle_subtitles() {
+                    "Sous-titres suivants".into()
+                } else {
+                    "Sous-titres non supportés".into()
+                };
+            }
+            Message::PlayerTick => {
                 #[cfg(target_os = "android")]
                 {
                     let fg = iced::android::is_foreground();
@@ -2272,76 +2365,45 @@ impl FluxPlay {
                     }
                 }
                 self.session.refresh_times();
-                if !self.session.native.is_running()
+                self.session.refresh_buffering_state();
+                // External / Intent: no owned process — never treat as EOF.
+                let owned_playback = !matches!(self.session.backend, Some(BackendId::External));
+                if owned_playback
+                    && !self.session.native.is_running()
                     && matches!(
                         self.session.state,
                         PlaybackState::Playing | PlaybackState::Paused
                     )
                 {
-                    self.session.state = PlaybackState::Idle;
-                    self.video_frame = None;
-                    self.video_allocation = None;
-                    self.video_upload_busy = false;
-                    self.status = "Lecture terminée".into();
+                    self.playback_ended_streak = self.playback_ended_streak.saturating_add(1);
+                    // ~0.5–1s at 60–120 Hz — ignore idle/path flaps during seek/remux.
+                    // Keep last GPU frame on stage (no black wipe) when ending.
+                    if self.playback_ended_streak >= 36 {
+                        self.session.stop();
+                        self.video_upload_busy = false;
+                        self.video_pending = None;
+                        self.playback_ended_streak = 0;
+                        self.status = "Lecture terminée".into();
+                    }
+                } else {
+                    self.playback_ended_streak = 0;
                 }
                 let mut tasks = Vec::new();
-                // Soft-render: pull RGBA, then GPU-allocate BEFORE swapping the
-                // displayed Handle — iced async-uploads otherwise flash black
-                // between unique frame IDs (documented flicker for animated images).
-                // Present rate is capped by display_caps.video_hz via subscription period;
-                // still skip when mpv reports no new frame.
+                // Soft-render: pull RGBA only when GPU upload is free. Pulling while busy
+                // burns mpv/ffmpeg SW time into a soon-overwritten pending buffer and
+                // clears dirty/frame_ready — worst coupling under load.
                 if !self.video_upload_busy
                     && self.session.has_embedded_video()
                     && matches!(
                         self.session.state,
-                        PlaybackState::Playing | PlaybackState::Buffering
+                        PlaybackState::Playing
+                            | PlaybackState::Buffering
+                            | PlaybackState::Paused
                     )
                     && self.session.frame_needs_redraw()
                 {
-                    let frozen = self
-                        .player_layout_freeze_until
-                        .is_some_and(|t| std::time::Instant::now() < t);
-                    let (fw, fh) = self
-                        .session
-                        .native
-                        .video_rect()
-                        .map(|r| (r.w, r.h))
-                        .unwrap_or((1280, 720));
-                    let uhd = std::env::var_os("FLUXPLAY_SOFT_UHD").is_some();
-                    let max_w = if uhd { 3840u32 } else { 1920 };
-                    let max_h = if uhd { 2160u32 } else { 1080 };
-                    let scale = (max_w as f32 / fw.max(1) as f32)
-                        .min(max_h as f32 / fh.max(1) as f32)
-                        .min(1.0);
-                    let rw = ((fw as f32 * scale).round() as u32).max(2) & !1;
-                    let rh = ((fh as f32 * scale).round() as u32).max(2) & !1;
-                    let (rw, rh) = if self.video_frame_wh.0 >= 2 && self.video_frame_wh.1 >= 2 {
-                        let (pw, ph) = self.video_frame_wh;
-                        if frozen {
-                            (pw, ph)
-                        } else {
-                            let dw = (pw as i32 - rw as i32).unsigned_abs();
-                            let dh = (ph as i32 - rh as i32).unsigned_abs();
-                            if dw <= 8 && dh <= 8 {
-                                (pw, ph)
-                            } else if (rw as f32 - pw as f32).abs() / (pw.max(1) as f32) < 0.05
-                                && (rh as f32 - ph as f32).abs() / (ph.max(1) as f32) < 0.05
-                            {
-                                (pw, ph)
-                            } else {
-                                (rw, rh)
-                            }
-                        }
-                    } else {
-                        (rw, rh)
-                    };
-                    if let Some((w, h, rgba)) = self.session.pull_video_frame(rw, rh) {
-                        self.video_frame_wh = (w, h);
-                        self.video_upload_busy = true;
-                        let handle = ImageHandle::from_rgba(w, h, rgba);
-                        tasks.push(
-                            iced_image::allocate(handle).map(Message::VideoFrameAllocated),
-                        );
+                    if let Some(task) = self.enqueue_soft_video_frame() {
+                        tasks.push(task);
                     }
                 }
                 if let Some(deadline) = self.sleep_until {
@@ -2352,14 +2414,6 @@ impl FluxPlay {
                         self.status = "Veille — lecture en pause".into();
                     }
                 }
-                self.maybe_autohide_player_chrome();
-                self.lerp_chrome_alpha();
-                if self.browse_coast_vy.abs() >= 2.0 {
-                    tasks.push(self.apply_browse_coast_step());
-                }
-                if let Some(prefetch) = self.maybe_prefetch_next_episode() {
-                    tasks.push(prefetch);
-                }
                 if !tasks.is_empty() {
                     return Task::batch(tasks);
                 }
@@ -2369,10 +2423,33 @@ impl FluxPlay {
                 match result {
                     Ok(allocation) => {
                         self.video_frame = Some(allocation.handle().clone());
+                        // Keep prior GPU texture one frame so drop never races the draw.
+                        self.video_allocation_hold = self.video_allocation.take();
                         self.video_allocation = Some(allocation);
                     }
                     Err(e) => {
                         tracing::warn!(error = %e, "video frame GPU allocate failed");
+                    }
+                }
+                // Drain latest pending, else pull next dirty frame immediately (present clock
+                // = allocate completion, not only the iced timer).
+                if let Some((w, h, rgba)) = self.video_pending.take() {
+                    self.video_frame_wh = (w, h);
+                    self.video_upload_busy = true;
+                    let handle = ImageHandle::from_rgba(w, h, rgba);
+                    return iced_image::allocate(handle).map(Message::VideoFrameAllocated);
+                }
+                if self.session.has_embedded_video()
+                    && matches!(
+                        self.session.state,
+                        PlaybackState::Playing
+                            | PlaybackState::Buffering
+                            | PlaybackState::Paused
+                    )
+                    && self.session.frame_needs_redraw()
+                {
+                    if let Some(task) = self.enqueue_soft_video_frame() {
+                        return task;
                     }
                 }
             }
@@ -2411,6 +2488,17 @@ impl FluxPlay {
                 ));
                 if self.session.screenshot_to_path(&path) {
                     self.status = format!("Capture · {}", path.display());
+                } else if let Some((w, h, rgba)) = self.session.soft_rgba_snapshot() {
+                    match image::RgbaImage::from_raw(w, h, rgba) {
+                        Some(img) => match img.save(&path) {
+                            Ok(()) => self.status = format!("Capture · {}", path.display()),
+                            Err(e) => {
+                                tracing::warn!(error = %e, "soft PNG save failed");
+                                self.status = "Capture échouée".into();
+                            }
+                        },
+                        None => self.status = "Capture échouée".into(),
+                    }
                 } else {
                     self.status = "Capture échouée".into();
                 }
@@ -2426,12 +2514,18 @@ impl FluxPlay {
                 }
             }
             Message::ToggleSubVisibility => {
-                self.session.toggle_sub_visibility();
-                self.status = "Visibilité sous-titres basculée".into();
+                self.status = if self.session.toggle_sub_visibility() {
+                    "Visibilité sous-titres basculée".into()
+                } else {
+                    "Sous-titres non supportés".into()
+                };
             }
             Message::CycleAspect => {
-                self.session.cycle_aspect();
-                self.status = format!("Aspect {}", self.session.aspect.label());
+                self.status = if self.session.cycle_aspect() {
+                    format!("Aspect {}", self.session.aspect.label())
+                } else {
+                    "Aspect non supporté".into()
+                };
             }
             Message::ToggleOntop => {
                 self.session.toggle_ontop();
@@ -2455,6 +2549,8 @@ impl FluxPlay {
                 #[cfg(target_os = "android")]
                 {
                     self.pip_mode = !self.pip_mode;
+                    self.player_layout_freeze_until =
+                        Some(std::time::Instant::now() + std::time::Duration::from_millis(600));
                     if self.pip_mode {
                         let (w, h) = if self.video_frame_wh.0 > 0 {
                             self.video_frame_wh
@@ -2472,6 +2568,8 @@ impl FluxPlay {
                 #[cfg(not(target_os = "android"))]
                 {
                     self.pip_mode = !self.pip_mode;
+                    self.player_layout_freeze_until =
+                        Some(std::time::Instant::now() + std::time::Duration::from_millis(600));
                     if let Some(id) = self.player_id {
                         let size = if self.pip_mode {
                             Size::new(480.0, 320.0)
@@ -2495,7 +2593,12 @@ impl FluxPlay {
                                     window::Level::Normal
                                 },
                             ),
-                            self.sync_player_layout_task(id),
+                            Task::perform(
+                                async {
+                                    tokio::time::sleep(std::time::Duration::from_millis(650)).await;
+                                },
+                                move |_| Message::PlayerLayoutDirty(id),
+                            ),
                         ]);
                     }
                 }
@@ -2532,16 +2635,25 @@ impl FluxPlay {
                 };
             }
             Message::MarkAbA => {
-                self.session.mark_ab_a();
-                self.status = "Point A".into();
+                self.status = if self.session.mark_ab_a() {
+                    "Point A".into()
+                } else {
+                    "A–B non supporté".into()
+                };
             }
             Message::MarkAbB => {
-                self.session.mark_ab_b();
-                self.status = "Point B".into();
+                self.status = if self.session.mark_ab_b() {
+                    "Point B".into()
+                } else {
+                    "A–B non supporté".into()
+                };
             }
             Message::ClearAbLoop => {
-                self.session.clear_ab_loop();
-                self.status = "A–B off".into();
+                self.status = if self.session.clear_ab_loop() {
+                    "A–B off".into()
+                } else {
+                    "A–B non supporté".into()
+                };
             }
             Message::SubDelay(d) => {
                 self.session.nudge_sub_delay(d);
@@ -2626,20 +2738,41 @@ impl FluxPlay {
                 }
                 match hk {
                     PlayerHotkey::TogglePause => {
-                        if self.session.state == PlaybackState::Paused {
-                            self.session.resume();
-                        } else {
-                            self.session.pause();
+                        if self.session.caps().pause {
+                            if self.session.state == PlaybackState::Paused {
+                                self.session.resume();
+                            } else {
+                                self.session.pause();
+                            }
+                            self.status = self.session.status_line();
                         }
-                        self.status = self.session.status_line();
                     }
-                    PlayerHotkey::SeekBack => self.session.seek_relative(-10.0),
-                    PlayerHotkey::SeekFwd => self.session.seek_relative(10.0),
-                    PlayerHotkey::SeekBackBig => self.session.seek_relative(-30.0),
-                    PlayerHotkey::SeekFwdBig => self.session.seek_relative(30.0),
-                    PlayerHotkey::VolumeUp => self.session.volume_delta(0.05),
-                    PlayerHotkey::VolumeDown => self.session.volume_delta(-0.05),
-                    PlayerHotkey::Mute => self.session.toggle_mute(),
+                    PlayerHotkey::SeekBack if self.session.caps().seek_rel => {
+                        self.session.seek_relative(-10.0)
+                    }
+                    PlayerHotkey::SeekFwd if self.session.caps().seek_rel => {
+                        self.session.seek_relative(10.0)
+                    }
+                    PlayerHotkey::SeekBackBig if self.session.caps().seek_rel => {
+                        self.session.seek_relative(-30.0)
+                    }
+                    PlayerHotkey::SeekFwdBig if self.session.caps().seek_rel => {
+                        self.session.seek_relative(30.0)
+                    }
+                    PlayerHotkey::VolumeUp if self.session.caps().volume_live => {
+                        self.session.volume_delta(0.05)
+                    }
+                    PlayerHotkey::VolumeDown if self.session.caps().volume_live => {
+                        self.session.volume_delta(-0.05)
+                    }
+                    PlayerHotkey::Mute if self.session.caps().mute => self.session.toggle_mute(),
+                    PlayerHotkey::SeekBack
+                    | PlayerHotkey::SeekFwd
+                    | PlayerHotkey::SeekBackBig
+                    | PlayerHotkey::SeekFwdBig
+                    | PlayerHotkey::VolumeUp
+                    | PlayerHotkey::VolumeDown
+                    | PlayerHotkey::Mute => {}
                     PlayerHotkey::Fullscreen => {
                         return Task::done(Message::ToggleFullscreen);
                     }
@@ -2658,21 +2791,35 @@ impl FluxPlay {
                         return self.close_player_window();
                     }
                     PlayerHotkey::Stop => {
-                        self.session.stop();
-                        self.status = "Arrêté".into();
+                        if self.session.caps().owned {
+                            self.session.stop();
+                            self.status = "Arrêté".into();
+                        }
                     }
-                    PlayerHotkey::Restart => self.session.restart(),
+                    PlayerHotkey::Restart => {
+                        if self.session.caps().owned {
+                            self.session.restart();
+                        }
+                    }
                     PlayerHotkey::Speed => {
-                        self.session.cycle_speed();
-                        self.status = format!("Vitesse {:.2}×", self.session.speed);
+                        if self.session.caps().speed_loop {
+                            self.session.cycle_speed();
+                            self.status = format!("Vitesse {:.2}×", self.session.speed);
+                        }
                     }
                     PlayerHotkey::Loop => {
-                        self.session.toggle_loop();
+                        if self.session.caps().speed_loop {
+                            self.session.toggle_loop();
+                        }
                     }
                     PlayerHotkey::Screenshot => {
-                        return Task::done(Message::Screenshot);
+                        if self.session.caps().screenshot {
+                            return Task::done(Message::Screenshot);
+                        }
                     }
-                    PlayerHotkey::FrameStep => self.session.frame_step(),
+                    PlayerHotkey::FrameStep => {
+                        let _ = self.session.frame_step();
+                    }
                 }
             }
             Message::CycleTheme => {
@@ -5498,11 +5645,8 @@ impl FluxPlay {
         let active = !matches!(self.session.state, PlaybackState::Idle)
             || self.session.channel.is_some();
         let embedded_video = self.session.has_embedded_video();
-        let backend_label = self
-            .session
-            .backend
-            .map(|b| b.label())
-            .unwrap_or("—");
+        let backend_label = self.session.backend_display_label();
+        let caps = self.session.caps();
 
         player_ui::player_window(player_ui::PlayerChrome {
             ui,
@@ -5523,6 +5667,7 @@ impl FluxPlay {
             fullscreen: self.player_fullscreen,
             embedded_video,
             backend_label,
+            caps,
         })
     }
 

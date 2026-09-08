@@ -14,7 +14,9 @@ typedef struct FluxFfmpegOpenOpts {
     const char *url;
     const char *user_agent;
     const char *referer;
+    const char *http_proxy;
     int low_latency;
+    int hwdec;
 } FluxFfmpegOpenOpts;
 
 /* Opens URL and starts a decode thread. Returns NULL on failure. */
@@ -32,6 +34,7 @@ int flux_ffmpeg_pull_rgba(FluxFfmpegPlayer *p, uint8_t *out, int out_w, int out_
 /* Hint decode thread to scale toward this size (next frames). */
 void flux_ffmpeg_set_output_size(FluxFfmpegPlayer *p, int w, int h);
 
+int flux_ffmpeg_is_alive(FluxFfmpegPlayer *p);
 int flux_ffmpeg_has_frame(FluxFfmpegPlayer *p);
 void flux_ffmpeg_pause(FluxFfmpegPlayer *p, int paused);
 void flux_ffmpeg_set_volume(FluxFfmpegPlayer *p, float volume01);

@@ -165,8 +165,11 @@ pub fn resolve_caps(
         monitor_hz.min(gpu_gui_budget).min(GUI_CAP_MAX),
     );
     let mut video_auto = monitor_hz.min(soft_budget).min(SOFT_PRESENT_MAX);
-    if let Some(cfps) = content_fps.filter(|f| *f > 1.0 && f.is_finite()) {
-        video_auto = video_auto.min(cfps.round() as u32).max(MIN_HZ);
+    // content_fps gates waste — soft path already skips when !dirty. Only apply when the
+    // estimate looks stable (≥20); flaky estimated-vf-fps at startup must not pin us to 24.
+    if let Some(cfps) = content_fps.filter(|f| *f >= 20.0 && f.is_finite()) {
+        let capped = (cfps.ceil() as u32).saturating_add(2).max(MIN_HZ);
+        video_auto = video_auto.min(capped);
     }
     let video_hz = resolve_pref(video_pref, env_u32("FLUXPLAY_VIDEO_FPS"), video_auto);
 
@@ -275,10 +278,25 @@ fn soft_video_budget(tier: GpuTier, stage_wh: Option<(u32, u32)>, on_battery: bo
     if on_battery {
         base = base.min(60);
     }
-    if std::env::var_os("FLUXPLAY_SOFT_UHD").is_some() || pixels > 1920 * 1080 {
-        base.min(30)
-    } else if pixels > 1280 * 720 {
+    // Soft RGBA upload is heavy — step caps, avoid cliff that flaps with ±1px resize.
+    // Discrete can sustain 1080p @ 60–120; UHD stays conservative unless FLUXPLAY_SOFT_UHD.
+    if std::env::var_os("FLUXPLAY_SOFT_UHD").is_some() {
         base.min(60)
+    } else if pixels > 2560 * 1440 {
+        base.min(30)
+    } else if pixels > 1920 * 1080 {
+        // Slightly above 1080p (letterbox / DPI) — keep 60 on discrete, not a 30 cliff.
+        base.min(if matches!(tier, GpuTier::Discrete) {
+            60
+        } else {
+            45
+        })
+    } else if pixels > 1280 * 720 {
+        base.min(if matches!(tier, GpuTier::Discrete) {
+            120
+        } else {
+            60
+        })
     } else {
         base
     }
@@ -314,19 +332,22 @@ fn probe_hardware() -> DisplayProbe {
             on_battery,
             source,
         };
-        info!(
-            monitor = %probe.monitor_name,
-            res = %format!("{}x{}", probe.monitor_w, probe.monitor_h),
-            hz = probe.monitor_hz,
-            gpu = %probe.gpu_name,
-            tier = ?probe.gpu_tier,
-            cpu = probe.cpu_logical,
-            arch = probe.cpu_arch,
-            session = %probe.session.label(),
-            on_battery,
-            source = probe.source,
-            "host caps probed"
-        );
+        static LOGGED: OnceLock<()> = OnceLock::new();
+        let _ = LOGGED.get_or_init(|| {
+            info!(
+                monitor = %probe.monitor_name,
+                res = %format!("{}x{}", probe.monitor_w, probe.monitor_h),
+                hz = probe.monitor_hz,
+                gpu = %probe.gpu_name,
+                tier = ?probe.gpu_tier,
+                cpu = probe.cpu_logical,
+                arch = probe.cpu_arch,
+                session = %probe.session.label(),
+                on_battery,
+                source = probe.source,
+                "host caps probed"
+            );
+        });
         return probe;
     }
     let _ = WARNED.get_or_init(|| {

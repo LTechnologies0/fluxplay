@@ -18,7 +18,9 @@ struct FluxFfmpegOpenOpts {
     url: *const c_char,
     user_agent: *const c_char,
     referer: *const c_char,
+    http_proxy: *const c_char,
     low_latency: c_int,
+    hwdec: c_int,
 }
 
 extern "C" {
@@ -55,7 +57,9 @@ impl LibFfmpeg {
         url: &str,
         user_agent: Option<&str>,
         referer: Option<&str>,
+        http_proxy: Option<&str>,
         low_latency: bool,
+        hwdec: bool,
     ) -> Result<Self> {
         debug!("LibFfmpeg::open");
         if let Some(level) = crate::native_log::ffmpeg_av_log_level() {
@@ -72,18 +76,27 @@ impl LibFfmpeg {
             .map(CString::new)
             .transpose()
             .map_err(|e| PlayerError::Backend(e.to_string()))?;
+        let proxy_c = http_proxy
+            .map(CString::new)
+            .transpose()
+            .map_err(|e| PlayerError::Backend(e.to_string()))?;
 
         let opts = FluxFfmpegOpenOpts {
             url: url_c.as_ptr(),
             user_agent: ua_c.as_ref().map(|c| c.as_ptr()).unwrap_or(ptr::null()),
             referer: ref_c.as_ref().map(|c| c.as_ptr()).unwrap_or(ptr::null()),
+            http_proxy: proxy_c.as_ref().map(|c| c.as_ptr()).unwrap_or(ptr::null()),
             low_latency: if low_latency { 1 } else { 0 },
+            hwdec: if hwdec { 1 } else { 0 },
         };
         keepalive.push(url_c);
         if let Some(c) = ua_c {
             keepalive.push(c);
         }
         if let Some(c) = ref_c {
+            keepalive.push(c);
+        }
+        if let Some(c) = proxy_c {
             keepalive.push(c);
         }
 

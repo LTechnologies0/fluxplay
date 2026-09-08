@@ -37,6 +37,8 @@ struct FluxFfmpegPlayer {
     float volume;
     double position;
     double duration;
+    double audio_clock;
+    int want_hwdec;
 
     uint8_t *frame_rgba;
     int frame_w;
@@ -52,6 +54,7 @@ struct FluxFfmpegPlayer {
     char *url;
     char *user_agent;
     char *referer;
+    char *http_proxy;
     int low_latency;
 };
 
@@ -76,7 +79,9 @@ FluxFfmpegPlayer *flux_ffmpeg_open(const FluxFfmpegOpenOpts *opts) {
     p->url = flux_strdup(opts->url);
     p->user_agent = flux_strdup(opts->user_agent);
     p->referer = flux_strdup(opts->referer);
+    p->http_proxy = flux_strdup(opts->http_proxy);
     p->low_latency = opts->low_latency;
+    p->want_hwdec = opts->hwdec ? 1 : 0;
     p->volume = 1.0f;
     p->alive = 1;
     p->want_w = 960;
@@ -104,6 +109,7 @@ void flux_ffmpeg_close(FluxFfmpegPlayer *p) {
     free(p->url);
     free(p->user_agent);
     free(p->referer);
+    free(p->http_proxy);
     pthread_mutex_destroy(&p->mu);
     free(p);
 }
@@ -117,9 +123,12 @@ int flux_ffmpeg_pull_rgba(FluxFfmpegPlayer *p, uint8_t *out, int out_w, int out_
         pthread_mutex_unlock(&p->mu);
         return 0;
     }
-    /* Size mismatch: drop stale frame so decode can emit at want_w×want_h.
-     * Leaving frame_ready=1 caused a deadlock (UI never consumes, decode skip_store forever → black stage). */
+    /* Size mismatch: retarget decode want_* and drop unread frame once so store can
+     * emit at the new size. Do not touch want when already matching the request —
+     * avoids want thrash from UI noise. */
     if (p->frame_w != out_w || p->frame_h != out_h) {
+        p->want_w = out_w > 3840 ? 3840 : out_w;
+        p->want_h = out_h > 2160 ? 2160 : out_h;
         p->frame_ready = 0;
         pthread_mutex_unlock(&p->mu);
         return 0;
@@ -227,20 +236,33 @@ static void store_frame(FluxFfmpegPlayer *p, AVFrame *frame, int target_w, int t
     p->sws = sws;
 
     size_t need = (size_t)tw * (size_t)th * 4;
-    uint8_t *dst = (uint8_t *)malloc(need);
-    if (!dst) {
-        return;
+    pthread_mutex_lock(&p->mu);
+    uint8_t *dst = p->frame_rgba;
+    if (!dst || (size_t)p->frame_w * (size_t)p->frame_h * 4 != need) {
+        free(dst);
+        dst = (uint8_t *)malloc(need);
+        if (!dst) {
+            pthread_mutex_unlock(&p->mu);
+            return;
+        }
+        p->frame_rgba = dst;
     }
+    /* Scale into the retained buffer (no per-frame malloc). */
     uint8_t *dst_slices[4] = {dst, NULL, NULL, NULL};
     int dst_stride[4] = {tw * 4, 0, 0, 0};
+    /* Unlock during sws_scale — pull_rgba only reads when frame_ready. */
+    p->frame_ready = 0;
+    pthread_mutex_unlock(&p->mu);
+
     sws_scale(sws, (const uint8_t *const *)frame->data, frame->linesize, 0, frame->height, dst_slices, dst_stride);
 
     pthread_mutex_lock(&p->mu);
-    free(p->frame_rgba);
-    p->frame_rgba = dst;
-    p->frame_w = tw;
-    p->frame_h = th;
-    p->frame_ready = 1;
+    /* Recheck pointer still ours (destroy/stop could race — stop joins thread first). */
+    if (p->frame_rgba == dst) {
+        p->frame_w = tw;
+        p->frame_h = th;
+        p->frame_ready = 1;
+    }
     pthread_mutex_unlock(&p->mu);
 }
 
@@ -334,12 +356,13 @@ static int try_init_hw(FluxFfmpegPlayer *p, const AVCodec *codec, AVCodecContext
 enum { FLUX_AUDIO_RATE = 48000, FLUX_AUDIO_CH = 2 };
 
 static FILE *open_audio_sink(int rate, int channels) {
-    char cmd[320];
+    /* Resolve via PATH (Nix/Homebrew/custom prefixes), not hardcoded /usr/bin. */
+    char cmd[384];
     FILE *f = NULL;
-    if (access("/usr/bin/pw-play", X_OK) == 0) {
+    if (system("command -v pw-play >/dev/null 2>&1") == 0) {
         snprintf(cmd, sizeof(cmd),
-                 "exec pw-play -a --format s16 --rate %d --channels %d - 2>/dev/null",
-                 rate, channels);
+                 "exec pw-play -a --format s16 --rate %d --channels %d - 2>/dev/null", rate,
+                 channels);
         f = popen(cmd, "w");
         if (f) {
             fprintf(stderr, "flux_ffmpeg: audio sink pw-play %d Hz / %d ch\n", rate, channels);
@@ -347,10 +370,10 @@ static FILE *open_audio_sink(int rate, int channels) {
             return f;
         }
     }
-    if (access("/usr/bin/pacat", X_OK) == 0) {
+    if (system("command -v pacat >/dev/null 2>&1") == 0) {
         snprintf(cmd, sizeof(cmd),
-                 "exec pacat --raw --format=s16le --rate=%d --channels=%d 2>/dev/null",
-                 rate, channels);
+                 "exec pacat --raw --format=s16le --rate=%d --channels=%d 2>/dev/null", rate,
+                 channels);
         f = popen(cmd, "w");
         if (f) {
             fprintf(stderr, "flux_ffmpeg: audio sink pacat %d Hz / %d ch\n", rate, channels);
@@ -358,10 +381,9 @@ static FILE *open_audio_sink(int rate, int channels) {
             return f;
         }
     }
-    if (access("/usr/bin/aplay", X_OK) == 0) {
-        snprintf(cmd, sizeof(cmd),
-                 "exec aplay -q -t raw -f S16_LE -r %d -c %d 2>/dev/null",
-                 rate, channels);
+    if (system("command -v aplay >/dev/null 2>&1") == 0) {
+        snprintf(cmd, sizeof(cmd), "exec aplay -q -t raw -f S16_LE -r %d -c %d 2>/dev/null", rate,
+                 channels);
         f = popen(cmd, "w");
         if (f) {
             fprintf(stderr, "flux_ffmpeg: audio sink aplay %d Hz / %d ch\n", rate, channels);
@@ -459,12 +481,19 @@ static int setup_audio(FluxFfmpegPlayer *p, AVFormatContext *fmt, int *aindex_ou
 }
 
 static void play_audio_frame(FluxFfmpegPlayer *p, AVCodecContext *actx, SwrContext *swr, FILE *sink,
-                             AVFrame *frame) {
+                             AVFrame *frame, AVStream *ast) {
     if (!swr || !sink || !frame) return;
     float volume;
     pthread_mutex_lock(&p->mu);
     volume = p->volume;
     pthread_mutex_unlock(&p->mu);
+
+    if (ast && frame->best_effort_timestamp != AV_NOPTS_VALUE) {
+        double apts = frame->best_effort_timestamp * av_q2d(ast->time_base);
+        pthread_mutex_lock(&p->mu);
+        p->audio_clock = apts;
+        pthread_mutex_unlock(&p->mu);
+    }
 
     uint8_t *out_planes[1] = {NULL};
     int max_out = swr_get_out_samples(swr, frame->nb_samples);
@@ -511,6 +540,9 @@ static void *decode_thread(void *arg) {
         char hdr[1024];
         snprintf(hdr, sizeof(hdr), "Referer: %s\r\n", p->referer);
         av_dict_set(&opts, "headers", hdr, 0);
+    }
+    if (p->http_proxy && p->http_proxy[0]) {
+        av_dict_set(&opts, "http_proxy", p->http_proxy, 0);
     }
     av_dict_set(&opts, "reconnect", "1", 0);
     av_dict_set(&opts, "reconnect_streamed", "1", 0);
@@ -562,7 +594,11 @@ static void *decode_thread(void *arg) {
         if (avcodec_parameters_to_context(vctx, st->codecpar) < 0) goto done;
         vctx->pkt_timebase = st->time_base;
         vctx->thread_count = 0; /* auto */
-        try_init_hw(p, codec, vctx);
+        if (p->want_hwdec) {
+            try_init_hw(p, codec, vctx);
+        } else {
+            fprintf(stderr, "flux_ffmpeg: hwdec disabled by opts\n");
+        }
         if (avcodec_open2(vctx, codec, NULL) < 0) {
             /* Retry without hw if open failed */
             if (p->use_hw) {
@@ -597,6 +633,7 @@ static void *decode_thread(void *arg) {
 
     int64_t clock0 = av_gettime_relative();
     double pts0 = NAN;
+    int pause_flushed = 0;
     int send_err_logged = 0;
     int xfer_err_logged = 0;
     int frames_out = 0;
@@ -623,21 +660,38 @@ static void *decode_thread(void *arg) {
             pthread_mutex_lock(&p->mu);
             p->seek_req = 0;
             p->position = seek_secs;
+            p->audio_clock = 0.0;
             pthread_mutex_unlock(&p->mu);
             pts0 = NAN;
             clock0 = av_gettime_relative();
         }
 
         if (paused) {
+            /* Drain residual PCM in pw-play/pacat buffer so pause is silent. */
+            if (audio_sink && !pause_flushed) {
+                int16_t z[FLUX_AUDIO_RATE / 25 * FLUX_AUDIO_CH];
+                memset(z, 0, sizeof(z));
+                (void)fwrite(z, 1, sizeof(z), audio_sink);
+                pause_flushed = 1;
+            }
             usleep(20000);
             clock0 = av_gettime_relative();
             pts0 = NAN;
             continue;
         }
+        pause_flushed = 0;
 
         int r = av_read_frame(fmt, pkt);
         if (r < 0) {
-            if (r == AVERROR_EOF) break;
+            /* Live/HLS: lavf often returns EOF between playlist reloads — don't die. */
+            if (r == AVERROR_EOF) {
+                int live = fmt->duration <= 0;
+                if (live && !p->stop) {
+                    usleep(250000);
+                    continue;
+                }
+                break;
+            }
             usleep(10000);
             continue;
         }
@@ -652,7 +706,7 @@ static void *decode_thread(void *arg) {
                 int rret = avcodec_receive_frame(actx, aframe);
                 if (rret == AVERROR(EAGAIN) || rret == AVERROR_EOF) break;
                 if (rret < 0) break;
-                play_audio_frame(p, actx, swr, audio_sink, aframe);
+                play_audio_frame(p, actx, swr, audio_sink, aframe, fmt->streams[aindex]);
                 av_frame_unref(aframe);
             }
             continue;
@@ -736,8 +790,38 @@ static void *decode_thread(void *arg) {
                     if (sw) av_frame_free(&sw);
                 }
 
-                /* Pace to media clock so we don't melt the CPU decoding ASAP. */
-                if (isnan(pts0)) {
+                /* Pace only when we actually presented a frame. If UI is behind
+                 * (skip_store), drop without sleeping — catch up to realtime. */
+                if (skip_store) {
+                    av_frame_unref(frame);
+                    continue;
+                }
+
+                /* Pace video to audio clock when present (sync audio), else wall clock. */
+                if (audio_sink) {
+                    double aclk;
+                    pthread_mutex_lock(&p->mu);
+                    aclk = p->audio_clock;
+                    pthread_mutex_unlock(&p->mu);
+                    if (aclk > 0.0) {
+                        if (pos > aclk + 0.08) {
+                            int64_t delay = (int64_t)((pos - aclk) * 1000000.0);
+                            if (delay > 100000) delay = 100000;
+                            if (delay > 1000) usleep((useconds_t)delay);
+                        }
+                    } else if (isnan(pts0)) {
+                        pts0 = pos;
+                        clock0 = av_gettime_relative();
+                    } else {
+                        int64_t target = clock0 + (int64_t)((pos - pts0) * 1000000.0);
+                        int64_t now = av_gettime_relative();
+                        if (target > now + 1000) {
+                            int64_t delay = target - now;
+                            if (delay > 100000) delay = 100000;
+                            usleep((useconds_t)delay);
+                        }
+                    }
+                } else if (isnan(pts0)) {
                     pts0 = pos;
                     clock0 = av_gettime_relative();
                 } else {

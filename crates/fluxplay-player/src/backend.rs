@@ -7,6 +7,7 @@ use std::net::Shutdown;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use fluxplay_core::models::PlayerBackendPref;
@@ -37,6 +38,93 @@ impl BackendId {
             Self::ExoPlayer => "ExoPlayer (Android)",
             Self::AvPlayer => "AVPlayer (iOS)",
         }
+    }
+}
+
+/// What the active backend can actually honor (UI must gate on this).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BackendCaps {
+    pub pause: bool,
+    pub volume_live: bool,
+    pub mute: bool,
+    pub seek_rel: bool,
+    pub seek_abs: bool,
+    pub times: bool,
+    pub speed_loop: bool,
+    pub screenshot: bool,
+    pub tracks_filters: bool,
+    pub owned: bool,
+}
+
+impl BackendCaps {
+    pub const NONE: Self = Self {
+        pause: false,
+        volume_live: false,
+        mute: false,
+        seek_rel: false,
+        seek_abs: false,
+        times: false,
+        speed_loop: false,
+        screenshot: false,
+        tracks_filters: false,
+        owned: false,
+    };
+
+    fn mpv_full() -> Self {
+        Self {
+            pause: true,
+            volume_live: true,
+            mute: true,
+            seek_rel: true,
+            seek_abs: true,
+            times: true,
+            speed_loop: true,
+            screenshot: true,
+            tracks_filters: true,
+            owned: true,
+        }
+    }
+
+    fn libffmpeg() -> Self {
+        Self {
+            pause: true,
+            volume_live: true,
+            mute: true,
+            seek_rel: true,
+            seek_abs: true,
+            times: true,
+            speed_loop: false,
+            screenshot: true,
+            tracks_filters: false,
+            owned: true,
+        }
+    }
+
+    fn ffplay_cli() -> Self {
+        Self {
+            pause: true,
+            volume_live: false,
+            mute: true,
+            seek_rel: true,
+            seek_abs: false,
+            times: false,
+            speed_loop: false,
+            screenshot: false,
+            tracks_filters: false,
+            owned: true,
+        }
+    }
+}
+
+fn preferred_hwdec() -> &'static str {
+    #[cfg(target_os = "android")]
+    {
+        "mediacodec-copy"
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        // Same policy for embed + CLI (auto-copy / auto-safe are close; prefer auto-copy).
+        "auto-copy"
     }
 }
 
@@ -403,6 +491,14 @@ fn which(bin: &str) -> Option<String> {
             "/opt/homebrew/bin/mpv".into(),
         ]);
     }
+    if bin == "ffplay" || bin == "ffmpeg" {
+        candidates.extend([
+            format!("/home/linuxbrew/.linuxbrew/bin/{bin}"),
+            format!("/usr/local/bin/{bin}"),
+            format!("/usr/bin/{bin}"),
+            format!("/opt/homebrew/bin/{bin}"),
+        ]);
+    }
     candidates.into_iter().find(|p| Path::new(p).is_file())
 }
 
@@ -471,6 +567,11 @@ pub struct NativePlayer {
     video_rect: Option<VideoRect>,
     /// Last mute state sent to ffplay CLI (`m` is a toggle — keep edge-only).
     ffplay_muted: bool,
+    /// Last pause state for ffplay CLI (`space` is a toggle).
+    ffplay_paused: bool,
+    /// Last soft RGBA frame (libmpv / libffmpeg) for screenshot fallback.
+    last_soft_rgba: Option<(u32, u32, Arc<[u8]>)>,
+    soft_shot_tick: u32,
 }
 
 impl Default for NativePlayer {
@@ -499,7 +600,70 @@ impl NativePlayer {
             opts,
             video_rect: None,
             ffplay_muted: false,
+            ffplay_paused: false,
+            last_soft_rgba: None,
+            soft_shot_tick: 0,
         }
+    }
+
+    /// Capability mask for UI gating (honest vs optimistic session mirrors).
+    pub fn caps(&self) -> BackendCaps {
+        #[cfg(all(feature = "native-mpv", fluxplay_has_libmpv))]
+        if self.libmpv.is_some() {
+            return BackendCaps::mpv_full();
+        }
+        if self.ipc_path.is_some() {
+            return BackendCaps::mpv_full();
+        }
+        if self.using_libffmpeg() {
+            return BackendCaps::libffmpeg();
+        }
+        if self.using_ffplay_cli() {
+            return BackendCaps::ffplay_cli();
+        }
+        if self.backend == Some(BackendId::External) {
+            return BackendCaps::NONE;
+        }
+        BackendCaps::NONE
+    }
+
+    /// Honest status label (embed vs CLI).
+    pub fn display_label(&self) -> &'static str {
+        #[cfg(all(feature = "native-mpv", fluxplay_has_libmpv))]
+        if self.libmpv.is_some() {
+            return "libmpv (embed)";
+        }
+        if self.ipc_path.is_some() {
+            return "mpv (CLI)";
+        }
+        if self.using_libffmpeg() {
+            return "FFmpeg (embed)";
+        }
+        if self.using_ffplay_cli() {
+            return "ffplay (CLI)";
+        }
+        self.backend.map(|b| b.label()).unwrap_or("—")
+    }
+
+    /// mpv `paused-for-cache` — drives Buffering state.
+    pub fn paused_for_cache(&self) -> bool {
+        #[cfg(all(feature = "native-mpv", fluxplay_has_libmpv))]
+        if let Some(mpv) = &self.libmpv {
+            return matches!(
+                mpv.get_property_string("paused-for-cache").as_deref(),
+                Some("yes") | Some("true")
+            );
+        }
+        if let Some(path) = &self.ipc_path {
+            return mpv_get_bool(path, "paused-for-cache") == Some(true);
+        }
+        false
+    }
+
+    pub fn last_soft_rgba(&self) -> Option<(u32, u32, &[u8])> {
+        self.last_soft_rgba
+            .as_ref()
+            .map(|(w, h, b)| (*w, *h, b.as_ref()))
     }
 
     fn using_ffplay_cli(&self) -> bool {
@@ -558,11 +722,20 @@ impl NativePlayer {
         #[cfg(all(feature = "native-mpv", fluxplay_has_libmpv))]
         if let Some(mpv) = self.libmpv.as_mut() {
             let pixels = mpv.render_sw_rgba(rw, rh)?;
+            self.soft_shot_tick = self.soft_shot_tick.wrapping_add(1);
+            // Snapshot for screenshot ~1×/s at 60 Hz — avoid Arc copy hitch every frame.
+            if self.last_soft_rgba.is_none() || self.soft_shot_tick % 60 == 0 {
+                self.last_soft_rgba = Some((rw, rh, Arc::from(pixels.as_slice())));
+            }
             return Some((rw, rh, pixels));
         }
         #[cfg(all(feature = "native-ffmpeg", fluxplay_has_ffmpeg))]
         if let Some(ff) = self.libffmpeg.as_ref() {
             let pixels = ff.pull_rgba(rw, rh)?;
+            self.soft_shot_tick = self.soft_shot_tick.wrapping_add(1);
+            if self.last_soft_rgba.is_none() || self.soft_shot_tick % 60 == 0 {
+                self.last_soft_rgba = Some((rw, rh, Arc::from(pixels.as_slice())));
+            }
             return Some((rw, rh, pixels));
         }
         let _ = (rw, rh);
@@ -620,15 +793,19 @@ impl NativePlayer {
         #[cfg(all(feature = "native-mpv", fluxplay_has_libmpv))]
         {
             if let Some(mpv) = &self.libmpv {
-                // EOF / quit: idle-active or no path means playback ended.
-                if let Some(idle) = mpv.get_property_string("idle-active") {
-                    if idle == "yes" || idle == "true" {
-                        return false;
-                    }
-                }
+                // Avoid idle-active alone (flaps → black stage). Combine EOF + empty path.
                 if let Some(eof) = mpv.get_property_string("eof-reached") {
                     if eof == "yes" || eof == "true" {
                         return false;
+                    }
+                }
+                let path = mpv.get_property_string("path").unwrap_or_default();
+                if path.is_empty() {
+                    if let Some(idle) = mpv.get_property_string("idle-active") {
+                        if idle == "yes" || idle == "true" {
+                            // Failed/stalled loadfile: idle with nothing loaded.
+                            return false;
+                        }
                     }
                 }
                 return true;
@@ -639,6 +816,25 @@ impl NativePlayer {
             if let Some(ff) = &self.libffmpeg {
                 return ff.is_alive();
             }
+        }
+        // CLI mpv: keep-open leaves the process alive after EOF — check IPC.
+        if let Some(path) = &self.ipc_path {
+            let child_alive = match &mut self.child {
+                Some(c) => matches!(c.try_wait(), Ok(None)),
+                None => false,
+            };
+            if !child_alive {
+                return false;
+            }
+            if mpv_get_bool(path, "eof-reached") == Some(true) {
+                return false;
+            }
+            if mpv_get_string(path, "path").as_deref().unwrap_or("").is_empty()
+                && mpv_get_bool(path, "idle-active") == Some(true)
+            {
+                return false;
+            }
+            return true;
         }
         match &mut self.child {
             Some(c) => matches!(c.try_wait(), Ok(None)),
@@ -760,6 +956,10 @@ impl NativePlayer {
             trace!("NativePlayer::stop idle");
         }
         self.backend = None;
+        self.last_soft_rgba = None;
+        self.soft_shot_tick = 0;
+        self.ffplay_muted = false;
+        self.ffplay_paused = false;
     }
 
     pub fn pause(&mut self, paused: bool) -> Result<()> {
@@ -777,10 +977,17 @@ impl NativePlayer {
             mpv_cmd(path, &["set_property", "pause", if paused { "true" } else { "false" }])?;
             return Ok(());
         }
-        if self.backend == Some(BackendId::Ffmpeg) {
-            ffplay_send_key("space");
+        if self.using_ffplay_cli() {
+            // SDL `space` toggles — edge-trigger like mute.
+            if self.ffplay_paused != paused {
+                ffplay_send_key("space");
+                self.ffplay_paused = paused;
+            }
+            return Ok(());
         }
-        Ok(())
+        Err(PlayerError::Backend(
+            "pause: aucun backend contrôlable (external / sans lecteur)".into(),
+        ))
     }
 
     pub fn set_volume(&mut self, vol: f32) -> Result<()> {
@@ -804,7 +1011,9 @@ impl NativePlayer {
             // Volume is applied at spawn (`-volume`); live change needs restart.
             return Ok(());
         }
-        Ok(())
+        Err(PlayerError::Backend(
+            "set_volume: aucun backend contrôlable".into(),
+        ))
     }
 
     pub fn set_mute(&mut self, muted: bool) -> Result<()> {
@@ -829,7 +1038,9 @@ impl NativePlayer {
             }
             return Ok(());
         }
-        Ok(())
+        Err(PlayerError::Backend(
+            "set_mute: aucun backend contrôlable".into(),
+        ))
     }
 
     /// Relative seek in seconds (negative = rewind). Best with mpv / VOD.
@@ -892,15 +1103,12 @@ impl NativePlayer {
 
     pub fn toggle_fullscreen(&mut self) -> Result<()> {
         debug!("NativePlayer::toggle_fullscreen");
-        #[cfg(all(feature = "native-mpv", fluxplay_has_libmpv))]
-        if let Some(mpv) = &self.libmpv {
-            return mpv.command(&["cycle", "fullscreen"]);
+        // Soft embed: no OS video window — iced owns fullscreen.
+        if self.has_embedded_video() {
+            return Ok(());
         }
         if let Some(path) = &self.ipc_path {
             return mpv_cmd(path, &["cycle", "fullscreen"]);
-        }
-        if self.using_libffmpeg() {
-            return Ok(());
         }
         if self.using_ffplay_cli() {
             ffplay_send_key("f");
@@ -1008,11 +1216,11 @@ impl NativePlayer {
         #[cfg(all(feature = "native-mpv", fluxplay_has_libmpv))]
         if let Some(mpv) = &self.libmpv {
             let fps = mpv
-                .get_property_f64("estimated-vf-fps")
-                .filter(|f| *f > 1.0 && f.is_finite())
+                .get_property_f64("container-fps")
+                .filter(|f| *f >= 20.0 && f.is_finite())
                 .or_else(|| {
-                    mpv.get_property_f64("container-fps")
-                        .filter(|f| *f > 1.0 && f.is_finite())
+                    mpv.get_property_f64("estimated-vf-fps")
+                        .filter(|f| *f >= 20.0 && f.is_finite())
                 });
             return fps;
         }
@@ -1022,10 +1230,10 @@ impl NativePlayer {
             return None;
         }
         let path = self.ipc_path.as_ref()?;
-        mpv_get_number(path, "estimated-vf-fps")
-            .filter(|f| *f > 1.0 && f.is_finite())
+        mpv_get_number(path, "container-fps")
+            .filter(|f| *f >= 20.0 && f.is_finite())
             .or_else(|| {
-                mpv_get_number(path, "container-fps").filter(|f| *f > 1.0 && f.is_finite())
+                mpv_get_number(path, "estimated-vf-fps").filter(|f| *f >= 20.0 && f.is_finite())
             })
     }
 
@@ -1057,7 +1265,9 @@ impl NativePlayer {
             };
         }
         warn!(%name, %value, "set_prop skipped — no active mpv");
-        Ok(())
+        Err(PlayerError::Backend(format!(
+            "set_prop {name}: pas de libmpv/IPC (backend non supporté)"
+        )))
     }
 
     fn run_cmd(&self, args: &[&str]) -> Result<()> {
@@ -1089,7 +1299,9 @@ impl NativePlayer {
             };
         }
         warn!(%cmd, "run_cmd skipped — no active mpv");
-        Ok(())
+        Err(PlayerError::Backend(format!(
+            "run_cmd {cmd}: pas de libmpv/IPC (backend non supporté)"
+        )))
     }
 
     pub fn set_speed(&mut self, speed: f64) -> Result<()> {
@@ -1118,7 +1330,20 @@ impl NativePlayer {
 
     pub fn screenshot_to(&mut self, path: &str) -> Result<()> {
         info!(%path, "NativePlayer::screenshot");
-        self.run_cmd(&["screenshot-to-file", path, "video"])
+        #[cfg(all(feature = "native-mpv", fluxplay_has_libmpv))]
+        if self.libmpv.is_some() {
+            return self.run_cmd(&["screenshot-to-file", path, "video"]);
+        }
+        if self.ipc_path.is_some() {
+            return self.run_cmd(&["screenshot-to-file", path, "video"]);
+        }
+        // Soft embed: app writes PNG from last_soft_rgba when this error is seen.
+        if self.last_soft_rgba.is_some() {
+            return Err(PlayerError::Backend("SOFT_RGBA".into()));
+        }
+        Err(PlayerError::Backend(
+            "screenshot: pas de libmpv/IPC ni frame soft".into(),
+        ))
     }
 
     pub fn seek_absolute(&mut self, secs: f64) -> Result<()> {
@@ -1318,7 +1543,10 @@ impl NativePlayer {
         // Android NativeActivity: OpenSLES audio; soft RGBA present (vo=libmpv).
         #[cfg(target_os = "android")]
         {
-            soft_set(&mpv, "ao", "opensles");
+            // Hard-require OpenSLES — soft_set hid silent audio death on media-kit builds.
+            mpv.set_option("ao", "opensles").map_err(|e| {
+                PlayerError::Backend(format!("{e} — ao=opensles requis sur Android"))
+            })?;
             soft_set(&mpv, "audio-device", "auto");
         }
         soft_set(
@@ -1347,18 +1575,8 @@ impl NativePlayer {
         }
 
         if self.opts.hwdec {
-            #[cfg(target_os = "android")]
-            {
-                // media-kit: MediaCodec → system RAM for vo=libmpv SW present.
-                soft_set(&mpv, "hwdec", "mediacodec-copy");
-                soft_set(&mpv, "hwdec-codecs", "all");
-            }
-            #[cfg(not(target_os = "android"))]
-            {
-                // Homebrew libmpv often lacks NVDEC; auto-copy still helps on VAAPI builds.
-                soft_set(&mpv, "hwdec", "auto-copy");
-                soft_set(&mpv, "hwdec-codecs", "all");
-            }
+            soft_set(&mpv, "hwdec", preferred_hwdec());
+            soft_set(&mpv, "hwdec-codecs", "all");
         } else {
             soft_set(&mpv, "hwdec", "no");
         }
@@ -1510,7 +1728,7 @@ impl NativePlayer {
         }
 
         if self.opts.hwdec {
-            args.push("--hwdec=auto-safe".into());
+            args.push(format!("--hwdec={}", preferred_hwdec()));
         } else {
             args.push("--hwdec=no".into());
         }
@@ -1608,7 +1826,9 @@ impl NativePlayer {
             url,
             self.opts.user_agent.as_deref(),
             self.opts.referer.as_deref(),
+            self.opts.http_proxy.as_deref(),
             self.opts.low_latency,
+            self.opts.hwdec,
         )?;
         ff.set_volume(self.opts.volume);
         if let Some(rect) = self.video_rect.filter(|r| r.is_usable()) {
@@ -1666,6 +1886,9 @@ impl NativePlayer {
             if let Some(ref_r) = &self.opts.referer {
                 cmd.arg("-headers").arg(format!("Referer: {ref_r}\r\n"));
             }
+            if let Some(proxy) = &self.opts.http_proxy {
+                cmd.arg("-http_proxy").arg(proxy);
+            }
 
             // Probe room for HEVC IPTV / VOD (before -i).
             cmd.arg("-probesize").arg("8M");
@@ -1681,11 +1904,12 @@ impl NativePlayer {
                 let mpeg_ts = looks_like_mpeg_ts(url);
                 let is_hls = url.to_ascii_lowercase().contains(".m3u8");
                 if self.opts.low_latency && !mpeg_ts && !is_hls {
-                    cmd.arg("-fflags").arg("nobuffer");
+                    cmd.arg("-fflags").arg("+genpts+discardcorrupt+nobuffer");
                     cmd.arg("-flags").arg("low_delay");
                     cmd.arg("-framedrop");
                 } else {
                     // Sync video to audio (not external clock) so sound stays audible/locked.
+                    cmd.arg("-fflags").arg("+genpts+discardcorrupt");
                     cmd.arg("-sync").arg("audio");
                 }
                 // HTTP reconnect (input options; ignored if unsupported).
@@ -1732,6 +1956,7 @@ impl NativePlayer {
 
         self.child = Some(child);
         self.ffplay_muted = false;
+        self.ffplay_paused = false;
         info!(
             %endpoint,
             %bin,
@@ -1790,6 +2015,37 @@ fn ffplay_send_key(key: &str) {
 fn mpv_get_number(ipc: &Path, prop: &str) -> Option<f64> {
     let cmd = serde_json::json!({ "command": ["get_property", prop] });
     let line = format!("{cmd}\n");
+    mpv_ipc_data(ipc, &line).and_then(|d| {
+        d.as_f64()
+            .or_else(|| d.as_i64().map(|i| i as f64))
+            .or_else(|| d.as_bool().map(|b| if b { 1.0 } else { 0.0 }))
+    })
+}
+
+fn mpv_get_bool(ipc: &Path, prop: &str) -> Option<bool> {
+    let cmd = serde_json::json!({ "command": ["get_property", prop] });
+    let line = format!("{cmd}\n");
+    mpv_ipc_data(ipc, &line).and_then(|d| {
+        d.as_bool()
+            .or_else(|| d.as_f64().map(|n| n >= 0.5))
+            .or_else(|| {
+                d.as_str()
+                    .map(|s| s == "yes" || s == "true" || s == "1")
+            })
+    })
+}
+
+fn mpv_get_string(ipc: &Path, prop: &str) -> Option<String> {
+    let cmd = serde_json::json!({ "command": ["get_property", prop] });
+    let line = format!("{cmd}\n");
+    mpv_ipc_data(ipc, &line).and_then(|d| {
+        d.as_str()
+            .map(|s| s.to_string())
+            .or_else(|| d.as_f64().map(|n| n.to_string()))
+    })
+}
+
+fn mpv_ipc_data(ipc: &Path, line: &str) -> Option<serde_json::Value> {
     #[cfg(unix)]
     {
         use std::io::Read;
@@ -1801,8 +2057,8 @@ fn mpv_get_number(ipc: &Path, prop: &str) -> Option<f64> {
         let _ = stream.read_to_string(&mut buf);
         for raw in buf.lines() {
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(raw) {
-                if let Some(n) = v.get("data").and_then(|d| d.as_f64()) {
-                    return Some(n);
+                if let Some(data) = v.get("data") {
+                    return Some(data.clone());
                 }
             }
         }

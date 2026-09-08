@@ -8,7 +8,7 @@ use iced::widget::image::Handle;
 use iced::{
     Alignment, Background, Border, Color, Element, Fill, Length, Padding, Theme,
 };
-use fluxplay_player::{PlaybackState, StreamSession};
+use fluxplay_player::{BackendCaps, PlaybackState, StreamSession};
 
 use crate::theme::{
     elevation_shadow, radius_dock, radius_fab, stage_black, UiTheme, FAB_MEDIUM, LOADING_SIZE,
@@ -50,6 +50,7 @@ pub struct PlayerChrome<'a> {
     /// libmpv / libav* software-render embeds frames in iced; CLI fallback uses an OS window.
     pub embedded_video: bool,
     pub backend_label: &'a str,
+    pub caps: BackendCaps,
 }
 
 pub fn player_window(p: PlayerChrome<'_>) -> Element<'_, Message> {
@@ -290,11 +291,15 @@ fn control_dock<'a>(p: &PlayerChrome<'a>, chrome_alpha: f32) -> Element<'a, Mess
     let active = p.active;
     let paused = s.state == PlaybackState::Paused || s.state == PlaybackState::Idle;
     let play_glyph = if paused { Icon::Play } else { Icon::Pause };
-    let can_seek = active && !live;
+    let can_seek = active && !live && p.caps.seek_abs;
+    let can_seek_rel = active && !live && p.caps.seek_rel;
     let mute_glyph = if s.muted { Icon::VolumeOff } else { Icon::VolumeUp };
     let progress = s.progress_ratio();
     let time_label = s.elapsed_label();
     let vol = if s.muted { 0.0 } else { s.volume };
+    let vol_enabled = active && p.caps.volume_live;
+    let mute_enabled = active && p.caps.mute;
+    let pause_enabled = active && p.caps.pause;
     let on_tb = ui.on_primary_container();
     let primary = ui.primary();
     let alpha = chrome_alpha.clamp(0.0, 1.0);
@@ -319,6 +324,25 @@ fn control_dock<'a>(p: &PlayerChrome<'a>, chrome_alpha: f32) -> Element<'a, Mess
             text(format!("●  Direct · {time_label}"))
                 .size(TYPE_LABEL_L)
                 .color(ui.on_error_container()),
+        )
+        .width(Fill)
+        .height(Length::Fixed(SLIDER_S_HEIGHT))
+        .center_y(Fill)
+        .into()
+    } else if !p.caps.seek_abs {
+        container(
+            text(if p.caps.times {
+                time_label.clone()
+            } else {
+                format!("Lecture · {}", p.backend_label)
+            })
+            .size(TYPE_LABEL_L)
+            .color(Color::from_rgba(
+                ui.inverse_on_surface().r,
+                ui.inverse_on_surface().g,
+                ui.inverse_on_surface().b,
+                0.75,
+            )),
         )
         .width(Fill)
         .height(Length::Fixed(SLIDER_S_HEIGHT))
@@ -374,9 +398,9 @@ fn control_dock<'a>(p: &PlayerChrome<'a>, chrome_alpha: f32) -> Element<'a, Mess
     // Connected transport segment (−10 | Play FAB | +10), gap 0, shared soft shell.
     let transport = container(
         row![
-            toolbar_svg(ui, Icon::Replay10, Message::SeekRel(-10), can_seek, false),
-            play_fab(ui, play_glyph, Message::TogglePause, active),
-            toolbar_svg(ui, Icon::Forward10, Message::SeekRel(10), can_seek, false),
+            toolbar_svg(ui, Icon::Replay10, Message::SeekRel(-10), can_seek_rel, false),
+            play_fab(ui, play_glyph, Message::TogglePause, pause_enabled),
+            toolbar_svg(ui, Icon::Forward10, Message::SeekRel(10), can_seek_rel, false),
         ]
         .spacing(0)
         .align_y(Alignment::Center),
@@ -397,31 +421,43 @@ fn control_dock<'a>(p: &PlayerChrome<'a>, chrome_alpha: f32) -> Element<'a, Mess
         ..Default::default()
     });
 
-    let left = row![
-        toolbar_svg(ui, mute_glyph, Message::ToggleMute, true, s.muted),
-        container(
-            slider(0.0..=1.0, vol, Message::VolumeChanged)
-                .step(0.01_f32)
-                .height(32.0)
-                .style(move |theme: &Theme, status| {
-                    let mut st = slider::default(theme, status);
-                    st.rail.backgrounds.0 = Background::Color(ui.primary());
-                    st.rail.backgrounds.1 = Background::Color(Color::from_rgba(
-                        on_tb.r,
-                        on_tb.g,
-                        on_tb.b,
-                        0.28,
-                    ));
-                    st.rail.width = 8.0;
-                    st.handle.background = Background::Color(on_tb);
-                    st.handle.shape = slider::HandleShape::Circle { radius: 6.0 };
-                    st
-                }),
-        )
-        .width(Length::Fixed(96.0)),
-    ]
-    .spacing(SPACE_SM)
-    .align_y(Alignment::Center);
+    let left = if vol_enabled {
+        row![
+            toolbar_svg(ui, mute_glyph, Message::ToggleMute, mute_enabled, s.muted),
+            container(
+                slider(0.0..=1.0, vol, Message::VolumeChanged)
+                    .step(0.01_f32)
+                    .height(32.0)
+                    .style(move |theme: &Theme, status| {
+                        let mut st = slider::default(theme, status);
+                        st.rail.backgrounds.0 = Background::Color(ui.primary());
+                        st.rail.backgrounds.1 = Background::Color(Color::from_rgba(
+                            on_tb.r,
+                            on_tb.g,
+                            on_tb.b,
+                            0.28,
+                        ));
+                        st.rail.width = 8.0;
+                        st.handle.background = Background::Color(on_tb);
+                        st.handle.shape = slider::HandleShape::Circle { radius: 6.0 };
+                        st
+                    }),
+            )
+            .width(Length::Fixed(96.0)),
+        ]
+        .spacing(SPACE_SM)
+        .align_y(Alignment::Center)
+    } else {
+        row![toolbar_svg(
+            ui,
+            mute_glyph,
+            Message::ToggleMute,
+            mute_enabled,
+            s.muted
+        )]
+        .spacing(SPACE_SM)
+        .align_y(Alignment::Center)
+    };
 
     let right = row![
         toolbar_svg(
@@ -573,31 +609,66 @@ fn more_sheet<'a>(p: &PlayerChrome<'a>) -> Element<'a, Message> {
         .align_y(Alignment::Center),
         hdr("Lecture"),
         chip_row(vec![
-            chip_btn(ui, &speed, Message::CycleSpeed, active),
-            chip_btn(ui, loop_l, Message::ToggleLoop, active),
-            chip_btn(ui, "Capture d’écran", Message::Screenshot, active),
+            chip_btn(ui, &speed, Message::CycleSpeed, active && p.caps.speed_loop),
+            chip_btn(ui, loop_l, Message::ToggleLoop, active && p.caps.speed_loop),
+            chip_btn(
+                ui,
+                "Capture d’écran",
+                Message::Screenshot,
+                active && p.caps.screenshot,
+            ),
             chip_btn(
                 ui,
                 "Aller à un timecode…",
                 Message::PlayerPanel(PlayerPanel::Goto),
-                active && !s.is_live(),
+                active && !s.is_live() && p.caps.seek_abs,
             ),
-            chip_btn(ui, "Reprendre depuis le début", Message::RestartStream, active),
-            chip_btn(ui, "Stop", Message::Stop, active),
+            chip_btn(
+                ui,
+                "Reprendre depuis le début",
+                Message::RestartStream,
+                active && p.caps.owned,
+            ),
+            chip_btn(ui, "Stop", Message::Stop, active && p.caps.owned),
         ]),
         hdr("Pistes audio / sous-titres / format"),
         chip_row(vec![
-            chip_btn(ui, "Piste audio suivante", Message::CycleAudio, active),
-            chip_btn(ui, "Piste sous-titres suivante", Message::CycleSubtitles, active),
-            chip_btn(ui, "Afficher / masquer sous-titres", Message::ToggleSubVisibility, active),
-            chip_btn(ui, s.aspect.label(), Message::CycleAspect, active),
+            chip_btn(
+                ui,
+                "Piste audio suivante",
+                Message::CycleAudio,
+                active && p.caps.tracks_filters,
+            ),
+            chip_btn(
+                ui,
+                "Piste sous-titres suivante",
+                Message::CycleSubtitles,
+                active && p.caps.tracks_filters,
+            ),
+            chip_btn(
+                ui,
+                "Afficher / masquer sous-titres",
+                Message::ToggleSubVisibility,
+                active && p.caps.tracks_filters,
+            ),
+            chip_btn(
+                ui,
+                s.aspect.label(),
+                Message::CycleAspect,
+                active && p.caps.tracks_filters,
+            ),
         ]),
         hdr("Fenêtre"),
         chip_row({
             let mut chips = Vec::new();
             #[cfg(not(target_os = "android"))]
             {
-                chips.push(chip_btn(ui, ontop_l, Message::ToggleOntop, true));
+                chips.push(chip_btn(
+                    ui,
+                    ontop_l,
+                    Message::ToggleOntop,
+                    active && p.caps.tracks_filters,
+                ));
             }
             chips.push(chip_btn(ui, pip_l, Message::TogglePip, true));
             chips.push(chip_btn(ui, fs_l, Message::ToggleFullscreen, true));
@@ -611,17 +682,32 @@ fn more_sheet<'a>(p: &PlayerChrome<'a>) -> Element<'a, Message> {
         }),
         hdr("Navigation & outils"),
         chip_row(vec![
-            chip_btn(ui, "Chapitre précédent", Message::ChapterStep(-1), active && !s.is_live()),
-            chip_btn(ui, "Chapitre suivant", Message::ChapterStep(1), active && !s.is_live()),
+            chip_btn(
+                ui,
+                "Chapitre précédent",
+                Message::ChapterStep(-1),
+                active && !s.is_live() && p.caps.tracks_filters,
+            ),
+            chip_btn(
+                ui,
+                "Chapitre suivant",
+                Message::ChapterStep(1),
+                active && !s.is_live() && p.caps.tracks_filters,
+            ),
             chip_btn(ui, "Chaîne / piste précédente", Message::PlaylistPrev, true),
             chip_btn(ui, "Chaîne / piste suivante", Message::PlaylistNext, true),
-            chip_btn(ui, "Ajouter un signet", Message::AddBookmark, active && !s.is_live()),
+            chip_btn(
+                ui,
+                "Ajouter un signet",
+                Message::AddBookmark,
+                active && !s.is_live() && p.caps.times,
+            ),
             chip_btn(ui, &sleep_l, Message::CycleSleepTimer, true),
             chip_btn(
                 ui,
                 "Paramètres image & audio…",
                 Message::PlayerPanel(PlayerPanel::Advanced),
-                true,
+                active && p.caps.tracks_filters,
             ),
             chip_btn(ui, "Changer le thème UI", Message::CycleTheme, true),
             chip_btn(ui, "Fermer le lecteur", Message::ClosePlayerWindow, true),
@@ -639,7 +725,7 @@ fn more_sheet<'a>(p: &PlayerChrome<'a>) -> Element<'a, Message> {
 fn advanced_sheet<'a>(p: &PlayerChrome<'a>) -> Element<'a, Message> {
     let ui = p.ui;
     let s = p.session;
-    let active = p.active;
+    let active = p.active && p.caps.tracks_filters;
     let ab = match (s.ab_a, s.ab_b) {
         (Some(a), Some(b)) => format!("Boucle A–B : {:.0}s → {:.0}s", a, b),
         (Some(a), None) => format!("Point A = {:.0}s — définir B", a),
@@ -755,14 +841,14 @@ fn bookmarks_row<'a>(p: &PlayerChrome<'a>) -> Element<'a, Message> {
         ui,
         "Ajouter ici",
         Message::AddBookmark,
-        active && !p.session.is_live(),
+        active && !p.session.is_live() && p.caps.times,
     ));
     for (i, b) in p.session.bookmarks.iter().enumerate().take(6) {
         chips.push(chip_btn(
             ui,
             &format!("Aller à {}", b.label),
             Message::JumpBookmark(i),
-            active,
+            active && p.caps.seek_abs,
         ));
     }
     chip_row(chips)

@@ -322,6 +322,29 @@ impl StreamSession {
         self.native.has_embedded_video()
     }
 
+    pub fn caps(&self) -> crate::BackendCaps {
+        self.native.caps()
+    }
+
+    pub fn backend_display_label(&self) -> &'static str {
+        self.native.display_label()
+    }
+
+    /// Sync Playing ↔ Buffering from mpv cache-pause (no-op for other backends).
+    pub fn refresh_buffering_state(&mut self) {
+        if !matches!(
+            self.state,
+            PlaybackState::Playing | PlaybackState::Buffering
+        ) {
+            return;
+        }
+        if self.native.paused_for_cache() {
+            self.state = PlaybackState::Buffering;
+        } else if self.state == PlaybackState::Buffering {
+            self.state = PlaybackState::Playing;
+        }
+    }
+
     pub fn is_live(&self) -> bool {
         self.channel
             .as_ref()
@@ -389,18 +412,25 @@ impl StreamSession {
     }
 
     pub fn pause(&mut self) {
-        if self.state == PlaybackState::Playing {
+        if matches!(
+            self.state,
+            PlaybackState::Playing | PlaybackState::Buffering
+        ) {
             debug!("StreamSession::pause");
-            let _ = self.native.pause(true);
-            self.state = PlaybackState::Paused;
+            match self.native.pause(true) {
+                Ok(()) => self.state = PlaybackState::Paused,
+                Err(e) => warn!(error = %e, "StreamSession::pause failed"),
+            }
         }
     }
 
     pub fn resume(&mut self) {
         if self.state == PlaybackState::Paused {
             debug!("StreamSession::resume");
-            let _ = self.native.pause(false);
-            self.state = PlaybackState::Playing;
+            match self.native.pause(false) {
+                Ok(()) => self.state = PlaybackState::Playing,
+                Err(e) => warn!(error = %e, "StreamSession::resume failed"),
+            }
         }
     }
 
@@ -421,19 +451,37 @@ impl StreamSession {
     }
 
     pub fn toggle_mute(&mut self) {
-        self.muted = !self.muted;
-        debug!(muted = self.muted, "StreamSession::toggle_mute");
-        let _ = self.native.set_mute(self.muted);
-        if !self.muted {
-            let _ = self.native.set_volume(self.volume);
+        let next = !self.muted;
+        debug!(muted = next, "StreamSession::toggle_mute");
+        match self.native.set_mute(next) {
+            Ok(()) => {
+                self.muted = next;
+                if !next {
+                    let _ = self.native.set_volume(self.volume);
+                }
+            }
+            Err(e) => warn!(error = %e, "toggle_mute failed"),
         }
     }
 
     pub fn set_volume(&mut self, vol: f32) {
-        self.volume = vol.clamp(0.0, 1.0);
-        debug!(volume = self.volume, "StreamSession::set_volume");
+        let next = vol.clamp(0.0, 1.0);
+        debug!(volume = next, "StreamSession::set_volume");
+        if self.muted && next > 0.0 {
+            match self.native.set_mute(false) {
+                Ok(()) => self.muted = false,
+                Err(e) => {
+                    warn!(error = %e, "unmute via volume failed");
+                    return;
+                }
+            }
+        }
+        // Always remember preferred volume for next open.
+        self.volume = next;
         if !self.muted {
-            let _ = self.native.set_volume(self.volume);
+            if let Err(e) = self.native.set_volume(self.volume) {
+                warn!(error = %e, "set_volume native failed");
+            }
         }
     }
 
@@ -494,26 +542,48 @@ impl StreamSession {
         let _ = self.native.toggle_fullscreen();
     }
 
-    pub fn cycle_audio(&mut self) {
+    pub fn cycle_audio(&mut self) -> bool {
         debug!("StreamSession::cycle_audio");
-        let _ = self.native.cycle_audio();
+        match self.native.cycle_audio() {
+            Ok(()) => true,
+            Err(e) => {
+                warn!(error = %e, "cycle_audio failed");
+                false
+            }
+        }
     }
 
-    pub fn cycle_subtitles(&mut self) {
+    pub fn cycle_subtitles(&mut self) -> bool {
         debug!("StreamSession::cycle_subtitles");
-        let _ = self.native.cycle_subtitles();
+        match self.native.cycle_subtitles() {
+            Ok(()) => true,
+            Err(e) => {
+                warn!(error = %e, "cycle_subtitles failed");
+                false
+            }
+        }
     }
 
-    pub fn frame_step(&mut self) {
-        if self.state == PlaybackState::Paused {
-            trace!("StreamSession::frame_step");
-            let _ = self.native.frame_step();
+    pub fn frame_step(&mut self) -> bool {
+        if self.state != PlaybackState::Paused {
+            return false;
+        }
+        trace!("StreamSession::frame_step");
+        match self.native.frame_step() {
+            Ok(()) => true,
+            Err(e) => {
+                warn!(error = %e, "frame_step failed");
+                false
+            }
         }
     }
 
     pub fn set_speed(&mut self, speed: f64) {
-        self.speed = speed.clamp(0.25, 3.0);
-        let _ = self.native.set_speed(self.speed);
+        let next = speed.clamp(0.25, 3.0);
+        match self.native.set_speed(next) {
+            Ok(()) => self.speed = next,
+            Err(e) => warn!(error = %e, speed = next, "set_speed unsupported"),
+        }
     }
 
     pub fn cycle_speed(&mut self) {
@@ -528,26 +598,55 @@ impl StreamSession {
     }
 
     pub fn toggle_loop(&mut self) {
-        self.loop_file = !self.loop_file;
-        let _ = self.native.set_loop_file(self.loop_file);
+        let next = !self.loop_file;
+        match self.native.set_loop_file(next) {
+            Ok(()) => self.loop_file = next,
+            Err(e) => warn!(error = %e, "toggle_loop unsupported"),
+        }
     }
 
-    pub fn mark_ab_a(&mut self) {
+    pub fn mark_ab_a(&mut self) -> bool {
         self.refresh_times();
-        self.ab_a = Some(self.position_secs);
-        let _ = self.native.set_ab_loop(self.ab_a, self.ab_b);
+        let a = Some(self.position_secs);
+        match self.native.set_ab_loop(a, self.ab_b) {
+            Ok(()) => {
+                self.ab_a = a;
+                true
+            }
+            Err(e) => {
+                warn!(error = %e, "mark_ab_a unsupported");
+                false
+            }
+        }
     }
 
-    pub fn mark_ab_b(&mut self) {
+    pub fn mark_ab_b(&mut self) -> bool {
         self.refresh_times();
-        self.ab_b = Some(self.position_secs);
-        let _ = self.native.set_ab_loop(self.ab_a, self.ab_b);
+        let b = Some(self.position_secs);
+        match self.native.set_ab_loop(self.ab_a, b) {
+            Ok(()) => {
+                self.ab_b = b;
+                true
+            }
+            Err(e) => {
+                warn!(error = %e, "mark_ab_b unsupported");
+                false
+            }
+        }
     }
 
-    pub fn clear_ab_loop(&mut self) {
-        self.ab_a = None;
-        self.ab_b = None;
-        let _ = self.native.set_ab_loop(None, None);
+    pub fn clear_ab_loop(&mut self) -> bool {
+        match self.native.set_ab_loop(None, None) {
+            Ok(()) => {
+                self.ab_a = None;
+                self.ab_b = None;
+                true
+            }
+            Err(e) => {
+                warn!(error = %e, "clear_ab_loop unsupported");
+                false
+            }
+        }
     }
 
     pub fn seek_absolute(&mut self, secs: f64) {
@@ -580,31 +679,45 @@ impl StreamSession {
     }
 
     pub fn nudge_sub_delay(&mut self, delta: f64) {
-        self.sub_delay = (self.sub_delay + delta).clamp(-10.0, 10.0);
-        let _ = self.native.set_sub_delay(self.sub_delay);
+        let next = (self.sub_delay + delta).clamp(-10.0, 10.0);
+        match self.native.set_sub_delay(next) {
+            Ok(()) => self.sub_delay = next,
+            Err(e) => warn!(error = %e, "sub_delay unsupported"),
+        }
     }
 
     pub fn nudge_audio_delay(&mut self, delta: f64) {
-        self.audio_delay = (self.audio_delay + delta).clamp(-10.0, 10.0);
-        let _ = self.native.set_audio_delay(self.audio_delay);
+        let next = (self.audio_delay + delta).clamp(-10.0, 10.0);
+        match self.native.set_audio_delay(next) {
+            Ok(()) => self.audio_delay = next,
+            Err(e) => warn!(error = %e, "audio_delay unsupported"),
+        }
     }
 
     pub fn cycle_audio_mode(&mut self) {
-        self.audio_mode = self.audio_mode.cycle();
-        let _ = self.native.set_audio_channels(self.audio_mode.mpv_value());
+        let next = self.audio_mode.cycle();
+        match self.native.set_audio_channels(next.mpv_value()) {
+            Ok(()) => self.audio_mode = next,
+            Err(e) => warn!(error = %e, "audio_mode unsupported"),
+        }
     }
 
     pub fn cycle_eq(&mut self) {
+        let prev = self.eq_preset;
         self.eq_preset = self.eq_preset.cycle();
-        self.apply_af();
+        if self.apply_af().is_err() {
+            self.eq_preset = prev;
+        }
     }
 
     pub fn toggle_loudnorm(&mut self) {
         self.loudnorm = !self.loudnorm;
-        self.apply_af();
+        if self.apply_af().is_err() {
+            self.loudnorm = !self.loudnorm;
+        }
     }
 
-    fn apply_af(&mut self) {
+    fn apply_af(&mut self) -> Result<(), ()> {
         let mut parts = Vec::new();
         let eq = self.eq_preset.af();
         if !eq.is_empty() {
@@ -614,92 +727,130 @@ impl StreamSession {
             parts.push("lavfi=[dynaudnorm=f=150:g=15]".into());
         }
         let af = parts.join(",");
-        let _ = self.native.set_af(&af);
+        match self.native.set_af(&af) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                warn!(error = %e, "set_af unsupported");
+                Err(())
+            }
+        }
     }
 
     pub fn toggle_deinterlace(&mut self) {
-        self.deinterlace = self.deinterlace.cycle();
-        info!(mode = self.deinterlace.label(), "StreamSession::deinterlace");
-        if let Err(e) = self.native.set_deinterlace_mode(self.deinterlace.mpv_value()) {
-            warn!(error = %e, "deinterlace failed");
+        let next = self.deinterlace.cycle();
+        info!(mode = next.label(), "StreamSession::deinterlace");
+        match self.native.set_deinterlace_mode(next.mpv_value()) {
+            Ok(()) => self.deinterlace = next,
+            Err(e) => warn!(error = %e, "deinterlace failed"),
         }
     }
 
     pub fn cycle_upscale(&mut self) {
-        self.upscale = self.upscale.cycle();
-        info!(mode = self.upscale.label(), "StreamSession::upscale");
-        if let Err(e) = self.native.set_scale(self.upscale.mpv_scale()) {
-            warn!(error = %e, "upscale/scale failed");
+        let next = self.upscale.cycle();
+        info!(mode = next.label(), "StreamSession::upscale");
+        match self.native.set_scale(next.mpv_scale()) {
+            Ok(()) => self.upscale = next,
+            Err(e) => warn!(error = %e, "upscale/scale failed"),
         }
     }
 
     pub fn cycle_rotate(&mut self) {
-        self.rotate_deg = match self.rotate_deg {
+        let next = match self.rotate_deg {
             0 => 90,
             90 => 180,
             180 => 270,
             _ => 0,
         };
-        info!(deg = self.rotate_deg, "StreamSession::rotate");
-        if let Err(e) = self.native.set_video_rotate(self.rotate_deg) {
-            warn!(error = %e, "rotate failed");
+        info!(deg = next, "StreamSession::rotate");
+        match self.native.set_video_rotate(next) {
+            Ok(()) => self.rotate_deg = next,
+            Err(e) => warn!(error = %e, "rotate failed"),
         }
     }
 
     pub fn nudge_zoom(&mut self, delta: f64) {
-        self.zoom = (self.zoom + delta).clamp(-1.5, 1.5);
-        info!(zoom = self.zoom, "StreamSession::zoom");
-        if let Err(e) = self.native.set_video_zoom(self.zoom) {
-            warn!(error = %e, "zoom failed");
+        let next = (self.zoom + delta).clamp(-1.5, 1.5);
+        info!(zoom = next, "StreamSession::zoom");
+        match self.native.set_video_zoom(next) {
+            Ok(()) => self.zoom = next,
+            Err(e) => warn!(error = %e, "zoom failed"),
         }
     }
 
-    pub fn cycle_aspect(&mut self) {
-        self.aspect = self.aspect.cycle();
-        info!(aspect = self.aspect.label(), "StreamSession::aspect");
-        if let Err(e) = self.native.set_aspect(self.aspect.mpv_value()) {
-            warn!(error = %e, "aspect failed");
+    pub fn cycle_aspect(&mut self) -> bool {
+        let next = self.aspect.cycle();
+        info!(aspect = next.label(), "StreamSession::aspect");
+        match self.native.set_aspect(next.mpv_value()) {
+            Ok(()) => {
+                self.aspect = next;
+                true
+            }
+            Err(e) => {
+                warn!(error = %e, "aspect failed");
+                false
+            }
         }
     }
 
     pub fn toggle_ontop(&mut self) {
-        self.ontop = !self.ontop;
-        info!(ontop = self.ontop, "StreamSession::ontop (mpv prop; iced window handled by UI)");
-        let _ = self.native.set_ontop(self.ontop);
+        let next = !self.ontop;
+        info!(ontop = next, "StreamSession::ontop (mpv prop; iced window handled by UI)");
+        match self.native.set_ontop(next) {
+            Ok(()) => self.ontop = next,
+            Err(e) => warn!(error = %e, "ontop unsupported"),
+        }
     }
 
     pub fn toggle_night_vf(&mut self) {
         self.night_vf = !self.night_vf;
         info!(night = self.night_vf, "StreamSession::night_vf");
-        self.apply_video_filters();
+        if self.apply_video_filters().is_err() {
+            self.night_vf = !self.night_vf;
+        }
     }
 
-    fn apply_video_filters(&mut self) {
+    fn apply_video_filters(&mut self) -> Result<(), ()> {
         let mut parts = Vec::new();
         if self.night_vf {
             parts.push("eq=gamma=0.85:saturation=0.85:contrast=1.05");
         }
         let vf = parts.join(",");
-        if let Err(e) = self.native.set_vf(&vf) {
-            warn!(error = %e, vf = %vf, "set_vf failed");
+        match self.native.set_vf(&vf) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                warn!(error = %e, vf = %vf, "set_vf failed");
+                Err(())
+            }
         }
     }
 
-    pub fn toggle_sub_visibility(&mut self) {
+    pub fn toggle_sub_visibility(&mut self) -> bool {
         info!("StreamSession::toggle_sub_visibility");
-        if let Err(e) = self.native.toggle_sub_visibility() {
-            warn!(error = %e, "sub-visibility failed");
+        match self.native.toggle_sub_visibility() {
+            Ok(()) => true,
+            Err(e) => {
+                warn!(error = %e, "sub-visibility failed");
+                false
+            }
         }
     }
 
     pub fn screenshot_to_path(&mut self, path: &std::path::Path) -> bool {
         match self.native.screenshot_to(&path.to_string_lossy()) {
             Ok(()) => true,
+            Err(e) if e.to_string().contains("SOFT_RGBA") => false, // app soft-writes PNG
             Err(e) => {
                 warn!(error = %e, "screenshot failed");
                 false
             }
         }
+    }
+
+    /// Soft RGBA bytes for PNG capture when mpv screenshot is unavailable.
+    pub fn soft_rgba_snapshot(&self) -> Option<(u32, u32, Vec<u8>)> {
+        self.native
+            .last_soft_rgba()
+            .map(|(w, h, b)| (w, h, b.to_vec()))
     }
 
     pub fn refresh_times(&mut self) {
@@ -739,7 +890,6 @@ impl StreamSession {
     }
 
     pub fn status_line(&self) -> String {
-        let be = self.backend.map(|b| b.label()).unwrap_or("—");
         match (&self.state, &self.channel, &self.routed) {
             (PlaybackState::Idle, _, _) => "Prêt".into(),
             (PlaybackState::Opening, Some(ch), _) => format!("Ouverture — {}", ch.name),
@@ -748,9 +898,11 @@ impl StreamSession {
                 ch.name,
                 r.url.scheme.label(),
                 r.url.delivery.label(),
-                be
+                self.backend_display_label()
             ),
-            (PlaybackState::Paused, Some(ch), _) => format!("Pause — {} · {}", ch.name, be),
+            (PlaybackState::Paused, Some(ch), _) => {
+                format!("Pause — {} · {}", ch.name, self.backend_display_label())
+            }
             (PlaybackState::Buffering, Some(ch), _) => format!("Buffer — {}", ch.name),
             (PlaybackState::Error, _, _) => self
                 .error

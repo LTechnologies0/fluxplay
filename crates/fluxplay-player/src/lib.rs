@@ -21,7 +21,8 @@ use thiserror::Error;
 use tracing::{debug, info, trace, warn};
 
 pub use backend::{
-    detect_backends, BackendId, BackendInfo, NativePlayer, PlayOptions, PlayerEvent, VideoRect,
+    detect_backends, BackendCaps, BackendId, BackendInfo, NativePlayer, PlayOptions, PlayerEvent,
+    VideoRect,
 };
 pub use native_log::{
     ffmpeg_av_log_level, log_native_verbosity_banner, mpv_msg_level, mpv_verbose_log_path,

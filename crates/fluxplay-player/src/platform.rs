@@ -1,5 +1,7 @@
 //! Platform / target profiles for FluxPlay (desktop + mobile).
 
+use std::sync::OnceLock;
+
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, trace};
 
@@ -64,60 +66,66 @@ pub struct TargetProfile {
 }
 
 pub fn target_profile() -> TargetProfile {
-    let profile = match Platform::current() {
-        Platform::Linux => TargetProfile {
-            platform: Platform::Linux,
-            ui_shell: "iced (desktop)",
-            preferred_backends: &["mpv", "ffmpeg", "external"],
-            hw_accel: "vaapi / vulkan / cuda",
-            notes: "mpv embeds FFmpeg; VA-API for HW decode",
-        },
-        Platform::MacOs => TargetProfile {
-            platform: Platform::MacOs,
-            ui_shell: "iced (desktop)",
-            preferred_backends: &["mpv", "ffmpeg", "external"],
-            hw_accel: "videotoolbox",
-            notes: "mpv + VideoToolbox; IINA/mpv as external fallback",
-        },
-        Platform::Windows => TargetProfile {
-            platform: Platform::Windows,
-            ui_shell: "iced (desktop)",
-            preferred_backends: &["mpv", "ffmpeg", "external"],
-            hw_accel: "d3d11va / dxva2",
-            notes: "mpv + D3D11VA; bundle libmpv in installer",
-        },
-        Platform::Android => TargetProfile {
-            platform: Platform::Android,
-            ui_shell: "iced (same as desktop) + NativeActivity",
-            preferred_backends: &["mpv", "intent"],
-            hw_accel: "mediacodec-copy via libmpv (vo=libmpv soft present) / Intent fallback",
-            notes: "in-process libmpv (vendored NDK .so) → RGBA embed; ACTION_VIEW fallback",
-        },
-        Platform::Ios => TargetProfile {
-            platform: Platform::Ios,
-            ui_shell: "SwiftUI + fluxplay-ffi",
-            preferred_backends: &["avplayer"],
-            hw_accel: "VideoToolbox",
-            notes: "AVPlayer; Rust core via UniFFI",
-        },
-        Platform::Unknown => TargetProfile {
-            platform: Platform::Unknown,
-            ui_shell: "unknown",
-            preferred_backends: &["external"],
-            hw_accel: "none",
-            notes: "fallback open URL",
-        },
-    };
-    debug!(
-        platform = %profile.platform.label(),
-        ui = profile.ui_shell,
-        backends = ?profile.preferred_backends,
-        "target_profile"
-    );
-    info!(
-        platform = %profile.platform.label(),
-        preferred = profile.preferred_backends.first().copied().unwrap_or("external"),
-        "target profile ready"
-    );
-    profile
+    // Settings `view` calls this every redraw — cache + log once (was INFO spam).
+    static PROFILE: OnceLock<TargetProfile> = OnceLock::new();
+    PROFILE
+        .get_or_init(|| {
+            let profile = match Platform::current() {
+                Platform::Linux => TargetProfile {
+                    platform: Platform::Linux,
+                    ui_shell: "iced (desktop)",
+                    preferred_backends: &["mpv", "ffmpeg", "external"],
+                    hw_accel: "vaapi / vulkan / cuda",
+                    notes: "mpv embeds FFmpeg; VA-API for HW decode",
+                },
+                Platform::MacOs => TargetProfile {
+                    platform: Platform::MacOs,
+                    ui_shell: "iced (desktop)",
+                    preferred_backends: &["mpv", "ffmpeg", "external"],
+                    hw_accel: "videotoolbox",
+                    notes: "mpv + VideoToolbox; IINA/mpv as external fallback",
+                },
+                Platform::Windows => TargetProfile {
+                    platform: Platform::Windows,
+                    ui_shell: "iced (desktop)",
+                    preferred_backends: &["mpv", "ffmpeg", "external"],
+                    hw_accel: "d3d11va / dxva2",
+                    notes: "mpv + D3D11VA; bundle libmpv in installer",
+                },
+                Platform::Android => TargetProfile {
+                    platform: Platform::Android,
+                    ui_shell: "iced (same as desktop) + NativeActivity",
+                    preferred_backends: &["mpv", "intent"],
+                    hw_accel: "mediacodec-copy via libmpv (vo=libmpv soft present) / Intent fallback",
+                    notes: "in-process libmpv (vendored NDK .so) → RGBA embed; ACTION_VIEW fallback",
+                },
+                Platform::Ios => TargetProfile {
+                    platform: Platform::Ios,
+                    ui_shell: "SwiftUI + fluxplay-ffi",
+                    preferred_backends: &["avplayer"],
+                    hw_accel: "VideoToolbox",
+                    notes: "AVPlayer; Rust core via UniFFI",
+                },
+                Platform::Unknown => TargetProfile {
+                    platform: Platform::Unknown,
+                    ui_shell: "unknown",
+                    preferred_backends: &["external"],
+                    hw_accel: "none",
+                    notes: "fallback open URL",
+                },
+            };
+            debug!(
+                platform = %profile.platform.label(),
+                ui = profile.ui_shell,
+                backends = ?profile.preferred_backends,
+                "target_profile"
+            );
+            info!(
+                platform = %profile.platform.label(),
+                preferred = profile.preferred_backends.first().copied().unwrap_or("external"),
+                "target profile ready"
+            );
+            profile
+        })
+        .clone()
 }
