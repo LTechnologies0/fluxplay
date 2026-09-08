@@ -79,17 +79,16 @@ uses_cleartext_traffic = true
 # Java subclass (SAF / PiP / insets) — inject classes.dex via scripts/inject-android-java.sh
 has_code = true
 
-# cargo-apk does not expand ~ or $HOME in path. Machine-local debug keystore for local builds.
-# Prefer CI overrides: CARGO_APK_RELEASE_CI_KEYSTORE (+ _PASSWORD), or inject script
-# FLUXPLAY_ANDROID_KS / FLUXPLAY_ANDROID_KS_PASS / FLUXPLAY_ANDROID_KEY_ALIAS / FLUXPLAY_ANDROID_KEY_PASS.
+# cargo-apk does not expand ~ or $HOME. Use a crate-local keystore (gitignored);
+# scripts/build-android-apk.sh and CI ensure it exists before `cargo apk build`.
 [package.metadata.android.signing.release]
-path = "/home/user/.android/debug.keystore"
+path = "debug.keystore"
 keystore_password = "android"
 key_alias = "androiddebugkey"
 key_password = "android"
 
 [package.metadata.android.signing.release-ci]
-path = "/home/user/.android/debug.keystore"
+path = "debug.keystore"
 keystore_password = "android"
 key_alias = "androiddebugkey"
 key_password = "android"

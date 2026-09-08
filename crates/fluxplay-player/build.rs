@@ -196,7 +196,14 @@ fn setup_ffmpeg() {
             let _ = std::fs::remove_file(&dest);
             let src = lib_dir.join(spec);
             if src.is_file() {
-                let _ = std::os::unix::fs::symlink(&src, &dest);
+                #[cfg(unix)]
+                {
+                    let _ = std::os::unix::fs::symlink(&src, &dest);
+                }
+                #[cfg(not(unix))]
+                {
+                    let _ = std::fs::copy(&src, &dest);
+                }
             }
             println!("cargo:rustc-link-lib=dylib={short}");
         } else {

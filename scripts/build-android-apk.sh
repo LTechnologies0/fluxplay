@@ -8,6 +8,24 @@ export ANDROID_HOME="${ANDROID_HOME:-$HOME/Android/Sdk}"
 # Prefer ANDROID_HOME; some toolchains still read ANDROID_SDK_ROOT.
 export ANDROID_SDK_ROOT="${ANDROID_SDK_ROOT:-$ANDROID_HOME}"
 
+# cargo-apk signing path is crate-relative (see fluxplay-android Cargo.toml).
+KS_CRATE="$ROOT/crates/fluxplay-android/debug.keystore"
+if [[ ! -f "$KS_CRATE" ]]; then
+  mkdir -p "$HOME/.android"
+  if [[ -f "$HOME/.android/debug.keystore" ]]; then
+    cp -a "$HOME/.android/debug.keystore" "$KS_CRATE"
+  else
+    keytool -genkeypair -v \
+      -keystore "$KS_CRATE" \
+      -storepass android -alias androiddebugkey \
+      -keypass android -keyalg RSA -keysize 2048 -validity 10000 \
+      -dname "CN=Android Debug,O=Android,C=US"
+    cp -a "$KS_CRATE" "$HOME/.android/debug.keystore"
+  fi
+fi
+# Keep inject-script default ($HOME/.android/...) aligned when present.
+export FLUXPLAY_ANDROID_KS="${FLUXPLAY_ANDROID_KS:-$KS_CRATE}"
+
 cargo apk build -p fluxplay-android --profile release-ci "$@"
 
 APK=""

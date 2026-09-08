@@ -13,8 +13,11 @@ crates/fluxplay-player/vendor/ffmpeg-include/
 !.env.example
 *.pem
 *.key
+*.keystore
 credentials.json
 secrets/
+crates/fluxplay-android/debug.keystore
+
 
 # Local FluxPlay state may contain portal credentials
 **/state.json

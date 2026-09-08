@@ -50,6 +50,8 @@ jobs:
             bin: fluxplay.exe
             require_libmpv: "0"
     runs-on: ${{ matrix.os }}
+    # Intel macOS cross-build is flaky (host brew libmpv is arm64).
+    continue-on-error: ${{ matrix.target == 'x86_64-apple-darwin' }}
     steps:
       - uses: actions/checkout@v5
         with:
@@ -186,13 +188,15 @@ jobs:
 
   release:
     needs: [build, android-apk]
-    if: startsWith(github.ref, 'refs/tags/v')
+    # Publish whatever targets succeeded (matrix fail-fast=false; android is optional).
+    if: always() && startsWith(github.ref, 'refs/tags/v') && needs.build.result != 'cancelled'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
         with:
           path: artifacts
           merge-multiple: true
+        continue-on-error: true
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
