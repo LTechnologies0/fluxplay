@@ -113,95 +113,28 @@ pub fn open_url(url: &str, mime: Option<&str>) -> Result<(), String> {
     let mut env = vm.attach_current_thread().map_err(|e| e.to_string())?;
     clear_ex(&mut env);
 
-    let action = env
-        .new_string("android.intent.action.VIEW")
-        .map_err(|e| e.to_string())?;
+    let Some(cls) = fluxplay_activity_class(&mut env, context) else {
+        return Err("FluxPlayNativeActivity class missing".into());
+    };
     let url_j = env.new_string(url).map_err(|e| e.to_string())?;
-
-    let uri_class = env
-        .find_class("android/net/Uri")
-        .map_err(|e| {
-            clear_ex(&mut env);
-            e.to_string()
-        })?;
-    let uri = env
-        .call_static_method(
-            uri_class,
-            "parse",
-            "(Ljava/lang/String;)Landroid/net/Uri;",
-            &[JValue::Object(&url_j)],
-        )
-        .map_err(|e| {
-            clear_ex(&mut env);
-            e.to_string()
-        })?
-        .l()
+    let mime_j = env
+        .new_string(mime.unwrap_or(""))
         .map_err(|e| e.to_string())?;
-
-    let intent_class = env
-        .find_class("android/content/Intent")
-        .map_err(|e| {
-            clear_ex(&mut env);
-            e.to_string()
-        })?;
-    let intent = env
-        .new_object(
-            &intent_class,
-            "(Ljava/lang/String;Landroid/net/Uri;)V",
-            &[JValue::Object(&action), JValue::Object(&uri)],
-        )
-        .map_err(|e| {
-            clear_ex(&mut env);
-            e.to_string()
-        })?;
-
-    if let Some(mime_str) = mime {
-        let mime_j = env.new_string(mime_str).map_err(|e| e.to_string())?;
-        if env
-            .call_method(
-                &intent,
-                "setDataAndType",
-                "(Landroid/net/Uri;Ljava/lang/String;)Landroid/content/Intent;",
-                &[JValue::Object(&uri), JValue::Object(&mime_j)],
-            )
-            .is_err()
-        {
-            clear_ex(&mut env);
-        }
-    }
-
-    // NEW_TASK required when starting from Application context.
-    const FLAG_ACTIVITY_NEW_TASK: i32 = 0x1000_0000;
-    if env
-        .call_method(
-            &intent,
-            "addFlags",
-            "(I)Landroid/content/Intent;",
-            &[JValue::Int(FLAG_ACTIVITY_NEW_TASK)],
-        )
-        .is_err()
-    {
-        clear_ex(&mut env);
-    }
-
-    // Prefer Activity.startActivity via sInstance (static finishActivity-style helpers).
-    // FluxPlayNativeActivity has no openUrl helper — start from context with NEW_TASK.
-    let context_obj = unsafe { JObject::from_raw(context) };
-    match env.call_method(
-        &context_obj,
-        "startActivity",
-        "(Landroid/content/Intent;)V",
-        &[JValue::Object(&intent)],
+    match env.call_static_method(
+        cls,
+        "openUrl",
+        "(Ljava/lang/String;Ljava/lang/String;)V",
+        &[JValue::Object(&url_j), JValue::Object(&mime_j)],
     ) {
         Ok(_) => {
-            info!("startActivity ok");
+            info!("openUrl ok");
             Ok(())
         }
         Err(e) => {
             clear_ex(&mut env);
-            error!(error = %e, "startActivity failed");
+            error!(error = %e, "openUrl JNI failed");
             warn!("Install VLC / a video player if no handler is registered");
-            Err(format!("startActivity: {e}"))
+            Err(format!("openUrl: {e}"))
         }
     }
 }

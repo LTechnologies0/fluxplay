@@ -65,6 +65,8 @@ data = [
   { mime_type = "video/*" },
   { mime_type = "audio/*" },
   { mime_type = "*/*" },
+  { scheme = "https" },
+  { scheme = "http" },
 ]
 
 [[package.metadata.android.queries.intent]]

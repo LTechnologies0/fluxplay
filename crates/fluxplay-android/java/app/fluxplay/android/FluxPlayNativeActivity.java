@@ -69,6 +69,8 @@ public class FluxPlayNativeActivity extends NativeActivity {
     @Override
     protected void onDestroy() {
         if (sInstance == this) {
+            abandonAudioFocusInner();
+            writeAudioFocusFlag(false);
             sInstance = null;
         }
         super.onDestroy();
@@ -315,6 +317,27 @@ public class FluxPlayNativeActivity extends NativeActivity {
         a.runOnUiThread(a::finish);
     }
 
+    /** ACTION_VIEW from Activity UI thread (ndk_context is often Application). */
+    public static void openUrl(String url, String mime) {
+        FluxPlayNativeActivity a = sInstance;
+        if (a == null || url == null || url.isEmpty()) {
+            return;
+        }
+        final String u = url;
+        final String m = mime;
+        a.runOnUiThread(() -> {
+            try {
+                Intent intent = new Intent(Intent.ACTION_VIEW, Uri.parse(u));
+                if (m != null && !m.isEmpty()) {
+                    intent.setDataAndType(Uri.parse(u), m);
+                }
+                a.startActivity(intent);
+            } catch (Exception e) {
+                Log.e(TAG, "openUrl failed", e);
+            }
+        });
+    }
+
     public static void requestAudioFocus() {
         FluxPlayNativeActivity a = sInstance;
         if (a == null) {
@@ -339,16 +362,19 @@ public class FluxPlayNativeActivity extends NativeActivity {
             }
             if (audioFocusListener == null) {
                 audioFocusListener = focusChange -> {
-                    // Persist for Rust PlayerTick (pause on LOSS*, resume on GAIN).
-                    boolean lost = focusChange == AudioManager.AUDIOFOCUS_LOSS
-                            || focusChange == AudioManager.AUDIOFOCUS_LOSS_TRANSIENT
-                            || focusChange == AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK;
-                    writeAudioFocusFlag(!lost);
-                    if (lost) {
+                    if (focusChange == AudioManager.AUDIOFOCUS_LOSS
+                            || focusChange == AudioManager.AUDIOFOCUS_LOSS_TRANSIENT) {
+                        writeAudioFocusFlag(false);
                         Log.i(TAG, "audio focus lost: " + focusChange);
+                    } else if (focusChange == AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK) {
+                        // Keep held=true — Rust should not hard-pause for duck.
+                        Log.i(TAG, "audio focus duck");
+                    } else if (focusChange == AudioManager.AUDIOFOCUS_GAIN) {
+                        writeAudioFocusFlag(true);
                     }
                 };
             }
+            int granted;
             if (Build.VERSION.SDK_INT >= 26) {
                 if (audioFocusRequest == null) {
                     AudioAttributes attrs = new AudioAttributes.Builder()
@@ -360,14 +386,14 @@ public class FluxPlayNativeActivity extends NativeActivity {
                             .setOnAudioFocusChangeListener(audioFocusListener)
                             .build();
                 }
-                am.requestAudioFocus(audioFocusRequest);
+                granted = am.requestAudioFocus(audioFocusRequest);
             } else {
-                am.requestAudioFocus(
+                granted = am.requestAudioFocus(
                         audioFocusListener,
                         AudioManager.STREAM_MUSIC,
                         AudioManager.AUDIOFOCUS_GAIN);
             }
-            writeAudioFocusFlag(true);
+            writeAudioFocusFlag(granted == AudioManager.AUDIOFOCUS_REQUEST_GRANTED);
         } catch (Exception e) {
             Log.e(TAG, "requestAudioFocus failed", e);
         }

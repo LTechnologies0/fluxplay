@@ -367,36 +367,36 @@ pub fn system_insets_dp() -> (f32, f32, f32, f32) {
     let Some(cls) = fp_class_obj(&mut env, activity) else {
         return content_rect_insets_dp();
     };
-    let Ok(arr) = env.call_static_method(cls, "systemInsetsPx", "()[I", &[]) else {
-        clear_ex(&mut env);
-        return content_rect_insets_dp();
-    };
-    let Ok(obj) = arr.l() else {
-        clear_ex(&mut env);
-        return content_rect_insets_dp();
-    };
-    let jint_arr: jni::objects::JIntArray =
-        unsafe { jni::objects::JIntArray::from_raw(obj.into_raw()) };
-    let Ok(len) = env.get_array_length(&jint_arr) else {
-        clear_ex(&mut env);
-        return content_rect_insets_dp();
-    };
-    if len < 5 {
-        return content_rect_insets_dp();
+    // Nested attach on android_main never pops locals — frame the JNI call.
+    let read = env.with_local_frame(16, |env| -> Result<[i32; 5], jni::errors::Error> {
+        let arr = env.call_static_method(cls, "systemInsetsPx", "()[I", &[])?;
+        let obj = arr.l()?;
+        let jint_arr: jni::objects::JIntArray =
+            unsafe { jni::objects::JIntArray::from_raw(obj.into_raw()) };
+        let len = env.get_array_length(&jint_arr)?;
+        if len < 5 {
+            return Err(jni::errors::Error::JavaException);
+        }
+        let mut buf = [0i32; 5];
+        env.get_int_array_region(&jint_arr, 0, &mut buf)?;
+        Ok(buf)
+    });
+    match read {
+        Ok(buf) => {
+            let dpi = buf[4].max(120) as f32;
+            let scale = dpi / 160.0;
+            (
+                buf[0] as f32 / scale,
+                buf[1] as f32 / scale,
+                buf[2] as f32 / scale,
+                buf[3] as f32 / scale,
+            )
+        }
+        Err(_) => {
+            clear_ex(&mut env);
+            content_rect_insets_dp()
+        }
     }
-    let mut buf = [0i32; 5];
-    if env.get_int_array_region(&jint_arr, 0, &mut buf).is_err() {
-        clear_ex(&mut env);
-        return content_rect_insets_dp();
-    }
-    let dpi = buf[4].max(120) as f32;
-    let scale = dpi / 160.0;
-    (
-        buf[0] as f32 / scale,
-        buf[1] as f32 / scale,
-        buf[2] as f32 / scale,
-        buf[3] as f32 / scale,
-    )
 }
 
 fn content_rect_insets_dp() -> (f32, f32, f32, f32) {

@@ -484,8 +484,8 @@ fn which(bin: &str) -> Option<String> {
     // GUI launches often miss Homebrew / ~/.local in PATH.
     let mut candidates = Vec::new();
     if let Ok(path) = std::env::var("PATH") {
-        for dir in path.split(':') {
-            candidates.push(format!("{dir}/{bin}"));
+        for dir in std::env::split_paths(&path) {
+            candidates.push(dir.join(bin).display().to_string());
         }
     }
     if bin == "mpv" {

@@ -2417,15 +2417,19 @@ impl FluxPlay {
                     let fg = iced::android::is_foreground();
                     let in_pip = crate::android_bridge::poll_pip_mode();
                     self.pip_mode = in_pip;
-                    if let Some(false) = crate::android_bridge::poll_audio_focus_held() {
-                        if matches!(
-                            self.session.state,
-                            PlaybackState::Playing | PlaybackState::Buffering
-                        ) && !matches!(self.session.backend, Some(BackendId::External))
+                    if let Some(held) = crate::android_bridge::poll_audio_focus_held() {
+                        if !held
+                            && matches!(
+                                self.session.state,
+                                PlaybackState::Playing | PlaybackState::Buffering
+                            )
+                            && !matches!(self.session.backend, Some(BackendId::External))
                         {
                             self.session.pause();
                             self.status = "Pause — focus audio perdu".into();
                             self.audio_focus_held = false;
+                        } else if held {
+                            self.audio_focus_held = true;
                         }
                     }
                     if !fg && !self.lifecycle_paused && !in_pip {
@@ -2455,7 +2459,10 @@ impl FluxPlay {
                     if keep {
                         if !self.audio_focus_held {
                             crate::android_bridge::request_audio_focus();
-                            self.audio_focus_held = true;
+                            // Grant is async on UI thread — latch from flag when ready.
+                            if crate::android_bridge::poll_audio_focus_held() == Some(true) {
+                                self.audio_focus_held = true;
+                            }
                         }
                     } else if self.audio_focus_held
                         && matches!(
@@ -2676,7 +2683,9 @@ impl FluxPlay {
                         crate::android_bridge::enter_pip(w.max(1) as i32, h.max(1) as i32);
                         if !self.audio_focus_held {
                             crate::android_bridge::request_audio_focus();
-                            self.audio_focus_held = true;
+                            if crate::android_bridge::poll_audio_focus_held() == Some(true) {
+                                self.audio_focus_held = true;
+                            }
                         }
                         self.status = "PiP système".into();
                     } else {
