@@ -2,7 +2,6 @@
 //! plus optional CLI mpv/ffplay fallback.
 //! Inspired by IPTVnator embedded MPV and Kodi's FFmpeg pipeline.
 
-use std::io::Write;
 use std::net::Shutdown;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -119,7 +118,9 @@ impl BackendCaps {
 fn preferred_hwdec() -> &'static str {
     #[cfg(target_os = "android")]
     {
-        "mediacodec-copy"
+        // Soft RGBA embed: mediacodec-copy still does a full CPU blit into mpv SW render
+        // and has starved the NativeActivity thread (FocusEvent ANR on HOME). Prefer SW.
+        "no"
     }
     #[cfg(not(target_os = "android"))]
     {
@@ -1562,7 +1563,10 @@ impl NativePlayer {
         if let Some(level) = crate::native_log::mpv_msg_level() {
             let log_path = crate::native_log::mpv_verbose_log_path();
             soft_set(&mpv, "terminal", "yes");
-            soft_set(&mpv, "msg-level", level);
+            // Hard-set: soft_set can silently drop msg-level on media-kit.
+            if mpv.set_option("msg-level", level).is_err() {
+                soft_set(&mpv, "msg-level", level);
+            }
             soft_set(&mpv, "log-file", &log_path.to_string_lossy());
             info!(
                 msg_level = level,
@@ -1581,13 +1585,21 @@ impl NativePlayer {
         })?;
         soft_set(&mpv, "force-window", "no");
         soft_set(&mpv, "keep-open", "yes");
-        soft_set(&mpv, "ytdl", "no");
+        // media-kit Android omits ytdl/osc — skip to avoid soft_set DEBUG noise.
+        #[cfg(not(target_os = "android"))]
+        {
+            soft_set(&mpv, "ytdl", "no");
+            soft_set(&mpv, "osc", "no");
+        }
         soft_set(&mpv, "title", "FluxPlay");
-        soft_set(&mpv, "osc", "no");
         soft_set(&mpv, "osd-level", "0");
         soft_set(&mpv, "input-default-bindings", "no");
         soft_set(&mpv, "input-vo-keyboard", "no");
-        soft_set(&mpv, "video-timing-offset", "0");
+        // Soft present uploads async via iced — a zero offset races audio ahead of GPU.
+        // Hard-set: soft_set can silently skip on media-kit → A/V desync.
+        if mpv.set_option("video-timing-offset", "0.050").is_err() {
+            soft_set(&mpv, "video-timing-offset", "0.050");
+        }
         // Android NativeActivity: OpenSLES audio; soft RGBA present (vo=libmpv).
         #[cfg(target_os = "android")]
         {
@@ -1623,10 +1635,16 @@ impl NativePlayer {
         }
 
         if self.opts.hwdec {
-            soft_set(&mpv, "hwdec", preferred_hwdec());
-            soft_set(&mpv, "hwdec-codecs", "all");
+            let preferred = preferred_hwdec();
+            // Hard-set: soft_set hid silent mediacodec-copy failure → black video + audio.
+            if mpv.set_option("hwdec", preferred).is_err() {
+                warn!(%preferred, "hwdec preferred failed — falling back to software");
+                let _ = mpv.set_option("hwdec", "no");
+            } else if preferred != "no" {
+                soft_set(&mpv, "hwdec-codecs", "all");
+            }
         } else {
-            soft_set(&mpv, "hwdec", "no");
+            let _ = mpv.set_option("hwdec", "no");
         }
         // Fast filters for CPU soft-render path (stage already matches window size).
         soft_set(&mpv, "scale", "bilinear");
@@ -1635,14 +1653,18 @@ impl NativePlayer {
         soft_set(&mpv, "correct-downscaling", "no");
         soft_set(&mpv, "sigmoid-upscaling", "no");
         soft_set(&mpv, "interpolation", "no");
-        soft_set(&mpv, "video-sync", "audio");
-        soft_set(&mpv, "framedrop", "vo");
+        if mpv.set_option("video-sync", "audio").is_err() {
+            soft_set(&mpv, "video-sync", "audio");
+        }
+        if mpv.set_option("framedrop", "vo").is_err() {
+            soft_set(&mpv, "framedrop", "vo");
+        }
         soft_set(&mpv, "vd-lavc-threads", "0");
 
         if self.opts.low_latency && !mpeg_ts && !vod {
             soft_set(&mpv, "profile", "low-latency");
             soft_set(&mpv, "cache", "no");
-            soft_set(&mpv, "untimed", "yes");
+            // Do not set untimed=yes with soft/embedded VO — iced upload is async A/V.
         }
 
         if let Some(ua) = &self.opts.user_agent {
@@ -1657,12 +1679,15 @@ impl NativePlayer {
                 PlayerError::Backend(format!("http-proxy: {e} — tunnel would leak to clearnet"))
             })?;
             let _ = soft_set(&mpv, "ytdl-raw-options", &format!("proxy={safe}"));
+            // protocol_whitelist rejected on media-kit Android (code -7).
+            #[cfg(not(target_os = "android"))]
             let _ = soft_set(
                 &mpv,
                 "stream-lavf-o",
                 "protocol_whitelist=http,https,tcp,tls,rtmp,rtmps,rtsp,rtsps,rtp,udp,srt",
             );
         } else {
+            #[cfg(not(target_os = "android"))]
             let _ = soft_set(
                 &mpv,
                 "stream-lavf-o",
@@ -1701,7 +1726,21 @@ impl NativePlayer {
         // Desktop only: brief settle so hwdec-current is meaningful. Never sleep on
         // Android UI thread (ANR / frozen NativeActivity).
         #[cfg(not(target_os = "android"))]
-        std::thread::sleep(std::time::Duration::from_millis(200));
+        {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            let hw = mpv
+                .get_property_string("hwdec-current")
+                .unwrap_or_else(|| "none".into());
+            // After settle: if preferred never engaged, force software (avoid black soft VO).
+            if self.opts.hwdec
+                && (hw.is_empty()
+                    || hw.eq_ignore_ascii_case("no")
+                    || hw.eq_ignore_ascii_case("none"))
+            {
+                let _ = mpv.set_property("hwdec", "no");
+                warn!(%endpoint, "hwdec-current idle — forced software decode");
+            }
+        }
         let hw = mpv
             .get_property_string("hwdec-current")
             .unwrap_or_else(|| "none".into());

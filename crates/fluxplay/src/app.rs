@@ -33,6 +33,7 @@ use crate::display_caps::{DisplayCaps, DisplayProbe};
 use iced::event::{self, Event};
 use iced::keyboard::{self, Key, Modifiers};
 use iced::keyboard::key::Named;
+#[cfg(target_os = "android")]
 use std::sync::Mutex;
 
 #[cfg(target_os = "android")]
@@ -206,6 +207,9 @@ struct FluxPlay {
     /// Android AudioManager focus held (edge-trigger request/abandon).
     #[cfg(target_os = "android")]
     audio_focus_held: bool,
+    /// Why playback is paused — avoids abandoning focus after LOSS (stuck pause).
+    #[cfg(target_os = "android")]
+    pause_cause: PauseCause,
     player_panel: PlayerPanel,
     goto_draft: String,
     sleep_until: Option<std::time::Instant>,
@@ -295,6 +299,17 @@ struct FluxPlay {
 enum EpisodeFlat {
     Header(u32),
     Ep { season_idx: usize, ep_idx: usize },
+}
+
+/// Why we paused on Android (user vs system) — drives focus abandon/resume.
+#[cfg(target_os = "android")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum PauseCause {
+    #[default]
+    None,
+    User,
+    AudioFocus,
+    Lifecycle,
 }
 
 /// Android SAF document picker purpose.
@@ -712,6 +727,8 @@ impl FluxPlay {
             playback_ended_since: None,
             #[cfg(target_os = "android")]
             audio_focus_held: false,
+            #[cfg(target_os = "android")]
+            pause_cause: PauseCause::None,
             player_panel: PlayerPanel::None,
             goto_draft: String::new(),
             sleep_until: None,
@@ -767,7 +784,7 @@ impl FluxPlay {
             #[cfg(target_os = "android")]
             saf_kind: None,
             #[cfg(target_os = "android")]
-            system_insets: (0.0, 0.0, 0.0, 24.0),
+            system_insets: (0.0, 0.0, 0.0, 48.0),
         };
         app.display_caps = display_caps::resolve_caps(
             app.settings.fps_gui,
@@ -1317,8 +1334,19 @@ impl FluxPlay {
             .map(|r| (r.w, r.h))
             .unwrap_or((1280, 720));
         let uhd = std::env::var_os("FLUXPLAY_SOFT_UHD").is_some();
-        let max_w = if uhd { 3840u32 } else { 1920 };
-        let max_h = if uhd { 2160u32 } else { 1080 };
+        #[cfg(target_os = "android")]
+        let (max_w, max_h) = if uhd {
+            (1920u32, 1080u32)
+        } else {
+            // Soft RGBA on UI thread — 1080p@45+ causes FocusEvent ANRs on Waydroid.
+            (1280u32, 720u32)
+        };
+        #[cfg(not(target_os = "android"))]
+        let (max_w, max_h) = if uhd {
+            (3840u32, 2160u32)
+        } else {
+            (1920u32, 1080u32)
+        };
         let scale = (max_w as f32 / fw.max(1) as f32)
             .min(max_h as f32 / fh.max(1) as f32)
             .min(1.0);
@@ -1368,6 +1396,9 @@ impl FluxPlay {
             if clear_displayed && self.audio_focus_held {
                 crate::android_bridge::abandon_audio_focus();
                 self.audio_focus_held = false;
+            }
+            if clear_displayed {
+                self.pause_cause = PauseCause::None;
             }
         }
     }
@@ -1503,6 +1534,10 @@ impl FluxPlay {
                     if self.main_id.is_none() {
                         self.main_id = Some(id);
                     }
+                    // Soft video is edge-to-edge — hide system bars while playing.
+                    self.player_fullscreen = true;
+                    self.player_chrome_visible = true;
+                    crate::android_bridge::set_immersive_mode(true);
                 }
                 let layout = self.sync_player_layout_task(id);
                 if std::env::var_os("FLUXPLAY_AUTO_FULLSCREEN").is_some() {
@@ -1528,6 +1563,8 @@ impl FluxPlay {
                 if self.main_id == Some(id) {
                     // Guard against zero / garbage sizes from early surface churn.
                     if size.width >= 32.0 && size.height >= 32.0 {
+                        let changed = (self.main_size.width - size.width).abs() > 0.5
+                            || (self.main_size.height - size.height).abs() > 0.5;
                         self.main_size = size;
                         self.refresh_layout_cache();
                         // Approx content viewport until the first scrollable on_scroll.
@@ -1536,7 +1573,9 @@ impl FluxPlay {
                         {
                             self.system_insets = crate::android_bridge::system_insets_dp();
                         }
-                        tracing::info!(w = size.width, h = size.height, "main window size");
+                        if changed {
+                            tracing::info!(w = size.width, h = size.height, "main window size");
+                        }
                     } else {
                         tracing::warn!(
                             w = size.width,
@@ -2113,6 +2152,7 @@ impl FluxPlay {
             #[cfg(target_os = "android")]
             Message::SafPoll => {
                 self.refresh_system_dark();
+                crate::android_bridge::refresh_system_insets();
                 self.system_insets = crate::android_bridge::system_insets_dp();
                 self.pip_mode = crate::android_bridge::poll_pip_mode();
                 let Some(inbox) = crate::android_bridge::poll_saf_inbox() else {
@@ -2203,7 +2243,12 @@ impl FluxPlay {
                     self.status = "Catalogue".into();
                     return Task::none();
                 }
-                // Root: finish Activity (Back at home).
+                // Nested tabs → Live first; only finish Activity from Live root.
+                if !matches!(self.tab, Tab::Live) {
+                    self.tab = Tab::Live;
+                    self.status = "Télévision".into();
+                    return Task::none();
+                }
                 crate::android_bridge::finish_activity();
                 return Task::none();
             }
@@ -2275,8 +2320,26 @@ impl FluxPlay {
             }
             Message::TogglePause => {
                 match self.session.state {
-                    PlaybackState::Playing => self.session.pause(),
-                    PlaybackState::Paused => self.session.resume(),
+                    PlaybackState::Playing => {
+                        self.session.pause();
+                        #[cfg(target_os = "android")]
+                        {
+                            self.pause_cause = PauseCause::User;
+                        }
+                    }
+                    PlaybackState::Paused => {
+                        #[cfg(target_os = "android")]
+                        {
+                            if !self.audio_focus_held {
+                                crate::android_bridge::request_audio_focus();
+                                if crate::android_bridge::poll_audio_focus_held() == Some(true) {
+                                    self.audio_focus_held = true;
+                                }
+                            }
+                            self.pause_cause = PauseCause::None;
+                        }
+                        self.session.resume();
+                    }
                     _ => {}
                 }
                 self.status = self.session.status_line();
@@ -2413,10 +2476,14 @@ impl FluxPlay {
             }
             Message::PlayerTick => {
                 #[cfg(target_os = "android")]
+                let mut allow_soft_present = true;
+                #[cfg(target_os = "android")]
                 {
                     let fg = iced::android::is_foreground();
                     let in_pip = crate::android_bridge::poll_pip_mode();
                     self.pip_mode = in_pip;
+                    // Never soft-render when backgrounded — mpv SW on UI thread → FocusEvent ANR.
+                    allow_soft_present = (fg || in_pip) && !self.lifecycle_paused;
                     if let Some(held) = crate::android_bridge::poll_audio_focus_held() {
                         if !held
                             && matches!(
@@ -2426,10 +2493,20 @@ impl FluxPlay {
                             && !matches!(self.session.backend, Some(BackendId::External))
                         {
                             self.session.pause();
+                            self.pause_cause = PauseCause::AudioFocus;
                             self.status = "Pause — focus audio perdu".into();
                             self.audio_focus_held = false;
                         } else if held {
                             self.audio_focus_held = true;
+                            // LOSS→GAIN: resume only if we paused for focus (not user).
+                            if self.pause_cause == PauseCause::AudioFocus
+                                && self.session.state == PlaybackState::Paused
+                                && (fg || in_pip)
+                            {
+                                self.session.resume();
+                                self.pause_cause = PauseCause::None;
+                                self.status = self.session.status_line();
+                            }
                         }
                     }
                     if !fg && !self.lifecycle_paused && !in_pip {
@@ -2438,7 +2515,9 @@ impl FluxPlay {
                             PlaybackState::Playing | PlaybackState::Buffering
                         ) {
                             self.session.pause();
+                            self.pause_cause = PauseCause::Lifecycle;
                             self.lifecycle_paused = true;
+                            allow_soft_present = false;
                             crate::android_bridge::set_keep_screen_on(false);
                             if self.audio_focus_held {
                                 crate::android_bridge::abandon_audio_focus();
@@ -2446,8 +2525,19 @@ impl FluxPlay {
                             }
                         }
                     } else if fg && self.lifecycle_paused {
-                        self.session.resume();
                         self.lifecycle_paused = false;
+                        if self.pause_cause == PauseCause::Lifecycle {
+                            crate::android_bridge::request_audio_focus();
+                            if crate::android_bridge::poll_audio_focus_held() == Some(true) {
+                                self.audio_focus_held = true;
+                                self.session.resume();
+                                self.pause_cause = PauseCause::None;
+                            } else {
+                                // Wait for focus grant on a later tick.
+                                self.pause_cause = PauseCause::AudioFocus;
+                            }
+                        }
+                        allow_soft_present = true;
                     }
                     let keep = (fg || in_pip)
                         && !matches!(self.session.backend, Some(BackendId::External))
@@ -2469,11 +2559,18 @@ impl FluxPlay {
                             self.session.state,
                             PlaybackState::Paused | PlaybackState::Idle | PlaybackState::Error
                         )
+                        // Never abandon after LOSS — same tick would re-request and stick paused.
+                        && !matches!(
+                            self.pause_cause,
+                            PauseCause::AudioFocus | PauseCause::Lifecycle
+                        )
                     {
                         crate::android_bridge::abandon_audio_focus();
                         self.audio_focus_held = false;
                     }
                 }
+                #[cfg(not(target_os = "android"))]
+                let allow_soft_present = true;
                 self.session.refresh_times();
                 self.session.refresh_buffering_state();
                 // External / Intent: no owned process — never treat as EOF.
@@ -2500,7 +2597,8 @@ impl FluxPlay {
                 // Soft-render: pull RGBA only when GPU upload is free. Pulling while busy
                 // burns mpv/ffmpeg SW time into a soon-overwritten pending buffer and
                 // clears dirty/frame_ready — worst coupling under load.
-                if !self.video_upload_busy
+                if allow_soft_present
+                    && !self.video_upload_busy
                     && self.session.has_embedded_video()
                     && matches!(
                         self.session.state,
@@ -2513,12 +2611,41 @@ impl FluxPlay {
                     if let Some(task) = self.enqueue_soft_video_frame() {
                         tasks.push(task);
                     }
+                } else if allow_soft_present
+                    && self.video_upload_busy
+                    && self.session.has_embedded_video()
+                    && matches!(
+                        self.session.state,
+                        PlaybackState::Playing
+                            | PlaybackState::Buffering
+                            | PlaybackState::Paused
+                    )
+                    && self.session.frame_needs_redraw()
+                {
+                    // Desktop only: keep latest frame while GPU upload flies.
+                    // Android: second SW render on the UI thread → FocusEvent ANRs.
+                    #[cfg(not(target_os = "android"))]
+                    {
+                        let (rw, rh) = self.soft_present_wh();
+                        if let Some((w, h, rgba)) = self.session.pull_video_frame(rw, rh) {
+                            let gen = self.video_upload_gen;
+                            if let Some((_, _, old, _)) =
+                                self.video_pending.replace((w, h, rgba, gen))
+                            {
+                                self.session.recycle_soft_rgba(old);
+                            }
+                        }
+                    }
                 }
                 if let Some(deadline) = self.sleep_until {
                     if std::time::Instant::now() >= deadline {
                         self.sleep_until = None;
                         self.sleep_mins = None;
                         self.session.pause();
+                        #[cfg(target_os = "android")]
+                        {
+                            self.pause_cause = PauseCause::User;
+                        }
                         self.status = "Veille — lecture en pause".into();
                     }
                 }
@@ -2562,7 +2689,15 @@ impl FluxPlay {
                     }
                     self.session.recycle_soft_rgba(rgba);
                 }
-                if self.session.has_embedded_video()
+                // Android: never soft-render on allocate-complete while backgrounded —
+                // bypasses video_hz and caused FocusEvent ANRs. Next PlayerTick pulls.
+                #[cfg(target_os = "android")]
+                let allow_soft = (iced::android::is_foreground() || self.pip_mode)
+                    && !self.lifecycle_paused;
+                #[cfg(not(target_os = "android"))]
+                let allow_soft = true;
+                if allow_soft
+                    && self.session.has_embedded_video()
                     && matches!(
                         self.session.state,
                         PlaybackState::Playing
@@ -5728,9 +5863,9 @@ impl FluxPlay {
             .into()
         };
 
-        // Android: dynamic WindowInsets (fallback 56dp bottom).
+        // Android: dynamic WindowInsets (nav bar ~48–56dp; never underlap 3-button bar).
         #[cfg(target_os = "android")]
-        let (top_inset, bottom_inset) = (self.system_insets.1, self.system_insets.3.max(24.0));
+        let (top_inset, bottom_inset) = (self.system_insets.1, self.system_insets.3.max(48.0));
         #[cfg(not(target_os = "android"))]
         let (top_inset, bottom_inset) = (0.0_f32, 0.0_f32);
         container(main_col)
@@ -6420,6 +6555,10 @@ impl FluxPlay {
                 let Some(ch) = self.bundle.channels.get(bi) else {
                     continue;
                 };
+                let thumb = ch
+                    .logo
+                    .as_deref()
+                    .and_then(|u| self.images.get(u));
                 rows.push(browser::media_row(
                     ch.name.clone(),
                     ch.group.clone().unwrap_or_else(|| "Live".into()),
@@ -6427,8 +6566,8 @@ impl FluxPlay {
                     Some((true, Message::ToggleFavorite(ch.id.clone()))),
                     ui,
                     self.selected_channel.as_deref() == Some(ch.id.as_str()),
-                    None,
-                    0.0,
+                    thumb,
+                    40.0,
                     m.content_w.max(120.0),
                 ));
             }
@@ -7681,6 +7820,8 @@ fn ui_action_label(message: &Message) -> Option<&'static str> {
         Message::PlayerLayout { .. } | Message::PlayerLayoutDirty(_) | Message::WindowResized { .. } => {
             return None;
         }
+        #[cfg(target_os = "android")]
+        Message::SafPoll | Message::SafResult { .. } => return None,
         Message::Tab(_) => "nav.onglet",
         Message::CatFilterChanged(_) => "nav.filtre",
         #[cfg(target_os = "android")]
@@ -7779,7 +7920,8 @@ fn ui_action_label(message: &Message) -> Option<&'static str> {
         Message::MainWindowOpened(_) => "fenetre.main_open",
         Message::PlayerWindowOpened(_) => "fenetre.player_open",
         Message::WindowClosed(_) => "fenetre.close",
-        _ => "ui.autre",
+        // High-frequency / async bookkeeping — do not spam ui.interaction.
+        _ => return None,
     })
 }
 

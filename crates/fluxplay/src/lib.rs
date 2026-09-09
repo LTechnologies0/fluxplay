@@ -42,25 +42,42 @@ pub fn run() -> iced::Result {
 #[cfg(target_os = "android")]
 pub fn run_android(android_app: android_activity::AndroidApp) -> iced::Result {
     init_tracing_android();
-    tracing::info!("FluxPlay starting (android iced)");
+    tracing::info!(target: "fluxplay::boot", "FluxPlay starting (android iced)");
+    if fluxplay_core::profiling_enabled() {
+        tracing::info!(
+            target: "fluxplay::profile",
+            overlay = fluxplay_core::overlay_enabled(),
+            "interaction profiler ON"
+        );
+    }
     fluxplay_core::profiler!("boot");
     app::run_daemon_android(android_app)
 }
 
 fn init_tracing() {
-    // FLUXPLAY_VERBOSE seeds a richer RUST_LOG when the user did not set one.
-    if fluxplay_player::verbose_master() && std::env::var_os("RUST_LOG").is_none() {
-        // iced_* at info catches window/resize/wgpu surface issues without drowning in TRACE.
+    // Full diagnostic by default (FLUXPLAY_QUIET=1 → quiet). Seeds RUST_LOG + native verbose.
+    if fluxplay_core::full_logs_enabled() {
+        if std::env::var_os("RUST_LOG").is_none() {
+            std::env::set_var("RUST_LOG", fluxplay_core::FULL_ENV_FILTER);
+        }
+        if std::env::var_os("FLUXPLAY_VERBOSE").is_none() {
+            std::env::set_var("FLUXPLAY_VERBOSE", "1");
+        }
+    } else if fluxplay_player::verbose_master() && std::env::var_os("RUST_LOG").is_none() {
         std::env::set_var(
             "RUST_LOG",
             "fluxplay=debug,fluxplay_core=debug,fluxplay_providers=debug,\
              fluxplay_player=debug,fluxplay::ui=debug,fluxplay::net=debug,\
-             iced=info,iced_winit=info,iced_wgpu=warn,iced_runtime=info",
+             iced=info,iced_winit=info,iced_wgpu=warn,iced_runtime=info,profiler=trace",
         );
     }
     let _ = tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-            fluxplay_core::DEFAULT_ENV_FILTER.into()
+            if fluxplay_core::full_logs_enabled() {
+                fluxplay_core::FULL_ENV_FILTER.into()
+            } else {
+                fluxplay_core::DEFAULT_ENV_FILTER.into()
+            }
         }))
         .try_init();
     fluxplay_player::log_native_verbosity_banner();
@@ -68,21 +85,72 @@ fn init_tracing() {
 
 #[cfg(target_os = "android")]
 fn init_tracing_android() {
+    // Full diagnostic on Android unless FLUXPLAY_QUIET=1 (logcat is the only signal).
+    let full = fluxplay_core::full_logs_enabled();
+    if full {
+        if std::env::var_os("RUST_LOG").is_none() {
+            std::env::set_var("RUST_LOG", fluxplay_core::FULL_ENV_FILTER);
+        }
+        if std::env::var_os("FLUXPLAY_VERBOSE").is_none() {
+            std::env::set_var("FLUXPLAY_VERBOSE", "1");
+        }
+        if std::env::var_os("FLUXPLAY_MPV_LOG").is_none() {
+            std::env::set_var("FLUXPLAY_MPV_LOG", "v");
+        }
+        if std::env::var_os("FLUXPLAY_FFMPEG_LOG").is_none() {
+            std::env::set_var("FLUXPLAY_FFMPEG_LOG", "verbose");
+        }
+    }
+    let verbose = full
+        || fluxplay_player::verbose_master()
+        || fluxplay_core::profiling_enabled();
+
+    // Keep android_logger below Trace — naga/wgpu use `log` and would flood logcat.
+    let log_max = if verbose {
+        log::LevelFilter::Debug
+    } else {
+        log::LevelFilter::Info
+    };
     android_logger::init_once(
         android_logger::Config::default()
-            .with_max_level(log::LevelFilter::Info)
+            .with_max_level(log_max)
             .with_tag("FluxPlay"),
     );
     let _ = tracing_log::LogTracer::init();
 
-    // Bridge tracing → android logcat (fmt→sink hid all player/libmpv diagnostics).
     use std::io::Write;
+    /// Fmt sink: prefer leading tracing level token, else INFO.
     struct AndroidLogWriter;
     impl Write for AndroidLogWriter {
         fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
             if let Ok(s) = std::str::from_utf8(buf) {
                 for line in s.lines().filter(|l| !l.is_empty()) {
-                    log::info!("{line}");
+                    let level = {
+                        let mut tok = line.split_whitespace();
+                        let mut found = None;
+                        for _ in 0..4 {
+                            let Some(t) = tok.next() else { break };
+                            found = match t {
+                                "ERROR" => Some(log::Level::Error),
+                                "WARN" => Some(log::Level::Warn),
+                                "INFO" => Some(log::Level::Info),
+                                "DEBUG" => Some(log::Level::Debug),
+                                "TRACE" => Some(log::Level::Trace),
+                                _ => None,
+                            };
+                            if found.is_some() {
+                                break;
+                            }
+                        }
+                        found.unwrap_or(log::Level::Info)
+                    };
+                    match level {
+                        log::Level::Error => log::error!("{line}"),
+                        log::Level::Warn => log::warn!("{line}"),
+                        log::Level::Info => log::info!("{line}"),
+                        log::Level::Debug => log::debug!("{line}"),
+                        log::Level::Trace => log::trace!("{line}"),
+                    }
                 }
             }
             Ok(buf.len())
@@ -91,11 +159,33 @@ fn init_tracing_android() {
             Ok(())
         }
     }
+
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        if full {
+            fluxplay_core::FULL_ENV_FILTER.into()
+        } else {
+            format!(
+                "{},fluxplay::ui=info,fluxplay::icons=info,fluxplay::images=info,\
+                 fluxplay::android=info,iced_winit=info,iced_wgpu=warn,\
+                 wgpu_hal=warn,wgpu=warn,naga=warn,profiler=info",
+                fluxplay_core::DEFAULT_ENV_FILTER
+            )
+            .into()
+        }
+    });
     let _ = tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-            "fluxplay=info,fluxplay_player=info,fluxplay_core=warn,iced_wgpu=warn".into()
-        }))
+        .with_env_filter(filter)
         .with_ansi(false)
+        .with_target(true)
+        .with_level(true)
         .with_writer(|| AndroidLogWriter)
         .try_init();
+    tracing::info!(
+        target: "fluxplay::boot",
+        filter = %std::env::var("RUST_LOG").unwrap_or_else(|_| "(default)".into()),
+        verbose,
+        full_logs = full,
+        "android logcat bridge ready"
+    );
+    fluxplay_player::log_native_verbosity_banner();
 }

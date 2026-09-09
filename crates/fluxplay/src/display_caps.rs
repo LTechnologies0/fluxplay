@@ -153,10 +153,21 @@ pub fn resolve_caps(
     let mut gpu_gui_budget = match probe.gpu_tier {
         GpuTier::Discrete => 120,
         GpuTier::Integrated => 60,
-        GpuTier::Unknown => 90,
+        GpuTier::Unknown => {
+            if cfg!(target_os = "android") {
+                30
+            } else {
+                90
+            }
+        }
     };
     if probe.on_battery {
         gpu_gui_budget = gpu_gui_budget.min(60);
+    }
+    #[cfg(target_os = "android")]
+    {
+        // GUI also shares the NativeActivity thread with soft present.
+        gpu_gui_budget = gpu_gui_budget.min(30);
     }
 
     let gui_hz = resolve_pref(
@@ -171,7 +182,11 @@ pub fn resolve_caps(
         let capped = (cfps.ceil() as u32).saturating_add(2).max(MIN_HZ);
         video_auto = video_auto.min(capped);
     }
-    let video_hz = resolve_pref(video_pref, env_u32("FLUXPLAY_VIDEO_FPS"), video_auto);
+    let mut video_hz = resolve_pref(video_pref, env_u32("FLUXPLAY_VIDEO_FPS"), video_auto);
+    // Android: hard-cap even if settings/env ask for 60+ (FocusEvent ANR risk).
+    if cfg!(target_os = "android") {
+        video_hz = video_hz.min(30);
+    }
 
     let probe = DisplayProbe {
         monitor_hz,
@@ -272,8 +287,21 @@ fn soft_video_budget(tier: GpuTier, stage_wh: Option<(u32, u32)>, on_battery: bo
     let pixels = w.saturating_mul(h);
     let mut base = match tier {
         GpuTier::Discrete => 120,
-        GpuTier::Integrated => 60,
-        GpuTier::Unknown => 90,
+        GpuTier::Integrated => {
+            if cfg!(target_os = "android") {
+                30
+            } else {
+                60
+            }
+        }
+        // Android probe has no lspci — Unknown must not claim 90Hz soft RGBA.
+        GpuTier::Unknown => {
+            if cfg!(target_os = "android") {
+                30
+            } else {
+                90
+            }
+        }
     };
     if on_battery {
         base = base.min(60);
@@ -463,16 +491,24 @@ fn probe_on_battery() -> bool {
 }
 
 fn probe_monitor() -> Option<(String, u32, u32, u32, &'static str)> {
-    if let Some(v) = parse_xrandr(&run_cmd("xrandr", &[])) {
-        return Some((v.0, v.1, v.2, v.3, "xrandr"));
+    // Waydroid / Android expose host DRM via /sys — do not treat laptop eDP as the Activity.
+    #[cfg(target_os = "android")]
+    {
+        return Some(("Android".into(), DEFAULT_HZ, 0, 0, "android"));
     }
-    if let Some(v) = parse_wlr_randr(&run_cmd("wlr-randr", &[])) {
-        return Some((v.0, v.1, v.2, v.3, "wlr-randr"));
+    #[cfg(not(target_os = "android"))]
+    {
+        if let Some(v) = parse_xrandr(&run_cmd("xrandr", &[])) {
+            return Some((v.0, v.1, v.2, v.3, "xrandr"));
+        }
+        if let Some(v) = parse_wlr_randr(&run_cmd("wlr-randr", &[])) {
+            return Some((v.0, v.1, v.2, v.3, "wlr-randr"));
+        }
+        if let Some(v) = probe_drm_sysfs() {
+            return Some((v.0, v.1, v.2, v.3, "drm"));
+        }
+        None
     }
-    if let Some(v) = probe_drm_sysfs() {
-        return Some((v.0, v.1, v.2, v.3, "drm"));
-    }
-    None
 }
 
 fn run_cmd(bin: &str, args: &[&str]) -> String {
@@ -655,8 +691,16 @@ fn parse_drm_mode_hz(line: &str) -> Option<u32> {
 }
 
 fn probe_gpu() -> (String, GpuTier) {
-    let out = run_cmd("lspci", &["-nn"]);
-    parse_lspci_gpu(&out).unwrap_or_else(|| ("GPU".into(), GpuTier::Unknown))
+    #[cfg(target_os = "android")]
+    {
+        // Soft present on mobile SoCs — treat as integrated, not Unknown@90Hz.
+        return ("Android GPU".into(), GpuTier::Integrated);
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let out = run_cmd("lspci", &["-nn"]);
+        parse_lspci_gpu(&out).unwrap_or_else(|| ("GPU".into(), GpuTier::Unknown))
+    }
 }
 
 pub fn parse_lspci_gpu(out: &str) -> Option<(String, GpuTier)> {

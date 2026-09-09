@@ -58,7 +58,24 @@ Activity: `app.fluxplay.android.FluxPlayNativeActivity`.
 ```bash
 adb install -r -g target/release-ci/apk/FluxPlay.apk
 adb shell am start -W -n app.fluxplay.android/app.fluxplay.android.FluxPlayNativeActivity
-adb logcat -s FluxPlay:I *:S
+
+# Default: INFO+ with targets fluxplay::*, iced_winit, profiler
+adb logcat -s FluxPlay:V *:S
+
+# Verbose (debug icons/images/player) — rebuild with env, or:
+adb shell setprop debug.fluxplay.verbose 1   # reserved; prefer rebuild:
+# FLUXPLAY_VERBOSE=1 ./scripts/build-android-apk.sh
+# Or wrap:
+adb shell "run-as app.fluxplay.android sh -c 'export FLUXPLAY_VERBOSE=1; …'"  # debuggable only
+
+# Profiler lines (target profiler):
+# FLUXPLAY_PROFILE=1 RUST_LOG=profiler=trace,fluxplay=debug ./scripts/build-android-apk.sh
+```
+
+Severity is preserved in logcat (E/W/I/D/V). Useful filters:
+
+```bash
+adb logcat -s FluxPlay:V | rg 'ERROR|WARN|fluxplay::icons|fluxplay::images|profiler|iced_winit|surface'
 ```
 
 ## Notes
@@ -67,7 +84,9 @@ adb logcat -s FluxPlay:I *:S
 - Android uses `iced::application` (single window); player UI embeds in-place via `vo=libmpv` soft RGBA.
 - **Lifecycle**: iced_winit drops wgpu surfaces on `Suspended` and recreates them on `Resumed` (fixes black screen after Home / app switch). Requires vendored `vendor/iced_winit` patch.
 - Playback: dynamic link to vendored `libmpv.so` (media-kit). ABIs: `arm64-v8a` (phone) + `x86_64` (Waydroid). Backend « FFmpeg » mappe vers libmpv/lavc. Audio: `ao=opensles`. Fallback: `ACTION_VIEW`.
-- Mosaic / listes: overlay drag + `on_release` titres (slop ~12px).
-- Phone UI: letter/`#` posters (GLES quirk), barre nav 1 rangée `FillPortion`, real system insets via JNI (no fake 56dp), Fira Sans + `advanced-shaping`.
-- Waydroid: `adb connect 192.168.240.112:5555`, build `--target x86_64-linux-android`. Pixel-like: `wm size 1080x2400` + `wm density 420`.
+- Default `./scripts/build-android-apk.sh` builds a **fat APK** (both ABIs). Use `--target` for single-ABI.
+- Mosaic / listes: overlay drag + `on_release` titres; channel thumbs + letter avatars; tinted white PNG chrome icons.
+- Phone UI: Fira Sans named font, real system insets via JNI, immersive during playback.
+- Waydroid: `adb connect 192.168.240.112:5555`. Prefer fat APK or `--target x86_64-linux-android`.
 - Patches live in `vendor/iced` + `vendor/iced_winit` (`[patch.crates-io]`).
+- **armeabi-v7a / x86**: not shipped (no vendored libmpv). Add libs under `vendor/android-native/{armeabi-v7a,x86}/` and extend `build_targets` if needed.

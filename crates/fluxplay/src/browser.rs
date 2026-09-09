@@ -1228,14 +1228,57 @@ pub fn media_row<'a>(
     };
     let row_w = row_w.max(120.0);
 
-    // Android GLES: text-only row (no nested image). Fav is a sibling mouse_area
-    // so titles stay visible; thumb ignored for GLES safety.
-    // Trailing ▶ makes episode / channel launch discoverable (tap row or glyph).
+    // Android GLES: flat row — letter/thumb sibling (not nested under titles).
+    // Prefer letter avatar when thumb missing; image only as peer of text.
     #[cfg(target_os = "android")]
     {
-        let _ = (thumb, thumb_size);
         let (sub_sz, _) = type_style(TypeRole::LabelM, false);
         let sub_c = ui.on_surface_variant();
+        let ts = thumb_size.clamp(36.0, 56.0);
+        let glyph = title
+            .chars()
+            .find(|c| c.is_ascii_alphanumeric())
+            .map(|c| c.to_ascii_uppercase())
+            .unwrap_or('#');
+        let thumb_el: Element<'a, Message> = if let Some(handle) = thumb {
+            tracing::trace!(target: "fluxplay::images", "media_row thumb");
+            container(
+                image(handle)
+                    .width(Length::Fixed(ts))
+                    .height(Length::Fixed(ts))
+                    .content_fit(iced::ContentFit::Cover),
+            )
+            .width(Length::Fixed(ts))
+            .height(Length::Fixed(ts))
+            .style(move |_t: &Theme| container::Style {
+                background: Some(Background::Color(ui.surface_container_low())),
+                border: Border {
+                    radius: CARD_RADIUS.into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+            .into()
+        } else {
+            container(
+                text(glyph.to_string())
+                    .size((ts * 0.42).clamp(14.0, 22.0))
+                    .color(ui.on_surface_variant()),
+            )
+            .width(Length::Fixed(ts))
+            .height(Length::Fixed(ts))
+            .center_x(Fill)
+            .center_y(Fill)
+            .style(move |_t: &Theme| container::Style {
+                background: Some(Background::Color(ui.surface_container_highest())),
+                border: Border {
+                    radius: CARD_RADIUS.into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+            .into()
+        };
         let titles: Element<'a, Message> = if subtitle.is_empty() {
             text(title)
                 .size(title_sz)
@@ -1253,7 +1296,7 @@ pub fn media_row<'a>(
             .spacing(SPACE_XXS)
             .into()
         };
-        let row_h = list_row_height(0.0);
+        let row_h = list_row_height(ts);
         let row_style = move |_t: &Theme| container::Style {
             background: Some(Background::Color(row_bg)),
             border: Border {
@@ -1269,23 +1312,30 @@ pub fn media_row<'a>(
         };
         let play_w = TOUCH_TARGET;
         let play_el = mouse_area(
-            container(text("▶").size(TYPE_TITLE_M).color(ui.primary()))
-                .width(Length::Fixed(play_w))
-                .height(Length::Fixed(row_h))
-                .center_x(Fill)
-                .center_y(Fill),
+            container(crate::icons::icon(
+                crate::icons::Icon::Play,
+                22.0,
+                ui.primary(),
+            ))
+            .width(Length::Fixed(play_w))
+            .height(Length::Fixed(row_h))
+            .center_x(Fill)
+            .center_y(Fill),
         )
         .on_press(on_open.clone());
-        // on_release on title: soft_scroll_mosaic overlay owns press for drag;
-        // detail episode lists have no overlay — press on ▶ still works.
         if let Some((is_fav, fav_msg)) = on_fav {
-            let star = if is_fav { "★" } else { "☆" };
-            let fav_c = ui.tertiary();
+            let fav_c = if is_fav {
+                ui.tertiary()
+            } else {
+                ui.on_surface_variant()
+            };
             let fav_w = TOUCH_TARGET;
-            let title_w = (row_w - fav_w - play_w).max(64.0);
+            let title_w = (row_w - ts - fav_w - play_w - 12.0).max(64.0);
+            let fav_icon = crate::icons::icon(crate::icons::Icon::Favorite, 22.0, fav_c);
             return row![
+                thumb_el,
                 mouse_area(
-                    container(text(star).size(TYPE_TITLE_M).color(fav_c))
+                    container(fav_icon)
                         .width(Length::Fixed(fav_w))
                         .height(Length::Fixed(row_h))
                         .center_x(Fill)
@@ -1303,12 +1353,14 @@ pub fn media_row<'a>(
                 .on_release(on_open),
                 play_el,
             ]
+            .spacing(8)
             .align_y(Alignment::Center)
             .width(Length::Fixed(row_w))
             .into();
         }
-        let title_w = (row_w - play_w).max(64.0);
+        let title_w = (row_w - ts - play_w - 12.0).max(64.0);
         return row![
+            thumb_el,
             mouse_area(
                 container(titles)
                     .width(Length::Fixed(title_w))
@@ -1320,6 +1372,7 @@ pub fn media_row<'a>(
             .on_release(on_open),
             play_el,
         ]
+        .spacing(8)
         .align_y(Alignment::Center)
         .width(Length::Fixed(row_w))
         .into();
@@ -1644,7 +1697,12 @@ pub fn mosaic_tile<'a>(
             })
             .into()
         } else {
-            mosaic_empty_poster(ui, w, h)
+            let letter = title
+                .chars()
+                .find(|c| c.is_ascii_alphanumeric())
+                .map(|c| c.to_ascii_uppercase())
+                .unwrap_or('#');
+            mosaic_empty_poster(ui, w, h, letter)
         }
     };
 
@@ -1690,10 +1748,10 @@ pub fn mosaic_tile<'a>(
         .into()
 }
 
-fn mosaic_empty_poster<'a>(ui: UiTheme, w: f32, h: f32) -> Element<'a, Message> {
-    // Single ASCII label — fancy glyphs / multi-text often vanish on Android GLES.
+fn mosaic_empty_poster<'a>(ui: UiTheme, w: f32, h: f32, letter: char) -> Element<'a, Message> {
+    // Single ASCII letter — emoji/multi-glyph often vanish on Android GLES.
     container(
-        text("#")
+        text(letter.to_string())
             .size((w * 0.28).clamp(18.0, 40.0))
             .color(ui.ink_muted()),
     )

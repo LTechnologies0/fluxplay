@@ -14,6 +14,8 @@
 #include <libswresample/swresample.h>
 #include <libswscale/swscale.h>
 
+#include <errno.h>
+#include <fcntl.h>
 #include <math.h>
 #include <pthread.h>
 #include <stdio.h>
@@ -362,6 +364,40 @@ static int try_init_hw(FluxFfmpegPlayer *p, const AVCodec *codec, AVCodecContext
 
 enum { FLUX_AUDIO_RATE = 48000, FLUX_AUDIO_CH = 2 };
 
+static void audio_sink_nonblock(FILE *f) {
+    if (!f) return;
+    int fd = fileno(f);
+    if (fd < 0) return;
+    int fl = fcntl(fd, F_GETFL, 0);
+    if (fl >= 0) {
+        (void)fcntl(fd, F_SETFL, fl | O_NONBLOCK);
+    }
+}
+
+/** Non-blocking PCM write — drop on EAGAIN so decode never stalls behind a full sink. */
+static int audio_sink_write(FILE *sink, const void *buf, size_t bytes) {
+    int fd = fileno(sink);
+    if (fd < 0) {
+        return fwrite(buf, 1, bytes, sink) == bytes ? 0 : -1;
+    }
+    const uint8_t *p = (const uint8_t *)buf;
+    size_t left = bytes;
+    while (left > 0) {
+        ssize_t n = write(fd, p, left);
+        if (n > 0) {
+            p += (size_t)n;
+            left -= (size_t)n;
+            continue;
+        }
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            return 0; /* drop remainder — better than freezing A/V */
+        }
+        if (n < 0 && errno == EINTR) continue;
+        return -1;
+    }
+    return 0;
+}
+
 static FILE *open_audio_sink(int rate, int channels) {
     /* Absolute paths only — never `system("command -v")` / PATH (hijack risk). */
     static const char *pw_play_bins[] = {
@@ -381,6 +417,7 @@ static FILE *open_audio_sink(int rate, int channels) {
         if (f) {
             fprintf(stderr, "flux_ffmpeg: audio sink %s\n", pw_play_bins[i]);
             setvbuf(f, NULL, _IONBF, 0);
+            audio_sink_nonblock(f);
             return f;
         }
     }
@@ -393,6 +430,7 @@ static FILE *open_audio_sink(int rate, int channels) {
         if (f) {
             fprintf(stderr, "flux_ffmpeg: audio sink %s\n", pacat_bins[i]);
             setvbuf(f, NULL, _IONBF, 0);
+            audio_sink_nonblock(f);
             return f;
         }
     }
@@ -404,6 +442,7 @@ static FILE *open_audio_sink(int rate, int channels) {
         if (f) {
             fprintf(stderr, "flux_ffmpeg: audio sink %s\n", aplay_bins[i]);
             setvbuf(f, NULL, _IONBF, 0);
+            audio_sink_nonblock(f);
             return f;
         }
     }
@@ -525,7 +564,7 @@ static void play_audio_frame(FluxFfmpegPlayer *p, AVCodecContext *actx, SwrConte
         int16_t *pcm = (int16_t *)out_planes[0];
         apply_volume_s16(pcm, converted * FLUX_AUDIO_CH, volume);
         size_t bytes = (size_t)converted * (size_t)FLUX_AUDIO_CH * sizeof(int16_t);
-        if (fwrite(pcm, 1, bytes, sink) != bytes) {
+        if (audio_sink_write(sink, pcm, bytes) != 0) {
             /* sink died — ignore further writes this session */
             fprintf(stderr, "flux_ffmpeg: audio sink write failed\n");
         }

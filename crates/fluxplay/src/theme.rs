@@ -759,14 +759,30 @@ pub fn type_size(role: TypeRole) -> f32 {
 }
 
 pub fn type_font(emphasized: bool) -> Font {
-    Font {
-        family: Family::SansSerif,
-        weight: if emphasized {
-            Weight::Bold
-        } else {
-            Weight::Medium
-        },
-        ..Font::DEFAULT
+    #[cfg(target_os = "android")]
+    {
+        // Named Fira Sans — Family::SansSerif bypasses iced default_font on NativeActivity.
+        Font {
+            family: Family::Name("Fira Sans"),
+            weight: if emphasized {
+                Weight::Bold
+            } else {
+                Weight::Medium
+            },
+            ..Font::DEFAULT
+        }
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        Font {
+            family: Family::SansSerif,
+            weight: if emphasized {
+                Weight::Bold
+            } else {
+                Weight::Medium
+            },
+            ..Font::DEFAULT
+        }
     }
 }
 

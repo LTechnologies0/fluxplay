@@ -9,7 +9,7 @@ pub mod protocol;
 pub mod xmltv;
 
 pub use error::{Error, Result};
-pub use log::{Stopwatch, DEFAULT_ENV_FILTER};
+pub use log::{Stopwatch, DEFAULT_ENV_FILTER, FULL_ENV_FILTER, full_logs_enabled};
 pub use models::*;
 pub use profiler::{
     format_bytes, format_bytes_signed, overlay_enabled, overlay_status_line, profiling_enabled,

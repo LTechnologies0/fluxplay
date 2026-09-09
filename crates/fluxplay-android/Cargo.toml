@@ -58,16 +58,26 @@ required = false
 name = "android.software.leanback"
 required = false
 
-# Package visibility (API 31+) for VIEW / SAF document intents.
+# Package visibility (API 31+): one <data> type per <intent> (install reject otherwise).
 [[package.metadata.android.queries.intent]]
 actions = ["android.intent.action.VIEW"]
-data = [
-  { mime_type = "video/*" },
-  { mime_type = "audio/*" },
-  { mime_type = "*/*" },
-  { scheme = "https" },
-  { scheme = "http" },
-]
+data = [{ mime_type = "video/*" }]
+
+[[package.metadata.android.queries.intent]]
+actions = ["android.intent.action.VIEW"]
+data = [{ mime_type = "audio/*" }]
+
+[[package.metadata.android.queries.intent]]
+actions = ["android.intent.action.VIEW"]
+data = [{ mime_type = "*/*" }]
+
+[[package.metadata.android.queries.intent]]
+actions = ["android.intent.action.VIEW"]
+data = [{ scheme = "https" }]
+
+[[package.metadata.android.queries.intent]]
+actions = ["android.intent.action.VIEW"]
+data = [{ scheme = "http" }]
 
 [[package.metadata.android.queries.intent]]
 actions = ["android.intent.action.OPEN_DOCUMENT"]

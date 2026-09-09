@@ -158,6 +158,9 @@ fn call_static_void_bool(name: &str, arg: bool) {
         .is_err()
     {
         clear_ex(&mut env);
+        warn!(target: "fluxplay::android", %name, "static void(bool) JNI failed");
+    } else {
+        debug!(target: "fluxplay::android", %name, arg, "static void(bool) ok");
     }
 }
 
@@ -347,6 +350,11 @@ pub fn set_immersive_mode(enable: bool) {
     call_static_void_bool("setImmersiveMode", enable);
 }
 
+/// Ask the Activity to refresh WindowInsets into the JNI cache (UI thread).
+pub fn refresh_system_insets() {
+    call_static_void("refreshSystemInsets");
+}
+
 pub fn finish_activity() {
     call_static_void("finishActivity");
 }
@@ -403,7 +411,7 @@ fn content_rect_insets_dp() -> (f32, f32, f32, f32) {
     if is_television() {
         (0.0, 0.0, 0.0, 0.0)
     } else {
-        (0.0, 0.0, 0.0, 24.0)
+        (0.0, 0.0, 0.0, 48.0)
     }
 }
 

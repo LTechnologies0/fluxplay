@@ -78,7 +78,11 @@ impl Default for ImageCache {
 
 impl ImageCache {
     pub fn get(&self, url: &str) -> Option<&Handle> {
-        self.handles.get(url)
+        let h = self.handles.get(url);
+        if h.is_some() {
+            trace!(target: "fluxplay::images", %url, "cache hit");
+        }
+        h
     }
 
     pub fn inflight_len(&self) -> usize {
@@ -183,9 +187,11 @@ impl ImageCache {
             self.host_circuit.remove(&host);
         }
         if bytes.len() < 64 || looks_like_html(&bytes) {
+            warn!(target: "fluxplay::images", %url, len = bytes.len(), "reject non-image bytes");
             self.failed.insert(url);
             return;
         }
+        debug!(target: "fluxplay::images", %url, len = bytes.len(), "insert handle");
         if self.handles.contains_key(&url) {
             self.handles.insert(url.clone(), Handle::from_bytes(bytes));
             self.promote(&url);
@@ -329,6 +335,12 @@ fn normalize_image_url(url: &str) -> String {
 pub fn is_fetchable_image_url(url: &str) -> bool {
     let url = url.trim();
     if !(url.starts_with("http://") || url.starts_with("https://")) {
+        return false;
+    }
+    // Workspace `image` crate has no SVG decoder — skip remote .svg logos.
+    let path = url.split('?').next().unwrap_or(url).to_ascii_lowercase();
+    if path.ends_with(".svg") || path.contains(".svg/") {
+        trace!(target: "fluxplay::images", %url, "reject svg logo url");
         return false;
     }
     if let Some(rest) = url.split("/t/p/").nth(1) {

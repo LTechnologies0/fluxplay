@@ -430,18 +430,39 @@ impl LibMpv {
         self.free_render();
         let _ = self.command(&["stop"]);
         let _ = self.set_property("pause", "yes");
-        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(300);
-        while std::time::Instant::now() < deadline {
-            let ev = unsafe { mpv_wait_event(self.ctx, 0.05) };
-            if ev.is_null() {
-                break;
+        // Android: never block the UI/NativeActivity thread (ANR). Desktop: brief drain.
+        #[cfg(target_os = "android")]
+        {
+            let _ = unsafe { mpv_wait_event(self.ctx, 0.0) };
+            // mpv_terminate_destroy can join demux — defer off UI thread on zap/stop.
+            let ctx = std::mem::replace(&mut self.ctx, ptr::null_mut());
+            if !ctx.is_null() {
+                // Pass as usize so the destroy thread is Send (raw *mut isn't).
+                let ctx_addr = ctx as usize;
+                let _ = std::thread::Builder::new()
+                    .name("flux-mpv-destroy".into())
+                    .spawn(move || {
+                        debug!("LibMpv terminate_destroy (async)");
+                        unsafe { mpv_terminate_destroy(ctx_addr as *mut mpv_handle) };
+                    });
             }
-            let id = unsafe { (*ev).event_id };
-            if id == MPV_EVENT_NONE || id == MPV_EVENT_SHUTDOWN {
-                break;
-            }
+            return;
         }
-        self.ctx_destroy();
+        #[cfg(not(target_os = "android"))]
+        {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(300);
+            while std::time::Instant::now() < deadline {
+                let ev = unsafe { mpv_wait_event(self.ctx, 0.05) };
+                if ev.is_null() {
+                    break;
+                }
+                let id = unsafe { (*ev).event_id };
+                if id == MPV_EVENT_NONE || id == MPV_EVENT_SHUTDOWN {
+                    break;
+                }
+            }
+            self.ctx_destroy();
+        }
     }
 
     fn ctx_destroy(&mut self) {

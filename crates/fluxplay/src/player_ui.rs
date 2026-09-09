@@ -281,7 +281,7 @@ fn control_dock<'a>(p: &PlayerChrome<'a>, chrome_alpha: f32) -> Element<'a, Mess
     let active = p.active;
     let paused = s.state == PlaybackState::Paused || s.state == PlaybackState::Idle;
     let play_glyph = if paused { Icon::Play } else { Icon::Pause };
-    let can_seek = active && !live && p.caps.seek_abs;
+    let _can_seek = active && !live && p.caps.seek_abs;
     let can_seek_rel = active && !live && p.caps.seek_rel;
     let mute_glyph = if s.muted { Icon::VolumeOff } else { Icon::VolumeUp };
     let progress = s.progress_ratio();

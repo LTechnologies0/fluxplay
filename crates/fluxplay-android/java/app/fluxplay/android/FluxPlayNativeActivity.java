@@ -61,8 +61,22 @@ public class FluxPlayNativeActivity extends NativeActivity {
                     return v.onApplyWindowInsets(insets);
                 });
             }
+            // NativeActivity often skips the first insets dispatch — force a read.
+            decor.post(this::refreshInsetsFromDecor);
         } catch (Exception e) {
             Log.e(TAG, "onCreate insets listener", e);
+        }
+    }
+
+    @Override
+    public void onWindowFocusChanged(boolean hasFocus) {
+        super.onWindowFocusChanged(hasFocus);
+        if (hasFocus) {
+            try {
+                refreshInsetsFromDecor();
+            } catch (Exception e) {
+                Log.e(TAG, "onWindowFocusChanged insets", e);
+            }
         }
     }
 
@@ -233,6 +247,54 @@ public class FluxPlayNativeActivity extends NativeActivity {
         }
     }
 
+    private void refreshInsetsFromDecor() {
+        try {
+            View decor = getWindow().getDecorView();
+            DisplayMetrics dm = getResources().getDisplayMetrics();
+            synchronized (sInsetsPx) {
+                sInsetsPx[4] = dm.densityDpi;
+            }
+            WindowInsets insets = decor.getRootWindowInsets();
+            if (insets != null) {
+                cacheInsetsFrom(insets);
+            } else {
+                // Fallback: navigation_bar_height resource when insets never delivered.
+                int nav = systemDimenPx("navigation_bar_height");
+                int status = systemDimenPx("status_bar_height");
+                synchronized (sInsetsPx) {
+                    if (sInsetsPx[3] <= 0 && nav > 0) {
+                        sInsetsPx[3] = nav;
+                    }
+                    if (sInsetsPx[1] <= 0 && status > 0) {
+                        sInsetsPx[1] = status;
+                    }
+                }
+            }
+            // Still zero bottom? Use resource estimate (3-button nav ~48–56dp).
+            synchronized (sInsetsPx) {
+                if (sInsetsPx[3] <= 0) {
+                    int nav = systemDimenPx("navigation_bar_height");
+                    if (nav > 0) {
+                        sInsetsPx[3] = nav;
+                    }
+                }
+            }
+        } catch (Exception e) {
+            Log.e(TAG, "refreshInsetsFromDecor", e);
+        }
+    }
+
+    private int systemDimenPx(String name) {
+        try {
+            int id = getResources().getIdentifier(name, "dimen", "android");
+            if (id != 0) {
+                return getResources().getDimensionPixelSize(id);
+            }
+        } catch (Exception ignored) {
+        }
+        return 0;
+    }
+
     /**
      * Returns insets in px: [left, top, right, bottom, densityDpi].
      * Safe from any thread — reads UI-thread cache (no Window access off-UI).
@@ -243,12 +305,30 @@ public class FluxPlayNativeActivity extends NativeActivity {
         if (a != null) {
             try {
                 dpi = a.getResources().getDisplayMetrics().densityDpi;
+                // Kick a UI refresh when cache looks empty (first frames / NativeActivity).
+                boolean empty;
+                synchronized (sInsetsPx) {
+                    empty = sInsetsPx[0] == 0 && sInsetsPx[1] == 0
+                            && sInsetsPx[2] == 0 && sInsetsPx[3] == 0;
+                }
+                if (empty) {
+                    a.runOnUiThread(a::refreshInsetsFromDecor);
+                }
             } catch (Exception ignored) {
             }
         }
         synchronized (sInsetsPx) {
             return new int[] {sInsetsPx[0], sInsetsPx[1], sInsetsPx[2], sInsetsPx[3], dpi};
         }
+    }
+
+    /** Explicit UI-thread insets refresh (Rust SafPoll). */
+    public static void refreshSystemInsets() {
+        FluxPlayNativeActivity a = sInstance;
+        if (a == null) {
+            return;
+        }
+        a.runOnUiThread(a::refreshInsetsFromDecor);
     }
 
     public static void setKeepScreenOn(boolean enable) {
