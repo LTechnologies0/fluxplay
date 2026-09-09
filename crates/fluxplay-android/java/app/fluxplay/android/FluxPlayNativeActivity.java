@@ -338,7 +338,16 @@ public class FluxPlayNativeActivity extends NativeActivity {
                 return;
             }
             if (audioFocusListener == null) {
-                audioFocusListener = focusChange -> { /* Rust polls playback state */ };
+                audioFocusListener = focusChange -> {
+                    // Persist for Rust PlayerTick (pause on LOSS*, resume on GAIN).
+                    boolean lost = focusChange == AudioManager.AUDIOFOCUS_LOSS
+                            || focusChange == AudioManager.AUDIOFOCUS_LOSS_TRANSIENT
+                            || focusChange == AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK;
+                    writeAudioFocusFlag(!lost);
+                    if (lost) {
+                        Log.i(TAG, "audio focus lost: " + focusChange);
+                    }
+                };
             }
             if (Build.VERSION.SDK_INT >= 26) {
                 if (audioFocusRequest == null) {
@@ -358,6 +367,7 @@ public class FluxPlayNativeActivity extends NativeActivity {
                         AudioManager.STREAM_MUSIC,
                         AudioManager.AUDIOFOCUS_GAIN);
             }
+            writeAudioFocusFlag(true);
         } catch (Exception e) {
             Log.e(TAG, "requestAudioFocus failed", e);
         }
@@ -374,6 +384,7 @@ public class FluxPlayNativeActivity extends NativeActivity {
             } else if (audioFocusListener != null) {
                 am.abandonAudioFocus(audioFocusListener);
             }
+            writeAudioFocusFlag(false);
         } catch (Exception e) {
             Log.e(TAG, "abandonAudioFocus failed", e);
         }
@@ -422,6 +433,18 @@ public class FluxPlayNativeActivity extends NativeActivity {
             }
         } catch (Exception e) {
             Log.e(TAG, "writePipFlag", e);
+        }
+    }
+
+    private void writeAudioFocusFlag(boolean held) {
+        try {
+            File meta = new File(safInboxDir(), "audio_focus.json");
+            String json = "{\"held\":" + (held ? "true" : "false") + "}";
+            try (FileOutputStream fos = new FileOutputStream(meta)) {
+                fos.write(json.getBytes("UTF-8"));
+            }
+        } catch (Exception e) {
+            Log.e(TAG, "writeAudioFocusFlag", e);
         }
     }
 

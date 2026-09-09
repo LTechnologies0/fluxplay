@@ -1660,13 +1660,13 @@ impl NativePlayer {
             let _ = soft_set(
                 &mpv,
                 "stream-lavf-o",
-                "protocol_whitelist=file,http,https,tcp,tls,rtmp,rtmps,rtsp,rtsps,rtp,udp,srt,crypto,data",
+                "protocol_whitelist=http,https,tcp,tls,rtmp,rtmps,rtsp,rtsps,rtp,udp,srt",
             );
         } else {
             let _ = soft_set(
                 &mpv,
                 "stream-lavf-o",
-                "protocol_whitelist=file,http,https,tcp,tls,rtmp,rtmps,rtsp,rtsps,rtp,udp,srt,crypto,data",
+                "protocol_whitelist=http,https,tcp,tls,rtmp,rtmps,rtsp,rtsps,rtp,udp,srt",
             );
         }
         if let Some(ref_r) = &self.opts.referer {
@@ -2154,64 +2154,131 @@ fn mpv_get_string(ipc: &Path, prop: &str) -> Option<String> {
 }
 
 fn mpv_ipc_data(ipc: &Path, line: &str) -> Option<serde_json::Value> {
-    #[cfg(unix)]
-    {
-        use std::io::Read;
-        use std::os::unix::net::UnixStream;
-        let mut stream = UnixStream::connect(ipc).ok()?;
-        stream.write_all(line.as_bytes()).ok()?;
-        let _ = stream.shutdown(Shutdown::Write);
-        let mut buf = String::new();
-        let _ = stream.read_to_string(&mut buf);
-        for raw in buf.lines() {
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(raw) {
-                if v.get("event").is_some() {
-                    continue;
-                }
-                if let Some(err) = v.get("error").and_then(|e| e.as_str()) {
-                    if err != "success" {
-                        continue;
-                    }
-                }
-                if let Some(data) = v.get("data") {
-                    return Some(data.clone());
-                }
+    let mut stream = mpv_ipc_stream(ipc)?;
+    stream.write_all(line.as_bytes()).ok()?;
+    let _ = stream.shutdown_write();
+    let raw = stream.read_line_timeout(std::time::Duration::from_millis(800))?;
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) {
+        if v.get("event").is_some() {
+            return None;
+        }
+        if let Some(err) = v.get("error").and_then(|e| e.as_str()) {
+            if err != "success" {
+                return None;
             }
         }
-        None
+        return v.get("data").cloned();
     }
-    #[cfg(not(unix))]
+    None
+}
+
+struct MpvIpcStream {
+    #[cfg(unix)]
+    inner: std::os::unix::net::UnixStream,
+    #[cfg(windows)]
+    inner: std::fs::File,
+}
+
+impl MpvIpcStream {
+    fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()> {
+        use std::io::Write;
+        self.inner.write_all(buf)
+    }
+
+    fn shutdown_write(&mut self) -> std::io::Result<()> {
+        #[cfg(unix)]
+        {
+            self.inner.shutdown(Shutdown::Write)
+        }
+        #[cfg(windows)]
+        {
+            use std::io::Write;
+            self.inner.flush()
+        }
+    }
+
+    /// One JSON IPC line — never `read_to_string` (mpv keeps the pipe open → hang).
+    fn read_line_timeout(&mut self, timeout: std::time::Duration) -> Option<String> {
+        use std::io::Read;
+        #[cfg(unix)]
+        {
+            let _ = self.inner.set_read_timeout(Some(timeout));
+        }
+        let deadline = std::time::Instant::now() + timeout;
+        let mut acc = Vec::with_capacity(256);
+        let mut tmp = [0u8; 128];
+        while std::time::Instant::now() < deadline {
+            match self.inner.read(&mut tmp) {
+                Ok(0) => break,
+                Ok(n) => {
+                    acc.extend_from_slice(&tmp[..n]);
+                    if acc.contains(&b'\n') {
+                        break;
+                    }
+                }
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::WouldBlock
+                        || e.kind() == std::io::ErrorKind::TimedOut =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(_) => break,
+            }
+        }
+        if acc.is_empty() {
+            return None;
+        }
+        String::from_utf8(acc).ok().map(|s| {
+            s.lines().next().unwrap_or("").trim().to_string()
+        })
+    }
+}
+
+fn mpv_ipc_stream(ipc: &Path) -> Option<MpvIpcStream> {
+    #[cfg(unix)]
     {
-        let _ = (ipc, line);
+        use std::os::unix::net::UnixStream;
+        let inner = UnixStream::connect(ipc).ok()?;
+        let _ = inner.set_read_timeout(Some(std::time::Duration::from_millis(800)));
+        Some(MpvIpcStream { inner })
+    }
+    #[cfg(windows)]
+    {
+        use std::fs::OpenOptions;
+        use std::os::windows::fs::OpenOptionsExt;
+        const ACCESS: u32 = 0x8000_0000 | 0x4000_0000;
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .access_mode(ACCESS)
+            .open(ipc)
+            .ok()
+            .map(|inner| MpvIpcStream { inner })
+    }
+    #[cfg(all(not(unix), not(windows)))]
+    {
+        let _ = ipc;
         None
     }
 }
 
 fn mpv_cmd(ipc: &Path, parts: &[&str]) -> Result<()> {
-    // JSON IPC: { "command": ["loadfile", "url"] }
     let cmd = serde_json::json!({ "command": parts });
     let line = format!("{cmd}\n");
 
-    #[cfg(unix)]
-    {
-        use std::io::Read;
-        use std::os::unix::net::UnixStream;
-        // Brief retry — mpv may still be starting.
-        let mut last = None;
-        for _ in 0..20 {
-            match UnixStream::connect(ipc) {
-                Ok(mut stream) => {
-                    stream
-                        .write_all(line.as_bytes())
-                        .map_err(|e| PlayerError::Backend(e.to_string()))?;
-                    let _ = stream.shutdown(Shutdown::Write);
-                    let mut buf = String::new();
-                    let _ = stream.read_to_string(&mut buf);
-                    for raw in buf.lines() {
-                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(raw) {
-                            if v.get("event").is_some() {
-                                continue;
-                            }
+    let mut last = None;
+    for _ in 0..20 {
+        match mpv_ipc_stream(ipc) {
+            Some(mut stream) => {
+                stream
+                    .write_all(line.as_bytes())
+                    .map_err(|e| PlayerError::Backend(e.to_string()))?;
+                let _ = stream.shutdown_write();
+                if let Some(raw) =
+                    stream.read_line_timeout(std::time::Duration::from_millis(800))
+                {
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) {
+                        if v.get("event").is_none() {
                             match v.get("error").and_then(|e| e.as_str()) {
                                 Some("success") | None => return Ok(()),
                                 Some(err) => {
@@ -2222,26 +2289,18 @@ fn mpv_cmd(ipc: &Path, parts: &[&str]) -> Result<()> {
                             }
                         }
                     }
-                    // No reply parsed — treat as soft success (older mpv).
-                    return Ok(());
                 }
-                Err(e) => {
-                    last = Some(e);
-                    std::thread::sleep(std::time::Duration::from_millis(50));
-                }
+                return Ok(());
+            }
+            None => {
+                last = Some("connect failed");
+                std::thread::sleep(std::time::Duration::from_millis(50));
             }
         }
-        warn!(?last, "mpv ipc connect failed");
-        Err(PlayerError::Backend(format!(
-            "mpv IPC: {}",
-            last.map(|e| e.to_string()).unwrap_or_default()
-        )))
     }
-    #[cfg(not(unix))]
-    {
-        let _ = (ipc, line);
-        Err(PlayerError::Backend(
-            "mpv IPC non supporté sur cette plateforme".into(),
-        ))
-    }
+    warn!(?last, "mpv ipc connect failed");
+    Err(PlayerError::Backend(format!(
+        "mpv IPC: {}",
+        last.unwrap_or("unavailable")
+    )))
 }

@@ -155,7 +155,8 @@ if [[ -f "$MANIFEST" ]] && ! grep -a -q 'supportsPictureInPicture' "$MANIFEST" 2
       fi
     fi
     if [[ "$PIP_OK" -ne 1 ]]; then
-      echo "WARNING: apktool PiP patch failed; continuing with dex only" >&2
+      echo "ERROR: apktool PiP patch failed — supportsPictureInPicture required" >&2
+      exit 1
     fi
   else
     # No apktool: try text/binary heuristics, aapt2 dump, androguard.
@@ -176,11 +177,11 @@ if [[ -f "$MANIFEST" ]] && ! grep -a -q 'supportsPictureInPicture' "$MANIFEST" 2
       fi
     fi
     if [[ "$PIP_OK" -ne 1 ]]; then
-      echo "WARNING: could not patch supportsPictureInPicture (apktool/androguard/aapt missing or binary AXML). Dex injected; PiP may still work via enterPictureInPictureMode at runtime." >&2
+      echo "ERROR: could not patch supportsPictureInPicture (install apktool)" >&2
+      exit 1
     fi
   fi
 fi
-
 (
   cd unpacked
   # Android R+ requires resources.arsc stored uncompressed + 4-byte aligned.

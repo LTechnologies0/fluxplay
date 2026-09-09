@@ -207,6 +207,25 @@ pub fn route(raw_url: &str) -> Result<RoutedStream> {
         );
         return Err(PlayerError::Unsupported(url.scheme.label().into()));
     }
+    // Remote playlists must not force local file:// opens (path traversal / SSRF-ish).
+    if url.scheme == StreamScheme::File {
+        let allow = std::env::var("FLUXPLAY_ALLOW_FILE")
+            .map(|v| v == "1")
+            .unwrap_or(false);
+        if !allow {
+            let path = raw_url
+                .strip_prefix("file://")
+                .or_else(|| raw_url.strip_prefix("file:"))
+                .unwrap_or(raw_url);
+            let p = std::path::Path::new(path);
+            if !p.is_file() {
+                return Err(PlayerError::Unsupported(
+                    "file:// refusé (fichier local introuvable; FLUXPLAY_ALLOW_FILE=1 pour forcer)"
+                        .into(),
+                ));
+            }
+        }
+    }
 
     let routed = RoutedStream {
         open_externally: !support.decode,

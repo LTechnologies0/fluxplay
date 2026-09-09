@@ -2417,6 +2417,17 @@ impl FluxPlay {
                     let fg = iced::android::is_foreground();
                     let in_pip = crate::android_bridge::poll_pip_mode();
                     self.pip_mode = in_pip;
+                    if let Some(false) = crate::android_bridge::poll_audio_focus_held() {
+                        if matches!(
+                            self.session.state,
+                            PlaybackState::Playing | PlaybackState::Buffering
+                        ) && !matches!(self.session.backend, Some(BackendId::External))
+                        {
+                            self.session.pause();
+                            self.status = "Pause — focus audio perdu".into();
+                            self.audio_focus_held = false;
+                        }
+                    }
                     if !fg && !self.lifecycle_paused && !in_pip {
                         if matches!(
                             self.session.state,

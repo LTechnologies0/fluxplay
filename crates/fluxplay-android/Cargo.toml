@@ -61,12 +61,19 @@ required = false
 # Package visibility (API 31+) for VIEW / SAF document intents.
 [[package.metadata.android.queries.intent]]
 actions = ["android.intent.action.VIEW"]
+data = [
+  { mime_type = "video/*" },
+  { mime_type = "audio/*" },
+  { mime_type = "*/*" },
+]
 
 [[package.metadata.android.queries.intent]]
 actions = ["android.intent.action.OPEN_DOCUMENT"]
+data = [{ mime_type = "*/*" }]
 
 [[package.metadata.android.queries.intent]]
 actions = ["android.intent.action.CREATE_DOCUMENT"]
+data = [{ mime_type = "*/*" }]
 
 [package.metadata.android.application]
 label = "FluxPlay"

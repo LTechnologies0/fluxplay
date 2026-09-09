@@ -87,11 +87,17 @@ jobs:
         run: cargo build -p fluxplay --release --target ${{ matrix.target }}
 
       - name: Bundle libmpv (Unix shared)
-        if: runner.os != 'Windows'
+        if: runner.os != 'Windows' && matrix.require_libmpv == '1'
         run: |
           chmod +x scripts/bundle-libmpv.sh
-          scripts/bundle-libmpv.sh "target/${{ matrix.target }}/release/${{ matrix.bin }}" || true
+          scripts/bundle-libmpv.sh "target/${{ matrix.target }}/release/${{ matrix.bin }}"
 
+      - name: Bundle libmpv (best-effort when optional)
+        if: runner.os != 'Windows' && matrix.require_libmpv != '1'
+        continue-on-error: true
+        run: |
+          chmod +x scripts/bundle-libmpv.sh
+          scripts/bundle-libmpv.sh "target/${{ matrix.target }}/release/${{ matrix.bin }}"
       - name: Package (Unix)
         if: runner.os != 'Windows'
         run: |
@@ -179,25 +185,24 @@ jobs:
           name: fluxplay-android-aarch64
           path: |
             target/**/apk/FluxPlay.apk
-          if-no-files-found: warn
+          if-no-files-found: error
 
   release:
     needs: [build, android-apk]
-    # Publish whatever targets succeeded (matrix fail-fast=false; android is optional).
-    if: always() && startsWith(github.ref, 'refs/tags/v') && needs.build.result != 'cancelled'
+    # Require at least the desktop matrix to succeed (android may be failure/skipped).
+    if: always() && startsWith(github.ref, 'refs/tags/v') && needs.build.result == 'success'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
         with:
           path: artifacts
           merge-multiple: true
-        continue-on-error: true
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           files: artifacts/**
           generate_release_notes: true
-          fail_on_unmatched_files: false
+          fail_on_unmatched_files: true
           draft: false
           prerelease: false

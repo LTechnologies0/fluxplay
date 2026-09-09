@@ -194,6 +194,24 @@ fn pip_flag_path() -> Option<PathBuf> {
     files_dir().map(|b| b.join("saf_inbox").join("pip.json"))
 }
 
+fn audio_focus_flag_path() -> Option<PathBuf> {
+    files_dir().map(|b| b.join("saf_inbox").join("audio_focus.json"))
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct AudioFocusFlag {
+    held: bool,
+}
+
+/// True when Java reports we still hold audio focus (false after LOSS*).
+pub fn poll_audio_focus_held() -> Option<bool> {
+    let path = audio_focus_flag_path()?;
+    let text = std::fs::read_to_string(&path).ok()?;
+    serde_json::from_str::<AudioFocusFlag>(&text)
+        .ok()
+        .map(|f| f.held)
+}
+
 /// Launch SAF OPEN_DOCUMENT / CREATE_DOCUMENT via FluxPlayNativeActivity.
 pub fn start_saf_open(mime: &str) {
     SAF_PENDING.store(true, Ordering::SeqCst);

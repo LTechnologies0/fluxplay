@@ -26,12 +26,15 @@ fn main() {
     if env::var_os("CARGO_FEATURE_NATIVE_MPV").is_some() {
         setup_libmpv();
     }
-    // FFmpeg C embed needs separate libav* — not shipped in media-kit libmpv.so.
-    // On Android we rely on libmpv (which embeds codecs) for soft RGBA.
-    if env::var_os("CARGO_FEATURE_NATIVE_FFMPEG").is_some() && !is_android {
+    // FFmpeg C embed: Linux desktop only (pw-play/pacat sinks; no CoreAudio/WASAPI yet).
+    // Android uses libmpv OpenSLES + soft RGBA.
+    let is_linux_desktop = target.contains("linux") && !is_android;
+    if env::var_os("CARGO_FEATURE_NATIVE_FFMPEG").is_some() && is_linux_desktop {
         setup_ffmpeg();
-    } else if is_android && env::var_os("CARGO_FEATURE_NATIVE_FFMPEG").is_some() {
-        println!("cargo:warning=Android: native-ffmpeg skipped (use libmpv embed)");
+    } else if env::var_os("CARGO_FEATURE_NATIVE_FFMPEG").is_some() && !is_linux_desktop {
+        println!(
+            "cargo:warning=native-ffmpeg skipped on {target} (Linux desktop only; use libmpv)"
+        );
     }
 }
 
@@ -118,15 +121,17 @@ fn setup_libmpv() {
         || env::var_os("CARGO_FEATURE_BUNDLE_RPATH").is_some();
     let target = env::var("TARGET").unwrap_or_default();
     let cross_android = target.contains("android");
+    let is_linux = target.contains("linux");
+    let is_macos = target.contains("apple-darwin") || target.contains("macos");
     if bundle_rpath && !cross_android {
-        if cfg!(target_os = "linux") {
+        // Portable runtree only — never bake absolute host Homebrew/system paths.
+        if is_linux {
             println!("cargo:rustc-link-arg=-Wl,-rpath,$ORIGIN/lib");
-        } else if cfg!(target_os = "macos") {
+        } else if is_macos {
             println!("cargo:rustc-link-arg=-Wl,-rpath,@loader_path/lib");
         }
-    }
-    // Never inject host rpath when cross-compiling for Android.
-    if !cross_android && (cfg!(target_os = "linux") || cfg!(target_os = "macos")) {
+    } else if !cross_android && !bundle_rpath && (is_linux || is_macos) {
+        // Dev builds: allow finding system libmpv without LD_LIBRARY_PATH.
         println!("cargo:rustc-link-arg=-Wl,-rpath,{}", lib_dir.display());
     }
 

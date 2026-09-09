@@ -114,6 +114,8 @@ pub struct LibMpv {
     ctx: *mut mpv_handle,
     render: *mut mpv_render_context,
     frame_dirty: Arc<AtomicBool>,
+    /// Extra Arc ownership for the C update callback (`into_raw` / `from_raw`).
+    frame_dirty_cb_raw: *const AtomicBool,
     /// Reused tightly-packed RGBA scratch (render target).
     sw_rgba: Vec<u8>,
     /// Previous present buffer recycled to avoid alloc+memcpy every frame.
@@ -132,23 +134,21 @@ unsafe impl Send for LibMpv {}
 impl LibMpv {
     pub fn create() -> Result<Self> {
         debug!("LibMpv::create");
-        // libmpv requires LC_NUMERIC=C for property/option parsing.
+        // libmpv requires LC_NUMERIC=C for property/option parsing — set every create
+        // (locale may change; Windows LC_NUMERIC is not 1).
         {
-            use std::sync::Once;
-            static ONCE: Once = Once::new();
-            ONCE.call_once(|| {
-                extern "C" {
-                    fn setlocale(category: i32, locale: *const c_char) -> *mut c_char;
+            extern "C" {
+                fn setlocale(category: i32, locale: *const c_char) -> *mut c_char;
+            }
+            #[cfg(windows)]
+            const LC_NUMERIC: i32 = 0x0000_0004; // CRT locale.h
+            #[cfg(not(windows))]
+            const LC_NUMERIC: i32 = 1; // glibc/musl/macOS
+            if let Ok(c) = CString::new("C") {
+                unsafe {
+                    setlocale(LC_NUMERIC, c.as_ptr());
                 }
-                // LC_NUMERIC — 1 on glibc/musl/macOS.
-                const LC_NUMERIC: i32 = 1;
-                let c = CString::new("C").ok();
-                if let Some(c) = c {
-                    unsafe {
-                        setlocale(LC_NUMERIC, c.as_ptr());
-                    }
-                }
-            });
+            }
         }
         let ctx = unsafe { mpv_create() };
         if ctx.is_null() {
@@ -162,6 +162,7 @@ impl LibMpv {
             ctx,
             render: ptr::null_mut(),
             frame_dirty: Arc::new(AtomicBool::new(false)),
+            frame_dirty_cb_raw: ptr::null(),
             sw_rgba: Vec::new(),
             sw_recycle: Vec::new(),
             sw_rgb0: Vec::new(),
@@ -224,9 +225,21 @@ impl LibMpv {
             return Err(PlayerError::Backend("mpv_render_context_create null".into()));
         }
         self.render = render;
-        let cb_ptr = Arc::as_ptr(&self.frame_dirty) as *mut c_void;
+        // Own an Arc for the C callback so teardown cannot race a dangling as_ptr.
+        if !self.frame_dirty_cb_raw.is_null() {
+            unsafe {
+                drop(Arc::from_raw(self.frame_dirty_cb_raw));
+            }
+            self.frame_dirty_cb_raw = ptr::null();
+        }
+        let cb_raw = Arc::into_raw(Arc::clone(&self.frame_dirty));
+        self.frame_dirty_cb_raw = cb_raw;
         unsafe {
-            mpv_render_context_set_update_callback(self.render, Some(render_update_cb), cb_ptr);
+            mpv_render_context_set_update_callback(
+                self.render,
+                Some(render_update_cb),
+                cb_raw as *mut c_void,
+            );
         }
         self.frame_dirty.store(true, Ordering::Release);
         self.force_render = true;
@@ -402,6 +415,12 @@ impl LibMpv {
                 mpv_render_context_free(self.render);
             }
             self.render = ptr::null_mut();
+        }
+        if !self.frame_dirty_cb_raw.is_null() {
+            unsafe {
+                drop(Arc::from_raw(self.frame_dirty_cb_raw));
+            }
+            self.frame_dirty_cb_raw = ptr::null();
         }
     }
 

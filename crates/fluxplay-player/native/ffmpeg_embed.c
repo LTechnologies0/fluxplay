@@ -363,37 +363,46 @@ static int try_init_hw(FluxFfmpegPlayer *p, const AVCodec *codec, AVCodecContext
 enum { FLUX_AUDIO_RATE = 48000, FLUX_AUDIO_CH = 2 };
 
 static FILE *open_audio_sink(int rate, int channels) {
-    /* Resolve via PATH (Nix/Homebrew/custom prefixes), not hardcoded /usr/bin. */
-    char cmd[384];
+    /* Absolute paths only — never `system("command -v")` / PATH (hijack risk). */
+    static const char *pw_play_bins[] = {
+        "/usr/bin/pw-play", "/bin/pw-play", "/usr/local/bin/pw-play", NULL};
+    static const char *pacat_bins[] = {
+        "/usr/bin/pacat", "/bin/pacat", "/usr/local/bin/pacat", NULL};
+    static const char *aplay_bins[] = {
+        "/usr/bin/aplay", "/bin/aplay", "/usr/local/bin/aplay", NULL};
+    char cmd[512];
     FILE *f = NULL;
-    if (system("command -v pw-play >/dev/null 2>&1") == 0) {
+    for (int i = 0; pw_play_bins[i]; i++) {
+        if (access(pw_play_bins[i], X_OK) != 0) continue;
         snprintf(cmd, sizeof(cmd),
-                 "exec pw-play -a --format s16 --rate %d --channels %d - 2>/dev/null", rate,
-                 channels);
+                 "exec '%s' -a --format s16 --rate %d --channels %d - 2>/dev/null",
+                 pw_play_bins[i], rate, channels);
         f = popen(cmd, "w");
         if (f) {
-            fprintf(stderr, "flux_ffmpeg: audio sink pw-play %d Hz / %d ch\n", rate, channels);
+            fprintf(stderr, "flux_ffmpeg: audio sink %s\n", pw_play_bins[i]);
             setvbuf(f, NULL, _IONBF, 0);
             return f;
         }
     }
-    if (system("command -v pacat >/dev/null 2>&1") == 0) {
+    for (int i = 0; pacat_bins[i]; i++) {
+        if (access(pacat_bins[i], X_OK) != 0) continue;
         snprintf(cmd, sizeof(cmd),
-                 "exec pacat --raw --format=s16le --rate=%d --channels=%d 2>/dev/null", rate,
-                 channels);
+                 "exec '%s' --raw --format=s16le --rate=%d --channels=%d 2>/dev/null",
+                 pacat_bins[i], rate, channels);
         f = popen(cmd, "w");
         if (f) {
-            fprintf(stderr, "flux_ffmpeg: audio sink pacat %d Hz / %d ch\n", rate, channels);
+            fprintf(stderr, "flux_ffmpeg: audio sink %s\n", pacat_bins[i]);
             setvbuf(f, NULL, _IONBF, 0);
             return f;
         }
     }
-    if (system("command -v aplay >/dev/null 2>&1") == 0) {
-        snprintf(cmd, sizeof(cmd), "exec aplay -q -t raw -f S16_LE -r %d -c %d 2>/dev/null", rate,
-                 channels);
+    for (int i = 0; aplay_bins[i]; i++) {
+        if (access(aplay_bins[i], X_OK) != 0) continue;
+        snprintf(cmd, sizeof(cmd), "exec '%s' -q -t raw -f S16_LE -r %d -c %d 2>/dev/null",
+                 aplay_bins[i], rate, channels);
         f = popen(cmd, "w");
         if (f) {
-            fprintf(stderr, "flux_ffmpeg: audio sink aplay %d Hz / %d ch\n", rate, channels);
+            fprintf(stderr, "flux_ffmpeg: audio sink %s\n", aplay_bins[i]);
             setvbuf(f, NULL, _IONBF, 0);
             return f;
         }
@@ -581,9 +590,10 @@ static void *decode_thread(void *arg) {
         safe_px[j] = 0;
         if (safe_px[0]) av_dict_set(&opts, "http_proxy", safe_px, 0);
     }
-    /* Block nested playlist URLs from opening file:/concat:/crypto: etc. */
+    /* Nested playlist URLs must not open file:/crypto:/data: (local/special).
+     * Local file:// playback uses libmpv; this embed is for network streams. */
     av_dict_set(&opts, "protocol_whitelist",
-                "file,http,https,tcp,tls,rtmp,rtmps,rtsp,rtsps,rtp,udp,srt,crypto,data", 0);
+                "http,https,tcp,tls,rtmp,rtmps,rtsp,rtsps,rtp,udp,srt", 0);
     av_dict_set(&opts, "reconnect", "1", 0);
     av_dict_set(&opts, "reconnect_streamed", "1", 0);
     av_dict_set(&opts, "reconnect_delay_max", "5", 0);
