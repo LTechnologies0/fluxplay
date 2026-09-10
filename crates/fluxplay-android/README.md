@@ -21,7 +21,14 @@ vendor/android-native/include/mpv/*.h
 ```
 
 `cargo-apk` packs them via `[package.metadata.android] runtime_libs`.
-Unused `libmediakitandroidhelper.so` lives under `vendor/android-native-optional/` (not packaged).
+Also packs `libmediakitandroidhelper.so` (MediaCodec JNI/JavaVM bridge) from the same ABI dirs.
+A copy remains under `vendor/android-native-optional/` for reference.
+
+## Android session (rotation + Surface)
+
+- Activity: `screenOrientation=fullSensor` + `configChanges` (no Activity recreate on rotate).
+- Java `onConfigurationChanged` / `onResume` / Surface destroy → `stabilizeAndroidSession` + delayed Surface reattach.
+- Rust `maintain_android_surface_session` rebinds mpv `wid` when Surface `gen` or size changes.
 
 ## Build
 
@@ -81,9 +88,15 @@ adb logcat -s FluxPlay:V | rg 'ERROR|WARN|fluxplay::icons|fluxplay::images|profi
 ## Notes
 
 - Desktop binary unchanged: `cargo run -p fluxplay` (iced daemon + libmpv).
-- Android uses `iced::application` (single window); player UI embeds in-place via `vo=libmpv` soft RGBA.
+- Android uses `iced::application` (single window); player UI embeds in-place.
+- **Present paths (Phases A–D)**:
+  - Prefer `vo=mediacodec_embed` + `hwdec=mediacodec` on a `SurfaceView` under translucent iced (1080p/4K/HDR when the SoC supports it).
+  - Fallback: `vo=libmpv` soft RGBA + `mediacodec-copy` (capped ~720p).
+  - Optional Phase D: drop-in Vulkan libmpv via `scripts/fetch-libmpv-vulkan.sh`, then `FLUXPLAY_ANDROID_VO=gpu`.
+  - Overrides: `FLUXPLAY_ANDROID_PRESENT=surface|soft|gpu`.
 - **Lifecycle**: iced_winit drops wgpu surfaces on `Suspended` and recreates them on `Resumed` (fixes black screen after Home / app switch). Requires vendored `vendor/iced_winit` patch.
 - Playback: dynamic link to vendored `libmpv.so` (media-kit). ABIs: `arm64-v8a` (phone) + `x86_64` (Waydroid). Backend « FFmpeg » mappe vers libmpv/lavc. Audio: `ao=opensles`. Fallback: `ACTION_VIEW`.
+- Device caps (HDR types, refresh Hz, MediaCodec 4K/HDR, surface size) → `files/saf_inbox/device_caps.json`.
 - Default `./scripts/build-android-apk.sh` builds a **fat APK** (both ABIs). Use `--target` for single-ABI.
 - Mosaic / listes: overlay drag + `on_release` titres; channel thumbs + letter avatars; tinted white PNG chrome icons.
 - Phone UI: Fira Sans named font, real system insets via JNI, immersive during playback.

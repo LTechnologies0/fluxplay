@@ -76,9 +76,9 @@ pub struct JobMeters {
 impl JobMeters {
     pub fn new() -> Self {
         Self {
-            ingest: Arc::new(JobProgress::default()),
-            browse_index: Arc::new(JobProgress::default()),
-            images: Arc::new(JobProgress::default()),
+            ingest: Arc::new(JobProgress::new(0)),
+            browse_index: Arc::new(JobProgress::new(0)),
+            images: Arc::new(JobProgress::new(0)),
             browse_gen: Arc::new(AtomicU64::new(0)),
         }
     }
@@ -129,6 +129,7 @@ pub async fn run_blocking<T: Send + 'static>(
 
 /// Fold `items` in chunks of `chunk`, calling `on_chunk` for each slice.
 /// Updates `progress` after every chunk (`done` += chunk len).
+#[allow(dead_code)]
 pub fn for_each_chunk<T, F>(
     items: &[T],
     chunk: usize,

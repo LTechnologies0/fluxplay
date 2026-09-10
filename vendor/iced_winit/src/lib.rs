@@ -700,15 +700,25 @@ async fn run_instance<P>(
                     if window.surface.take().is_some() {
                         log::debug!("Dropped Android render surface");
                     }
+                    // Stale cfg would skip the first Outdated configure after resume.
+                    window.android_last_cfg = None;
                 }
                 continue;
             }
             #[cfg(target_os = "android")]
             Event::AndroidResumeSurfaces => {
-                // Defer recreate until RedrawRequested (compositor type is known).
-                android_recreate_surfaces = true;
-                for (_id, window) in window_manager.iter_mut() {
-                    window.raw.request_redraw();
+                // Recreate after Suspend dropped surfaces, or if a dead 0×0 surface stuck.
+                let need = window_manager.iter_mut().any(|(_id, w)| {
+                    w.surface.is_none() || {
+                        let sz = w.state.physical_size();
+                        sz.width == 0 || sz.height == 0
+                    }
+                });
+                if need {
+                    android_recreate_surfaces = true;
+                    for (_id, window) in window_manager.iter_mut() {
+                        window.raw.request_redraw();
+                    }
                 }
                 continue;
             }
@@ -938,6 +948,9 @@ async fn run_instance<P>(
                                         physical_size.width,
                                         physical_size.height,
                                     ));
+                                // Fresh ANativeWindow — force next Outdated path
+                                // to configure; stale last_cfg would skip it.
+                                win.android_last_cfg = None;
                                 win.surface_version =
                                     win.state.surface_version();
                                 win.raw.request_redraw();
@@ -990,6 +1003,11 @@ async fn run_instance<P>(
                                     physical_size.width,
                                     physical_size.height,
                                 );
+                                #[cfg(target_os = "android")]
+                                {
+                                    window.android_last_cfg =
+                                        Some((physical_size.width, physical_size.height));
+                                }
                             }
 
                             window.surface_version =
@@ -997,7 +1015,13 @@ async fn run_instance<P>(
                         }
 
                         if window.surface.is_none() {
-                            // Android suspended — no NativeWindow yet.
+                            // Android suspended — no NativeWindow yet. If NW is back,
+                            // arm recreate instead of silently skipping forever.
+                            #[cfg(target_os = "android")]
+                            if android::has_native_window() {
+                                android_recreate_surfaces = true;
+                                window.raw.request_redraw();
+                            }
                             continue;
                         }
 
@@ -1194,6 +1218,7 @@ async fn run_instance<P>(
                                     // Reconfigure surface and try redrawing
                                     let physical_size =
                                         window.state.physical_size();
+                                    let mut need_redraw = true;
 
                                     if error == compositor::SurfaceError::Lost {
                                         #[cfg(target_os = "android")]
@@ -1215,9 +1240,16 @@ async fn run_instance<P>(
                                                         physical_size.height,
                                                     ),
                                             );
+                                            #[cfg(target_os = "android")]
+                                            {
+                                                window.android_last_cfg = None;
+                                            }
                                         } else {
                                             #[cfg(target_os = "android")]
                                             {
+                                                // Dead Surface handle — don't keep presenting into it.
+                                                window.surface = None;
+                                                window.android_last_cfg = None;
                                                 android_recreate_surfaces =
                                                     true;
                                             }
@@ -1225,14 +1257,37 @@ async fn run_instance<P>(
                                     } else if let Some(surface) =
                                         window.surface.as_mut()
                                     {
-                                        current_compositor.configure_surface(
-                                            surface,
-                                            physical_size.width,
-                                            physical_size.height,
-                                        );
+                                        // Outdated
+                                        #[cfg(target_os = "android")]
+                                        let skip = window.android_last_cfg
+                                            == Some((
+                                                physical_size.width,
+                                                physical_size.height,
+                                            ));
+                                        #[cfg(not(target_os = "android"))]
+                                        let skip = false;
+                                        if !skip {
+                                            current_compositor.configure_surface(
+                                                surface,
+                                                physical_size.width,
+                                                physical_size.height,
+                                            );
+                                            #[cfg(target_os = "android")]
+                                            {
+                                                window.android_last_cfg = Some((
+                                                    physical_size.width,
+                                                    physical_size.height,
+                                                ));
+                                            }
+                                        } else {
+                                            // Same-size Outdated — avoid redraw spin on Pixel BLAST.
+                                            need_redraw = false;
+                                        }
                                     }
 
-                                    window.raw.request_redraw();
+                                    if need_redraw {
+                                        window.raw.request_redraw();
+                                    }
                                 }
                                 _ => {
                                     present_span.finish();
@@ -1277,12 +1332,25 @@ async fn run_instance<P>(
                             continue;
                         };
 
-                        match window_event {
-                            winit::event::WindowEvent::Resized(_) => {
+                        // Pixel BLAST: same-size NativeWindowResized at display Hz.
+                        // Skip redraw AND skip pushing Resized into the app (layout churn).
+                        let same_size_resize = matches!(
+                            &window_event,
+                            winit::event::WindowEvent::Resized(new_size)
+                                if new_size.width
+                                    == window.state.physical_size().width
+                                    && new_size.height
+                                        == window.state.physical_size().height
+                        );
+
+                        match &window_event {
+                            winit::event::WindowEvent::Resized(_)
+                                if !same_size_resize =>
+                            {
                                 window.raw.request_redraw();
                             }
                             winit::event::WindowEvent::ThemeChanged(theme) => {
-                                let mode = conversion::theme_mode(theme);
+                                let mode = conversion::theme_mode(*theme);
 
                                 if mode != system_theme {
                                     system_theme = mode;
@@ -1319,6 +1387,8 @@ async fn run_instance<P>(
                                 &mut is_window_opening,
                                 &mut system_theme,
                             );
+                        } else if same_size_resize {
+                            // Drop identical Resized before state.update / conversion.
                         } else {
                             window.state.update(
                                 &program,
@@ -1336,6 +1406,19 @@ async fn run_instance<P>(
                         }
                     }
                     event::Event::AboutToWait => {
+                        #[cfg(target_os = "android")]
+                        if android_recreate_surfaces && android::has_native_window()
+                        {
+                            // RedrawRequested may have been consumed while NW was gone —
+                            // re-arm only when a window has a usable size (avoid 0×0 spin).
+                            for (_id, window) in window_manager.iter_mut() {
+                                let sz = window.state.physical_size();
+                                if sz.width > 0 && sz.height > 0 {
+                                    window.raw.request_redraw();
+                                }
+                            }
+                        }
+
                         if actions > 0 {
                             proxy.free_slots(actions);
                             actions = 0;

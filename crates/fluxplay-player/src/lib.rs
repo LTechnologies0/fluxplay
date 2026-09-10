@@ -4,11 +4,14 @@
 //! Android iced (`fluxplay-android`): vendored **libmpv** RGBA embed + `ACTION_VIEW` Intent.
 //! iOS / legacy FFI: AVPlayer (experimental).
 
+mod android_quality;
 mod backend;
 #[cfg(all(feature = "native-ffmpeg", fluxplay_has_ffmpeg))]
 mod ffmpeg_ffi;
 #[cfg(all(feature = "native-mpv", fluxplay_has_libmpv))]
 mod mpv_ffi;
+#[cfg(all(feature = "native-mpv", fluxplay_has_libmpv))]
+mod soft_pump;
 mod native_log;
 mod platform;
 mod session;
@@ -20,6 +23,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracing::{debug, info, trace, warn};
 
+pub use android_quality::{AndroidDeviceCaps, AndroidPresentMode, CompatTier, SoftBudget};
 pub use backend::{
     detect_backends, BackendCaps, BackendId, BackendInfo, NativePlayer, PlayOptions, PlayerEvent,
     VideoRect,
@@ -53,6 +57,20 @@ pub enum PlayerError {
 }
 
 pub type Result<T> = std::result::Result<T, PlayerError>;
+
+/// Register Android `JavaVM` with the FFmpeg inside libmpv (MediaCodec Surface).
+/// Safe no-op when libmpv is not linked.
+pub fn register_android_java_vm(vm: *mut std::ffi::c_void) -> bool {
+    #[cfg(all(feature = "native-mpv", fluxplay_has_libmpv))]
+    {
+        mpv_ffi::register_android_java_vm(vm)
+    }
+    #[cfg(not(all(feature = "native-mpv", fluxplay_has_libmpv)))]
+    {
+        let _ = vm;
+        false
+    }
+}
 
 /// Scheme + host only — avoids logging path/query credentials.
 pub(crate) fn url_endpoint(raw: &str) -> String {

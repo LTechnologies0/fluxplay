@@ -11,12 +11,12 @@ use iced::{
 use fluxplay_player::{BackendCaps, PlaybackState, StreamSession};
 
 use crate::theme::{
-    elevation_shadow, radius_dock, radius_fab, stage_black, UiTheme, FAB_MEDIUM, LOADING_SIZE,
-    RADIUS_EXTRA_LARGE, RADIUS_FULL, RADIUS_LG, SLIDER_HANDLE_W, SLIDER_S_HEIGHT, SLIDER_S_TRACK,
-    SPACE_MD, SPACE_SM, SPACE_XS, SPACE_XXS, TOOLBAR_H, TOOLBAR_OUTER_PAD, TYPE_LABEL_L,
-    TYPE_LABEL_M, TYPE_LABEL_S, TYPE_TITLE_M,
+    elevation_shadow, radius_fab, radius_floating_toolbar, stage_black, UiTheme, FAB_MEDIUM,
+    LOADING_SIZE, RADIUS_EXTRA_LARGE, RADIUS_FULL, RADIUS_LG, SLIDER_HANDLE_W, SLIDER_S_HEIGHT,
+    SLIDER_S_TRACK, SPACE_MD, SPACE_SM, SPACE_XS, SPACE_XXS, TOOLBAR_H, TOOLBAR_ITEM_GAP,
+    TOOLBAR_OUTER_PAD, TYPE_LABEL_L, TYPE_LABEL_M, TYPE_LABEL_S, TYPE_TITLE_M,
 };
-use crate::app::Message;
+use crate::app::{Message, PasteTarget};
 use crate::icons::{self, Icon};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -49,15 +49,19 @@ pub struct PlayerChrome<'a> {
     pub fullscreen: bool,
     /// libmpv / libav* software-render embeds frames in iced; CLI fallback uses an OS window.
     pub embedded_video: bool,
+    /// Android MediaCodec Surface under iced (transparent stage punch-through).
+    pub surface_video: bool,
     pub backend_label: &'a str,
     pub caps: BackendCaps,
+    /// System safe-area insets (l,t,r,b) — chrome overlays only, not the stage.
+    pub safe: Padding,
 }
 
 pub fn player_window(p: PlayerChrome<'_>) -> Element<'_, Message> {
     let stage = stage_panel(&p);
     let live = p.session.is_live();
     let alpha = p.chrome_alpha.clamp(0.0, 1.0);
-    let interactive = alpha > 0.05 || p.panel != PlayerPanel::None;
+    let interactive = (p.chrome_visible && alpha > 0.05) || p.panel != PlayerPanel::None;
 
     // Full-bleed video; ALL chrome is overlay (never reflows the image stage → no flicker).
     let overlay: Element<'_, Message> = if interactive {
@@ -68,9 +72,18 @@ pub fn player_window(p: PlayerChrome<'_>) -> Element<'_, Message> {
         };
         let mut title_ink = p.ui.inverse_on_surface();
         title_ink.a *= alpha;
-        let title = text(truncate(p.title, 64))
-            .size(TYPE_TITLE_M)
-            .color(title_ink);
+        let mut meta_ink = p.ui.inverse_on_surface();
+        meta_ink.a *= alpha * 0.72;
+        let title_block = column![
+            text(truncate(p.title, 64))
+                .size(TYPE_TITLE_M)
+                .color(title_ink),
+            text(truncate(p.meta, 72))
+                .size(TYPE_LABEL_S)
+                .color(meta_ink),
+        ]
+        .spacing(2)
+        .width(Fill);
         let fs = if p.fullscreen {
             #[cfg(target_os = "android")]
             {
@@ -84,9 +97,14 @@ pub fn player_window(p: PlayerChrome<'_>) -> Element<'_, Message> {
             Space::new().width(0).into()
         };
         let top = container(
-            row![badge, title, Space::new().width(Fill), fs]
+            row![badge, title_block, Space::new().width(Fill), fs]
                 .spacing(SPACE_MD)
-                .padding(Padding::from([12, 16]))
+                .padding(Padding {
+                    top: 12.0 + p.safe.top,
+                    right: 16.0 + p.safe.right,
+                    bottom: 12.0,
+                    left: 16.0 + p.safe.left,
+                })
                 .align_y(Alignment::Center),
         )
         .width(Fill)
@@ -167,11 +185,16 @@ fn stage_panel<'a>(p: &PlayerChrome<'a>) -> Element<'a, Message> {
         PlaybackState::Playing | PlaybackState::Paused | PlaybackState::Buffering
     );
 
-    let center: Element<'a, Message> = if let Some(frame) = p.video {
+    let center: Element<'a, Message> = if p.surface_video {
+        // SurfaceView under iced — never paint art/loader (opaque) over MediaCodec.
+        Space::new().width(Fill).height(Fill).into()
+    } else if let Some(frame) = p.video {
+        // Soft RGBA is already letterboxed into the stage-shaped buffer (mpv keepaspect /
+        // aspect-safe vf). Contain would double-letterbox after rotate.
         iced::widget::image(frame)
             .width(Fill)
             .height(Fill)
-            .content_fit(iced::ContentFit::Contain)
+            .content_fit(iced::ContentFit::Fill)
             .into()
     } else if playing && p.embedded_video {
         // Loader until first GPU frame — avoid black gap when clock leads video,
@@ -260,6 +283,11 @@ fn stage_panel<'a>(p: &PlayerChrome<'a>) -> Element<'a, Message> {
     };
 
     // Always full-bleed: never put title chrome in this column (it resized the image → flicker).
+    let stage_bg = if p.surface_video {
+        Color::TRANSPARENT
+    } else {
+        stage_black()
+    };
     container(center)
         .width(Fill)
         .height(Fill)
@@ -267,7 +295,7 @@ fn stage_panel<'a>(p: &PlayerChrome<'a>) -> Element<'a, Message> {
         .center_y(Fill)
         .clip(true)
         .style(move |_t: &Theme| container::Style {
-            background: Some(Background::Color(stage_black())),
+            background: Some(Background::Color(stage_bg)),
             ..Default::default()
         })
         .into()
@@ -385,16 +413,43 @@ fn control_dock<'a>(p: &PlayerChrome<'a>, chrome_alpha: f32) -> Element<'a, Mess
         .into()
     };
 
-    // Connected transport segment (−10 | Play FAB | +10), gap 0, shared soft shell.
+        let status_line: Element<'a, Message> = if p.status.is_empty() {
+            Space::new().height(0).into()
+        } else {
+            // Android: status sits on primary_container — use on_primary_container ink.
+            #[cfg(target_os = "android")]
+            {
+                let mut ink = on_tb;
+                ink.a *= alpha.clamp(0.55, 1.0);
+                text(truncate(p.status, 72))
+                    .size(TYPE_LABEL_S)
+                    .color(ink)
+                    .into()
+            }
+            #[cfg(not(target_os = "android"))]
+            {
+                let mut status_ink = ui.inverse_on_surface();
+                status_ink.a *= alpha * 0.8;
+                text(truncate(p.status, 96))
+                    .size(TYPE_LABEL_S)
+                    .color(status_ink)
+                    .into()
+            }
+        };
+
+    // Connected transport segment (−10 | Play FAB | +10 | Stop), gap 0, shared soft shell.
     let transport = container(
         row![
             toolbar_svg(ui, Icon::Replay10, Message::SeekRel(-10), can_seek_rel, false),
             play_fab(ui, play_glyph, Message::TogglePause, pause_enabled),
             toolbar_svg(ui, Icon::Forward10, Message::SeekRel(10), can_seek_rel, false),
+            toolbar_svg(ui, Icon::Stop, Message::Stop, active && p.caps.owned, false),
         ]
         .spacing(0)
-        .align_y(Alignment::Center),
+        .align_y(Alignment::Center)
+        .width(Length::Shrink),
     )
+    .width(Length::Shrink)
     .padding(Padding::from([2, 2]))
     .style(move |_t: &Theme| container::Style {
         background: Some(Background::Color(Color::from_rgba(
@@ -411,8 +466,119 @@ fn control_dock<'a>(p: &PlayerChrome<'a>, chrome_alpha: f32) -> Element<'a, Mess
         ..Default::default()
     });
 
+    #[cfg(target_os = "android")]
+    {
+        // Phone width: never pack prev/vol/transport/more into one overflowing row.
+        // Row 1 — channel skip + transport (centered).
+        // Row 2 — mute + volume | more / fullscreen / close.
+        let transport_row = row![
+            toolbar_svg(ui, Icon::SkipPrevious, Message::PlaylistPrev, true, false),
+            transport,
+            toolbar_svg(ui, Icon::SkipNext, Message::PlaylistNext, true, false),
+        ]
+        .spacing(SPACE_SM)
+        .align_y(Alignment::Center)
+        .width(Length::Shrink);
+
+        let vol_slider: Element<'a, Message> = if vol_enabled {
+            container(
+                slider(0.0..=1.0, vol, Message::VolumeChanged)
+                    .step(0.01_f32)
+                    .height(32.0)
+                    .style(move |theme: &Theme, status| {
+                        let mut st = slider::default(theme, status);
+                        st.rail.backgrounds.0 = Background::Color(ui.primary());
+                        st.rail.backgrounds.1 = Background::Color(Color::from_rgba(
+                            on_tb.r,
+                            on_tb.g,
+                            on_tb.b,
+                            0.28,
+                        ));
+                        st.rail.width = 8.0;
+                        st.handle.background = Background::Color(on_tb);
+                        st.handle.shape = slider::HandleShape::Circle { radius: 6.0 };
+                        st
+                    }),
+            )
+            .width(Fill)
+            .into()
+        } else {
+            Space::new().width(Fill).into()
+        };
+
+        let actions = row![
+            toolbar_svg(ui, mute_glyph, Message::ToggleMute, mute_enabled, s.muted),
+            vol_slider,
+            toolbar_svg(
+                ui,
+                Icon::More,
+                Message::PlayerPanel(PlayerPanel::More),
+                true,
+                p.panel == PlayerPanel::More,
+            ),
+            toolbar_svg(ui, Icon::Fullscreen, Message::ToggleFullscreen, true, p.fullscreen),
+            toolbar_svg(ui, Icon::Close, Message::ClosePlayerWindow, true, false),
+        ]
+        .spacing(SPACE_XS)
+        .align_y(Alignment::Center)
+        .width(Fill);
+
+        let floating = container(
+            column![
+                status_line,
+                scrub,
+                container(transport_row)
+                    .width(Fill)
+                    .center_x(Fill)
+                    .padding(Padding::from([SPACE_XXS as u16, 0])),
+                actions,
+            ]
+            .spacing(SPACE_XXS)
+            .padding(Padding {
+                top: SPACE_XS,
+                right: SPACE_SM,
+                bottom: SPACE_XS,
+                left: SPACE_SM,
+            })
+            .height(Length::Shrink),
+        )
+        .width(Fill)
+        .height(Length::Shrink)
+        .style(move |_t: &Theme| {
+            let mut fill = ui.primary_container();
+            fill.a *= alpha;
+            container::Style {
+                background: Some(Background::Color(fill)),
+                border: Border {
+                    color: ui.outline_variant(),
+                    width: 1.0,
+                    radius: radius_floating_toolbar(),
+                },
+                shadow: Default::default(),
+                ..Default::default()
+            }
+        });
+
+        return container(floating)
+            .width(Fill)
+            .height(Length::Shrink)
+            .padding(Padding {
+                top: 0.0,
+                right: TOOLBAR_OUTER_PAD + p.safe.right,
+                bottom: TOOLBAR_OUTER_PAD + p.safe.bottom,
+                left: TOOLBAR_OUTER_PAD + p.safe.left,
+            })
+            .style(move |_t: &Theme| container::Style {
+                background: None,
+                ..Default::default()
+            })
+            .into();
+    }
+
+    #[cfg(not(target_os = "android"))]
     let left = if vol_enabled {
         row![
+            toolbar_svg(ui, Icon::SkipPrevious, Message::PlaylistPrev, true, false),
             toolbar_svg(ui, mute_glyph, Message::ToggleMute, mute_enabled, s.muted),
             container(
                 slider(0.0..=1.0, vol, Message::VolumeChanged)
@@ -434,21 +600,27 @@ fn control_dock<'a>(p: &PlayerChrome<'a>, chrome_alpha: f32) -> Element<'a, Mess
                     }),
             )
             .width(Length::Fixed(96.0)),
+            toolbar_svg(ui, Icon::SkipNext, Message::PlaylistNext, true, false),
         ]
-        .spacing(SPACE_SM)
+        .spacing(TOOLBAR_ITEM_GAP)
         .align_y(Alignment::Center)
     } else {
-        row![toolbar_svg(
-            ui,
-            mute_glyph,
-            Message::ToggleMute,
-            mute_enabled,
-            s.muted
-        )]
-        .spacing(SPACE_SM)
+        row![
+            toolbar_svg(ui, Icon::SkipPrevious, Message::PlaylistPrev, true, false),
+            toolbar_svg(
+                ui,
+                mute_glyph,
+                Message::ToggleMute,
+                mute_enabled,
+                s.muted
+            ),
+            toolbar_svg(ui, Icon::SkipNext, Message::PlaylistNext, true, false),
+        ]
+        .spacing(TOOLBAR_ITEM_GAP)
         .align_y(Alignment::Center)
     };
 
+    #[cfg(not(target_os = "android"))]
     let right = row![
         toolbar_svg(
             ui,
@@ -463,6 +635,7 @@ fn control_dock<'a>(p: &PlayerChrome<'a>, chrome_alpha: f32) -> Element<'a, Mess
     .spacing(SPACE_XS)
     .align_y(Alignment::Center);
 
+    #[cfg(not(target_os = "android"))]
     let toolbar_row = row![
         left,
         Space::new().width(Fill),
@@ -472,13 +645,14 @@ fn control_dock<'a>(p: &PlayerChrome<'a>, chrome_alpha: f32) -> Element<'a, Mess
     ]
     .align_y(Alignment::Center)
     .width(Fill)
-    .height(Length::Fixed(TOOLBAR_H))
+    .height(Length::Fixed(p.chrome_h.max(TOOLBAR_H).min(TOOLBAR_H + 24.0)))
     .padding(Padding::from([0, SPACE_MD as u16]));
 
     // Compact floating chrome — MUST Shrink or iced stretches the container
     // to leftover overlay height (huge empty primaryContainer band).
+    #[cfg(not(target_os = "android"))]
     let floating = container(
-        column![scrub, toolbar_row]
+        column![status_line, scrub, toolbar_row]
             .spacing(SPACE_XXS)
             .padding(Padding {
                 top: SPACE_XS,
@@ -493,28 +667,13 @@ fn control_dock<'a>(p: &PlayerChrome<'a>, chrome_alpha: f32) -> Element<'a, Mess
     .style(move |_t: &Theme| {
         let mut fill = ui.primary_container();
         fill.a *= alpha;
-        #[cfg(target_os = "android")]
-        {
-            // GLES: primary_container fill + outline for depth (no desktop elev shadows).
-            container::Style {
-                background: Some(Background::Color(fill)),
-                border: Border {
-                    color: ui.outline_variant(),
-                    width: 1.0,
-                    radius: radius_dock(),
-                },
-                shadow: Default::default(),
-                ..Default::default()
-            }
-        }
-        #[cfg(not(target_os = "android"))]
         {
             container::Style {
                 background: Some(Background::Color(fill)),
                 border: Border {
                     color: Color::TRANSPARENT,
                     width: 0.0,
-                    radius: radius_dock(),
+                    radius: radius_floating_toolbar(),
                 },
                 shadow: elevation_shadow(2, ui.day),
                 ..Default::default()
@@ -522,23 +681,48 @@ fn control_dock<'a>(p: &PlayerChrome<'a>, chrome_alpha: f32) -> Element<'a, Mess
         }
     });
 
-    container(floating)
-        .width(Fill)
-        .height(Length::Shrink)
-        .padding(Padding {
-            top: 0.0,
-            right: TOOLBAR_OUTER_PAD,
-            bottom: TOOLBAR_OUTER_PAD,
-            left: TOOLBAR_OUTER_PAD,
-        })
-        .style(move |_t: &Theme| container::Style {
-            background: None,
-            ..Default::default()
-        })
-        .into()
+    #[cfg(not(target_os = "android"))]
+    {
+        container(floating)
+            .width(Fill)
+            .height(Length::Shrink)
+            .padding(Padding {
+                top: 0.0,
+                right: TOOLBAR_OUTER_PAD + p.safe.right,
+                bottom: TOOLBAR_OUTER_PAD + p.safe.bottom,
+                left: TOOLBAR_OUTER_PAD + p.safe.left,
+            })
+            .style(move |_t: &Theme| container::Style {
+                background: None,
+                ..Default::default()
+            })
+            .into()
+    }
 }
 
 fn truncate(s: &str, max: usize) -> String {
+    #[cfg(target_os = "android")]
+    let cleaned: String = {
+        s.chars()
+            .map(|c| {
+                if matches!(c, ' '..='~' | '\u{00A0}'..='\u{024F}')
+                    || matches!(
+                        c,
+                        '·' | '•' | '…' | '—' | '–' | '«' | '»' | '€' | '°' | '×' | '÷'
+                    )
+                {
+                    c
+                } else {
+                    ' '
+                }
+            })
+            .collect::<String>()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    #[cfg(target_os = "android")]
+    let s = cleaned.as_str();
     let mut t = String::new();
     for (i, ch) in s.chars().enumerate() {
         if i >= max {
@@ -813,6 +997,19 @@ fn goto_sheet(ui: UiTheme, draft: &str) -> Element<'_, Message> {
                     .on_submit(Message::GotoSubmit)
                     .padding(10)
                     .width(Length::Fixed(160.0)),
+                mouse_area(
+                    container(icons::icon(Icon::Paste, 18.0, ui.accent()))
+                        .padding(8)
+                        .style(move |_t: &Theme| container::Style {
+                            background: Some(Background::Color(ui.surface_container_highest())),
+                            border: Border {
+                                radius: RADIUS_FULL.into(),
+                                ..Default::default()
+                            },
+                            ..Default::default()
+                        }),
+                )
+                .on_press(Message::PasteInto(PasteTarget::Goto)),
                 chip_btn(ui, "OK", Message::GotoSubmit, true),
                 chip_btn(ui, "Annuler", Message::PlayerPanel(PlayerPanel::None), true),
             ]
@@ -1021,7 +1218,16 @@ fn toolbar_svg(
         Color::TRANSPARENT
     };
     let body = container(icons::icon(kind, 22.0, ink))
-        .padding(Padding::from([10, 12]))
+        .padding({
+            #[cfg(target_os = "android")]
+            {
+                Padding::from([8, 8])
+            }
+            #[cfg(not(target_os = "android"))]
+            {
+                Padding::from([10, 12])
+            }
+        })
         .style(move |_t: &Theme| container::Style {
             background: Some(Background::Color(bg)),
             border: Border {
@@ -1039,6 +1245,7 @@ fn toolbar_svg(
 }
 
 /// Icon button on vibrant floating toolbar (`onPrimaryContainer`) — text fallback.
+#[allow(dead_code)]
 fn toolbar_icon(
     ui: UiTheme,
     label: &str,
@@ -1081,17 +1288,20 @@ fn toolbar_icon(
 fn play_fab(ui: UiTheme, kind: Icon, msg: Message, enabled: bool) -> Element<'static, Message> {
     let fill = ui.primary();
     let ink = ui.on_primary();
+    #[cfg(target_os = "android")]
+    let fab_r = RADIUS_FULL.into();
+    #[cfg(not(target_os = "android"))]
+    let fab_r = radius_fab();
+    // Prefer `.center(FAB_MEDIUM)` — iced's `center_x(Fill)` *replaces* width with Fill
+    // (not merely aligns), which stretched the FAB into a full-width stadium pill.
     let body = container(icons::icon(kind, 28.0, ink))
-        .width(Length::Fixed(FAB_MEDIUM))
-        .height(Length::Fixed(FAB_MEDIUM))
-        .center_x(Fill)
-        .center_y(Fill)
+        .center(FAB_MEDIUM)
         .style(move |_t: &Theme| container::Style {
             background: Some(Background::Color(fill)),
             border: Border {
                 color: Color::TRANSPARENT,
                 width: 0.0,
-                radius: radius_fab(),
+                radius: fab_r,
             },
             shadow: elevation_shadow(3, ui.day),
             ..Default::default()

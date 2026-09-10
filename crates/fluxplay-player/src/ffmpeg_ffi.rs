@@ -117,16 +117,12 @@ impl LibFfmpeg {
         })
     }
 
-    /// Soft-present size (even dims, optional UHD). Matches iced pull clamp.
+    /// Soft-present size: trust the iced/app budget `(w,h)` (already quality-clamped).
+    /// Only enforce even dims and a hard decode ceiling — do not re-bucket by core count
+    /// (that fought `AndroidDeviceCaps::soft_budget` and discarded frames).
     pub fn soft_present_dims(w: u32, h: u32) -> (u32, u32) {
-        let uhd = std::env::var_os("FLUXPLAY_SOFT_UHD").is_some();
-        let max_w = if uhd { 3840u32 } else { 1920 };
-        let max_h = if uhd { 2160u32 } else { 1080 };
-        let scale = (max_w as f32 / w.max(1) as f32)
-            .min(max_h as f32 / h.max(1) as f32)
-            .min(1.0);
-        let rw = ((w as f32 * scale).round() as u32).max(2) & !1;
-        let rh = ((h as f32 * scale).round() as u32).max(2) & !1;
+        let rw = (w.clamp(2, 3840) & !1).max(2);
+        let rh = (h.clamp(2, 2160) & !1).max(2);
         (rw, rh)
     }
 

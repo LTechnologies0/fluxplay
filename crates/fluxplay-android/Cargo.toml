@@ -91,7 +91,8 @@ data = [{ mime_type = "*/*" }]
 label = "FluxPlay"
 icon = "@mipmap/ic_launcher"
 # TV leanback row image (also under resources/drawable/banner.png).
-theme = "@android:style/Theme.DeviceDefault.NoActionBar.Fullscreen"
+# Translucent so MediaCodec SurfaceView can show under iced chrome (Phase A).
+theme = "@style/FluxPlay.Transparent"
 # Prefer false for store/release; local debug builds can still use adb jdwp via NDK.
 debuggable = false
 uses_cleartext_traffic = true
@@ -115,8 +116,11 @@ key_password = "android"
 [package.metadata.android.application.activity]
 name = "app.fluxplay.android.FluxPlayNativeActivity"
 exported = true
+# Survive rotate / fold / density without Activity recreate — Java onConfigurationChanged
+# refreshes insets + Surface; Rust rebinds wid / caps.
 config_changes = "orientation|screenSize|screenLayout|keyboardHidden|uiMode|density|smallestScreenSize|keyboard|layoutDirection"
-orientation = "unspecified"
+# Auto-rotate with the sensor (portrait ↔ landscape ↔ reverse) when system allows.
+orientation = "fullSensor"
 launch_mode = "singleTop"
 resizeable_activity = true
 always_retain_task_state = true

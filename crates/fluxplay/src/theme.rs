@@ -1,5 +1,9 @@
 //! Material 3 Expressive tokens — accent presets + day/night surfaces.
 //! Inspired by M3 Expressive and IPTV clients (TiviMate / MYTV / Smarters).
+//!
+//! Design-system surface: many roles / spacing tokens are reserved for upcoming chrome.
+
+#![allow(dead_code)]
 
 use fluxplay_core::models::AccentPreset;
 use iced::font::{Family, Weight};
@@ -950,8 +954,6 @@ impl LayoutMetrics {
         }
         if cat_w > 0.0 {
             chrome += gap + pad * 2.0;
-        } else {
-            chrome += pad * 2.0;
         }
         let content_w = (w - rail_w - cat_w - chrome).max(120.0);
 
@@ -1011,9 +1013,21 @@ impl LayoutMetrics {
     }
 }
 
+/// Scroll rail reserved beside mosaic (must match `soft_scroll_mosaic`).
+fn mosaic_scroll_rail() -> f32 {
+    #[cfg(target_os = "android")]
+    {
+        16.0
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        12.0
+    }
+}
+
 /// How many mosaic columns fit in `content_width`.
 pub fn mosaic_cols(content_width: f32) -> usize {
-    let w = content_width.max(80.0);
+    let w = (content_width - mosaic_scroll_rail()).max(80.0);
     let cols = ((w + MOSAIC_GAP) / (MOSAIC_TILE_MIN + MOSAIC_GAP)).floor() as usize;
     cols.clamp(1, 14)
 }
@@ -1021,6 +1035,7 @@ pub fn mosaic_cols(content_width: f32) -> usize {
 pub fn mosaic_tile_width(content_width: f32, cols: usize) -> f32 {
     let cols = cols.max(1) as f32;
     let gaps = MOSAIC_GAP * (cols - 1.0);
+    let usable = (content_width - mosaic_scroll_rail()).max(80.0);
     // Slack so button padding cannot overflow the row.
-    ((content_width - gaps) / cols - 4.0).clamp(72.0, 320.0)
+    ((usable - gaps) / cols - 4.0).clamp(96.0, 320.0)
 }

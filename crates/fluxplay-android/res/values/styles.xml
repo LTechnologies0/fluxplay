@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Opaque theme (name historical). Soft present — no TRANSLUCENT punch. -->
+    <style name="FluxPlay.Transparent" parent="@android:style/Theme.DeviceDefault.NoActionBar.Fullscreen">
+        <item name="android:windowIsTranslucent">false</item>
+        <!-- Match iced night shell (surface_dim) to avoid pure-black OLED flash. -->
+        <item name="android:windowBackground">#FF05080E</item>
+        <item name="android:colorBackgroundCacheHint">@null</item>
+        <item name="android:windowContentOverlay">@null</item>
+        <item name="android:windowAnimationStyle">@null</item>
+        <item name="android:backgroundDimEnabled">false</item>
+    </style>
+</resources>

@@ -584,6 +584,361 @@ impl PlayerBackendPref {
     }
 }
 
+/// Soft / present resolution ceiling (360p → 4K). Auto = SoC SoftBudget / Surface full.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VideoQualityPref {
+    #[default]
+    Auto,
+    P360,
+    P480,
+    P720,
+    P1080,
+    P1440,
+    P2160,
+}
+
+impl VideoQualityPref {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "Auto (SoC)",
+            Self::P360 => "360p",
+            Self::P480 => "480p",
+            Self::P720 => "720p",
+            Self::P1080 => "1080p",
+            Self::P1440 => "1440p",
+            Self::P2160 => "4K / UHD",
+        }
+    }
+
+    /// Max soft-present size when forced (even dims).
+    pub fn max_wh(self) -> Option<(u32, u32)> {
+        match self {
+            Self::Auto => None,
+            Self::P360 => Some((640, 360)),
+            Self::P480 => Some((854, 480)),
+            Self::P720 => Some((1280, 720)),
+            Self::P1080 => Some((1920, 1080)),
+            Self::P1440 => Some((2560, 1440)),
+            Self::P2160 => Some((3840, 2160)),
+        }
+    }
+
+    pub fn cycle(self) -> Self {
+        match self {
+            Self::Auto => Self::P360,
+            Self::P360 => Self::P480,
+            Self::P480 => Self::P720,
+            Self::P720 => Self::P1080,
+            Self::P1080 => Self::P1440,
+            Self::P1440 => Self::P2160,
+            Self::P2160 => Self::Auto,
+        }
+    }
+}
+
+/// Panel tone profile — LED/LCD vivid vs AMOLED true-black.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DisplayPanelPref {
+    #[default]
+    Auto,
+    LedLcd,
+    Amoled,
+}
+
+impl DisplayPanelPref {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "Auto (détecté)",
+            Self::LedLcd => "LED / LCD (vif)",
+            Self::Amoled => "AMOLED (noirs profonds)",
+        }
+    }
+
+    pub fn cycle(self) -> Self {
+        match self {
+            Self::Auto => Self::LedLcd,
+            Self::LedLcd => Self::Amoled,
+            Self::Amoled => Self::Auto,
+        }
+    }
+
+    /// lavfi `eq=` fragment when a tone curve should run (soft path only).
+    pub fn eq_filter(self, oled_hint: bool) -> Option<&'static str> {
+        let kind = match self {
+            Self::Auto => {
+                if oled_hint {
+                    Self::Amoled
+                } else {
+                    return None; // neutral — no forced LED pop
+                }
+            }
+            other => other,
+        };
+        match kind {
+            Self::Auto => None,
+            Self::LedLcd => Some("eq=saturation=1.10:contrast=1.06:gamma=1.0"),
+            Self::Amoled => Some("eq=gamma=0.92:contrast=1.10:saturation=1.02:brightness=-0.02"),
+        }
+    }
+
+    /// mpv color properties (−100…100). Safe on MediaCodec Surface (no vf).
+    pub fn color_adjust(self, oled_hint: bool, night: bool) -> (i32, i32, i32, i32) {
+        let kind = match self {
+            Self::Auto if oled_hint => Self::Amoled,
+            Self::Auto => Self::LedLcd,
+            other => other,
+        };
+        let (mut b, mut c, mut s, mut g) = match (self, kind) {
+            (Self::Auto, Self::LedLcd) => (0, 0, 0, 0),
+            (_, Self::LedLcd) => (0, 6, 10, 0),
+            (_, Self::Amoled) => (-2, 10, 2, -8),
+            _ => (0, 0, 0, 0),
+        };
+        if night {
+            b -= 12;
+            s -= 15;
+            g -= 12;
+            c += 5;
+        }
+        (b.clamp(-100, 100), c.clamp(-100, 100), s.clamp(-100, 100), g.clamp(-100, 100))
+    }
+}
+
+/// mpv HDR / gamut options applied on desktop and Android.
+#[derive(Debug, Clone, Copy)]
+pub struct HdrMpvHints {
+    pub target_colorspace_hint: bool,
+    pub tone_mapping: Option<&'static str>,
+    pub target_prim: Option<&'static str>,
+    pub target_trc: Option<&'static str>,
+    pub hdr_compute_peak: bool,
+}
+
+/// Window / Surface color mode preference (Android COLOR_MODE_* + tonemap).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HdrPref {
+    #[default]
+    Auto,
+    Off,
+    WideGamut,
+    Hdr,
+    HdrPlus,
+}
+
+impl HdrPref {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "HDR Auto",
+            Self::Off => "SDR forcé",
+            Self::WideGamut => "Wide color (P3)",
+            Self::Hdr => "HDR10 / HLG",
+            Self::HdrPlus => "HDR10+ / Dolby Vision",
+        }
+    }
+
+    pub fn cycle(self) -> Self {
+        match self {
+            Self::Auto => Self::Off,
+            Self::Off => Self::WideGamut,
+            Self::WideGamut => Self::Hdr,
+            Self::Hdr => Self::HdrPlus,
+            Self::HdrPlus => Self::Auto,
+        }
+    }
+
+    /// mpv color-management hints (desktop VO + Android fallback).
+    pub fn mpv_color_hints(self, tonemap_hdr: bool) -> HdrMpvHints {
+        match self {
+            Self::Off => HdrMpvHints {
+                target_colorspace_hint: false,
+                tone_mapping: Some(if tonemap_hdr { "hable" } else { "clip" }),
+                target_prim: Some("bt.709"),
+                target_trc: Some("bt.1886"),
+                hdr_compute_peak: false,
+            },
+            Self::WideGamut => HdrMpvHints {
+                target_colorspace_hint: true,
+                tone_mapping: None,
+                target_prim: Some("display-p3"),
+                target_trc: None,
+                hdr_compute_peak: true,
+            },
+            Self::Hdr | Self::HdrPlus => HdrMpvHints {
+                // Soft/iced canvas is SDR — keep PQ in the bitstream, map to display.
+                target_colorspace_hint: true,
+                tone_mapping: Some(if tonemap_hdr { "hable" } else { "clip" }),
+                target_prim: Some("bt.2020"),
+                target_trc: Some("bt.1886"),
+                hdr_compute_peak: true,
+            },
+            Self::Auto => HdrMpvHints {
+                target_colorspace_hint: true,
+                tone_mapping: if tonemap_hdr { Some("hable") } else { None },
+                target_prim: None,
+                target_trc: None,
+                hdr_compute_peak: true,
+            },
+        }
+    }
+
+    /// JNI mode string for [`setDisplayColorMode`].
+    pub fn android_color_mode(self, panel_hdr: bool, has_hdr_plus: bool) -> &'static str {
+        match self {
+            Self::Off => "default",
+            Self::WideGamut => "wide",
+            Self::Hdr => "hdr",
+            Self::HdrPlus => {
+                if has_hdr_plus || panel_hdr {
+                    "hdr"
+                } else {
+                    "wide"
+                }
+            }
+            Self::Auto => {
+                if panel_hdr {
+                    "hdr"
+                } else {
+                    "wide"
+                }
+            }
+        }
+    }
+}
+
+/// Android present path preference.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AndroidPresentPref {
+    #[default]
+    Auto,
+    Surface,
+    Soft,
+    GpuEgl,
+}
+
+impl AndroidPresentPref {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "Présent Auto",
+            Self::Surface => "Surface MediaCodec",
+            Self::Soft => "Soft RGBA",
+            Self::GpuEgl => "GPU / EGL",
+        }
+    }
+
+    pub fn cycle(self) -> Self {
+        match self {
+            Self::Auto => Self::Surface,
+            Self::Surface => Self::Soft,
+            Self::Soft => Self::GpuEgl,
+            Self::GpuEgl => Self::Auto,
+        }
+    }
+
+    pub fn env_override(self) -> Option<&'static str> {
+        match self {
+            Self::Auto => None,
+            Self::Surface => Some("surface"),
+            Self::Soft => Some("soft"),
+            Self::GpuEgl => Some("gpu"),
+        }
+    }
+}
+
+/// Default image prefs applied at each play (also editable live in the player).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AspectPref {
+    #[default]
+    Auto,
+    R16x9,
+    R4x3,
+    R235,
+}
+
+impl AspectPref {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "Format auto",
+            Self::R16x9 => "16:9",
+            Self::R4x3 => "4:3",
+            Self::R235 => "2.35:1",
+        }
+    }
+
+    pub fn cycle(self) -> Self {
+        match self {
+            Self::Auto => Self::R16x9,
+            Self::R16x9 => Self::R4x3,
+            Self::R4x3 => Self::R235,
+            Self::R235 => Self::Auto,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeinterlacePref {
+    #[default]
+    Off,
+    On,
+    Auto,
+}
+
+impl DeinterlacePref {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Off => "Désentrelacement off",
+            Self::On => "Désentrelacement ON",
+            Self::Auto => "Désentrelacement auto",
+        }
+    }
+
+    pub fn cycle(self) -> Self {
+        match self {
+            Self::Off => Self::On,
+            Self::On => Self::Auto,
+            Self::Auto => Self::Off,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UpscalePref {
+    #[default]
+    Auto,
+    Bilinear,
+    Lanczos,
+    EwaLanczos,
+    Nearest,
+}
+
+impl UpscalePref {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "Upscale auto",
+            Self::Bilinear => "Bilinéaire",
+            Self::Lanczos => "Lanczos",
+            Self::EwaLanczos => "EWA Lanczos (HQ)",
+            Self::Nearest => "Nearest",
+        }
+    }
+
+    pub fn cycle(self) -> Self {
+        match self {
+            Self::Auto => Self::Bilinear,
+            Self::Bilinear => Self::Lanczos,
+            Self::Lanczos => Self::EwaLanczos,
+            Self::EwaLanczos => Self::Nearest,
+            Self::Nearest => Self::Auto,
+        }
+    }
+}
+
 /// User FPS ceiling for GUI timers / soft video present.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -595,6 +950,9 @@ pub enum FpsCapPref {
     Hz60,
     Hz90,
     Hz120,
+    Hz144,
+    Hz165,
+    Hz240,
 }
 
 impl FpsCapPref {
@@ -605,6 +963,9 @@ impl FpsCapPref {
             Self::Hz60 => "60",
             Self::Hz90 => "90",
             Self::Hz120 => "120",
+            Self::Hz144 => "144",
+            Self::Hz165 => "165",
+            Self::Hz240 => "240",
         }
     }
 
@@ -615,6 +976,9 @@ impl FpsCapPref {
             Self::Hz60 => Some(60),
             Self::Hz90 => Some(90),
             Self::Hz120 => Some(120),
+            Self::Hz144 => Some(144),
+            Self::Hz165 => Some(165),
+            Self::Hz240 => Some(240),
         }
     }
 
@@ -624,7 +988,10 @@ impl FpsCapPref {
             Self::Hz30 => Self::Hz60,
             Self::Hz60 => Self::Hz90,
             Self::Hz90 => Self::Hz120,
-            Self::Hz120 => Self::Auto,
+            Self::Hz120 => Self::Hz144,
+            Self::Hz144 => Self::Hz165,
+            Self::Hz165 => Self::Hz240,
+            Self::Hz240 => Self::Auto,
         }
     }
 }
@@ -676,6 +1043,31 @@ pub struct AppSettings {
     /// Cap for embedded video present (PlayerTick soft-frame pulls).
     #[serde(default)]
     pub fps_video: FpsCapPref,
+    /// Soft/Surface resolution ceiling (360p → 4K).
+    #[serde(default)]
+    pub video_quality: VideoQualityPref,
+    /// LED/LCD vs AMOLED tone curve.
+    #[serde(default)]
+    pub display_panel: DisplayPanelPref,
+    /// SDR / wide gamut / HDR / HDR+.
+    #[serde(default)]
+    pub hdr_mode: HdrPref,
+    /// Android present path (ignored on desktop).
+    #[serde(default)]
+    pub android_present: AndroidPresentPref,
+    /// Default image aspect for new playback.
+    #[serde(default)]
+    pub aspect: AspectPref,
+    #[serde(default)]
+    pub deinterlace: DeinterlacePref,
+    #[serde(default)]
+    pub upscale: UpscalePref,
+    /// Soft night eq (gamma/sat) as default.
+    #[serde(default)]
+    pub night_mode: bool,
+    /// Soft tonemap for HDR→SDR on soft present.
+    #[serde(default = "default_true")]
+    pub tonemap_hdr: bool,
     #[serde(default)]
     pub favorites: Vec<String>,
     #[serde(default)]
@@ -722,6 +1114,15 @@ impl Default for AppSettings {
             prefetch_next_episode: true,
             fps_gui: FpsCapPref::Auto,
             fps_video: FpsCapPref::Auto,
+            video_quality: VideoQualityPref::Auto,
+            display_panel: DisplayPanelPref::Auto,
+            hdr_mode: HdrPref::Auto,
+            android_present: AndroidPresentPref::Auto,
+            aspect: AspectPref::Auto,
+            deinterlace: DeinterlacePref::Off,
+            upscale: UpscalePref::Auto,
+            night_mode: false,
+            tonemap_hdr: true,
             favorites: Vec::new(),
             recent: Vec::new(),
             omdb_api_key: String::new(),

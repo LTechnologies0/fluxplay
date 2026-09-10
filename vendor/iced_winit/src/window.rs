@@ -77,6 +77,8 @@ where
                 exit_on_close_request,
                 surface,
                 surface_version,
+                #[cfg(target_os = "android")]
+                android_last_cfg: None,
                 renderer,
                 mouse_interaction: mouse::Interaction::None,
                 redraw_at: None,
@@ -170,6 +172,9 @@ where
     /// `None` after Android `Suspended` (NativeWindow destroyed) until `Resumed`.
     pub surface: Option<C::Surface>,
     pub surface_version: u64,
+    /// Last wgpu configure size — skip redundant Outdated reconfigure on Pixel.
+    #[cfg(target_os = "android")]
+    pub android_last_cfg: Option<(u32, u32)>,
     pub renderer: P::Renderer,
     pub redraw_at: Option<Instant>,
     preedit: Option<Preedit<P::Renderer>>,

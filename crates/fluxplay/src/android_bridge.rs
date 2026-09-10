@@ -8,8 +8,8 @@
 //! Resolve `app.fluxplay.android.FluxPlayNativeActivity` via the app ClassLoader.
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{Mutex, OnceLock};
 
 use jni::objects::{GlobalRef, JClass, JObject, JValue};
 use jni::JNIEnv;
@@ -18,6 +18,8 @@ use serde::Deserialize;
 use tracing::{debug, info, warn};
 
 static SAF_PENDING: AtomicBool = AtomicBool::new(false);
+/// Cached chrome inset (f32 bits) — skip JNI when unchanged.
+static LAST_CHROME_INSET_BITS: AtomicU32 = AtomicU32::new(u32::MAX);
 /// Cached `FluxPlayNativeActivity` class — avoids per-tick `loadClass` local refs
 /// on the permanently attached `android_main` thread (local-ref table overflow).
 static FP_ACTIVITY_CLASS: OnceLock<GlobalRef> = OnceLock::new();
@@ -65,7 +67,7 @@ fn fp_activity_global<'a>(
     FP_ACTIVITY_CLASS.get()
 }
 
-fn fp_class_obj<'a>(env: &mut JNIEnv<'a>, context: jni::sys::jobject) -> Option<&'static GlobalRef> {
+    fn fp_class_obj<'a>(env: &mut JNIEnv<'a>, context: jni::sys::jobject) -> Option<&'static GlobalRef> {
     fp_activity_global(env, context)
 }
 
@@ -201,6 +203,495 @@ fn audio_focus_flag_path() -> Option<PathBuf> {
     files_dir().map(|b| b.join("saf_inbox").join("audio_focus.json"))
 }
 
+fn device_caps_path() -> Option<PathBuf> {
+    files_dir().map(|b| b.join("saf_inbox").join("device_caps.json"))
+}
+
+fn surface_state_path() -> Option<PathBuf> {
+    files_dir().map(|b| b.join("saf_inbox").join("surface_state.json"))
+}
+
+/// Cached GlobalRef for the video Surface jobject (mpv wid lifetime).
+static VIDEO_SURFACE_REF: OnceLock<Mutex<Option<GlobalRef>>> = OnceLock::new();
+
+fn video_surface_slot() -> &'static Mutex<Option<GlobalRef>> {
+    VIDEO_SURFACE_REF.get_or_init(|| Mutex::new(None))
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct DeviceCapsJson {
+    #[serde(default)]
+    soc: String,
+    #[serde(default)]
+    board: String,
+    #[serde(default)]
+    hardware: String,
+    #[serde(default)]
+    manufacturer: String,
+    #[serde(default)]
+    model: String,
+    #[serde(default)]
+    gl_renderer: String,
+    #[serde(default)]
+    cores: u32,
+    #[serde(default)]
+    refresh_hz: u32,
+    #[serde(default)]
+    refresh_modes: Vec<f32>,
+    #[serde(default)]
+    hdr_types: Vec<i32>,
+    #[serde(default)]
+    hdr_capable: bool,
+    #[serde(default)]
+    mediacodec_4k: bool,
+    #[serde(default)]
+    mediacodec_hdr: bool,
+    #[serde(default)]
+    mediacodec_video: bool,
+    #[serde(default)]
+    mediacodec_max_w: u32,
+    #[serde(default)]
+    mediacodec_max_h: u32,
+    #[serde(default)]
+    sdk_int: u32,
+    #[serde(default)]
+    panel_oled: bool,
+    #[serde(default)]
+    hdr_labels: Vec<String>,
+    #[serde(default)]
+    surface_ready: bool,
+    #[serde(default)]
+    surface_w: u32,
+    #[serde(default)]
+    surface_h: u32,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct SurfaceStateJson {
+    #[serde(default)]
+    ready: bool,
+    #[serde(default)]
+    w: u32,
+    #[serde(default)]
+    h: u32,
+    #[serde(default)]
+    gen: u32,
+}
+
+/// Full device caps for quality matrix (Phases B–C).
+pub fn poll_android_device_caps() -> Option<fluxplay_player::AndroidDeviceCaps> {
+    let path = device_caps_path()?;
+    let text = std::fs::read_to_string(&path).ok()?;
+    let caps: DeviceCapsJson = serde_json::from_str(&text).ok()?;
+    Some(fluxplay_player::AndroidDeviceCaps {
+        soc: caps.soc,
+        board: caps.board,
+        hardware: caps.hardware,
+        manufacturer: caps.manufacturer,
+        model: caps.model,
+        gl_renderer: caps.gl_renderer,
+        cores: caps.cores,
+        refresh_hz: caps.refresh_hz,
+        refresh_modes: caps.refresh_modes,
+        hdr_types: caps.hdr_types,
+        hdr_capable: caps.hdr_capable,
+        mediacodec_4k: caps.mediacodec_4k,
+        mediacodec_hdr: caps.mediacodec_hdr,
+        mediacodec_video: caps.mediacodec_video,
+        mediacodec_max_w: caps.mediacodec_max_w,
+        mediacodec_max_h: caps.mediacodec_max_h,
+        sdk_int: caps.sdk_int,
+        panel_oled: caps.panel_oled,
+        hdr_labels: caps.hdr_labels,
+        surface_ready: caps.surface_ready,
+        surface_w: caps.surface_w,
+        surface_h: caps.surface_h,
+    })
+}
+
+/// Best-effort SoC / GPU label from Java `device_caps.json` (written at Activity start).
+pub fn poll_device_gpu() -> Option<(String, fluxplay_core::models::GpuTier)> {
+    let caps = poll_android_device_caps()?;
+    let mut parts: Vec<String> = Vec::new();
+    for s in [
+        caps.manufacturer.as_str(),
+        caps.model.as_str(),
+        caps.soc.as_str(),
+        caps.board.as_str(),
+        caps.hardware.as_str(),
+    ] {
+        let t = s.trim();
+        if !t.is_empty() && !parts.iter().any(|p| p.eq_ignore_ascii_case(t)) {
+            parts.push(t.to_string());
+        }
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    Some((parts.join(" · "), fluxplay_core::models::GpuTier::Integrated))
+}
+
+pub fn set_video_surface_visible(visible: bool) {
+    ensure_ffmpeg_java_vm();
+    call_static_void_bool("setVideoSurfaceVisible", visible);
+}
+
+/// Register Android JavaVM with FFmpeg once — required for MediaCodec Surface decode.
+fn ensure_ffmpeg_java_vm() {
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.load(Ordering::Acquire) {
+        return;
+    }
+    let vm_ptr = ndk_context::android_context().vm() as *mut std::ffi::c_void;
+    if vm_ptr.is_null() {
+        warn!("ensure_ffmpeg_java_vm: null JavaVM");
+        return;
+    }
+    if fluxplay_player::register_android_java_vm(vm_ptr) {
+        DONE.store(true, Ordering::Release);
+    }
+}
+
+pub fn set_window_punch_through(enable: bool) {
+    call_static_void_bool("setWindowPunchThrough", enable);
+}
+
+/// Refresh insets / caps / Surface session after rotate or resume.
+pub fn stabilize_android_session() {
+    call_static_void("stabilizeAndroidSession");
+}
+
+/// Freeze SurfaceView buffer size after wid is acquired (MediaCodec safety).
+pub fn lock_video_surface_size() {
+    call_static_void("lockVideoSurfaceSize");
+}
+
+pub fn surface_generation() -> u32 {
+    let Some((vm, activity)) = vm_activity() else {
+        return 0;
+    };
+    let Ok(mut env) = vm.attach_current_thread() else {
+        return 0;
+    };
+    let Some(cls) = fp_class_obj(&mut env, activity) else {
+        return 0;
+    };
+    match env.call_static_method(cls, "getSurfaceGeneration", "()I", &[]) {
+        Ok(v) => v.i().unwrap_or(0).max(0) as u32,
+        Err(_) => {
+            clear_ex(&mut env);
+            0
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SurfaceState {
+    pub ready: bool,
+    pub w: u32,
+    pub h: u32,
+    pub gen: u32,
+}
+
+pub fn poll_surface_state() -> SurfaceState {
+    // Prefer JNI — avoid reading surface_state.json every PlayerTick (I/O stutter).
+    let mut st = SurfaceState {
+        ready: call_static_bool("isVideoSurfaceReady"),
+        gen: surface_generation(),
+        ..SurfaceState::default()
+    };
+    if let Some((w, h)) = video_surface_size() {
+        st.w = w;
+        st.h = h;
+        return st;
+    }
+    // File fallback only when JNI size is missing (UI-thread race).
+    if let Some(path) = surface_state_path() {
+        if let Ok(text) = std::fs::read_to_string(path) {
+            if let Ok(j) = serde_json::from_str::<SurfaceStateJson>(&text) {
+                st.ready = j.ready || st.ready;
+                st.w = j.w;
+                st.h = j.h;
+                if j.gen > 0 {
+                    st.gen = j.gen;
+                }
+            }
+        }
+    }
+    st
+}
+
+pub fn is_video_surface_ready() -> bool {
+    // Trust live JNI only. Stale surface_state.json ready=true after GONE/destroy
+    // made bind "succeed" the wait then fail acquire in ~1ms (Pixel Soft black path).
+    if vm_activity().is_some() {
+        return call_static_bool("isVideoSurfaceReady");
+    }
+    let path = match surface_state_path() {
+        Some(p) => p,
+        None => return false,
+    };
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    serde_json::from_str::<SurfaceStateJson>(&text)
+        .ok()
+        .map(|s| s.ready)
+        .unwrap_or(false)
+}
+
+pub fn video_surface_size() -> Option<(u32, u32)> {
+    // Prefer live JNI ints — JSON can lag the UI thread after surfaceCreated.
+    if let Some((vm, activity)) = vm_activity() {
+        if let Ok(mut env) = vm.attach_current_thread() {
+            if let Some(cls) = fp_class_obj(&mut env, activity) {
+                let read = env.with_local_frame(8, |env| -> Result<(u32, u32), jni::errors::Error> {
+                    let arr = env.call_static_method(cls, "videoSurfaceSizePx", "()[I", &[])?;
+                    let obj = arr.l()?;
+                    let jint_arr: jni::objects::JIntArray =
+                        unsafe { jni::objects::JIntArray::from_raw(obj.into_raw()) };
+                    let len = env.get_array_length(&jint_arr)?;
+                    if len < 2 {
+                        return Err(jni::errors::Error::JavaException);
+                    }
+                    let mut buf = [0i32; 2];
+                    env.get_int_array_region(&jint_arr, 0, &mut buf)?;
+                    Ok((buf[0].max(0) as u32, buf[1].max(0) as u32))
+                });
+                if let Ok((w, h)) = read {
+                    if w >= 64 && h >= 64 {
+                        return Some((w, h));
+                    }
+                } else {
+                    clear_ex(&mut env);
+                }
+            }
+        }
+    }
+    let path = surface_state_path()?;
+    let text = std::fs::read_to_string(path).ok()?;
+    let st: SurfaceStateJson = serde_json::from_str(&text).ok()?;
+    if st.ready && st.w >= 64 && st.h >= 64 {
+        Some((st.w, st.h))
+    } else {
+        None
+    }
+}
+
+/// Acquire Surface jobject as mpv `wid` (GlobalRef kept alive until release).
+pub fn acquire_video_surface_wid() -> Option<i64> {
+    let (vm, activity) = vm_activity()?;
+    let mut env = vm.attach_current_thread().ok()?;
+    let cls = fp_class_obj(&mut env, activity)?;
+    let surface_v = env
+        .call_static_method(cls, "getVideoSurface", "()Landroid/view/Surface;", &[])
+        .ok()?;
+    let obj = surface_v.l().ok()?;
+    if obj.is_null() {
+        return None;
+    }
+    let global = env.new_global_ref(&obj).ok()?;
+    // jobject pointer value is what mpv's ANativeWindow_fromSurface expects as wid.
+    let wid = global.as_raw() as isize as i64;
+    if let Ok(mut slot) = video_surface_slot().lock() {
+        *slot = Some(global);
+    }
+    info!(wid, "android video Surface wid acquired");
+    Some(wid)
+}
+
+pub fn release_video_surface_wid() {
+    if let Ok(mut slot) = video_surface_slot().lock() {
+        *slot = None;
+    }
+    // End Surface session — stop reattach loop; keep punch-through off.
+    // Caller must have already run NativePlayer::detach_android_surface (vo=null, wid=0).
+    set_video_surface_visible(false);
+    set_window_punch_through(false);
+}
+
+pub fn set_video_frame_rate(fps: f32) {
+    // Cache: Surface.setFrameRate re-posted ~10×/s otherwise.
+    static LAST: AtomicU32 = AtomicU32::new(0);
+    let bits = fps.to_bits();
+    if LAST.swap(bits, Ordering::Relaxed) == bits {
+        return;
+    }
+    let Some((vm, activity)) = vm_activity() else {
+        return;
+    };
+    let Ok(mut env) = vm.attach_current_thread() else {
+        return;
+    };
+    let Some(cls) = fp_class_obj(&mut env, activity) else {
+        return;
+    };
+    if env
+        .call_static_method(cls, "setVideoFrameRate", "(F)V", &[JValue::Float(fps)])
+        .is_err()
+    {
+        clear_ex(&mut env);
+    }
+}
+
+/// Match MediaCodec buffer to video size — stops SurfaceFlinger stretch/squash.
+/// Push video geometry: `bw/bh` = decoded buffer size, `dw/dh` = display
+/// (SAR-corrected) size. Java cover-fits the buffer onto the screen via a
+/// SurfaceControl transform — the SurfaceView itself is never relayouted.
+pub fn set_video_buffer_size(bw: u32, bh: u32, dw: u32, dh: u32) {
+    // Cache: re-pushing identical dims re-runs the transform needlessly.
+    static LAST: AtomicU32 = AtomicU32::new(0);
+    static LASTH: AtomicU32 = AtomicU32::new(0);
+    static LASTDW: AtomicU32 = AtomicU32::new(0);
+    static LASTDH: AtomicU32 = AtomicU32::new(0);
+    if LAST.swap(bw, Ordering::Relaxed) == bw
+        && LASTH.swap(bh, Ordering::Relaxed) == bh
+        && LASTDW.swap(dw, Ordering::Relaxed) == dw
+        && LASTDH.swap(dh, Ordering::Relaxed) == dh
+    {
+        return;
+    }
+    let Some((vm, activity)) = vm_activity() else {
+        return;
+    };
+    let Ok(mut env) = vm.attach_current_thread() else {
+        return;
+    };
+    let Some(cls) = fp_class_obj(&mut env, activity) else {
+        log::warn!("set_video_buffer_size: no class");
+        return;
+    };
+    if env
+        .call_static_method(
+            cls,
+            "setVideoBufferSize",
+            "(IIII)V",
+            &[
+                JValue::Int(bw as i32),
+                JValue::Int(bh as i32),
+                JValue::Int(dw as i32),
+                JValue::Int(dh as i32),
+            ],
+        )
+        .is_err()
+    {
+        log::warn!("set_video_buffer_size: JNI call failed");
+        clear_ex(&mut env);
+    }
+}
+
+pub fn set_hdr_color_mode(hdr: bool) {
+    set_display_color_mode(if hdr { "hdr" } else { "default" });
+}
+
+/// Force sensor-landscape while a video plays (portrait UX dropped); restore on close.
+pub fn set_force_landscape(force: bool) {
+    call_static_void_bool("setForceLandscape", force);
+}
+
+/// Android window color mode: `default` | `wide` | `hdr`.
+pub fn set_display_color_mode(mode: &str) {
+    let Some((vm, activity)) = vm_activity() else {
+        return;
+    };
+    let Ok(mut env) = vm.attach_current_thread() else {
+        return;
+    };
+    let Some(cls) = fp_class_obj(&mut env, activity) else {
+        return;
+    };
+    let Ok(jmode) = env.new_string(mode) else {
+        clear_ex(&mut env);
+        return;
+    };
+    if env
+        .call_static_method(
+            cls,
+            "setDisplayColorMode",
+            "(Ljava/lang/String;)V",
+            &[JValue::Object(&jmode)],
+        )
+        .is_err()
+    {
+        clear_ex(&mut env);
+    }
+}
+
+/// Prepare SurfaceView present (mpv-android style): show view, return wid if ready.
+/// Non-blocking — caller retries via `maintain_android_surface_session`.
+pub fn prepare_surface_present() -> Option<(i64, (u32, u32))> {
+    ensure_ffmpeg_java_vm();
+    // Fast path: Surface already live — do not poke visibility/reattach every tick.
+    if is_video_surface_ready() {
+        let wh = video_surface_size().or_else(|| {
+            let st = poll_surface_state();
+            (st.ready && st.w >= 64 && st.h >= 64).then_some((st.w, st.h))
+        })?;
+        let wid = acquire_video_surface_wid()?;
+        return Some((wid, wh));
+    }
+    set_window_punch_through(false);
+    // SurfaceView above iced GLES; chrome inset keeps dock tappable.
+    set_video_surface_z_on_top(true);
+    set_video_surface_visible(true);
+    if !is_video_surface_ready() {
+        return None;
+    }
+    let wh = video_surface_size().or_else(|| {
+        let st = poll_surface_state();
+        (st.ready && st.w >= 64 && st.h >= 64).then_some((st.w, st.h))
+    })?;
+    let wid = acquire_video_surface_wid()?;
+    info!(wid, ?wh, "android SurfaceView present ready");
+    Some((wid, wh))
+}
+
+/// Leave bottom chrome (dp) uncovered so iced transport stays tappable above Z-order video.
+pub fn layout_video_surface_chrome_inset_dp(bottom_dp: f32) {
+    let next = bottom_dp.max(0.0);
+    let bits = next.to_bits();
+    let prev_bits = LAST_CHROME_INSET_BITS.load(Ordering::Relaxed);
+    if prev_bits != u32::MAX {
+        let prev = f32::from_bits(prev_bits);
+        if (prev - next).abs() < 0.25 {
+            return;
+        }
+    }
+    LAST_CHROME_INSET_BITS.store(bits, Ordering::Relaxed);
+    let Some((vm, activity)) = vm_activity() else {
+        return;
+    };
+    let Ok(mut env) = vm.attach_current_thread() else {
+        return;
+    };
+    let Some(cls) = fp_class_obj(&mut env, activity) else {
+        return;
+    };
+    if env
+        .call_static_method(
+            cls,
+            "layoutVideoSurfaceChromeInsetDp",
+            "(F)V",
+            &[JValue::Float(next)],
+        )
+        .is_err()
+    {
+        clear_ex(&mut env);
+    }
+}
+
+pub fn set_video_surface_z_on_top(on_top: bool) {
+    call_static_void_bool("setVideoSurfaceZOrderOnTop", on_top);
+}
+
+/// Select present mode from device caps + Surface readiness (Phase C).
+pub fn select_android_present_mode() -> fluxplay_player::AndroidPresentMode {
+    let mut caps = poll_android_device_caps().unwrap_or_default();
+    // Refresh surface_ready from live probe.
+    caps.surface_ready = is_video_surface_ready() || caps.surface_ready;
+    caps.select_present_mode()
+}
+
 #[derive(Debug, Clone, Deserialize)]
 struct AudioFocusFlag {
     held: bool,
@@ -318,15 +809,8 @@ pub fn poll_saf_inbox() -> Option<SafInbox> {
     None
 }
 
-/// Sync `pip_mode` from Java (`isInPip` + optional pip.json).
+/// Sync `pip_mode` from live Java `isInPip` (ignore stale pip.json).
 pub fn poll_pip_mode() -> bool {
-    if let Some(path) = pip_flag_path() {
-        if let Ok(text) = std::fs::read_to_string(&path) {
-            if let Ok(flag) = serde_json::from_str::<PipFlag>(&text) {
-                return flag.in_pip;
-            }
-        }
-    }
     call_static_bool("isInPip")
 }
 
@@ -393,12 +877,17 @@ pub fn system_insets_dp() -> (f32, f32, f32, f32) {
         Ok(buf) => {
             let dpi = buf[4].max(120) as f32;
             let scale = dpi / 160.0;
-            (
+            let (l, t, r, b) = (
                 buf[0] as f32 / scale,
                 buf[1] as f32 / scale,
                 buf[2] as f32 / scale,
                 buf[3] as f32 / scale,
-            )
+            );
+            // All-zero before first insets dispatch — keep non-TV bottom fallback.
+            if l == 0.0 && t == 0.0 && r == 0.0 && b == 0.0 {
+                return fallback;
+            }
+            (l, t, r, b)
         }
         Err(_) => {
             clear_ex(&mut env);
@@ -440,7 +929,18 @@ pub fn enter_pip(width: i32, height: i32) {
     }
 }
 
+pub fn exit_pip() {
+    call_static_void("exitPip");
+}
+
 pub fn set_keep_screen_on(enable: bool) {
+    // Cache: this is called every PlayerTick (36-48 Hz) — JNI runOnUiThread each time
+    // contends with Choreographer. Only cross JNI when the value actually changes.
+    static LAST: AtomicU32 = AtomicU32::new(u32::MAX);
+    let bits = u32::from(enable);
+    if LAST.swap(bits, Ordering::Relaxed) == bits {
+        return;
+    }
     if let Some((vm, activity)) = vm_activity() {
         if let Ok(mut env) = vm.attach_current_thread() {
             if let Some(cls) = fp_class_obj(&mut env, activity) {

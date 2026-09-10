@@ -49,6 +49,12 @@ pub struct StreamSession {
     pub aspect: AspectMode,
     pub ontop: bool,
     pub night_vf: bool,
+    /// Soft present scale vf kept when rebuilding eq/tonemap chains.
+    pub soft_vf_prefix: Option<String>,
+    /// LED/AMOLED eq fragment (`eq=...`) — soft path only.
+    pub panel_eq: Option<String>,
+    /// Panel color base (brightness, contrast, saturation, gamma) without night.
+    pub color_base: (i32, i32, i32, i32),
     pub bookmarks: Vec<Bookmark>,
 }
 
@@ -282,6 +288,9 @@ impl Default for StreamSession {
             aspect: AspectMode::Auto,
             ontop: false,
             night_vf: false,
+            soft_vf_prefix: None,
+            panel_eq: None,
+            color_base: (0, 0, 0, 0),
             bookmarks: Vec::new(),
         }
     }
@@ -741,6 +750,10 @@ impl StreamSession {
     }
 
     pub fn toggle_deinterlace(&mut self) {
+        if self.native.android_surface_present() {
+            warn!("deinterlace skipped on MediaCodec Surface (would black video)");
+            return;
+        }
         let next = self.deinterlace.cycle();
         info!(mode = next.label(), "StreamSession::deinterlace");
         match self.native.set_deinterlace_mode(next.mpv_value()) {
@@ -750,6 +763,10 @@ impl StreamSession {
     }
 
     pub fn cycle_upscale(&mut self) {
+        if self.native.android_surface_present() {
+            warn!("upscale/scale skipped on MediaCodec Surface (would black video)");
+            return;
+        }
         let next = self.upscale.cycle();
         info!(mode = next.label(), "StreamSession::upscale");
         match self.native.set_scale(next.mpv_scale()) {
@@ -808,17 +825,90 @@ impl StreamSession {
     pub fn toggle_night_vf(&mut self) {
         self.night_vf = !self.night_vf;
         info!(night = self.night_vf, "StreamSession::night_vf");
-        if self.apply_video_filters().is_err() {
+        if self.apply_color_and_filters().is_err() {
             self.night_vf = !self.night_vf;
         }
     }
 
-    fn apply_video_filters(&mut self) -> Result<(), ()> {
-        let mut parts = Vec::new();
+    /// Apply persisted Settings defaults right after open (aspect / deint / scale / tone).
+    /// Never injects a scale vf on Android Surface — that blacks MediaCodec embed.
+    pub fn apply_saved_video_prefs(
+        &mut self,
+        aspect: AspectMode,
+        deinterlace: DeinterlaceMode,
+        upscale: UpscaleMode,
+        night: bool,
+        panel_eq: Option<String>,
+        soft_vf_prefix: Option<String>,
+        color_base: (i32, i32, i32, i32),
+    ) {
+        let surface = self.native.android_surface_present();
+        self.soft_vf_prefix = if surface { None } else { soft_vf_prefix };
+        let _ = panel_eq; // tone via color props (safe on Surface)
+        self.color_base = color_base;
+        self.night_vf = night;
+        if self.native.set_aspect(aspect.mpv_value()).is_ok() {
+            self.aspect = aspect;
+        }
+        // Deinterlace / upscale inject filters that break mediacodec_embed zero-copy.
+        if !surface {
+            if self
+                .native
+                .set_deinterlace_mode(deinterlace.mpv_value())
+                .is_ok()
+            {
+                self.deinterlace = deinterlace;
+            }
+            if self.native.set_scale(upscale.mpv_scale()).is_ok() {
+                self.upscale = upscale;
+            }
+        }
+        let _ = self.apply_color_and_filters();
+    }
+
+    fn apply_color_and_filters(&mut self) -> Result<(), ()> {
+        let (mut b, mut c, mut s, mut g) = self.color_base;
         if self.night_vf {
-            parts.push("eq=gamma=0.85:saturation=0.85:contrast=1.05");
+            b -= 12;
+            s -= 15;
+            g -= 12;
+            c += 5;
+        }
+        if self
+            .native
+            .set_color_adjust(
+                b.clamp(-100, 100),
+                c.clamp(-100, 100),
+                s.clamp(-100, 100),
+                g.clamp(-100, 100),
+            )
+            .is_err()
+        {
+            return Err(());
+        }
+        if self.native.android_surface_present() {
+            return Ok(());
+        }
+        self.apply_video_filters()
+    }
+
+    /// Re-apply soft vf chain after layout/rotate (keeps aspect-safe scale in sync).
+    pub fn refresh_soft_filters(&mut self) -> Result<(), ()> {
+        self.apply_video_filters()
+    }
+
+    fn apply_video_filters(&mut self) -> Result<(), ()> {
+        if self.native.android_surface_present() {
+            return Ok(());
+        }
+        let mut parts = Vec::new();
+        if let Some(soft) = &self.soft_vf_prefix {
+            if !soft.is_empty() {
+                parts.push(soft.clone());
+            }
         }
         let vf = parts.join(",");
+        // Always set (including empty) so leftover soft scale is cleared on soft path.
         match self.native.set_vf(&vf) {
             Ok(()) => Ok(()),
             Err(e) => {

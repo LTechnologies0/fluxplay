@@ -21,7 +21,7 @@ use crate::theme::{
     RADIUS_LG, RADIUS_MD, RADIUS_XL, RADIUS_XXL, SPACE_MD, SPACE_SM, SPACE_XL, SPACE_XS, SPACE_XXS,
     TYPE_BODY_M, TYPE_LABEL_L, TYPE_LABEL_M, TYPE_TITLE_M,
 };
-use crate::app::Message;
+use crate::app::{Message, PasteTarget};
 
 pub const LIST_PAGE: usize = 48;
 /// Sidebar categories (Live / VOD / Series) — show the full catalog list.
@@ -109,7 +109,8 @@ impl BrowseIndex {
         }
     }
 }
-/// Episodes listed via the same virtual window.
+/// Episodes listed via the same virtual window (cap reserved for non-virtual fallbacks).
+#[allow(dead_code)]
 pub const EPISODE_PAGE: usize = 10_000;
 
 pub fn shell_background(ui: UiTheme) -> Color {
@@ -950,6 +951,24 @@ pub fn mode_top_nav<'a>(
     mode_top_nav_ex(ui, label_size, false, items)
 }
 
+fn paste_affix(ui: UiTheme, target: PasteTarget) -> Element<'static, Message> {
+    use crate::icons::{self, Icon};
+    mouse_area(
+        container(icons::icon(Icon::Paste, 18.0, ui.accent()))
+            .padding(8)
+            .style(move |_t: &Theme| container::Style {
+                background: Some(Background::Color(ui.surface_container_highest())),
+                border: Border {
+                    radius: RADIUS_FULL.into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+    )
+    .on_press(Message::PasteInto(target))
+    .into()
+}
+
 pub fn category_sidebar<'a>(
     ui: UiTheme,
     width: f32,
@@ -970,6 +989,13 @@ pub fn category_sidebar<'a>(
             s.background = Background::Color(ui.surface_container_low());
             s
         });
+    let filter_row = row![
+        container(filter_input).width(Fill),
+        paste_affix(ui, PasteTarget::CatFilter),
+    ]
+    .spacing(SPACE_XS)
+    .align_y(Alignment::Center)
+    .width(Fill);
 
     let total = entries.len();
     let row_h = cat_row_height();
@@ -984,6 +1010,8 @@ pub fn category_sidebar<'a>(
             } else {
                 name.clone()
             };
+            #[cfg(target_os = "android")]
+            let label = sanitize_android_ui_text(&label);
             rows.push(cat_row(
                 label.replace(';', " · "),
                 Message::SelectBrowseCategory(id.clone()),
@@ -1003,7 +1031,7 @@ pub fn category_sidebar<'a>(
         Length::Fixed(width.max(120.0)),
         column![
             text(title).size(13).color(ui.ink_muted()),
-            filter_input,
+            filter_row,
             soft_scroll_on(ui, list.width(Fill), "flux-cats", Message::CatScrolled),
         ]
         .spacing(SPACE_SM)
@@ -1032,12 +1060,15 @@ pub fn category_chips<'a>(
             s.background = Background::Color(ui.surface_container_low());
             s
         });
+    let filter_row = row![filter_input, paste_affix(ui, PasteTarget::CatFilter)]
+        .spacing(SPACE_XS)
+        .align_y(Alignment::Center);
 
     let mut chips = Row::new()
         .spacing(SPACE_SM)
         .align_y(Alignment::Center)
         .height(Length::Fixed(strip_h));
-    chips = chips.push(filter_input);
+    chips = chips.push(filter_row);
     // Phone strip: hard cap — horizontal scroll of 1500 chips is unusable anyway.
     for (id, name, active, count) in entries.iter().take(48) {
         let label = if *count > 0 {
@@ -1045,6 +1076,8 @@ pub fn category_chips<'a>(
         } else {
             name.replace(';', " · ")
         };
+        #[cfg(target_os = "android")]
+        let label = sanitize_android_ui_text(&label);
         let fg = if *active {
             ui.on_secondary_container()
         } else {
@@ -1150,6 +1183,10 @@ pub fn content_header<'a>(
     title_size: f32,
     stack: bool,
 ) -> Element<'a, Message> {
+    #[cfg(target_os = "android")]
+    let title = sanitize_android_ui_text(&title);
+    #[cfg(target_os = "android")]
+    let subtitle = sanitize_android_ui_text(&subtitle);
     let (title_sz, title_font) = if title_size >= 24.0 {
         type_style(TypeRole::HeadlineS, true)
     } else if title_size >= 20.0 {
@@ -1175,11 +1212,7 @@ pub fn content_header<'a>(
         .on_input(Message::SearchChanged)
         .padding(if stack { 12 } else { 14 })
         .size(TYPE_BODY_M)
-        .width(if stack {
-            Fill
-        } else {
-            Length::Fixed(search_width.clamp(100.0, 720.0))
-        })
+        .width(Fill)
         .style(move |theme: &Theme, status| {
             let mut s = text_input::default(theme, status);
             s.border.radius = RADIUS_FULL.into();
@@ -1191,14 +1224,31 @@ pub fn content_header<'a>(
             s.background = Background::Color(ui.surface_container_highest());
             s
         });
+    let search_row = row![
+        container(crate::icons::icon(
+            crate::icons::Icon::Search,
+            20.0,
+            ui.on_surface_variant(),
+        ))
+        .padding(Padding::from([0, 4])),
+        container(search_el).width(Fill),
+        paste_affix(ui, PasteTarget::Search),
+    ]
+    .spacing(SPACE_XS)
+    .align_y(Alignment::Center)
+    .width(if stack {
+        Fill
+    } else {
+        Length::Fixed(search_width.clamp(100.0, 720.0))
+    });
 
     if stack {
-        column![titles, search_el]
+        column![titles, search_row]
             .spacing(SPACE_SM)
             .width(Fill)
             .into()
     } else {
-        row![titles, search_el]
+        row![titles, search_row]
             .spacing(SPACE_MD)
             .align_y(Alignment::Center)
             .width(Fill)
@@ -1219,6 +1269,10 @@ pub fn media_row<'a>(
     row_w: f32,
 ) -> Element<'a, Message> {
     use crate::theme::TOUCH_TARGET;
+    #[cfg(target_os = "android")]
+    let title = sanitize_android_ui_text(&title);
+    #[cfg(target_os = "android")]
+    let subtitle = sanitize_android_ui_text(&subtitle);
     let (title_sz, title_font) = type_style(TypeRole::TitleM, active);
     let title_c = ui.on_surface();
     let row_bg = if active {
@@ -1615,6 +1669,8 @@ pub fn empty_hint(ui: UiTheme, msg: impl Into<String>) -> Element<'static, Messa
     .into()
 }
 
+/// Pagination control kept for TV / non-virtual fallbacks (`Message::LoadMore`).
+#[allow(dead_code)]
 pub fn load_more_btn(ui: UiTheme, remaining: Option<usize>) -> Element<'static, Message> {
     // Outlined / tonal L pill — mouse_area (styled `button` drops glyphs on GLES).
     let label = match remaining {
@@ -1772,16 +1828,68 @@ fn mosaic_empty_poster<'a>(ui: UiTheme, w: f32, h: f32, letter: char) -> Element
 }
 
 fn truncate_ui(s: &str, max: usize) -> Cow<'_, str> {
+    #[cfg(target_os = "android")]
+    {
+        // Fira Sans under NativeActivity has no emoji / superscript / many symbols → tofu.
+        let cleaned = sanitize_android_ui_text(s);
+        return Cow::Owned(truncate_chars(&cleaned, max));
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let mut count = 0usize;
+        for (i, _) in s.char_indices() {
+            if count >= max {
+                let mut t = s[..i].to_string();
+                t.push('…');
+                return Cow::Owned(t);
+            }
+            count += 1;
+        }
+        Cow::Borrowed(s)
+    }
+}
+
+#[cfg(target_os = "android")]
+fn truncate_chars(s: &str, max: usize) -> String {
     let mut count = 0usize;
     for (i, _) in s.char_indices() {
         if count >= max {
             let mut t = s[..i].to_string();
             t.push('…');
-            return Cow::Owned(t);
+            return t;
         }
         count += 1;
     }
-    Cow::Borrowed(s)
+    s.to_string()
+}
+
+/// Strip glyphs Fira Sans cannot render on Android (emoji, UHD superscripts, dingbats).
+#[cfg(target_os = "android")]
+fn sanitize_android_ui_text(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut prev_space = false;
+    for c in s.chars() {
+        let keep = matches!(c, ' '..='~' | '\u{00A0}'..='\u{024F}')
+            || matches!(
+                c,
+                '·' | '•' | '…' | '—' | '–' | '«' | '»' | '€' | '°' | '×' | '÷'
+            );
+        let ch = if keep { c } else { ' ' };
+        if ch == ' ' {
+            if prev_space || out.is_empty() {
+                continue;
+            }
+            prev_space = true;
+            out.push(' ');
+        } else {
+            prev_space = false;
+            out.push(ch);
+        }
+    }
+    while out.ends_with(' ') {
+        out.pop();
+    }
+    out
 }
 
 pub fn mosaic_grid<'a>(tiles: Vec<Element<'a, Message>>, cols: usize) -> Element<'a, Message> {
@@ -1952,7 +2060,7 @@ pub fn media_detail_page<'a>(
         meta_bits.push(g.to_string());
     }
     if let Some(r) = rating.filter(|s| !s.is_empty()) {
-        meta_bits.push(format!("★ {r}"));
+        meta_bits.push(format!("* {r}"));
     }
     if let Some(rt) = runtime.filter(|s| !s.is_empty()) {
         meta_bits.push(rt.to_string());
@@ -1977,11 +2085,12 @@ pub fn media_detail_page<'a>(
 
     let mut action_els: Vec<Element<'_, Message>> = Vec::new();
     if let (Some(label), Some(msg)) = (play_label, play_msg) {
-        // SplitButton / FAB primary — mouse_area (GLES-safe).
+        // Primary CTA — Shrink so wrap/Fill parents never stretch it full-width.
         action_els.push(
             mouse_area(
                 container(text(label).size(15).color(ui.on_primary()))
-                    .padding(Padding::from([14, 22]))
+                    .padding(Padding::from([12, 20]))
+                    .width(Length::Shrink)
                     .style(move |_t: &Theme| container::Style {
                         background: Some(Background::Color(ui.primary())),
                         border: Border {
@@ -2077,19 +2186,13 @@ pub fn media_detail_page<'a>(
     )
     .on_press(back);
 
-    // Header outside the scroll so the page always has a visible chrome
-    // (avoids a zero-height scroll-only layout on some window sizes).
-    // Episodes get a guaranteed FillPortion so a tall synopsis cannot steal
-    // the whole column (phone: missing episode rows / play affordance).
+    // Series: show full synopsis/meta at natural height (no nested FillPortion
+    // scroll box). Episodes keep the remaining viewport and their own scroller.
+    // VOD: one page scroll so long plots still fit without a clipped band.
     let page: Element<'a, Message> = if let Some(eps) = episodes {
         column![
             back,
-            container(soft_scroll_fit(
-                ui,
-                body.padding(Padding::from([0, 4])).width(Fill),
-            ))
-            .width(Fill)
-            .height(Length::FillPortion(2)),
+            body.padding(Padding::from([0, 4])).width(Fill),
             text("Épisodes").size(16),
             container(soft_scroll_on(
                 ui,
@@ -2098,7 +2201,7 @@ pub fn media_detail_page<'a>(
                 Message::BrowseScrolled,
             ))
             .width(Fill)
-            .height(Length::FillPortion(3)),
+            .height(Fill),
         ]
         .spacing(SPACE_MD)
         .width(Fill)

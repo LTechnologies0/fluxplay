@@ -1,5 +1,9 @@
 //! Local SQLite catalog — offline-first Single Source of Truth.
 //! Tuned PRAGMAs (WAL / NORMAL sync / mmap / page cache) + FTS5 search.
+//!
+//! Public helpers include sync-fallback / tooling APIs not always on the hot path.
+
+#![allow(dead_code)]
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};

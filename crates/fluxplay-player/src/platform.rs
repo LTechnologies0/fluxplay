@@ -96,8 +96,8 @@ pub fn target_profile() -> TargetProfile {
                     platform: Platform::Android,
                     ui_shell: "iced (same as desktop) + NativeActivity",
                     preferred_backends: &["mpv", "intent"],
-                    hw_accel: "mediacodec-copy via libmpv (vo=libmpv soft present) / Intent fallback",
-                    notes: "in-process libmpv (vendored NDK .so) → RGBA embed; ACTION_VIEW fallback",
+                    hw_accel: "MediaCodec Surface embed (4K/HDR) + soft RGBA fallback; optional Vulkan drop-in",
+                    notes: "SurfaceView under translucent iced; device_caps.json quality matrix; ACTION_VIEW fallback",
                 },
                 Platform::Ios => TargetProfile {
                     platform: Platform::Ios,

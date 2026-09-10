@@ -38,7 +38,10 @@ pub enum Icon {
     Replay10,
     Forward10,
     Stop,
+    #[allow(dead_code)]
     Playlist,
+    SkipPrevious,
+    SkipNext,
 }
 
 impl Icon {
@@ -71,6 +74,8 @@ impl Icon {
             Self::Forward10 => include_bytes!("../assets/icons/forward_10.svg"),
             Self::Stop => include_bytes!("../assets/icons/stop.svg"),
             Self::Playlist => include_bytes!("../assets/icons/playlist_play.svg"),
+            Self::SkipPrevious => include_bytes!("../assets/icons/skip_previous.svg"),
+            Self::SkipNext => include_bytes!("../assets/icons/skip_next.svg"),
         }
     }
 
@@ -109,10 +114,13 @@ impl Icon {
             Self::Forward10 => include_bytes!("../assets/icons/png/forward_10.png"),
             Self::Stop => include_bytes!("../assets/icons/png/stop.png"),
             Self::Playlist => include_bytes!("../assets/icons/png/playlist_play.png"),
+            Self::SkipPrevious => include_bytes!("../assets/icons/png/skip_previous.png"),
+            Self::SkipNext => include_bytes!("../assets/icons/png/skip_next.png"),
         })
     }
 
     /// ASCII-safe glyphs (Fira Sans / NativeActivity — no emoji).
+    #[allow(dead_code)]
     pub fn text_glyph(self) -> &'static str {
         match self {
             Self::LiveTv => "TV",
@@ -141,6 +149,8 @@ impl Icon {
             Self::Forward10 => "+10",
             Self::Stop => "[]",
             Self::Playlist => "PL",
+            Self::SkipPrevious => "<<",
+            Self::SkipNext => ">>",
         }
     }
 }

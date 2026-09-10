@@ -229,13 +229,35 @@ static void store_frame(FluxFfmpegPlayer *p, AVFrame *frame, int target_w, int t
     if (tw > 3840) tw = 3840;
     if (th > 2160) th = 2160;
 
+    /* Aspect-preserving fit into want WxH (letterbox / pillarbox), never stretch.
+     * Honour sample aspect ratio so anamorphic streams keep correct DAR. */
+    double sar = 1.0;
+    if (frame->sample_aspect_ratio.num > 0 && frame->sample_aspect_ratio.den > 0) {
+        sar = (double)frame->sample_aspect_ratio.num / (double)frame->sample_aspect_ratio.den;
+    }
+    double disp_w = (double)frame->width * sar;
+    double disp_h = (double)frame->height;
+    double sx = (double)tw / disp_w;
+    double sy = (double)th / disp_h;
+    double s = sx < sy ? sx : sy;
+    int dw = (int)(disp_w * s + 0.5);
+    int dh = (int)(disp_h * s + 0.5);
+    if (dw < 2) dw = 2;
+    if (dh < 2) dh = 2;
+    dw &= ~1;
+    dh &= ~1;
+    if (dw > tw) dw = tw & ~1;
+    if (dh > th) dh = th & ~1;
+    int ox = ((tw - dw) / 2) & ~1;
+    int oy = ((th - dh) / 2) & ~1;
+
     struct SwsContext *sws = sws_getCachedContext(
         p->sws,
         frame->width,
         frame->height,
         (enum AVPixelFormat)frame->format,
-        tw,
-        th,
+        dw,
+        dh,
         AV_PIX_FMT_RGBA,
         SWS_FAST_BILINEAR,
         NULL,
@@ -256,8 +278,9 @@ static void store_frame(FluxFfmpegPlayer *p, AVFrame *frame, int target_w, int t
         }
         p->frame_rgba = dst;
     }
-    /* Scale into the retained buffer (no per-frame malloc). */
-    uint8_t *dst_slices[4] = {dst, NULL, NULL, NULL};
+    memset(dst, 0, need);
+    uint8_t *dst_slices[4] = {
+        dst + (size_t)oy * (size_t)tw * 4 + (size_t)ox * 4, NULL, NULL, NULL};
     int dst_stride[4] = {tw * 4, 0, 0, 0};
     /* Unlock during sws_scale — pull_rgba only reads when frame_ready. */
     p->frame_ready = 0;
@@ -327,10 +350,22 @@ static int pick_video_stream(AVFormatContext *fmt) {
 }
 
 static int try_init_hw(FluxFfmpegPlayer *p, const AVCodec *codec, AVCodecContext *vctx) {
+    /* Vendor / platform order: phone MediaCodec first, then desktop GPU APIs.
+     * Soft RGBA present still needs CPU download — MediaCodec + hwdownload is
+     * far cheaper than full SW decode of 1080p/4K on Snapdragon/Tensor/Exynos/MTK. */
     static const enum AVHWDeviceType kTypes[] = {
+#if defined(__ANDROID__)
+        AV_HWDEVICE_TYPE_MEDIACODEC,
+#endif
         AV_HWDEVICE_TYPE_CUDA,
         AV_HWDEVICE_TYPE_VAAPI,
         AV_HWDEVICE_TYPE_VDPAU,
+        AV_HWDEVICE_TYPE_VULKAN,
+        AV_HWDEVICE_TYPE_D3D11VA,
+        AV_HWDEVICE_TYPE_DXVA2,
+        AV_HWDEVICE_TYPE_VIDEOTOOLBOX,
+        AV_HWDEVICE_TYPE_QSV,
+        AV_HWDEVICE_TYPE_DRM,
         AV_HWDEVICE_TYPE_NONE,
     };
     for (int t = 0; kTypes[t] != AV_HWDEVICE_TYPE_NONE; t++) {

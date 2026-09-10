@@ -129,6 +129,7 @@ pub fn parse_title_query(raw: &str) -> TitleQuery {
 }
 
 /// Back-compat: title only.
+#[allow(dead_code)]
 pub fn clean_title(raw: &str) -> String {
     parse_title_query(raw).title
 }

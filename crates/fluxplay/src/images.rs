@@ -161,10 +161,12 @@ impl ImageCache {
         }
     }
 
+    #[allow(dead_code)]
     pub fn take_inflight_source(&mut self, url: &str) -> Option<Uuid> {
         self.inflight_source.remove(url).flatten()
     }
 
+    #[allow(dead_code)]
     pub fn insert_bytes(&mut self, url: String, bytes: Vec<u8>) {
         self.inflight.remove(&url);
         self.inflight_source.remove(&url);
@@ -239,6 +241,7 @@ impl ImageCache {
     }
 
     /// Drop inflight without blacklisting — allows retry after transient network errors.
+    #[allow(dead_code)]
     pub fn clear_inflight(&mut self, url: &str) {
         self.inflight.remove(url);
         self.inflight_source.remove(url);
@@ -492,6 +495,7 @@ pub async fn fetch_image_bytes(
 }
 
 /// Fetch then downscale on the blocking pool (iced `update` stays light).
+#[allow(dead_code)]
 pub async fn fetch_image_prepared(
     url: String,
     source_id: Option<Uuid>,

@@ -118,15 +118,63 @@ impl BackendCaps {
 fn preferred_hwdec() -> &'static str {
     #[cfg(target_os = "android")]
     {
-        // Soft RGBA embed: mediacodec-copy still does a full CPU blit into mpv SW render
-        // and has starved the NativeActivity thread (FocusEvent ANR on HOME). Prefer SW.
-        "no"
+        // Soft RGBA (vo=libmpv) needs CPU-readable frames. `mediacodec-copy` is the
+        // vendor-agnostic path: Qualcomm/MediaTek/Exynos/Tensor/Unisoc all expose
+        // MediaCodec; mpv downloads NV12/YUV into SW for soft present.
+        // Plain `mediacodec` (zero-copy Surface) cannot feed vo=libmpv SW.
+        // Env override for labs: FLUXPLAY_HWDEC=mediacodec-copy|auto-safe|no
+        if let Ok(v) = std::env::var("FLUXPLAY_HWDEC") {
+            match v.to_ascii_lowercase().as_str() {
+                "no" | "none" | "software" => return "no",
+                "auto" | "auto-safe" => return "auto-safe",
+                "auto-copy" => return "auto-copy",
+                "mediacodec" => return "mediacodec-copy", // force copy for soft VO
+                other if !other.is_empty() => {
+                    // Leak a static for rare overrides (mediacodec-copy, …).
+                    return Box::leak(other.to_string().into_boxed_str());
+                }
+                _ => {}
+            }
+        }
+        "mediacodec-copy"
     }
     #[cfg(not(target_os = "android"))]
     {
-        // Same policy for embed + CLI (auto-copy / auto-safe are close; prefer auto-copy).
+        // Soft embed / hybrid: always copy path. Prefer auto-copy.
+        if let Ok(v) = std::env::var("FLUXPLAY_HWDEC") {
+            let lower = v.to_ascii_lowercase();
+            if matches!(
+                lower.as_str(),
+                "no" | "none" | "software" | "auto" | "auto-safe" | "auto-copy"
+                    | "vaapi" | "vaapi-copy" | "cuda" | "nvdec" | "vulkan" | "d3d11va"
+                    | "dxva2" | "videotoolbox"
+            ) {
+                return Box::leak(lower.into_boxed_str());
+            }
+        }
         "auto-copy"
     }
+}
+
+/// Android soft-present scale — prefer budget from live caps when provided.
+#[cfg(target_os = "android")]
+fn android_soft_vf_from_budget(budget: &str) -> String {
+    budget.to_string()
+}
+
+#[cfg(target_os = "android")]
+fn android_soft_vf_fallback() -> String {
+    // Last resort when caps were never probed (should be rare).
+    let cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4) as u32;
+    let caps = crate::AndroidDeviceCaps {
+        cores,
+        mediacodec_video: true,
+        refresh_hz: 60,
+        ..Default::default()
+    };
+    caps.soft_budget().vf_scale()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -153,6 +201,40 @@ pub struct PlayOptions {
     /// App-scoped proxy (e.g. `socks5h://127.0.0.1:PORT` from WireGuard userspace).
     #[serde(default)]
     pub http_proxy: Option<String>,
+    /// Android present path (Surface embed vs soft RGBA). Ignored on desktop.
+    #[serde(default)]
+    pub android_present: crate::AndroidPresentMode,
+    /// Dynamic soft vf chain from [`crate::AndroidDeviceCaps::soft_budget`].
+    #[serde(default)]
+    pub android_soft_vf: Option<String>,
+    /// Android `wid` = GlobalRef Surface jobject pointer (Phase A).
+    #[serde(default)]
+    pub android_surface_wid: Option<i64>,
+    /// Android `android-surface-size` WxH when known.
+    #[serde(default)]
+    pub android_surface_wh: Option<(u32, u32)>,
+    /// Linux DRM render node for VA-API when hybrid (`/dev/dri/renderD129`).
+    #[serde(default)]
+    pub vaapi_device: Option<String>,
+    /// When true, prefer `*-copy` hwdec (cross-GPU or soft present).
+    #[serde(default)]
+    pub hwdec_force_copy: bool,
+    /// Soft-path HDR→SDR tone-mapping (mpv tone-mapping=hable).
+    #[serde(default = "default_tonemap_on")]
+    pub tonemap_hdr: bool,
+    /// User quality ceiling (360p–4K). Soft path only; Surface keeps bitstream.
+    #[serde(default)]
+    pub video_max_wh: Option<(u32, u32)>,
+    /// HDR / gamut preference.
+    #[serde(default)]
+    pub hdr_mode: fluxplay_core::models::HdrPref,
+    /// LED vs AMOLED tone.
+    #[serde(default)]
+    pub display_panel: fluxplay_core::models::DisplayPanelPref,
+}
+
+fn default_tonemap_on() -> bool {
+    true
 }
 
 /// Screen-space rectangle for the mpv video surface.
@@ -217,6 +299,16 @@ impl Default for PlayOptions {
             low_latency: false,
             preferred: PlayerBackendPref::Auto,
             http_proxy: None,
+            android_present: crate::AndroidPresentMode::default(),
+            android_soft_vf: None,
+            android_surface_wid: None,
+            android_surface_wh: None,
+            vaapi_device: None,
+            hwdec_force_copy: false,
+            tonemap_hdr: true,
+            video_max_wh: None,
+            hdr_mode: Default::default(),
+            display_panel: Default::default(),
         }
     }
 }
@@ -563,7 +655,9 @@ fn pick_backend(pref: PlayerBackendPref) -> Result<BackendId> {
 pub struct NativePlayer {
     backend: Option<BackendId>,
     #[cfg(all(feature = "native-mpv", fluxplay_has_libmpv))]
-    libmpv: Option<crate::mpv_ffi::LibMpv>,
+    libmpv: Option<std::sync::Arc<std::sync::Mutex<crate::mpv_ffi::LibMpv>>>,
+    #[cfg(all(feature = "native-mpv", fluxplay_has_libmpv))]
+    soft_pump: Option<crate::soft_pump::SoftPump>,
     #[cfg(all(feature = "native-ffmpeg", fluxplay_has_ffmpeg))]
     libffmpeg: Option<crate::ffmpeg_ffi::LibFfmpeg>,
     child: Option<Child>,
@@ -578,6 +672,8 @@ pub struct NativePlayer {
     /// Last soft RGBA frame (libmpv / libffmpeg) for screenshot fallback.
     last_soft_rgba: Option<(u32, u32, Arc<[u8]>)>,
     soft_shot_tick: u32,
+    /// Active Android present path (soft vs Surface).
+    android_present: crate::AndroidPresentMode,
 }
 
 impl Default for NativePlayer {
@@ -599,6 +695,8 @@ impl NativePlayer {
             backend: None,
             #[cfg(all(feature = "native-mpv", fluxplay_has_libmpv))]
             libmpv: None,
+            #[cfg(all(feature = "native-mpv", fluxplay_has_libmpv))]
+            soft_pump: None,
             #[cfg(all(feature = "native-ffmpeg", fluxplay_has_ffmpeg))]
             libffmpeg: None,
             child: None,
@@ -609,6 +707,35 @@ impl NativePlayer {
             ffplay_paused: false,
             last_soft_rgba: None,
             soft_shot_tick: 0,
+            android_present: crate::AndroidPresentMode::default(),
+        }
+    }
+
+
+    #[cfg(all(feature = "native-mpv", fluxplay_has_libmpv))]
+    fn lock_mpv(&self) -> Option<std::sync::MutexGuard<'_, crate::mpv_ffi::LibMpv>> {
+        self.libmpv.as_ref()?.lock().ok()
+    }
+
+    #[cfg(all(feature = "native-mpv", fluxplay_has_libmpv))]
+    fn stop_soft_pump(&mut self) {
+        if let Some(pump) = self.soft_pump.take() {
+            pump.stop();
+        }
+    }
+
+    #[cfg(all(feature = "native-mpv", fluxplay_has_libmpv))]
+    fn ensure_soft_pump(&mut self) {
+        if self.android_present.uses_surface() {
+            self.stop_soft_pump();
+            return;
+        }
+        if self.soft_pump.is_some() {
+            return;
+        }
+        if let Some(arc) = self.libmpv.clone() {
+            self.soft_pump = Some(crate::soft_pump::SoftPump::start(arc));
+            tracing::info!("soft-pump started (off-UI mpv render)");
         }
     }
 
@@ -654,7 +781,7 @@ impl NativePlayer {
     /// mpv `paused-for-cache` — drives Buffering state.
     pub fn paused_for_cache(&self) -> bool {
         #[cfg(all(feature = "native-mpv", fluxplay_has_libmpv))]
-        if let Some(mpv) = &self.libmpv {
+        if let Some(mpv) = self.lock_mpv() {
             return matches!(
                 mpv.get_property_string("paused-for-cache").as_deref(),
                 Some("yes") | Some("true")
@@ -722,15 +849,32 @@ impl NativePlayer {
 
     /// Pull an RGBA frame for the iced stage (embedded libmpv / FFmpeg software render).
     /// Returns `None` when there is no new frame — keep the previous ImageHandle.
+    /// Android Surface present modes never produce soft frames.
     pub fn pull_video_frame(&mut self, w: u32, h: u32) -> Option<(u32, u32, Vec<u8>)> {
+        if self.android_present.uses_surface() {
+            return None;
+        }
         let rw = (w.clamp(2, 3840) & !1).max(2);
         let rh = (h.clamp(2, 2160) & !1).max(2);
         #[cfg(all(feature = "native-mpv", fluxplay_has_libmpv))]
-        if let Some(mpv) = self.libmpv.as_mut() {
-            let pixels = mpv.render_sw_rgba(rw, rh)?;
+        {
+            if let Some(pump) = self.soft_pump.as_ref() {
+                pump.set_target(rw, rh);
+                if let Some((fw, fh, pixels)) = pump.take_frame() {
+                    self.soft_shot_tick = self.soft_shot_tick.wrapping_add(1);
+                    if self.last_soft_rgba.is_none() || self.soft_shot_tick % 180 == 0 {
+                        self.last_soft_rgba = Some((fw, fh, Arc::from(pixels.as_slice())));
+                    }
+                    return Some((fw, fh, pixels));
+                }
+                return None;
+            }
+            let pixels = {
+                let mut mpv = self.lock_mpv()?;
+                mpv.render_sw_rgba(rw, rh)?
+            };
             self.soft_shot_tick = self.soft_shot_tick.wrapping_add(1);
-            // Snapshot for screenshot ~1×/s at 60 Hz — avoid Arc copy hitch every frame.
-            if self.last_soft_rgba.is_none() || self.soft_shot_tick % 60 == 0 {
+            if self.last_soft_rgba.is_none() || self.soft_shot_tick % 180 == 0 {
                 self.last_soft_rgba = Some((rw, rh, Arc::from(pixels.as_slice())));
             }
             return Some((rw, rh, pixels));
@@ -740,7 +884,7 @@ impl NativePlayer {
             let (rw, rh) = crate::ffmpeg_ffi::LibFfmpeg::soft_present_dims(w, h);
             let pixels = ff.pull_rgba(rw, rh)?;
             self.soft_shot_tick = self.soft_shot_tick.wrapping_add(1);
-            if self.last_soft_rgba.is_none() || self.soft_shot_tick % 60 == 0 {
+            if self.last_soft_rgba.is_none() || self.soft_shot_tick % 180 == 0 {
                 self.last_soft_rgba = Some((rw, rh, Arc::from(pixels.as_slice())));
             }
             return Some((rw, rh, pixels));
@@ -752,18 +896,32 @@ impl NativePlayer {
     /// Return a discarded soft RGBA buffer to the embed pool (mpv capacity recycle).
     pub fn recycle_soft_rgba(&mut self, buf: Vec<u8>) {
         #[cfg(all(feature = "native-mpv", fluxplay_has_libmpv))]
-        if let Some(mpv) = self.libmpv.as_mut() {
-            mpv.recycle_sw_rgba(buf);
-            return;
+        {
+            if let Some(pump) = self.soft_pump.as_ref() {
+                pump.offer_recycle(buf);
+                return;
+            }
+            if let Some(mut mpv) = self.lock_mpv() {
+                mpv.recycle_sw_rgba(buf);
+                return;
+            }
         }
         let _ = buf;
     }
 
     /// True when embedded backend has a newer frame than the last successful pull.
     pub fn frame_needs_redraw(&self) -> bool {
+        if self.android_present.uses_surface() {
+            return false;
+        }
         #[cfg(all(feature = "native-mpv", fluxplay_has_libmpv))]
-        if let Some(mpv) = &self.libmpv {
-            return mpv.frame_needs_redraw();
+        {
+            if let Some(pump) = self.soft_pump.as_ref() {
+                return pump.needs_redraw();
+            }
+            if let Some(mpv) = self.lock_mpv() {
+                return mpv.frame_needs_redraw();
+            }
         }
         #[cfg(all(feature = "native-ffmpeg", fluxplay_has_ffmpeg))]
         if let Some(ff) = &self.libffmpeg {
@@ -782,6 +940,101 @@ impl NativePlayer {
             return true;
         }
         false
+    }
+
+    /// Android Surface / gpu-egl present (video not in iced RGBA).
+    pub fn android_surface_present(&self) -> bool {
+        self.android_present.uses_surface() && self.has_embedded_video()
+    }
+
+    pub fn android_present_mode(&self) -> crate::AndroidPresentMode {
+        self.android_present
+    }
+
+    /// Rebind MediaCodec Surface after rotate / Surface recreate (gen bump).
+    pub fn rebind_android_surface(&mut self, wid: i64, wh: Option<(u32, u32)>) -> bool {
+        if !self.android_present.uses_surface() {
+            return false;
+        }
+        #[cfg(all(feature = "native-mpv", fluxplay_has_libmpv))]
+        {
+            let Some(mpv) = self.lock_mpv() else {
+                return false;
+            };
+            // mpv-android: ensure VO is active when surface returns.
+            if self.android_present == crate::AndroidPresentMode::SurfaceEmbed {
+                let _ = mpv.set_property("vo", "mediacodec_embed");
+            } else if self.android_present == crate::AndroidPresentMode::GpuEgl {
+                let _ = mpv.set_property("vo", "gpu");
+            }
+            let _ = mpv.set_property("force-window", "yes");
+            let ok = mpv.set_property_i64("wid", wid).is_ok();
+            if !ok {
+                warn!(wid, "android Surface wid rebind failed");
+                return false;
+            }
+            if let Some((w, h)) = wh {
+                let size = format!("{w}x{h}");
+                let _ = mpv.set_property("android-surface-size", &size);
+            }
+            drop(mpv);
+            if let Some((w, h)) = wh {
+                self.opts.android_surface_wh = Some((w, h));
+            }
+            self.opts.android_surface_wid = Some(wid);
+            info!(wid, ?wh, "android Surface wid rebound");
+            return true;
+        }
+        #[cfg(not(all(feature = "native-mpv", fluxplay_has_libmpv)))]
+        {
+            let _ = (wid, wh);
+        }
+        false
+    }
+
+    /// Update Surface size property only — keep the same wid (no MediaCodec tear-down).
+    pub fn rebind_android_surface_size(&mut self, wh: (u32, u32)) -> bool {
+        if !self.android_present.uses_surface() {
+            return false;
+        }
+        let (w, h) = wh;
+        if w < 64 || h < 64 {
+            return false;
+        }
+        #[cfg(all(feature = "native-mpv", fluxplay_has_libmpv))]
+        {
+            let Some(mpv) = self.lock_mpv() else {
+                return false;
+            };
+            let size = format!("{w}x{h}");
+            let ok = mpv.set_property("android-surface-size", &size).is_ok();
+            drop(mpv);
+            if ok {
+                self.opts.android_surface_wh = Some((w, h));
+                debug!(?wh, "android Surface size updated (wid kept)");
+            }
+            return ok;
+        }
+        #[cfg(not(all(feature = "native-mpv", fluxplay_has_libmpv)))]
+        {
+            self.opts.android_surface_wh = Some((w, h));
+            true
+        }
+    }
+
+    /// mpv-android detach order: `vo=null` → `force-window=no` → `wid=0` before
+    /// dropping the Surface GlobalRef (avoids UAF into a released jobject).
+    pub fn detach_android_surface(&mut self) {
+        #[cfg(all(feature = "native-mpv", fluxplay_has_libmpv))]
+        {
+            if let Some(mpv) = self.lock_mpv() {
+                let _ = mpv.set_property("vo", "null");
+                let _ = mpv.set_property("force-window", "no");
+                let _ = mpv.set_property_i64("wid", 0);
+                info!("android Surface detached (vo=null, wid=0)");
+            }
+        }
+        self.opts.android_surface_wid = None;
     }
 
     fn apply_video_geometry(&mut self) {
@@ -809,7 +1062,7 @@ impl NativePlayer {
     pub fn is_running(&mut self) -> bool {
         #[cfg(all(feature = "native-mpv", fluxplay_has_libmpv))]
         {
-            if let Some(mpv) = &self.libmpv {
+            if let Some(mpv) = self.lock_mpv() {
                 // Avoid idle-active alone (flaps → black stage). Combine EOF + empty path.
                 if let Some(eof) = mpv.get_property_string("eof-reached") {
                     if eof == "yes" || eof == "true" {
@@ -863,7 +1116,21 @@ impl NativePlayer {
         let _prof = Stopwatch::start("native_play");
         let endpoint = url_endpoint(url);
         debug!(%endpoint, preferred = ?self.opts.preferred, "NativePlayer::play");
+        // stop() detaches mpv wid — preserve the Surface bind prepared by the app
+        // so start_libmpv still sees mediacodec_embed + wid (otherwise soft black overlay).
+        #[cfg(target_os = "android")]
+        let preserved_surface = (
+            self.opts.android_present,
+            self.opts.android_surface_wid,
+            self.opts.android_surface_wh,
+        );
         self.stop();
+        #[cfg(target_os = "android")]
+        {
+            self.opts.android_present = preserved_surface.0;
+            self.opts.android_surface_wid = preserved_surface.1;
+            self.opts.android_surface_wh = preserved_surface.2;
+        }
         // Panels with max_connections=1 need a beat to release the CDN slot.
         // Never sleep on Android UI/NativeActivity thread (ANR).
         #[cfg(not(target_os = "android"))]
@@ -945,9 +1212,20 @@ impl NativePlayer {
         let had = self.backend;
         #[cfg(all(feature = "native-mpv", fluxplay_has_libmpv))]
         {
-            if let Some(mpv) = self.libmpv.take() {
+            self.detach_android_surface();
+            self.stop_soft_pump();
+            if let Some(arc) = self.libmpv.take() {
                 debug!("NativePlayer::stop libmpv shutdown");
-                mpv.shutdown();
+                match std::sync::Arc::try_unwrap(arc) {
+                    Ok(m) => {
+                        let mpv = m.into_inner().unwrap_or_else(|e| e.into_inner());
+                        mpv.shutdown();
+                    }
+                    Err(arc) => {
+                        // Unexpected extra refs — drop Arc; LibMpv::Drop shuts down.
+                        drop(arc);
+                    }
+                }
             }
         }
         #[cfg(all(feature = "native-ffmpeg", fluxplay_has_ffmpeg))]
@@ -973,6 +1251,7 @@ impl NativePlayer {
             trace!("NativePlayer::stop idle");
         }
         self.backend = None;
+        self.android_present = crate::AndroidPresentMode::default();
         self.last_soft_rgba = None;
         self.soft_shot_tick = 0;
         self.ffplay_muted = false;
@@ -982,7 +1261,7 @@ impl NativePlayer {
     pub fn pause(&mut self, paused: bool) -> Result<()> {
         debug!(paused, backend = ?self.backend, "NativePlayer::pause");
         #[cfg(all(feature = "native-mpv", fluxplay_has_libmpv))]
-        if let Some(mpv) = &self.libmpv {
+        if let Some(mpv) = self.lock_mpv() {
             return mpv.set_property("pause", if paused { "yes" } else { "no" });
         }
         #[cfg(all(feature = "native-ffmpeg", fluxplay_has_ffmpeg))]
@@ -1016,7 +1295,7 @@ impl NativePlayer {
         let v = (self.opts.volume * 100.0).clamp(0.0, 100.0);
         debug!(volume = self.opts.volume, "NativePlayer::set_volume");
         #[cfg(all(feature = "native-mpv", fluxplay_has_libmpv))]
-        if let Some(mpv) = &self.libmpv {
+        if let Some(mpv) = self.lock_mpv() {
             return mpv.set_property("volume", &format!("{v:.0}"));
         }
         #[cfg(all(feature = "native-ffmpeg", fluxplay_has_ffmpeg))]
@@ -1040,7 +1319,7 @@ impl NativePlayer {
     pub fn set_mute(&mut self, muted: bool) -> Result<()> {
         debug!(muted, "NativePlayer::set_mute");
         #[cfg(all(feature = "native-mpv", fluxplay_has_libmpv))]
-        if let Some(mpv) = &self.libmpv {
+        if let Some(mpv) = self.lock_mpv() {
             return mpv.set_property("mute", if muted { "yes" } else { "no" });
         }
         #[cfg(all(feature = "native-ffmpeg", fluxplay_has_ffmpeg))]
@@ -1072,7 +1351,7 @@ impl NativePlayer {
     pub fn seek_relative(&mut self, secs: f64) -> Result<()> {
         debug!(secs, "NativePlayer::seek_relative");
         #[cfg(all(feature = "native-mpv", fluxplay_has_libmpv))]
-        if let Some(mpv) = &self.libmpv {
+        if let Some(mpv) = self.lock_mpv() {
             return mpv.command(&["seek", &format!("{secs}"), "relative"]);
         }
         #[cfg(all(feature = "native-ffmpeg", fluxplay_has_ffmpeg))]
@@ -1110,7 +1389,7 @@ impl NativePlayer {
         let pct = pct.clamp(0.0, 100.0);
         debug!(pct, "NativePlayer::seek_percent");
         #[cfg(all(feature = "native-mpv", fluxplay_has_libmpv))]
-        if let Some(mpv) = &self.libmpv {
+        if let Some(mpv) = self.lock_mpv() {
             return mpv.command(&["seek", &format!("{pct}"), "absolute-percent"]);
         }
         #[cfg(all(feature = "native-ffmpeg", fluxplay_has_ffmpeg))]
@@ -1153,7 +1432,7 @@ impl NativePlayer {
     pub fn cycle_audio(&mut self) -> Result<()> {
         debug!("NativePlayer::cycle_audio");
         #[cfg(all(feature = "native-mpv", fluxplay_has_libmpv))]
-        if let Some(mpv) = &self.libmpv {
+        if let Some(mpv) = self.lock_mpv() {
             return mpv.command(&["cycle", "audio"]);
         }
         if let Some(path) = &self.ipc_path {
@@ -1176,7 +1455,7 @@ impl NativePlayer {
     pub fn cycle_subtitles(&mut self) -> Result<()> {
         debug!("NativePlayer::cycle_subtitles");
         #[cfg(all(feature = "native-mpv", fluxplay_has_libmpv))]
-        if let Some(mpv) = &self.libmpv {
+        if let Some(mpv) = self.lock_mpv() {
             return mpv.command(&["cycle", "sub"]);
         }
         if let Some(path) = &self.ipc_path {
@@ -1202,7 +1481,7 @@ impl NativePlayer {
         let endpoint = url_endpoint(url);
         info!(%endpoint, "NativePlayer::restart");
         #[cfg(all(feature = "native-mpv", fluxplay_has_libmpv))]
-        if let Some(mpv) = &self.libmpv {
+        if let Some(mpv) = self.lock_mpv() {
             mpv.command(&["loadfile", url, "replace"])?;
             return Ok(());
         }
@@ -1217,7 +1496,7 @@ impl NativePlayer {
     pub fn frame_step(&mut self) -> Result<()> {
         trace!("NativePlayer::frame_step");
         #[cfg(all(feature = "native-mpv", fluxplay_has_libmpv))]
-        if let Some(mpv) = &self.libmpv {
+        if let Some(mpv) = self.lock_mpv() {
             return mpv.command(&["frame-step"]);
         }
         if let Some(path) = &self.ipc_path {
@@ -1240,10 +1519,9 @@ impl NativePlayer {
     /// Query playback position / duration (seconds).
     pub fn playback_times(&self) -> Option<(f64, f64)> {
         #[cfg(all(feature = "native-mpv", fluxplay_has_libmpv))]
-        if let Some(mpv) = &self.libmpv {
+        if let Some(mpv) = self.lock_mpv() {
             let pos = mpv.get_property_f64("time-pos")?;
             let dur = mpv.get_property_f64("duration").unwrap_or(0.0);
-            trace!(pos, dur, "playback_times libmpv");
             return Some((pos, dur));
         }
         #[cfg(all(feature = "native-ffmpeg", fluxplay_has_ffmpeg))]
@@ -1263,7 +1541,7 @@ impl NativePlayer {
     /// Estimated content frame rate (VOD/HLS). Used to avoid over-presenting soft frames.
     pub fn content_fps(&self) -> Option<f64> {
         #[cfg(all(feature = "native-mpv", fluxplay_has_libmpv))]
-        if let Some(mpv) = &self.libmpv {
+        if let Some(mpv) = self.lock_mpv() {
             let fps = mpv
                 .get_property_f64("container-fps")
                 .filter(|f| *f >= 20.0 && f.is_finite())
@@ -1286,10 +1564,74 @@ impl NativePlayer {
             })
     }
 
+    /// Post-content-fps A/V offset for the Android Surface (zero-copy) path.
+    ///
+    /// A fixed pre-init `video-timing-offset` vs the mpv default left audio ~50 ms
+    /// ahead on 4K `mediacodec_embed`, which reads as judder on 24/25 fps streams.
+    /// Scale the offset by content rate once the demuxer knows it.
+    pub fn sync_android_video_timing(&self) {
+        if self.android_present.uses_soft_rgba() {
+            return;
+        }
+        let Some(fps) = self.content_fps() else {
+            return;
+        };
+        #[cfg(all(feature = "native-mpv", fluxplay_has_libmpv))]
+        if let Some(mpv) = self.lock_mpv() {
+            // ≈1 frame at content rate, clamped — covers MediaCodec queue depth without
+            // pushing VO behind audio on low-fps film.
+            let offset = (1.0 / fps).clamp(0.005, 0.042);
+            let v = format!("{offset:.4}");
+            if mpv.set_option("video-timing-offset", &v).is_err() {
+                soft_set(&mpv, "video-timing-offset", &v);
+            }
+        }
+    }
+
+    /// Display video size (SAR/DAR-corrected), e.g. (2386, 1080) for anamorphic scope.
+    /// `dw`/`dh` is what mpv would render — the SurfaceView is fit to this ratio.
+    pub fn video_wh(&self) -> Option<(u32, u32)> {
+        #[cfg(all(feature = "native-mpv", fluxplay_has_libmpv))]
+        if let Some(mpv) = self.lock_mpv() {
+            let (w, h) = mpv
+                .get_property_f64("video-out-params/dw")
+                .zip(mpv.get_property_f64("video-out-params/dh"))
+                .or_else(|| {
+                    mpv.get_property_f64("video-params/dw")
+                        .zip(mpv.get_property_f64("video-params/dh"))
+                })?;
+            if w >= 16.0 && h >= 16.0 {
+                return Some((w as u32, h as u32));
+            }
+        }
+        let _ = &self;
+        None
+    }
+
+    /// Decoded buffer size (no SAR/DAR correction) — matches the actual
+    /// MediaCodec/decoder frame dims fed to the Surface buffer.
+    pub fn video_buffer_wh(&self) -> Option<(u32, u32)> {
+        #[cfg(all(feature = "native-mpv", fluxplay_has_libmpv))]
+        if let Some(mpv) = self.lock_mpv() {
+            let (w, h) = mpv
+                .get_property_f64("video-out-params/w")
+                .zip(mpv.get_property_f64("video-out-params/h"))
+                .or_else(|| {
+                    mpv.get_property_f64("video-params/w")
+                        .zip(mpv.get_property_f64("video-params/h"))
+                })?;
+            if w >= 16.0 && h >= 16.0 {
+                return Some((w as u32, h as u32));
+            }
+        }
+        let _ = &self;
+        None
+    }
+
     fn set_prop(&self, name: &str, value: &str) -> Result<()> {
         debug!(%name, %value, "NativePlayer::set_prop");
         #[cfg(all(feature = "native-mpv", fluxplay_has_libmpv))]
-        if let Some(mpv) = &self.libmpv {
+        if let Some(mpv) = self.lock_mpv() {
             return match mpv.set_property(name, value) {
                 Ok(()) => {
                     info!(%name, %value, "set_prop ok (libmpv)");
@@ -1323,7 +1665,7 @@ impl NativePlayer {
         let cmd = args.first().copied().unwrap_or("");
         debug!(%cmd, args = ?args, "NativePlayer::run_cmd");
         #[cfg(all(feature = "native-mpv", fluxplay_has_libmpv))]
-        if let Some(mpv) = &self.libmpv {
+        if let Some(mpv) = self.lock_mpv() {
             return match mpv.command(args) {
                 Ok(()) => {
                     info!(%cmd, "run_cmd ok (libmpv)");
@@ -1492,6 +1834,32 @@ impl NativePlayer {
         self.set_prop("vf", filter)
     }
 
+    /// Color wheel safe on MediaCodec Surface (no vf / no black frames).
+    pub fn set_color_adjust(
+        &mut self,
+        brightness: i32,
+        contrast: i32,
+        saturation: i32,
+        gamma: i32,
+    ) -> Result<()> {
+        debug!(brightness, contrast, saturation, gamma, "NativePlayer::set_color_adjust");
+        self.set_prop("brightness", &brightness.to_string())?;
+        self.set_prop("contrast", &contrast.to_string())?;
+        self.set_prop("saturation", &saturation.to_string())?;
+        self.set_prop("gamma", &gamma.to_string())
+    }
+
+    /// Force Soft RGBA present flag (after Surface demotion). Does not recreate mpv.
+    pub fn force_android_soft_present(&mut self) {
+        self.detach_android_surface();
+        self.android_present = crate::AndroidPresentMode::SoftRgba;
+        self.opts.android_present = crate::AndroidPresentMode::SoftRgba;
+        self.opts.android_surface_wid = None;
+        self.opts.android_surface_wh = None;
+        #[cfg(all(feature = "native-mpv", fluxplay_has_libmpv))]
+        self.ensure_soft_pump();
+    }
+
     pub fn toggle_sub_visibility(&mut self) -> Result<()> {
         debug!("NativePlayer::toggle_sub_visibility");
         self.run_cmd(&["cycle", "sub-visibility"])
@@ -1577,13 +1945,137 @@ impl NativePlayer {
             soft_set(&mpv, "terminal", "no");
         }
         soft_set(&mpv, "idle", "yes");
-        // vo=libmpv is required for mpv_render SW → iced RGBA. Fail clearly if missing.
-        mpv.set_option("vo", "libmpv").map_err(|e| {
-            PlayerError::Backend(format!(
-                "{e} — libmpv Android sans vo=libmpv (media-kit incomplet?)"
-            ))
-        })?;
-        soft_set(&mpv, "force-window", "no");
+        #[cfg(target_os = "android")]
+        let present = {
+            let mut mode = self.opts.android_present;
+            // Surface path needs a live wid; otherwise fall back soft (no black video).
+            if mode.uses_surface() && self.opts.android_surface_wid.is_none() {
+                warn!(
+                    mode = mode.label(),
+                    "android surface wid missing — soft RGBA fallback"
+                );
+                mode = crate::AndroidPresentMode::SoftRgba;
+            }
+            mode
+        };
+        #[cfg(not(target_os = "android"))]
+        let present = crate::AndroidPresentMode::SoftRgba;
+        self.android_present = present;
+
+        #[cfg(target_os = "android")]
+        {
+            match present {
+                crate::AndroidPresentMode::SurfaceEmbed => {
+                    // Zero-copy MediaCodec → SurfaceView (HDR/4K capable).
+                    let wid = self.opts.android_surface_wid.unwrap();
+                    mpv.set_option_i64("wid", wid).map_err(|e| {
+                        PlayerError::Backend(format!("{e} — wid Surface requis pour mediacodec_embed"))
+                    })?;
+                    mpv.set_option("vo", "mediacodec_embed").map_err(|e| {
+                        PlayerError::Backend(format!("{e} — vo=mediacodec_embed indisponible"))
+                    })?;
+                    if let Some((w, h)) = self.opts.android_surface_wh {
+                        if mpv
+                            .set_option("android-surface-size", &format!("{w}x{h}"))
+                            .is_err()
+                        {
+                            soft_set(&mpv, "android-surface-size", &format!("{w}x{h}"));
+                        }
+                    }
+                    // Hard-set: soft_set can silently skip → SW decode / black video.
+                    if mpv.set_option("hwdec", "mediacodec").is_err() {
+                        soft_set(&mpv, "hwdec", "mediacodec");
+                        warn!("android Surface hwdec=mediacodec soft-set fallback");
+                    }
+                    soft_set(&mpv, "hwdec-codecs", "all");
+                    // mpv-android: force-window yes while Surface is attached.
+                    soft_set(&mpv, "force-window", "yes");
+                    // No vf scale — keep full bitstream quality on Surface.
+                    // Pre-init neutral; play_session re-tunes per content fps (sync_android_video_timing).
+                    if mpv.set_option("video-timing-offset", "0.020").is_err() {
+                        soft_set(&mpv, "video-timing-offset", "0.020");
+                    }
+                    info!(%endpoint, wid, "android present=mediacodec_embed");
+                }
+                crate::AndroidPresentMode::GpuEgl => {
+                    // Phase D without Vulkan rebuild: vo=gpu + egl-android on Surface wid.
+                    let wid = self.opts.android_surface_wid.unwrap();
+                    mpv.set_option_i64("wid", wid).map_err(|e| {
+                        PlayerError::Backend(format!("{e} — wid Surface requis pour vo=gpu"))
+                    })?;
+                    if mpv.set_option("vo", "gpu").is_err() {
+                        warn!("vo=gpu failed — falling back to mediacodec_embed");
+                        mpv.set_option("vo", "mediacodec_embed").map_err(|e| {
+                            PlayerError::Backend(format!("{e} — vo gpu/embed indisponible"))
+                        })?;
+                        soft_set(&mpv, "hwdec", "mediacodec");
+                    } else {
+                        soft_set(&mpv, "gpu-context", "android");
+                        soft_set(&mpv, "hwdec", "mediacodec-copy");
+                    }
+                    if let Some((w, h)) = self.opts.android_surface_wh {
+                        soft_set(&mpv, "android-surface-size", &format!("{w}x{h}"));
+                    }
+                    soft_set(&mpv, "force-window", "yes");
+                    info!(%endpoint, wid, "android present=gpu-egl");
+                }
+                crate::AndroidPresentMode::SoftRgba => {
+                    mpv.set_option("vo", "libmpv").map_err(|e| {
+                        PlayerError::Backend(format!(
+                            "{e} — libmpv Android sans vo=libmpv (media-kit incomplet?)"
+                        ))
+                    })?;
+                    soft_set(&mpv, "force-window", "no");
+                    // SW render into portrait stage must letterbox — never stretch.
+                    soft_set(&mpv, "keepaspect", "yes");
+                    soft_set(&mpv, "panscan", "0");
+                    info!(%endpoint, "android present=soft-rgba");
+                }
+            }
+        }
+        #[cfg(not(target_os = "android"))]
+        {
+            // vo=libmpv is required for mpv_render SW → iced RGBA. Fail clearly if missing.
+            mpv.set_option("vo", "libmpv").map_err(|e| {
+                PlayerError::Backend(format!("{e} — vo=libmpv requis pour soft present"))
+            })?;
+            soft_set(&mpv, "force-window", "no");
+            if let Some((w, h)) = self.opts.video_max_wh {
+                let w = w.max(2) & !1;
+                let h = h.max(2) & !1;
+                let vf = if w >= h {
+                    format!("scale={w}:-2:flags=fast_bilinear,format=yuv420p")
+                } else {
+                    format!("scale=-2:{h}:flags=fast_bilinear,format=yuv420p")
+                };
+                if mpv.set_option("vf", &vf).is_err() {
+                    soft_set(&mpv, "vf", &vf);
+                }
+            }
+        }
+
+        // HDR/gamut: iced RGBA is SDR — tonemap on soft. Surface keeps bitstream + window color mode.
+        if present.uses_soft_rgba() {
+            let hints = self.opts.hdr_mode.mpv_color_hints(self.opts.tonemap_hdr);
+            soft_set(
+                &mpv,
+                "target-colorspace-hint",
+                if hints.target_colorspace_hint { "yes" } else { "no" },
+            );
+            if let Some(tm) = hints.tone_mapping {
+                soft_set(&mpv, "tone-mapping", tm);
+            }
+            if let Some(p) = hints.target_prim {
+                soft_set(&mpv, "target-prim", p);
+            }
+            if let Some(t) = hints.target_trc {
+                soft_set(&mpv, "target-trc", t);
+            }
+            if hints.hdr_compute_peak {
+                soft_set(&mpv, "hdr-compute-peak", "yes");
+            }
+        }
+
         soft_set(&mpv, "keep-open", "yes");
         // media-kit Android omits ytdl/osc — skip to avoid soft_set DEBUG noise.
         #[cfg(not(target_os = "android"))]
@@ -1597,28 +2089,116 @@ impl NativePlayer {
         soft_set(&mpv, "input-vo-keyboard", "no");
         // Soft present uploads async via iced — a zero offset races audio ahead of GPU.
         // Hard-set: soft_set can silently skip on media-kit → A/V desync.
-        if mpv.set_option("video-timing-offset", "0.050").is_err() {
-            soft_set(&mpv, "video-timing-offset", "0.050");
+        if present.uses_soft_rgba() {
+            // ~2 frames @48Hz soft — covers iced GPU allocate without starving VO.
+            if mpv.set_option("video-timing-offset", "0.040").is_err() {
+                soft_set(&mpv, "video-timing-offset", "0.040");
+            }
         }
-        // Android NativeActivity: OpenSLES audio; soft RGBA present (vo=libmpv).
+        // Android NativeActivity audio + soft-only filters.
         #[cfg(target_os = "android")]
         {
-            // Hard-require OpenSLES — soft_set hid silent audio death on media-kit builds.
-            mpv.set_option("ao", "opensles").map_err(|e| {
-                PlayerError::Backend(format!("{e} — ao=opensles requis sur Android"))
-            })?;
+            // Vendored media-kit has OpenSLES (not AAudio) — avoid option warnings.
+            if mpv.set_option("ao", "opensles").is_err() {
+                soft_set(&mpv, "ao", "opensles");
+                if mpv.set_option("ao", "auto").is_err() {
+                    soft_set(&mpv, "ao", "auto");
+                }
+            }
             soft_set(&mpv, "audio-device", "auto");
+            soft_set(&mpv, "audio-buffer", "0.2");
+            if present.uses_soft_rgba() {
+                let vf_owned = self
+                    .opts
+                    .android_soft_vf
+                    .clone()
+                    .unwrap_or_else(android_soft_vf_fallback);
+                let vf = android_soft_vf_from_budget(&vf_owned);
+                // media-kit often rejects bare `vf=scale=…` — try lavfi wrapper then property.
+                let vf_ok = mpv.set_option("vf", &vf).is_ok()
+                    || mpv.set_option("vf", &format!("lavfi=[{vf}]")).is_ok()
+                    || {
+                        soft_set(&mpv, "vf", &vf);
+                        soft_set(&mpv, "vf", &format!("lavfi=[{vf}]"));
+                        false
+                    };
+                if !vf_ok {
+                    // Last resort: force SW decode budget so SoftPump isn't fed 4K copies.
+                    soft_set(&mpv, "hwdec", "no");
+                    warn!(%vf, "android soft vf rejected — hwdec=no fallback");
+                }
+                // HQ soft (≈720p+ budget): never skip loop filters / non-ref frames —
+                // those options were the main "saccade / soft quality loss" source on Tensor.
+                let hq_soft = self
+                    .opts
+                    .android_soft_vf
+                    .as_deref()
+                    .map(|s| {
+                        s.contains("1920")
+                            || s.contains("1280")
+                            || s.contains("1080")
+                            || s.contains("720")
+                    })
+                    .unwrap_or(true);
+                if hq_soft {
+                    soft_set(&mpv, "vd-lavc-skiploopfilter", "none");
+                    soft_set(&mpv, "vd-lavc-skipframe", "none");
+                    soft_set(&mpv, "vd-lavc-fast", "no");
+                    // Keep VO framedrop only — decoder+vo can starve soft present on media-kit.
+                    if mpv.set_option("framedrop", "vo").is_err() {
+                        soft_set(&mpv, "framedrop", "vo");
+                    }
+                    soft_set(&mpv, "hwdec-extra-frames", "8");
+                } else {
+                    soft_set(&mpv, "vd-lavc-skiploopfilter", "nonkey");
+                    soft_set(&mpv, "vd-lavc-skipframe", "nonref");
+                    soft_set(&mpv, "vd-lavc-fast", "yes");
+                    if mpv.set_option("framedrop", "vo").is_err() {
+                        soft_set(&mpv, "framedrop", "vo");
+                    }
+                }
+            } else {
+                // Surface path: drop VO only if compositor stalls; keep decode.
+                soft_set(&mpv, "framedrop", "no");
+            }
+            // Cap demux RAM on Android — 192+64 MiB was a large share of Unknown PSS.
+            soft_set(&mpv, "demuxer-max-bytes", "64MiB");
+            soft_set(&mpv, "demuxer-max-back-bytes", "16MiB");
         }
         soft_set(
             &mpv,
             "volume",
             &format!("{}", (self.opts.volume * 100.0) as u32),
         );
+        #[cfg(target_os = "android")]
+        let cache_secs = if vod {
+            cache_secs.min(8.0)
+        } else if mpeg_ts {
+            cache_secs.min(3.0)
+        } else {
+            cache_secs.min(2.0)
+        };
         soft_set(&mpv, "cache-secs", &format!("{cache_secs}"));
         soft_set(
             &mpv,
             "demuxer-readahead-secs",
-            &format!("{}", if vod { 12.0 } else if mpeg_ts { 4.0 } else { 2.0 }),
+            &format!(
+                "{}",
+                if vod {
+                    #[cfg(target_os = "android")]
+                    {
+                        6.0
+                    }
+                    #[cfg(not(target_os = "android"))]
+                    {
+                        12.0
+                    }
+                } else if mpeg_ts {
+                    3.0
+                } else {
+                    2.0
+                }
+            ),
         );
         soft_set(&mpv, "cache", "yes");
         soft_set(
@@ -1635,15 +2215,35 @@ impl NativePlayer {
         }
 
         if self.opts.hwdec {
-            let preferred = preferred_hwdec();
-            // Hard-set: soft_set hid silent mediacodec-copy failure → black video + audio.
-            if mpv.set_option("hwdec", preferred).is_err() {
-                warn!(%preferred, "hwdec preferred failed — falling back to software");
-                let _ = mpv.set_option("hwdec", "no");
-            } else if preferred != "no" {
-                soft_set(&mpv, "hwdec-codecs", "all");
+            #[cfg(target_os = "android")]
+            let skip_hwdec = present.uses_surface();
+            #[cfg(not(target_os = "android"))]
+            let skip_hwdec = false;
+            if !skip_hwdec {
+                let preferred = if self.opts.hwdec_force_copy {
+                    // Cross-GPU: never request zero-copy interop on the display GPU.
+                    match preferred_hwdec() {
+                        "vaapi" => "vaapi-copy",
+                        "cuda" | "nvdec" => "cuda-copy",
+                        "vulkan" => "vulkan-copy",
+                        other => other,
+                    }
+                } else {
+                    preferred_hwdec()
+                };
+                // Hard-set: soft_set hid silent mediacodec-copy failure → black video + audio.
+                if mpv.set_option("hwdec", preferred).is_err() {
+                    warn!(%preferred, "hwdec preferred failed — falling back to software");
+                    let _ = mpv.set_option("hwdec", "no");
+                } else if preferred != "no" {
+                    soft_set(&mpv, "hwdec-codecs", "all");
+                }
+                if let Some(dev) = &self.opts.vaapi_device {
+                    soft_set(&mpv, "vaapi-device", dev);
+                    info!(%dev, "vaapi-device (hybrid decode GPU)");
+                }
             }
-        } else {
+        } else if !present.uses_surface() {
             let _ = mpv.set_option("hwdec", "no");
         }
         // Fast filters for CPU soft-render path (stage already matches window size).
@@ -1656,6 +2256,7 @@ impl NativePlayer {
         if mpv.set_option("video-sync", "audio").is_err() {
             soft_set(&mpv, "video-sync", "audio");
         }
+        #[cfg(not(target_os = "android"))]
         if mpv.set_option("framedrop", "vo").is_err() {
             soft_set(&mpv, "framedrop", "vo");
         }
@@ -1721,8 +2322,16 @@ impl NativePlayer {
         }
 
         mpv.initialize()?;
-        mpv.init_sw_render()?;
+        if present.uses_soft_rgba() {
+            mpv.init_sw_render()?;
+        }
         mpv.command(&["loadfile", url, "replace"])?;
+        // Ensure AO audible after loadfile reconfig (OpenSL often start→stop→start).
+        let _ = mpv.set_property("mute", "no");
+        let _ = mpv.set_property(
+            "volume",
+            &format!("{}", (self.opts.volume * 100.0).clamp(0.0, 100.0) as u32),
+        );
         // Desktop only: brief settle so hwdec-current is meaningful. Never sleep on
         // Android UI thread (ANR / frozen NativeActivity).
         #[cfg(not(target_os = "android"))]
@@ -1741,14 +2350,36 @@ impl NativePlayer {
                 warn!(%endpoint, "hwdec-current idle — forced software decode");
             }
         }
+        #[cfg(target_os = "android")]
+        {
+            // Do NOT force hwdec=no here — MediaCodec often attaches after the first
+            // packets. Premature SW fallback was decoding 4K on CPU (~10 fps).
+            let hw = mpv
+                .get_property_string("hwdec-current")
+                .unwrap_or_else(|| "none".into());
+            info!(%endpoint, %hw, "android hwdec after loadfile (may still be attaching)");
+        }
         let hw = mpv
             .get_property_string("hwdec-current")
             .unwrap_or_else(|| "none".into());
         let vo = mpv
             .get_property_string("current-vo")
             .unwrap_or_else(|| "?".into());
-        self.libmpv = Some(mpv);
-        info!(%endpoint, %hw, %vo, "libmpv embedded loadfile ok");
+        let ao = mpv
+            .get_property_string("current-ao")
+            .unwrap_or_else(|| "?".into());
+        let vol = mpv
+            .get_property_string("volume")
+            .unwrap_or_else(|| "?".into());
+        let arc = std::sync::Arc::new(std::sync::Mutex::new(mpv));
+        self.libmpv = Some(std::sync::Arc::clone(&arc));
+        if present.uses_soft_rgba() {
+            self.soft_pump = Some(crate::soft_pump::SoftPump::start(arc));
+            info!("soft-pump started after loadfile");
+        } else {
+            self.stop_soft_pump();
+        }
+        info!(%endpoint, %hw, %vo, %ao, %vol, "libmpv embedded loadfile ok");
         Ok(())
     }
 

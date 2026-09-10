@@ -144,7 +144,13 @@ where
         match event {
             WindowEvent::Resized(new_size) => {
                 let size = Size::new(new_size.width, new_size.height);
-
+                // Pixel/Graphene: wgpu configure_surface re-emits NativeWindowResized
+                // at display Hz with the SAME size. Bumping surface_version then
+                // reconfigures again → storm → NativeWindowDestroyed → black UI.
+                let prev = self.viewport.physical_size();
+                if size.width == prev.width && size.height == prev.height {
+                    return;
+                }
                 self.viewport = Viewport::with_physical_size(
                     size,
                     window.scale_factor() as f32 * self.scale_factor,
@@ -156,12 +162,14 @@ where
                 ..
             } => {
                 let size = self.viewport.physical_size();
-
-                self.viewport = Viewport::with_physical_size(
-                    size,
-                    *new_scale_factor as f32 * self.scale_factor,
-                );
-                self.surface_version += 1;
+                let new_scale = *new_scale_factor as f32 * self.scale_factor;
+                // Same physical size + identical scale → no surface reconfigure.
+                // (winit can emit SCF with old==new; bumping version storms Pixel.)
+                let prev_scale = self.viewport.scale_factor();
+                self.viewport = Viewport::with_physical_size(size, new_scale);
+                if (self.viewport.scale_factor() - prev_scale).abs() > f32::EPSILON {
+                    self.surface_version += 1;
+                }
             }
             WindowEvent::CursorMoved { position, .. }
             | WindowEvent::Touch(Touch {

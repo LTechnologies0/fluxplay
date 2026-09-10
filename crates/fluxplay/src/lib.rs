@@ -6,6 +6,7 @@ mod browser;
 mod catalog_db;
 mod demo;
 mod display_caps;
+mod gpu_topology;
 mod icons;
 mod images;
 mod metadata;

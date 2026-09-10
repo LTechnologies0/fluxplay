@@ -85,6 +85,38 @@ extern "C" {
     );
 }
 
+/// Register the process JavaVM with FFmpeg MediaCodec (required for Surface hwdec).
+/// Without this, hevc_mediacodec logs "No Java virtual machine has been registered"
+/// and falls back to CPU nv12 — which `vo=mediacodec_embed` cannot display.
+#[cfg(target_os = "android")]
+pub fn register_android_java_vm(vm: *mut c_void) -> bool {
+    use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if vm.is_null() {
+        return false;
+    }
+    if DONE.load(AtomicOrdering::Acquire) {
+        return true;
+    }
+    extern "C" {
+        fn av_jni_set_java_vm(vm: *mut c_void, log_ctx: *mut c_void) -> c_int;
+    }
+    let rc = unsafe { av_jni_set_java_vm(vm, ptr::null_mut()) };
+    if rc == 0 {
+        DONE.store(true, AtomicOrdering::Release);
+        info!("av_jni_set_java_vm ok — MediaCodec Surface JNI ready");
+        true
+    } else {
+        warn!(rc, "av_jni_set_java_vm failed");
+        false
+    }
+}
+
+#[cfg(not(target_os = "android"))]
+pub fn register_android_java_vm(_vm: *mut c_void) -> bool {
+    false
+}
+
 fn mpv_err(code: c_int) -> Result<()> {
     if code >= 0 {
         return Ok(());
@@ -131,9 +163,21 @@ pub struct LibMpv {
 // Client API: one thread at a time per handle; UI/player tick owns it.
 unsafe impl Send for LibMpv {}
 
+/// Serialize Android create vs async `mpv_terminate_destroy` so a zap cannot
+/// rebind the same Surface wid while the previous handle is still tearing down.
+#[cfg(target_os = "android")]
+fn android_mpv_life() -> &'static std::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+}
+
 impl LibMpv {
     pub fn create() -> Result<Self> {
         debug!("LibMpv::create");
+        #[cfg(target_os = "android")]
+        let _life = android_mpv_life()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         // libmpv requires LC_NUMERIC=C for property/option parsing — set every create
         // (locale may change; Windows LC_NUMERIC is not 1).
         {
@@ -191,6 +235,35 @@ impl LibMpv {
         debug!(%name, %value, code, %msg, "libmpv set_option failed");
         Err(PlayerError::Backend(format!(
             "libmpv option {name}={value}: {msg}"
+        )))
+    }
+
+    /// Set a pre-init option as int64 (Android `wid` = Surface jobject pointer).
+    pub fn set_option_i64(&self, name: &str, value: i64) -> Result<()> {
+        extern "C" {
+            fn mpv_set_option(
+                ctx: *mut mpv_handle,
+                name: *const c_char,
+                format: c_int,
+                data: *mut c_void,
+            ) -> c_int;
+        }
+        const MPV_FORMAT_INT64: c_int = 4;
+        let c_name = CString::new(name).map_err(|e| PlayerError::Backend(e.to_string()))?;
+        let mut v = value;
+        let code = unsafe {
+            mpv_set_option(
+                self.ctx,
+                c_name.as_ptr(),
+                MPV_FORMAT_INT64,
+                &mut v as *mut i64 as *mut c_void,
+            )
+        };
+        if code >= 0 {
+            return Ok(());
+        }
+        Err(PlayerError::Backend(format!(
+            "libmpv option {name}={value} (i64) failed ({code})"
         )))
     }
 
@@ -253,6 +326,35 @@ impl LibMpv {
         mpv_err(unsafe { mpv_set_property_string(self.ctx, name.as_ptr(), value.as_ptr()) })
     }
 
+    /// Runtime int64 property (Android `wid` rebind after Surface recreate / rotate).
+    pub fn set_property_i64(&self, name: &str, value: i64) -> Result<()> {
+        extern "C" {
+            fn mpv_set_property(
+                ctx: *mut mpv_handle,
+                name: *const c_char,
+                format: c_int,
+                data: *mut c_void,
+            ) -> c_int;
+        }
+        const MPV_FORMAT_INT64: c_int = 4;
+        let c_name = CString::new(name).map_err(|e| PlayerError::Backend(e.to_string()))?;
+        let mut v = value;
+        let code = unsafe {
+            mpv_set_property(
+                self.ctx,
+                c_name.as_ptr(),
+                MPV_FORMAT_INT64,
+                &mut v as *mut i64 as *mut c_void,
+            )
+        };
+        if code >= 0 {
+            return Ok(());
+        }
+        Err(PlayerError::Backend(format!(
+            "libmpv property {name}={value} (i64) failed ({code})"
+        )))
+    }
+
     pub fn command(&self, args: &[&str]) -> Result<()> {
         let cmd = args.first().copied().unwrap_or("");
         debug!(%cmd, argc = args.len(), "LibMpv::command");
@@ -285,6 +387,12 @@ impl LibMpv {
 
     pub fn frame_needs_redraw(&self) -> bool {
         self.force_render || self.frame_dirty.load(Ordering::Acquire)
+    }
+
+    /// Shared dirty flag for the soft pump — avoids locking the mpv Mutex 250×/s
+    /// just to read an atomic (lock ping-pong stalls UI property reads mid-render).
+    pub fn frame_dirty_handle(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.frame_dirty)
     }
 
     /// Render current video into tightly packed RGBA (`w * h * 4`).
@@ -442,6 +550,9 @@ impl LibMpv {
                 let _ = std::thread::Builder::new()
                     .name("flux-mpv-destroy".into())
                     .spawn(move || {
+                        let _life = android_mpv_life()
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner());
                         debug!("LibMpv terminate_destroy (async)");
                         unsafe { mpv_terminate_destroy(ctx_addr as *mut mpv_handle) };
                     });
@@ -468,6 +579,10 @@ impl LibMpv {
     fn ctx_destroy(&mut self) {
         self.free_render();
         if !self.ctx.is_null() {
+            #[cfg(target_os = "android")]
+            let _life = android_mpv_life()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             debug!("LibMpv terminate_destroy");
             unsafe { mpv_terminate_destroy(self.ctx) };
             self.ctx = ptr::null_mut();
