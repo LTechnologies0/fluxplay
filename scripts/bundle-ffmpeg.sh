@@ -61,12 +61,10 @@ for name in "${CORE_LIBS[@]}"; do
   QUEUE+=("$dest")
 done
 
-# libmpv (bundled by bundle-libmpv.sh) dynamically links the same libav* family —
-# seed the crawl with it so its codec deps land in lib/ too. The binary itself is
-# NOT crawled: its GUI/system deps must come from the host.
-for seed in "$LIB_DIR"/libmpv.so*; do
-  [[ -e "$seed" ]] && QUEUE+=("$seed")
-done
+# NOTE: libmpv is deliberately NOT crawled — its full dep tree (libavfilter →
+# libarchive, libblas, …) balloons the bundle to 200MB+. The embedded backend
+# only needs the 5 core libs + their codec deps; libmpv keeps its status quo
+# (host ffmpeg libs, like any distro mpv package).
 
 echo "== transitive deps (ldd crawl) =="
 # Breadth-first: crawl NEEDED deps of everything we copy until fixpoint.
