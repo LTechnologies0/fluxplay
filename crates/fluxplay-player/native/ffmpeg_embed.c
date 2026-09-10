@@ -399,17 +399,12 @@ static int try_init_hw(FluxFfmpegPlayer *p, const AVCodec *codec, AVCodecContext
 
 enum { FLUX_AUDIO_RATE = 48000, FLUX_AUDIO_CH = 2 };
 
-static void audio_sink_nonblock(FILE *f) {
-    if (!f) return;
-    int fd = fileno(f);
-    if (fd < 0) return;
-    int fl = fcntl(fd, F_GETFL, 0);
-    if (fl >= 0) {
-        (void)fcntl(fd, F_SETFL, fl | O_NONBLOCK);
-    }
-}
 
-/** Non-blocking PCM write — drop on EAGAIN so decode never stalls behind a full sink. */
+/** Blocking PCM write — the sink drain rate (sound card clock) IS the master
+ * throttle for the whole decode loop: without it, demux/decoding of VOD runs
+ * at full CPU speed, audio_clock races ahead, video frames get skip_store'd
+ * (frozen/black stage) and excess PCM is dropped (fast-forward sounding audio).
+ * EINTR-safe; partial writes resume. */
 static int audio_sink_write(FILE *sink, const void *buf, size_t bytes) {
     int fd = fileno(sink);
     if (fd < 0) {
@@ -425,7 +420,7 @@ static int audio_sink_write(FILE *sink, const void *buf, size_t bytes) {
             continue;
         }
         if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-            return 0; /* drop remainder — better than freezing A/V */
+            return 0; /* should not happen on a blocking fd — drop rather than spin */
         }
         if (n < 0 && errno == EINTR) continue;
         return -1;
@@ -452,7 +447,6 @@ static FILE *open_audio_sink(int rate, int channels) {
         if (f) {
             fprintf(stderr, "flux_ffmpeg: audio sink %s\n", pw_play_bins[i]);
             setvbuf(f, NULL, _IONBF, 0);
-            audio_sink_nonblock(f);
             return f;
         }
     }
@@ -465,7 +459,6 @@ static FILE *open_audio_sink(int rate, int channels) {
         if (f) {
             fprintf(stderr, "flux_ffmpeg: audio sink %s\n", pacat_bins[i]);
             setvbuf(f, NULL, _IONBF, 0);
-            audio_sink_nonblock(f);
             return f;
         }
     }
@@ -477,7 +470,6 @@ static FILE *open_audio_sink(int rate, int channels) {
         if (f) {
             fprintf(stderr, "flux_ffmpeg: audio sink %s\n", aplay_bins[i]);
             setvbuf(f, NULL, _IONBF, 0);
-            audio_sink_nonblock(f);
             return f;
         }
     }
