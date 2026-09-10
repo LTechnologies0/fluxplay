@@ -485,6 +485,9 @@ fn candidate_include_dirs() -> Vec<PathBuf> {
         PathBuf::from("/opt/homebrew/opt/ffmpeg/include"),
         PathBuf::from("/usr/local/include"),
         PathBuf::from("/usr/include"),
+        // Debian/Ubuntu multiarch (libav*-dev install headers here).
+        PathBuf::from("/usr/include/x86_64-linux-gnu"),
+        PathBuf::from("/usr/include/aarch64-linux-gnu"),
     ]);
     out
 }
