@@ -626,9 +626,20 @@ mod worker {
                     a.reset();
                     a
                 }
+                // Frame exceeds the worker atlas cap (e.g. >8K): no atlas can
+                // hold it contiguously, so keep the existing one and let
+                // `upload` take the fragmented path instead of allocating a
+                // brand-new GPU texture every frame.
+                Some(a) if needed > atlas::WORKER_MAX_SIZE => {
+                    a.reset();
+                    a
+                }
                 slot => {
+                    // Worker atlases may exceed the UI `MAX_SIZE` (2048) so a
+                    // 4K frame is reused every frame instead of recreating
+                    // the texture; `with_size_uncapped` clamps to 8192.
                     let size = needed.next_power_of_two().max(atlas::DEFAULT_SIZE);
-                    slot.insert(Atlas::with_size(
+                    slot.insert(Atlas::with_size_uncapped(
                         &self.device,
                         self.backend,
                         self.texture_layout.clone(),

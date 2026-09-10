@@ -184,7 +184,7 @@ fn strip_lang_prefix(s: &str) -> Option<String> {
     while i < bytes.len() && bytes[i].is_ascii_alphabetic() {
         i += 1;
     }
-    if i < 2 || i > 3 {
+    if !(2..=3).contains(&i) {
         // allow IN-EN
         if let Some(rest) = s.split_once(" - ") {
             let head = rest.0.trim();

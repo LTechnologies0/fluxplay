@@ -65,6 +65,12 @@ extern "C" {
     ) -> c_int;
     fn mpv_command(ctx: *mut mpv_handle, args: *const *const c_char) -> c_int;
     fn mpv_get_property_string(ctx: *mut mpv_handle, name: *const c_char) -> *mut c_char;
+    fn mpv_get_property(
+        ctx: *mut mpv_handle,
+        name: *const c_char,
+        format: c_int,
+        data: *mut c_void,
+    ) -> c_int;
     fn mpv_free(data: *mut c_void);
     fn mpv_error_string(error: c_int) -> *const c_char;
     fn mpv_wait_event(ctx: *mut mpv_handle, timeout: f64) -> *mut MpvEvent;
@@ -385,6 +391,43 @@ impl LibMpv {
         self.get_property_string(name)?.parse().ok()
     }
 
+    /// Fast typed read — no mpv heap-string round-trip (hot path: per-tick polls).
+    pub fn get_property_double(&self, name: &str) -> Option<f64> {
+        let c_name = CString::new(name).ok()?;
+        self.get_property_double_c(&c_name)
+    }
+
+    /// Same with a pre-built CString (zero alloc on the hot path).
+    pub fn get_property_double_c(&self, c_name: &CString) -> Option<f64> {
+        const MPV_FORMAT_DOUBLE: c_int = 5;
+        let mut v: f64 = 0.0;
+        let code = unsafe {
+            mpv_get_property(
+                self.ctx,
+                c_name.as_ptr(),
+                MPV_FORMAT_DOUBLE,
+                &mut v as *mut f64 as *mut c_void,
+            )
+        };
+        (code >= 0).then_some(v)
+    }
+
+    /// Fast typed boolean read (MPV_FORMAT_FLAG) — no string round-trip.
+    pub fn get_property_flag(&self, name: &str) -> Option<bool> {
+        const MPV_FORMAT_FLAG: c_int = 3;
+        let c_name = CString::new(name).ok()?;
+        let mut v: c_int = 0;
+        let code = unsafe {
+            mpv_get_property(
+                self.ctx,
+                c_name.as_ptr(),
+                MPV_FORMAT_FLAG,
+                &mut v as *mut c_int as *mut c_void,
+            )
+        };
+        (code >= 0).then_some(v != 0)
+    }
+
     pub fn frame_needs_redraw(&self) -> bool {
         self.force_render || self.frame_dirty.load(Ordering::Acquire)
     }
@@ -431,8 +474,12 @@ impl LibMpv {
         let mut size = [w as c_int, h as c_int];
         let mut stride = (w as usize) * 4;
         // Prefer packed rgba (no rgb0→RGBA permute). Fall back to rgb0 if needed.
-        let fmt_rgba = CString::new("rgba").ok()?;
-        let fmt_rgb0 = CString::new("rgb0").ok()?;
+        // Static CStrings — this runs per frame; CString::new would alloc each time.
+        use std::sync::OnceLock;
+        static FMT_RGBA: OnceLock<CString> = OnceLock::new();
+        static FMT_RGB0: OnceLock<CString> = OnceLock::new();
+        let fmt_rgba = FMT_RGBA.get_or_init(|| CString::new("rgba").expect("static fmt"));
+        let fmt_rgb0 = FMT_RGB0.get_or_init(|| CString::new("rgb0").expect("static fmt"));
 
         let mut try_render = |fmt: &CString, buf: &mut [u8], stride: &mut usize| -> c_int {
             let mut params = [
@@ -460,10 +507,10 @@ impl LibMpv {
             unsafe { mpv_render_context_render(self.render, params.as_mut_ptr()) }
         };
 
-        let code = try_render(&fmt_rgba, &mut self.sw_rgba, &mut stride);
+        let code = try_render(fmt_rgba, &mut self.sw_rgba, &mut stride);
         if code < 0 {
             // rgb0: 4 bytes/pixel with unused alpha — write into reused scratch then pack.
-            let pad_stride = ((w as usize * 4 + 63) / 64) * 64;
+            let pad_stride = (w as usize * 4).div_ceil(64) * 64;
             let need_rgb0 = pad_stride.saturating_mul(h as usize);
             if self.sw_rgb0.capacity() < need_rgb0 {
                 self.sw_rgb0 = Vec::with_capacity(need_rgb0);
@@ -472,7 +519,7 @@ impl LibMpv {
                 self.sw_rgb0.set_len(need_rgb0);
             }
             let mut st = pad_stride;
-            if try_render(&fmt_rgb0, &mut self.sw_rgb0, &mut st) < 0 {
+            if try_render(fmt_rgb0, &mut self.sw_rgb0, &mut st) < 0 {
                 self.frame_dirty.store(true, Ordering::Release);
                 return None;
             }

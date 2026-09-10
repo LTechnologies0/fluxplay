@@ -267,7 +267,7 @@ impl AndroidDeviceCaps {
             CompatTier::Mid => 30,
             CompatTier::Low => 24,
         };
-        base.min(panel).min(60).max(20)
+        base.min(panel).clamp(20, 60)
     }
 
     pub fn soft_gui_hz_cap(&self) -> u32 {
@@ -372,7 +372,7 @@ impl AndroidDeviceCaps {
             content_fps
         } else {
             // Unknown content: prefer 60 or panel, not always peak (saves power).
-            return panel.min(60.0).max(24.0);
+            return panel.clamp(24.0, 60.0);
         };
 
         let mut candidates: Vec<f32> = modes
@@ -431,7 +431,8 @@ mod tests {
         let b = caps.soft_budget();
         assert_eq!(b.max_w, 1280);
         assert_eq!(b.max_h, 720);
-        assert!(b.video_hz >= 30 && b.video_hz <= 48);
+        // Cap raised to 60 for Ultra/High tiers (full-FPS soft fallback).
+        assert!(b.video_hz >= 30 && b.video_hz <= 60);
         assert!(b.gui_hz >= 90);
     }
 

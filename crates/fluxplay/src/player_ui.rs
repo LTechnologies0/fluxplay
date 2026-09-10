@@ -11,11 +11,13 @@ use iced::{
 use fluxplay_player::{BackendCaps, PlaybackState, StreamSession};
 
 use crate::theme::{
-    elevation_shadow, radius_fab, radius_floating_toolbar, stage_black, UiTheme, FAB_MEDIUM,
+    elevation_shadow, radius_floating_toolbar, stage_black, UiTheme, FAB_MEDIUM,
     LOADING_SIZE, RADIUS_EXTRA_LARGE, RADIUS_FULL, RADIUS_LG, SLIDER_HANDLE_W, SLIDER_S_HEIGHT,
-    SLIDER_S_TRACK, SPACE_MD, SPACE_SM, SPACE_XS, SPACE_XXS, TOOLBAR_H, TOOLBAR_ITEM_GAP,
+    SLIDER_S_TRACK, SPACE_MD, SPACE_SM, SPACE_XS, SPACE_XXS,
     TOOLBAR_OUTER_PAD, TYPE_LABEL_L, TYPE_LABEL_M, TYPE_LABEL_S, TYPE_TITLE_M,
 };
+#[cfg(not(target_os = "android"))] // desktop chrome dock constants
+use crate::theme::{radius_fab, TOOLBAR_H, TOOLBAR_ITEM_GAP};
 use crate::app::{Message, PasteTarget};
 use crate::icons::{self, Icon};
 
@@ -41,6 +43,8 @@ pub struct PlayerChrome<'a> {
     pub goto_draft: &'a str,
     pub sleep_mins: Option<u32>,
     pub pip: bool,
+    // Read only by the desktop soft-present toolbar height; Android chrome is overlay-only.
+    #[cfg_attr(target_os = "android", allow(dead_code))]
     pub chrome_h: f32,
     /// When false, chrome is fading out / hidden (see `chrome_alpha`).
     pub chrome_visible: bool,
@@ -645,7 +649,7 @@ fn control_dock<'a>(p: &PlayerChrome<'a>, chrome_alpha: f32) -> Element<'a, Mess
     ]
     .align_y(Alignment::Center)
     .width(Fill)
-    .height(Length::Fixed(p.chrome_h.max(TOOLBAR_H).min(TOOLBAR_H + 24.0)))
+    .height(Length::Fixed(p.chrome_h.clamp(TOOLBAR_H, TOOLBAR_H + 24.0)))
     .padding(Padding::from([0, SPACE_MD as u16]));
 
     // Compact floating chrome — MUST Shrink or iced stretches the container

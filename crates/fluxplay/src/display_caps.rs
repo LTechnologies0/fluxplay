@@ -15,12 +15,15 @@
 //! Env overrides still win: `FLUXPLAY_MONITOR_HZ`, `FLUXPLAY_GUI_FPS`,
 //! `FLUXPLAY_VIDEO_FPS`, `FLUXPLAY_META_PARALLEL`, `FLUXPLAY_IMAGE_INFLIGHT`.
 
+#[cfg(not(target_os = "android"))]
 use std::process::Command;
 use std::sync::OnceLock;
 use std::time::Duration;
 
 use fluxplay_core::models::{FpsCapPref, GpuTier};
-use tracing::{debug, info, warn};
+#[cfg(not(target_os = "android"))]
+use tracing::debug;
+use tracing::{info, warn};
 
 const DEFAULT_HZ: u32 = 60;
 const MIN_HZ: u32 = 24;
@@ -31,25 +34,34 @@ const GUI_CAP_MAX: u32 = 240;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DisplaySession {
+    // Linux desktop session types — never probed on Android (tests construct them).
+    #[cfg(any(test, not(target_os = "android")))]
     Wayland,
+    #[cfg(any(test, not(target_os = "android")))]
     X11,
     #[cfg_attr(not(target_os = "android"), allow(dead_code))]
     Android,
+    #[cfg(any(test, not(target_os = "android")))]
     Unknown,
 }
 
 impl DisplaySession {
     pub fn label(self) -> &'static str {
         match self {
+            #[cfg(any(test, not(target_os = "android")))]
             Self::Wayland => "Wayland",
+            #[cfg(any(test, not(target_os = "android")))]
             Self::X11 => "X11",
             Self::Android => "Android",
+            #[cfg(any(test, not(target_os = "android")))]
             Self::Unknown => "?",
         }
     }
 }
 
-use crate::gpu_topology::{topology_from_devices, GpuDevice, GpuTopology};
+use crate::gpu_topology::GpuTopology;
+#[cfg(any(test, not(target_os = "android")))]
+use crate::gpu_topology::{topology_from_devices, GpuDevice};
 
 #[derive(Debug, Clone)]
 pub struct DisplayProbe {
@@ -206,6 +218,7 @@ pub fn resolve_caps(
         let capped = (cfps.ceil() as u32).saturating_add(4).max(MIN_HZ);
         video_auto = video_auto.min(capped);
     }
+    #[allow(unused_mut)] // mutated only inside the Android cfg block below
     let mut video_hz = resolve_pref(video_pref, env_u32("FLUXPLAY_VIDEO_FPS"), video_auto);
     #[cfg(target_os = "android")]
     {
@@ -571,6 +584,7 @@ fn probe_monitor() -> Option<(String, u32, u32, u32, &'static str)> {
     }
 }
 
+#[cfg(not(target_os = "android"))]
 fn run_cmd(bin: &str, args: &[&str]) -> String {
     match Command::new(bin).args(args).output() {
         Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -585,6 +599,7 @@ fn run_cmd(bin: &str, args: &[&str]) -> String {
     }
 }
 
+#[cfg(any(test, not(target_os = "android")))]
 fn parse_mode_wh(mode: &str) -> (u32, u32) {
     let mode = mode.trim();
     let Some((w, h)) = mode.split_once('x') else {
@@ -601,15 +616,14 @@ fn parse_mode_wh(mode: &str) -> (u32, u32) {
 }
 
 /// Parse `xrandr` current mode marked with `*`. Returns (name, hz, w, h).
+#[cfg(any(test, not(target_os = "android")))]
 pub fn parse_xrandr(out: &str) -> Option<(String, u32, u32, u32)> {
     let mut current: Option<String> = None;
     let mut best: Option<(String, u32, u32, u32)> = None;
     for line in out.lines() {
         if line.contains(" connected") {
             let name = line.split_whitespace().next()?.to_string();
-            if line.contains(" primary") {
-                current = Some(name);
-            } else if current.is_none() {
+            if line.contains(" primary") || current.is_none() {
                 current = Some(name);
             }
             continue;
@@ -625,9 +639,9 @@ pub fn parse_xrandr(out: &str) -> Option<(String, u32, u32, u32)> {
         let mode = parts.next()?;
         let (mw, mh) = parse_mode_wh(mode);
         for tok in parts {
-            let rate = tok.trim_end_matches(|c: char| c == '*' || c == '+');
+            let rate = tok.trim_end_matches(['*', '+']);
             if let Ok(f) = rate.parse::<f64>() {
-                if f >= 20.0 && f <= 360.0 {
+                if (20.0..=360.0).contains(&f) {
                     let hz = f.round() as u32;
                     best = Some((name.clone(), hz, mw, mh));
                     if out
@@ -644,6 +658,7 @@ pub fn parse_xrandr(out: &str) -> Option<(String, u32, u32, u32)> {
 }
 
 /// Parse `wlr-randr` current mode. Returns (name, hz, w, h).
+#[cfg(any(test, not(target_os = "android")))]
 pub fn parse_wlr_randr(out: &str) -> Option<(String, u32, u32, u32)> {
     let mut name: Option<String> = None;
     let mut current_block = false;
@@ -667,8 +682,8 @@ pub fn parse_wlr_randr(out: &str) -> Option<(String, u32, u32, u32)> {
                     .next()
                     .map(|s| parse_mode_wh(s.replace(" px", "").trim()))
                     .unwrap_or((0, 0));
-                if let Some(rate_s) = before.split(',').last() {
-                    let rate_s = rate_s.trim().split_whitespace().last()?;
+                if let Some(rate_s) = before.split(',').next_back() {
+                    let rate_s = rate_s.split_whitespace().last()?;
                     if let Ok(f) = rate_s.parse::<f64>() {
                         if let Some(n) = &name {
                             return Some((n.clone(), f.round() as u32, mw, mh));
@@ -684,6 +699,7 @@ pub fn parse_wlr_randr(out: &str) -> Option<(String, u32, u32, u32)> {
     None
 }
 
+#[cfg(not(target_os = "android"))]
 fn probe_drm_sysfs() -> Option<(String, u32, u32, u32)> {
     let drm = std::path::Path::new("/sys/class/drm");
     let entries = std::fs::read_dir(drm).ok()?;
@@ -722,6 +738,7 @@ fn probe_drm_sysfs() -> Option<(String, u32, u32, u32)> {
     connected.into_iter().next()
 }
 
+#[cfg(not(target_os = "android"))]
 fn rank_connector(name: &str) -> u8 {
     let u = name.to_ascii_uppercase();
     if u.contains("EDP") {
@@ -735,6 +752,7 @@ fn rank_connector(name: &str) -> u8 {
     }
 }
 
+#[cfg(not(target_os = "android"))]
 fn parse_drm_mode_hz(line: &str) -> Option<u32> {
     if let Some((_, rest)) = line.split_once('@') {
         let num: String = rest
@@ -786,6 +804,7 @@ fn probe_gpu() -> (String, GpuTier) {
 }
 
 /// All VGA/3D controllers from lspci (multi-GPU).
+#[cfg(any(test, not(target_os = "android")))]
 pub fn parse_lspci_gpus(out: &str) -> Vec<GpuDevice> {
     let mut devices = Vec::new();
     for line in out.lines() {
@@ -813,6 +832,7 @@ pub fn parse_lspci_gpus(out: &str) -> Vec<GpuDevice> {
     devices
 }
 
+#[cfg(test)]
 pub fn parse_lspci_gpu(out: &str) -> Option<(String, GpuTier)> {
     let devices = parse_lspci_gpus(out);
     if devices.is_empty() {
@@ -824,6 +844,7 @@ pub fn parse_lspci_gpu(out: &str) -> Option<(String, GpuTier)> {
 }
 
 /// Best-effort: map PCI GPUs to `/dev/dri/renderD*` via sorted node list.
+#[cfg(not(target_os = "android"))]
 fn attach_drm_render_nodes(devices: &mut [GpuDevice]) {
     let Ok(entries) = std::fs::read_dir("/dev/dri") else {
         return;
@@ -845,6 +866,7 @@ fn attach_drm_render_nodes(devices: &mut [GpuDevice]) {
     }
 }
 
+#[cfg(any(test, not(target_os = "android")))]
 fn classify_gpu(lower: &str) -> (GpuTier, u8) {
     let nvidia = lower.contains("nvidia");
     let amd = lower.contains("amd") || lower.contains("ati");
@@ -880,6 +902,7 @@ fn classify_gpu(lower: &str) -> (GpuTier, u8) {
     (GpuTier::Unknown, 4)
 }
 
+#[cfg(any(test, not(target_os = "android")))]
 fn truncate_gpu_name(name: &str) -> String {
     let mut s = name.to_string();
     if let Some(idx) = s.rfind('[') {
@@ -890,7 +913,7 @@ fn truncate_gpu_name(name: &str) -> String {
     }
     if s.len() > 64 {
         s.truncate(61);
-        s.push_str("…");
+        s.push('…');
     }
     s
 }

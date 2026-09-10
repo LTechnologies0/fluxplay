@@ -9,6 +9,8 @@
 
 use fluxplay_core::models::GpuTier;
 use serde::{Deserialize, Serialize};
+// Only `topology_from_devices` logs; it is desktop/test-only.
+#[cfg(any(test, not(target_os = "android")))]
 use tracing::{debug, info};
 
 /// One enumerated graphics / video device.
@@ -67,6 +69,7 @@ impl GpuTopology {
         }
     }
 
+    #[cfg(test)]
     pub fn is_hybrid(&self) -> bool {
         self.devices.len() > 1
             && self.devices.iter().any(|d| d.tier == GpuTier::Discrete)
@@ -79,6 +82,8 @@ impl GpuTopology {
     }
 
     /// True when decode≠display → force `vaapi-copy` / `mediacodec-copy` / soft.
+    /// Hybrid multi-GPU is a desktop probe; Android is always single-SoC.
+    #[cfg(any(test, not(target_os = "android")))]
     pub fn requires_copy_path(&self) -> bool {
         self.policy == GpuDecodePolicy::StrongDecodeCopy
             || self.decode.render_node != self.display.render_node
@@ -102,6 +107,8 @@ impl GpuTopology {
 }
 
 /// Build topology from an ordered list (best discrete first preferred for decode).
+/// Called by the Linux `lspci` probe and unit tests; Android uses `GpuTopology::single`.
+#[cfg(any(test, not(target_os = "android")))]
 pub fn topology_from_devices(mut devices: Vec<GpuDevice>) -> GpuTopology {
     if devices.is_empty() {
         return GpuTopology::single("GPU", GpuTier::Unknown);

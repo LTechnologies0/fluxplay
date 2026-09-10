@@ -91,7 +91,7 @@ fn setup_libmpv() {
             static_archive.display()
         );
         if let Ok(deps) = env::var("FLUXPLAY_MPV_STATIC_DEPS") {
-            for dep in deps.split(|c| c == ':' || c == ',' || c == ' ') {
+            for dep in deps.split([':', ',', ' ']) {
                 let dep = dep.trim();
                 if !dep.is_empty() {
                     println!("cargo:rustc-link-lib=static={dep}");
@@ -225,11 +225,8 @@ fn setup_ffmpeg() {
     }
 
     println!("cargo:rustc-cfg=fluxplay_has_ffmpeg");
-    println!(
-        "cargo:warning=native FFmpeg embed enabled (include={}, lib={})",
-        include_dir.display(),
-        lib_dir.display()
-    );
+    // Informational only (not cargo:warning — keep builds warning-free).
+    let _ = (include_dir.display(), lib_dir.display());
 }
 
 fn discover_mpv_lib_dir() -> Option<PathBuf> {
@@ -331,12 +328,9 @@ fn discover_mpv_include_dir(lib_dir: &Option<PathBuf>) -> Option<PathBuf> {
             }
         }
     }
-    for candidate in candidate_include_dirs() {
-        if candidate.join("mpv").join("client.h").is_file() {
-            return Some(candidate);
-        }
-    }
-    None
+    candidate_include_dirs()
+        .into_iter()
+        .find(|candidate| candidate.join("mpv").join("client.h").is_file())
 }
 
 fn discover_ffmpeg_include_dir() -> Option<PathBuf> {
@@ -361,15 +355,12 @@ fn discover_ffmpeg_include_dir() -> Option<PathBuf> {
             return Some(candidate);
         }
     }
-    for candidate in [
+    [
         PathBuf::from("/tmp/ffmpeg-8.1"),
         PathBuf::from("/tmp/ffmpeg"),
-    ] {
-        if ffmpeg_headers_ok(&candidate) {
-            return Some(candidate);
-        }
-    }
-    None
+    ]
+    .into_iter()
+    .find(|candidate| ffmpeg_headers_ok(candidate))
 }
 
 fn ffmpeg_headers_ok(inc: &Path) -> bool {
@@ -401,12 +392,8 @@ fn discover_ffmpeg_lib_dir() -> Option<PathBuf> {
         PathBuf::from("/usr/lib/aarch64-linux-gnu"),
     ];
     dirs.extend(candidate_lib_dirs());
-    for candidate in dirs {
-        if ffmpeg_link_specs(&candidate).is_some() {
-            return Some(candidate);
-        }
-    }
-    None
+    dirs.into_iter()
+        .find(|candidate| ffmpeg_link_specs(candidate).is_some())
 }
 
 /// Returns linker names: either short names (`avcodec`) or versioned (`libavcodec.so.62`).

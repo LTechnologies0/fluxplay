@@ -367,6 +367,9 @@ pub(crate) enum PasteTarget {
     Goto,
 }
 
+/// Poster/art fetch result: (key, source uuid, bytes) or (key, error).
+type ImageLoadResult = Result<(String, Option<uuid::Uuid>, Vec<u8>), (String, String)>;
+
 #[derive(Debug, Clone)]
 pub(crate) enum Message {
     Tab(Tab),
@@ -475,6 +478,8 @@ pub(crate) enum Message {
     BundleCacheReady(Result<PlaylistBundle, String>),
     OpenExternal,
     PickPlaylistFile,
+    /// Desktop rfd file picker result; Android uses SAF (`SafResult`) instead.
+    #[cfg(not(target_os = "android"))]
     PlaylistFilePicked(Option<String>),
     ToggleFavorite(String),
     CycleBackend,
@@ -538,7 +543,7 @@ pub(crate) enum Message {
     MosaicPress(String),
     /// Category sidebar scroll (virtualized).
     CatScrolled(f32, f32),
-    ImageLoaded(Result<(String, Option<uuid::Uuid>, Vec<u8>), (String, String)>),
+    ImageLoaded(ImageLoadResult),
     /// Apply coalesced poster bytes to the RAM cache (one view rebuild).
     FlushPendingImages,
     /// SQLite ingest finished off the UI thread.
@@ -583,6 +588,8 @@ pub(crate) enum Message {
     GotoSubmit,
     ToggleSubVisibility,
     CycleAspect,
+    /// Desktop window level toggle; not offered in the Android UI.
+    #[cfg(not(target_os = "android"))]
     ToggleOntop,
     TogglePip,
     ChapterStep(i32),
@@ -2159,13 +2166,12 @@ impl FluxPlay {
                         self.vod_detail = None;
                         self.detail_meta_loading = false;
                         let idx = self.rebuild_browse_index();
-                        let follow = if id == "*" {
-                            self.refresh_browse_art()
-                        } else if self
-                            .bundle
-                            .vod
-                            .iter()
-                            .any(|v| v.category_id.as_deref() == Some(id.as_str()))
+                        let follow = if id == "*"
+                            || self
+                                .bundle
+                                .vod
+                                .iter()
+                                .any(|v| v.category_id.as_deref() == Some(id.as_str()))
                         {
                             self.refresh_browse_art()
                         } else {
@@ -2178,13 +2184,12 @@ impl FluxPlay {
                         self.series_detail = None;
                         self.detail_meta_loading = false;
                         let idx = self.rebuild_browse_index();
-                        let follow = if id == "*" {
-                            self.refresh_browse_art()
-                        } else if self
-                            .bundle
-                            .series
-                            .iter()
-                            .any(|s| s.category_id.as_deref() == Some(id.as_str()))
+                        let follow = if id == "*"
+                            || self
+                                .bundle
+                                .series
+                                .iter()
+                                .any(|s| s.category_id.as_deref() == Some(id.as_str()))
                         {
                             self.refresh_browse_art()
                         } else {
@@ -2268,7 +2273,7 @@ impl FluxPlay {
                     }
                 }
 
-                match {
+                let res = {
                     self.invalidate_soft_stage(false);
                     #[cfg(target_os = "android")]
                     {
@@ -2281,7 +2286,7 @@ impl FluxPlay {
                         self.pause_cause = PauseCause::None;
                     }
                     self.session.open_channel(ch.clone())
-                } {
+                }; match res {
                     Ok(()) => {
                         self.apply_saved_video_defaults_for_current_play();
                         self.status = self.session.status_line();
@@ -2423,7 +2428,7 @@ impl FluxPlay {
                         }
                     }
                 }
-                match {
+                let res = {
                     self.invalidate_soft_stage(false);
                     #[cfg(target_os = "android")]
                     {
@@ -2434,7 +2439,7 @@ impl FluxPlay {
                         self.pause_cause = PauseCause::None;
                     }
                     self.session.open_channel(ch)
-                } {
+                }; match res {
                     Ok(()) => {
                         self.apply_saved_video_defaults_for_current_play();
                         self.status = self.session.status_line();
@@ -2832,10 +2837,12 @@ impl FluxPlay {
                 };
             }
             Message::PlayerTick => {
+                // Deferred init: both are assigned unconditionally at the top of the
+                // Android block below before any read.
                 #[cfg(target_os = "android")]
-                let mut allow_soft_present = true;
+                let mut allow_soft_present;
                 #[cfg(target_os = "android")]
-                let mut pip_layout_dirty = false;
+                let pip_layout_dirty;
                 #[cfg(target_os = "android")]
                 {
                     let fg = iced::android::is_foreground();
@@ -3235,6 +3242,7 @@ impl FluxPlay {
                     "Aspect non supporté".into()
                 };
             }
+            #[cfg(not(target_os = "android"))]
             Message::ToggleOntop => {
                 self.session.toggle_ontop();
                 if let Some(id) = self.player_id {
@@ -3833,7 +3841,7 @@ impl FluxPlay {
                     crate::storage::write_profile_source_json(s);
                 }
                 self.persist();
-                self.status = format!("Playlist publique ajoutée — sync…");
+                self.status = "Playlist publique ajoutée — sync…".to_string();
                 self.loading = true;
                 return self.reload_one_task(id);
             }
@@ -4353,6 +4361,7 @@ impl FluxPlay {
                     );
                 }
             }
+            #[cfg(not(target_os = "android"))]
             Message::PlaylistFilePicked(Some(path)) => {
                 self.form_kind = SourceKind::M3uPlus;
                 self.form_endpoint = path;
@@ -4360,6 +4369,7 @@ impl FluxPlay {
                     self.form_name = "Playlist locale".into();
                 }
             }
+            #[cfg(not(target_os = "android"))]
             Message::PlaylistFilePicked(None) => {}
             Message::ToggleFavorite(id) => {
                 self.settings.toggle_favorite(&id);
@@ -4538,7 +4548,7 @@ impl FluxPlay {
             }
             Message::PrefetchDone(Ok(path)) => {
                 tracing::info!(%path, "next episode prefetched");
-                self.status = format!("Épisode suivant préchargé");
+                self.status = "Épisode suivant préchargé".to_string();
                 let _ = path;
             }
             Message::PrefetchDone(Err(e)) => {
@@ -5191,20 +5201,18 @@ impl FluxPlay {
                             });
                         }
                     }
-                    if let Some(joined) = set.join_next().await {
-                        if let Ok((is_series, id, sid, name, patch)) = joined {
-                            let kind = if is_series { "series" } else { "movie" };
-                            let q = crate::metadata::parse_title_query(&name);
-                            let key = q.cache_key(kind);
-                            if let Some(db) = &db {
-                                db.meta_cache_put(&key, kind, &q, patch.as_ref());
-                            }
-                            if let Some(patch) = patch {
-                                if is_series {
-                                    series_out.push((id, sid, patch));
-                                } else {
-                                    vod_out.push((id, sid, patch));
-                                }
+                    if let Some(Ok((is_series, id, sid, name, patch))) = set.join_next().await {
+                        let kind = if is_series { "series" } else { "movie" };
+                        let q = crate::metadata::parse_title_query(&name);
+                        let key = q.cache_key(kind);
+                        if let Some(db) = &db {
+                            db.meta_cache_put(&key, kind, &q, patch.as_ref());
+                        }
+                        if let Some(patch) = patch {
+                            if is_series {
+                                series_out.push((id, sid, patch));
+                            } else {
+                                vod_out.push((id, sid, patch));
                             }
                         }
                     }
@@ -5265,10 +5273,8 @@ impl FluxPlay {
                                 .ok()
                         });
                     }
-                    if let Some(joined) = set.join_next().await {
-                        if let Ok(Some(item)) = joined {
-                            out.push(item);
-                        }
+                    if let Some(Ok(Some(item))) = set.join_next().await {
+                        out.push(item);
                     }
                 }
                 tracing::info!(n = out.len(), "xtream vod_info batch done");
@@ -5776,6 +5782,7 @@ impl FluxPlay {
         }
         if let Some(db) = &self.catalog_db {
             db.evict_old_images(4_000);
+            db.evict_old_meta(30 * 24 * 60 * 60);
         }
         Task::none()
     }
@@ -6287,6 +6294,8 @@ impl FluxPlay {
         )
     }
 
+    // FLUXPLAY_AUTO_PLAY is honored in the desktop window-open path only.
+    #[cfg(not(target_os = "android"))]
     fn pick_autoplay_channel(&self) -> Option<Channel> {
         let group = self.selected_group.as_deref();
         self.bundle
@@ -6489,7 +6498,7 @@ impl FluxPlay {
                     crate::catalog_db::load_bundle_blocking(&ids)
                 })
                 .await
-                .unwrap_or_else(|e| Err(e))
+                .unwrap_or_else(Err)
             },
             Message::BundleCacheReady,
         )
@@ -8289,7 +8298,7 @@ impl FluxPlay {
     }
 }
 
-fn sanitize_sources(sources: &mut Vec<MediaSource>) {
+fn sanitize_sources(sources: &mut [MediaSource]) {
     let has_xtream = sources.iter().any(|s| s.kind == SourceKind::Xtream && s.enabled);
     if has_xtream {
         for s in sources.iter_mut() {
@@ -8316,6 +8325,8 @@ fn sanitize_sources(sources: &mut Vec<MediaSource>) {
     }
 }
 
+// Off-thread index build; each arg is an owned snapshot — a params struct adds indirection only.
+#[allow(clippy::too_many_arguments)]
 fn build_browse_index_blocking(
     tab: Tab,
     q: String,
@@ -9036,6 +9047,7 @@ fn profile_message_label(message: &Message) -> &'static str {
         Message::PrefetchDone(_) => "async.prefetch",
         Message::DiagnoseDone(_) => "async.diagnose",
         Message::ClipboardText(_, _) => "async.clipboard",
+        #[cfg(not(target_os = "android"))]
         Message::PlaylistFilePicked(_) => "async.file_pick",
         Message::BrowseScrolled(_, _) => "scroll.browse",
         Message::BrowseScrollBy(_) => "scroll.browse_by",
@@ -9104,6 +9116,7 @@ fn ui_action_label(message: &Message) -> Option<&'static str> {
         Message::GotoSubmit => "lecteur.goto",
         Message::ToggleSubVisibility => "lecteur.st_visibilite",
         Message::CycleAspect => "lecteur.aspect",
+        #[cfg(not(target_os = "android"))]
         Message::ToggleOntop => "lecteur.ontop",
         Message::TogglePip => "lecteur.pip",
         Message::ChapterStep(_) => "lecteur.chapitre",

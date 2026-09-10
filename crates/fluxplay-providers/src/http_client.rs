@@ -195,7 +195,7 @@ impl Resolve for HickoryResolve {
         let resolver = Arc::clone(&self.resolver);
         Box::pin(async move {
             let lookup = resolver.lookup_ip(host).await.map_err(|e| {
-                std::io::Error::new(std::io::ErrorKind::Other, e.to_string())
+                std::io::Error::other(e.to_string())
             })?;
             let addrs: Addrs = Box::new(lookup.into_iter().map(|ip| SocketAddr::new(ip, 0)));
             Ok(addrs)
@@ -267,8 +267,7 @@ async fn resolve_through_tunnel(
                     Err(e) => last_err = Some(e.to_string()),
                 }
             }
-            Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
+            Err(std::io::Error::other(
                 last_err.unwrap_or_else(|| "custom DNS via tunnel failed".into()),
             ))
         }
@@ -335,8 +334,7 @@ async fn dns_tcp_lookup(
         }
     }
     if ips.is_empty() {
-        Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
+        Err(std::io::Error::other(
             format!("no A/AAAA for {host} via {dns}"),
         ))
     } else {
@@ -352,7 +350,7 @@ async fn dns_tcp_query(
 ) -> std::io::Result<Vec<IpAddr>> {
     let mut stream = Socks5Stream::connect(proxy, dns)
         .await
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
     let qname = DnsName::from_utf8(host)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string()))?;
     let mut msg = Message::new();
@@ -363,7 +361,7 @@ async fn dns_tcp_query(
         .add_query(Query::query(qname, qtype));
     let payload = msg
         .to_vec()
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
     let len = (payload.len() as u16).to_be_bytes();
     stream.write_all(&len).await?;
     stream.write_all(&payload).await?;
@@ -408,8 +406,7 @@ async fn doh_lookup_via_socks(
         }
     }
     if ips.is_empty() {
-        Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
+        Err(std::io::Error::other(
             format!("DoH via tunnel returned no addresses for {host}"),
         ))
     } else {
@@ -450,7 +447,7 @@ async fn doh_query_via_socks(
         .add_query(Query::query(qname, qtype));
     let payload = msg
         .to_vec()
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
     let b64 = base64_url_nopad(&payload);
     let base = doh_url.trim().trim_end_matches('/');
     let url = format!("{base}?dns={b64}");
@@ -460,7 +457,7 @@ async fn doh_query_via_socks(
         .connect_timeout(Duration::from_secs(8))
         .pool_max_idle_per_host(2);
     let proxy = reqwest::Proxy::all(socks)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
     builder = builder.proxy(proxy);
     if let Some((name, addr)) = doh_resolve_override(doh_url) {
         builder = builder.resolve(&name, addr);
@@ -468,23 +465,22 @@ async fn doh_query_via_socks(
 
     let client = builder
         .build()
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
     let resp = client
         .get(&url)
         .header("Accept", "application/dns-message")
         .send()
         .await
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
     if !resp.status().is_success() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
+        return Err(std::io::Error::other(
             format!("DoH HTTP {}", resp.status()),
         ));
     }
     let bytes = resp
         .bytes()
         .await
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
     let response = Message::from_vec(&bytes)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
     Ok(extract_ips(&response))
@@ -634,7 +630,7 @@ pub async fn bootstrap_lookup_ip(bootstrap_dns: &str, host: &str) -> std::io::Re
     let lookup = resolver
         .lookup_ip(host)
         .await
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
     Ok(lookup.iter().collect())
 }
 

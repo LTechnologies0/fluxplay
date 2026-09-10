@@ -28,6 +28,12 @@ pub const MAX_INFLIGHT_IMAGES: usize = 24;
 const MAX_UI_EDGE_PX: u32 = 480;
 
 const URL_SOFT_FAIL: Duration = Duration::from_secs(12 * 60);
+/// Cap permanent-fail set — over cap, clear wholesale (worst case: one retry).
+const FAILED_CAP: usize = 4096;
+/// Sweep expired soft-fail entries once the map passes this size.
+const SOFT_FAIL_SWEEP_AT: usize = 1024;
+/// Cap for the `normalize_image_url` memo map — clear-on-full.
+const NORMALIZE_CACHE_CAP: usize = 2048;
 const HOST_COOLDOWN: Duration = Duration::from_secs(25 * 60);
 const HOST_FAIL_TRIP: u32 = 5;
 const HOST_WARN_INTERVAL: Duration = Duration::from_secs(90);
@@ -135,7 +141,7 @@ impl ImageCache {
     }
 
     pub fn request(&mut self, url: &str, source_id: Option<Uuid>) -> RequestOutcome {
-        let url_n = normalize_image_url(url);
+        let url_n = normalized_cached(url);
         if url_n.is_empty() || !is_fetchable_image_url(&url_n) || self.failed.contains(&url_n) {
             return RequestOutcome::Skip;
         }
@@ -172,7 +178,7 @@ impl ImageCache {
         self.inflight_source.remove(&url);
         self.soft_fail.remove(&url);
         if bytes.len() < 64 || looks_like_html(&bytes) {
-            self.failed.insert(url);
+            self.insert_failed(url);
             return;
         }
         let bytes = downscale_for_ui(bytes, self.decode_edge_px);
@@ -190,7 +196,7 @@ impl ImageCache {
         }
         if bytes.len() < 64 || looks_like_html(&bytes) {
             warn!(target: "fluxplay::images", %url, len = bytes.len(), "reject non-image bytes");
-            self.failed.insert(url);
+            self.insert_failed(url);
             return;
         }
         debug!(target: "fluxplay::images", %url, len = bytes.len(), "insert handle");
@@ -205,19 +211,31 @@ impl ImageCache {
         self.handles.insert(url, Handle::from_bytes(bytes));
     }
 
+    fn insert_failed(&mut self, url: String) {
+        if self.failed.len() >= FAILED_CAP {
+            self.failed.clear();
+        }
+        self.failed.insert(url);
+    }
+
     pub fn mark_failed(&mut self, url: String) {
         debug!(%url, "image mark failed (permanent)");
         self.inflight.remove(&url);
         self.inflight_source.remove(&url);
         self.soft_fail.remove(&url);
-        self.failed.insert(url);
+        self.insert_failed(url);
     }
 
     /// Transient network error: cool the URL + bump host circuit (no retry storm).
     pub fn mark_soft_failed(&mut self, url: String) {
         self.inflight.remove(&url);
         self.inflight_source.remove(&url);
-        let until = Instant::now() + URL_SOFT_FAIL;
+        let now = Instant::now();
+        // Amortized O(n) sweep: prune expired entries once the map grows large.
+        if self.soft_fail.len() >= SOFT_FAIL_SWEEP_AT {
+            self.soft_fail.retain(|_, until| *until > now);
+        }
+        let until = now + URL_SOFT_FAIL;
         self.soft_fail.insert(url.clone(), until);
         if let Some(host) = host_key(&url) {
             let entry = self.host_circuit.entry(host.clone()).or_insert(HostCircuit {
@@ -335,6 +353,26 @@ fn normalize_image_url(url: &str) -> String {
     }
 }
 
+/// Memoized `normalize_image_url` — pure function called per tile per frame.
+/// Global `Mutex` map (same pattern as `warn_host_once`); clear-on-full cap.
+fn normalized_cached(url: &str) -> String {
+    static CACHE: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+    let map = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Ok(mut g) = map.lock() {
+        if let Some(hit) = g.get(url) {
+            return hit.clone();
+        }
+        let out = normalize_image_url(url);
+        if g.len() >= NORMALIZE_CACHE_CAP {
+            g.clear();
+        }
+        g.insert(url.to_string(), out.clone());
+        out
+    } else {
+        normalize_image_url(url)
+    }
+}
+
 pub fn is_fetchable_image_url(url: &str) -> bool {
     let url = url.trim();
     if !(url.starts_with("http://") || url.starts_with("https://")) {
@@ -396,7 +434,7 @@ pub async fn fetch_image_bytes(
     url: String,
     source_id: Option<Uuid>,
 ) -> Result<(String, Option<Uuid>, Vec<u8>), (String, String)> {
-    let url = normalize_image_url(&url);
+    let url = normalized_cached(&url);
     if !is_fetchable_image_url(&url) {
         return Err((url, "invalid image url".into()));
     }
@@ -589,7 +627,7 @@ pub fn pick_art(
         .flatten()
         .map(str::trim)
         .find(|u| is_fetchable_image_url(u))
-        .map(normalize_image_url)
+        .map(normalized_cached)
 }
 
 #[cfg(test)]

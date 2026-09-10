@@ -13,6 +13,12 @@ use allocator::Allocator;
 pub const DEFAULT_SIZE: u32 = 2048;
 pub const MAX_SIZE: u32 = 2048;
 
+/// Upper bound for atlases used by the video-frame worker upload path.
+/// 8192 matches wgpu's default `max_texture_dimension_2d` limit (safe on
+/// desktop GPUs) and fits 4K/8K frames contiguously. The shared UI atlas
+/// stays capped at [`MAX_SIZE`].
+pub const WORKER_MAX_SIZE: u32 = 8192;
+
 use crate::core::Size;
 use crate::graphics::color;
 
@@ -44,7 +50,35 @@ impl Atlas {
         texture_layout: wgpu::BindGroupLayout,
         size: u32,
     ) -> Self {
-        let size = size.min(MAX_SIZE);
+        Self::with_size_capped(device, backend, texture_layout, size, MAX_SIZE)
+    }
+
+    /// Like [`Atlas::with_size`], but allows sizes up to [`WORKER_MAX_SIZE`].
+    /// Intended for the video-frame worker upload path, which must hold
+    /// whole 4K frames contiguously; the shared UI atlas keeps `MAX_SIZE`.
+    pub fn with_size_uncapped(
+        device: &wgpu::Device,
+        backend: wgpu::Backend,
+        texture_layout: wgpu::BindGroupLayout,
+        size: u32,
+    ) -> Self {
+        Self::with_size_capped(
+            device,
+            backend,
+            texture_layout,
+            size,
+            WORKER_MAX_SIZE,
+        )
+    }
+
+    fn with_size_capped(
+        device: &wgpu::Device,
+        backend: wgpu::Backend,
+        texture_layout: wgpu::BindGroupLayout,
+        size: u32,
+        max_size: u32,
+    ) -> Self {
+        let size = size.min(max_size);
 
         let layers = match backend {
             // On the GL backend we start with 2 layers, to help wgpu figure

@@ -371,14 +371,14 @@ where
                         #[cfg(target_os = "android")]
                         let got = if let Some(control) = self.force_control.take()
                         {
-                            Ok(Some(control))
+                            Some(control)
                         } else {
-                            self.receiver.try_next()
+                            self.receiver.try_recv().ok()
                         };
                         #[cfg(not(target_os = "android"))]
-                        let got = self.receiver.try_next();
+                        let got = self.receiver.try_recv().ok();
                         match got {
-                        Ok(Some(control)) => match control {
+                        Some(control) => match control {
                             Control::ChangeFlow(flow) => {
                                 use winit::event_loop::ControlFlow;
 
@@ -683,10 +683,9 @@ async fn run_instance<P>(
 
     'next_event: loop {
         // Empty the queue if possible
-        let event = if let Ok(event) = event_receiver.try_next() {
-            event
-        } else {
-            event_receiver.next().await
+        let event = match event_receiver.try_recv() {
+            Ok(event) => Some(event),
+            Err(_) => event_receiver.next().await,
         };
 
         let Some(event) = event else {

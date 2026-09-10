@@ -94,7 +94,7 @@ pub fn join_portal_script(portal: &Url, script: &str) -> Url {
 
 pub fn http_status_hint(status: u16) -> Option<&'static str> {
     let hint = match status {
-        885 | 886 | 887 => Some(
+        885..=887 => Some(
             "endpoint get.php bloqué par le panel (souvent indépendant du User-Agent). Fallback API Xtream.",
         ),
         401 | 403 => Some("identifiants refusés / UA filtré"),

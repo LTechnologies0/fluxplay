@@ -535,6 +535,17 @@ impl CatalogDb {
         }
     }
 
+    /// Drop meta_cache rows older than `ttl_secs` (best-effort, all profiles).
+    pub fn evict_old_meta(&self, ttl_secs: u64) {
+        let cutoff = now_secs().saturating_sub(ttl_secs) as i64;
+        for conn in self.conns.values() {
+            let _ = conn.execute(
+                "DELETE FROM meta_cache WHERE fetched_at < ?1",
+                params![cutoff],
+            );
+        }
+    }
+
     pub fn merge_epg(&self, source_id: Uuid, programmes: &[EpgProgramme]) -> rusqlite::Result<()> {
         let conn = self.conn(source_id)?;
         let tx = conn.unchecked_transaction()?;
@@ -811,6 +822,8 @@ impl CatalogDb {
         out
     }
 
+    // Column-per-arg mirrors the DB schema; a params struct would duplicate the row type.
+    #[allow(clippy::too_many_arguments)]
     pub fn update_vod_meta(
         &self,
         source_id: Uuid,
@@ -896,6 +909,8 @@ impl CatalogDb {
         Ok(())
     }
 
+    // Column-per-arg mirrors the DB schema; a params struct would duplicate the row type.
+    #[allow(clippy::too_many_arguments)]
     pub fn update_series_meta(
         &self,
         source_id: Uuid,
@@ -1704,11 +1719,10 @@ fn prefer_longer(dst: &mut Option<String>, src: Option<String>) {
 }
 
 fn prefer_if_empty(dst: &mut Option<String>, src: Option<String>) {
-    if dst.as_ref().map(|s| s.is_empty()).unwrap_or(true) {
-        if src.as_ref().map(|s| !s.is_empty()).unwrap_or(false) {
+    if dst.as_ref().map(|s| s.is_empty()).unwrap_or(true)
+        && src.as_ref().map(|s| !s.is_empty()).unwrap_or(false) {
             *dst = src;
         }
-    }
 }
 
 fn merge_vod_keep_meta(portal: &mut VodItem, old: &VodItem) {

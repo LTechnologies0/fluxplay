@@ -5,8 +5,10 @@
 use std::net::Shutdown;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+#[cfg(not(target_os = "android"))] // IPC_SEQ (CLI player sockets)
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+#[cfg(not(target_os = "android"))] // ipc_socket_path
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use fluxplay_core::models::PlayerBackendPref;
@@ -16,6 +18,7 @@ use tracing::{debug, error, info, trace, warn};
 
 use crate::{url_endpoint, PlayerError, Result};
 
+#[cfg(not(target_os = "android"))] // CLI/IPC player path — desktop only
 static IPC_SEQ: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -461,6 +464,7 @@ fn sanitize_http_field(s: &str) -> String {
     s.chars().filter(|c| *c != '\r' && *c != '\n').collect()
 }
 
+#[cfg(not(target_os = "android"))] // CLI player log — desktop only
 fn tail_player_log() -> String {
     let path = std::env::temp_dir().join("fluxplay-mpv.log");
     std::fs::read_to_string(&path)
@@ -717,6 +721,13 @@ impl NativePlayer {
         self.libmpv.as_ref()?.lock().ok()
     }
 
+    /// Non-blocking variant for per-tick UI polls — never stall the UI behind a
+    /// software render holding the mpv lock (returns None; callers keep last value).
+    #[cfg(all(feature = "native-mpv", fluxplay_has_libmpv))]
+    fn try_lock_mpv(&self) -> Option<std::sync::MutexGuard<'_, crate::mpv_ffi::LibMpv>> {
+        self.libmpv.as_ref()?.try_lock().ok()
+    }
+
     #[cfg(all(feature = "native-mpv", fluxplay_has_libmpv))]
     fn stop_soft_pump(&mut self) {
         if let Some(pump) = self.soft_pump.take() {
@@ -778,14 +789,35 @@ impl NativePlayer {
         self.backend.map(|b| b.label()).unwrap_or("—")
     }
 
-    /// mpv `paused-for-cache` — drives Buffering state.
+    /// Retained screenshot fallback, capped at ~1080p: a full 4K RGBA frame is ~33 MB
+/// held for the whole session for an occasional PNG capture — nearest-neighbor
+/// downscale keeps the fallback cheap (quality is irrelevant for a fallback).
+fn snapshot_scaled(w: u32, h: u32, pixels: &[u8]) -> (u32, u32, Arc<[u8]>) {
+    const MAX_EDGE: u32 = 1920;
+    if w <= MAX_EDGE && h <= MAX_EDGE {
+        return (w, h, Arc::from(pixels));
+    }
+    let scale = MAX_EDGE as f32 / w.max(h) as f32;
+    let dw = (((w as f32 * scale) as u32).max(2) & !1).min(w);
+    let dh = (((h as f32 * scale) as u32).max(2) & !1).min(h);
+    let mut out = vec![0u8; (dw as usize) * (dh as usize) * 4];
+    for y in 0..dh {
+        let sy = ((y as u64 * h as u64) / dh as u64).min(h as u64 - 1) as u32;
+        let srow = &pixels[(sy as usize) * (w as usize) * 4..][..(w as usize) * 4];
+        let drow = &mut out[(y as usize) * (dw as usize) * 4..][..(dw as usize) * 4];
+        for x in 0..dw {
+            let sx = ((x as u64 * w as u64) / dw as u64).min(w as u64 - 1) as u32;
+            drow[(x as usize) * 4..][..4].copy_from_slice(&srow[(sx as usize) * 4..][..4]);
+        }
+    }
+    (dw, dh, Arc::from(out.as_slice()))
+}
+
+/// mpv `paused-for-cache` — drives Buffering state.
     pub fn paused_for_cache(&self) -> bool {
         #[cfg(all(feature = "native-mpv", fluxplay_has_libmpv))]
-        if let Some(mpv) = self.lock_mpv() {
-            return matches!(
-                mpv.get_property_string("paused-for-cache").as_deref(),
-                Some("yes") | Some("true")
-            );
+        if let Some(mpv) = self.try_lock_mpv() {
+            return mpv.get_property_flag("paused-for-cache").unwrap_or(false);
         }
         if let Some(path) = &self.ipc_path {
             return mpv_get_bool(path, "paused-for-cache") == Some(true);
@@ -798,14 +830,13 @@ impl NativePlayer {
             .as_ref()
             .map(|(w, h, b)| (*w, *h, b.as_ref()))
     }
-
     fn using_ffplay_cli(&self) -> bool {
         if self.backend != Some(BackendId::Ffmpeg) || self.child.is_none() {
             return false;
         }
         #[cfg(all(feature = "native-ffmpeg", fluxplay_has_ffmpeg))]
         {
-            return self.libffmpeg.is_none();
+            self.libffmpeg.is_none()
         }
         #[cfg(not(all(feature = "native-ffmpeg", fluxplay_has_ffmpeg)))]
         {
@@ -816,7 +847,7 @@ impl NativePlayer {
     fn using_libffmpeg(&self) -> bool {
         #[cfg(all(feature = "native-ffmpeg", fluxplay_has_ffmpeg))]
         {
-            return self.libffmpeg.is_some();
+            self.libffmpeg.is_some()
         }
         #[cfg(not(all(feature = "native-ffmpeg", fluxplay_has_ffmpeg)))]
         {
@@ -857,13 +888,13 @@ impl NativePlayer {
         let rw = (w.clamp(2, 3840) & !1).max(2);
         let rh = (h.clamp(2, 2160) & !1).max(2);
         #[cfg(all(feature = "native-mpv", fluxplay_has_libmpv))]
-        {
+        if self.libmpv.is_some() {
             if let Some(pump) = self.soft_pump.as_ref() {
                 pump.set_target(rw, rh);
                 if let Some((fw, fh, pixels)) = pump.take_frame() {
                     self.soft_shot_tick = self.soft_shot_tick.wrapping_add(1);
-                    if self.last_soft_rgba.is_none() || self.soft_shot_tick % 180 == 0 {
-                        self.last_soft_rgba = Some((fw, fh, Arc::from(pixels.as_slice())));
+                    if self.last_soft_rgba.is_none() || self.soft_shot_tick.is_multiple_of(180) {
+                        self.last_soft_rgba = Some(Self::snapshot_scaled(fw, fh, &pixels));
                     }
                     return Some((fw, fh, pixels));
                 }
@@ -874,18 +905,20 @@ impl NativePlayer {
                 mpv.render_sw_rgba(rw, rh)?
             };
             self.soft_shot_tick = self.soft_shot_tick.wrapping_add(1);
-            if self.last_soft_rgba.is_none() || self.soft_shot_tick % 180 == 0 {
-                self.last_soft_rgba = Some((rw, rh, Arc::from(pixels.as_slice())));
+            if self.last_soft_rgba.is_none() || self.soft_shot_tick.is_multiple_of(180) {
+                self.last_soft_rgba = Some(Self::snapshot_scaled(rw, rh, &pixels));
             }
             return Some((rw, rh, pixels));
         }
+        // Software fallback path — reachable when the FFmpeg backend is selected
+        // at runtime (libmpv compiled but not the active backend).
         #[cfg(all(feature = "native-ffmpeg", fluxplay_has_ffmpeg))]
         if let Some(ff) = self.libffmpeg.as_ref() {
             let (rw, rh) = crate::ffmpeg_ffi::LibFfmpeg::soft_present_dims(w, h);
             let pixels = ff.pull_rgba(rw, rh)?;
             self.soft_shot_tick = self.soft_shot_tick.wrapping_add(1);
-            if self.last_soft_rgba.is_none() || self.soft_shot_tick % 180 == 0 {
-                self.last_soft_rgba = Some((rw, rh, Arc::from(pixels.as_slice())));
+            if self.last_soft_rgba.is_none() || self.soft_shot_tick.is_multiple_of(180) {
+                self.last_soft_rgba = Some(Self::snapshot_scaled(rw, rh, &pixels));
             }
             return Some((rw, rh, pixels));
         }
@@ -983,13 +1016,13 @@ impl NativePlayer {
             }
             self.opts.android_surface_wid = Some(wid);
             info!(wid, ?wh, "android Surface wid rebound");
-            return true;
+            true
         }
         #[cfg(not(all(feature = "native-mpv", fluxplay_has_libmpv)))]
         {
             let _ = (wid, wh);
+            false
         }
-        false
     }
 
     /// Update Surface size property only — keep the same wid (no MediaCodec tear-down).
@@ -1013,7 +1046,7 @@ impl NativePlayer {
                 self.opts.android_surface_wh = Some((w, h));
                 debug!(?wh, "android Surface size updated (wid kept)");
             }
-            return ok;
+            ok
         }
         #[cfg(not(all(feature = "native-mpv", fluxplay_has_libmpv)))]
         {
@@ -1519,9 +1552,9 @@ impl NativePlayer {
     /// Query playback position / duration (seconds).
     pub fn playback_times(&self) -> Option<(f64, f64)> {
         #[cfg(all(feature = "native-mpv", fluxplay_has_libmpv))]
-        if let Some(mpv) = self.lock_mpv() {
-            let pos = mpv.get_property_f64("time-pos")?;
-            let dur = mpv.get_property_f64("duration").unwrap_or(0.0);
+        if let Some(mpv) = self.try_lock_mpv() {
+            let pos = mpv.get_property_double("time-pos")?;
+            let dur = mpv.get_property_double("duration").unwrap_or(0.0);
             return Some((pos, dur));
         }
         #[cfg(all(feature = "native-ffmpeg", fluxplay_has_ffmpeg))]
@@ -1541,12 +1574,12 @@ impl NativePlayer {
     /// Estimated content frame rate (VOD/HLS). Used to avoid over-presenting soft frames.
     pub fn content_fps(&self) -> Option<f64> {
         #[cfg(all(feature = "native-mpv", fluxplay_has_libmpv))]
-        if let Some(mpv) = self.lock_mpv() {
+        if let Some(mpv) = self.try_lock_mpv() {
             let fps = mpv
-                .get_property_f64("container-fps")
+                .get_property_double("container-fps")
                 .filter(|f| *f >= 20.0 && f.is_finite())
                 .or_else(|| {
-                    mpv.get_property_f64("estimated-vf-fps")
+                    mpv.get_property_double("estimated-vf-fps")
                         .filter(|f| *f >= 20.0 && f.is_finite())
                 });
             return fps;
@@ -1592,13 +1625,13 @@ impl NativePlayer {
     /// `dw`/`dh` is what mpv would render — the SurfaceView is fit to this ratio.
     pub fn video_wh(&self) -> Option<(u32, u32)> {
         #[cfg(all(feature = "native-mpv", fluxplay_has_libmpv))]
-        if let Some(mpv) = self.lock_mpv() {
+        if let Some(mpv) = self.try_lock_mpv() {
             let (w, h) = mpv
-                .get_property_f64("video-out-params/dw")
-                .zip(mpv.get_property_f64("video-out-params/dh"))
+                .get_property_double("video-out-params/dw")
+                .zip(mpv.get_property_double("video-out-params/dh"))
                 .or_else(|| {
-                    mpv.get_property_f64("video-params/dw")
-                        .zip(mpv.get_property_f64("video-params/dh"))
+                    mpv.get_property_double("video-params/dw")
+                        .zip(mpv.get_property_double("video-params/dh"))
                 })?;
             if w >= 16.0 && h >= 16.0 {
                 return Some((w as u32, h as u32));
@@ -1612,13 +1645,13 @@ impl NativePlayer {
     /// MediaCodec/decoder frame dims fed to the Surface buffer.
     pub fn video_buffer_wh(&self) -> Option<(u32, u32)> {
         #[cfg(all(feature = "native-mpv", fluxplay_has_libmpv))]
-        if let Some(mpv) = self.lock_mpv() {
+        if let Some(mpv) = self.try_lock_mpv() {
             let (w, h) = mpv
-                .get_property_f64("video-out-params/w")
-                .zip(mpv.get_property_f64("video-out-params/h"))
+                .get_property_double("video-out-params/w")
+                .zip(mpv.get_property_double("video-out-params/h"))
                 .or_else(|| {
-                    mpv.get_property_f64("video-params/w")
-                        .zip(mpv.get_property_f64("video-params/h"))
+                    mpv.get_property_double("video-params/w")
+                        .zip(mpv.get_property_double("video-params/h"))
                 })?;
             if w >= 16.0 && h >= 16.0 {
                 return Some((w as u32, h as u32));
@@ -1750,11 +1783,7 @@ impl NativePlayer {
 
     pub fn chapter_step(&mut self, delta: i32) -> Result<()> {
         debug!(delta, "NativePlayer::chapter_step");
-        if delta >= 0 {
-            self.run_cmd(&["add", "chapter", &format!("{delta}")])
-        } else {
-            self.run_cmd(&["add", "chapter", &format!("{delta}")])
-        }
+        self.run_cmd(&["add", "chapter", &format!("{delta}")])
     }
 
     pub fn set_sub_delay(&mut self, secs: f64) -> Result<()> {
@@ -1889,7 +1918,10 @@ impl NativePlayer {
                 }
             }
         }
-        #[cfg(target_os = "android")]
+        #[cfg(all(
+            target_os = "android",
+            not(all(feature = "native-mpv", fluxplay_has_libmpv))
+        ))]
         {
             Err(PlayerError::Backend(
                 "libmpv indisponible — vérifiez vendor/android-native libmpv.so".into(),
@@ -2384,6 +2416,7 @@ impl NativePlayer {
     }
 
     #[cfg(feature = "cli-player")]
+    #[cfg(not(target_os = "android"))] // CLI fallback — desktop only
     fn start_mpv_cli(&mut self, url: &str) -> Result<()> {
         let _prof = Stopwatch::start("start_mpv_cli");
         let endpoint = url_endpoint(url);
@@ -2563,7 +2596,7 @@ impl NativePlayer {
         }
         #[cfg(feature = "cli-player")]
         {
-            return self.start_ffplay(url);
+            self.start_ffplay(url)
         }
         #[cfg(not(feature = "cli-player"))]
         {
@@ -2734,6 +2767,7 @@ impl Drop for NativePlayer {
     }
 }
 
+#[cfg(not(target_os = "android"))] // CLI/IPC player path — desktop only
 fn ipc_socket_path() -> PathBuf {
     let n = IPC_SEQ.fetch_add(1, Ordering::Relaxed);
     let ts = SystemTime::now()

@@ -247,7 +247,7 @@ impl InteractionGuard {
     }
 
     fn begin_ex(kind: &'static str, name: impl Into<String>, track_fps: bool) -> Self {
-        if !profiling_enabled() && !(track_fps && overlay_enabled()) {
+        if !(profiling_enabled() || track_fps && overlay_enabled()) {
             return Self {
                 kind,
                 name: String::new(),
@@ -370,21 +370,13 @@ impl FpsCounter {
 }
 
 /// Thread-local last samples + FPS for the iced UI thread.
+#[derive(Default)]
 pub struct GuiProfiler {
     pub fps: FpsCounter,
     pub last_update: Option<InteractionSample>,
     pub last_view: Option<InteractionSample>,
 }
 
-impl Default for GuiProfiler {
-    fn default() -> Self {
-        Self {
-            fps: FpsCounter::default(),
-            last_update: None,
-            last_view: None,
-        }
-    }
-}
 
 impl GuiProfiler {
     pub fn mark_view_sample(&mut self, sample: InteractionSample) {

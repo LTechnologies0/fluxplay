@@ -3,7 +3,9 @@
 
 use std::fs::{self, File};
 use std::io::{Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(not(target_os = "android"))]
+use std::path::PathBuf;
 
 use fluxplay_core::models::MediaSource;
 use serde::{Deserialize, Serialize};
@@ -218,6 +220,8 @@ pub fn suggested_export_name(source: &MediaSource) -> String {
     format!("{safe}.fluxplay")
 }
 
+// Desktop rfd save dialog starting dir; Android export goes through SAF.
+#[cfg(not(target_os = "android"))]
 pub fn default_export_dir() -> PathBuf {
     dirs::download_dir()
         .or_else(dirs::home_dir)

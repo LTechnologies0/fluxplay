@@ -42,8 +42,6 @@ impl StalkerClient {
         if !path.ends_with("portal.php") {
             let new_path = if path.is_empty() || path == "/" {
                 "/portal.php".into()
-            } else if path.ends_with("/c") || path.ends_with("/stalker_portal") {
-                format!("{path}/portal.php")
             } else {
                 format!("{path}/portal.php")
             };

@@ -497,15 +497,9 @@ struct AccentTokens {
 }
 
 /// Complementary secondary family keyed by accent group (opaque containers).
-fn secondary_tokens(
-    preset: AccentPreset,
-) -> (
-    (u8, u8, u8),
-    (u8, u8, u8),
-    (u8, u8, u8),
-    (u8, u8, u8),
-    (u8, u8, u8),
-) {
+type Rgb = (u8, u8, u8);
+
+fn secondary_tokens(preset: AccentPreset) -> (Rgb, Rgb, Rgb, Rgb, Rgb) {
     use AccentPreset::*;
     // (day, night, container_day, container_night, on_day)
     match preset {

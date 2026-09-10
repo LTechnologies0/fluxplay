@@ -1256,6 +1256,8 @@ pub fn content_header<'a>(
     }
 }
 
+// UI row builder: each arg maps to a distinct visual slot; a builder struct adds noise.
+#[allow(clippy::too_many_arguments)]
 pub fn media_row<'a>(
     title: String,
     subtitle: String,
@@ -1697,6 +1699,8 @@ pub fn load_more_btn(ui: UiTheme, remaining: Option<usize>) -> Element<'static, 
 }
 
 /// MYTV-style poster tile: vertical art + title + "year, genre".
+// UI tile builder: each arg maps to a distinct visual slot; a builder struct adds noise.
+#[allow(clippy::too_many_arguments)]
 pub fn mosaic_tile<'a>(
     title: String,
     meta_line: String,
@@ -1729,8 +1733,6 @@ pub fn mosaic_tile<'a>(
                 thumb
             }
         };
-        #[cfg(not(target_os = "android"))]
-        let thumb = thumb;
         if let Some(handle) = thumb {
             container(
                 image(handle)
@@ -1836,14 +1838,12 @@ fn truncate_ui(s: &str, max: usize) -> Cow<'_, str> {
     }
     #[cfg(not(target_os = "android"))]
     {
-        let mut count = 0usize;
-        for (i, _) in s.char_indices() {
+        for (count, (i, _)) in s.char_indices().enumerate() {
             if count >= max {
                 let mut t = s[..i].to_string();
                 t.push('…');
                 return Cow::Owned(t);
             }
-            count += 1;
         }
         Cow::Borrowed(s)
     }
@@ -1851,14 +1851,12 @@ fn truncate_ui(s: &str, max: usize) -> Cow<'_, str> {
 
 #[cfg(target_os = "android")]
 fn truncate_chars(s: &str, max: usize) -> String {
-    let mut count = 0usize;
-    for (i, _) in s.char_indices() {
+    for (count, (i, _)) in s.char_indices().enumerate() {
         if count >= max {
             let mut t = s[..i].to_string();
             t.push('…');
             return t;
         }
-        count += 1;
     }
     s.to_string()
 }
@@ -1986,6 +1984,8 @@ pub fn accent_mosaic(
 }
 
 /// Film / series detail: poster, synopsis, cast, primary play, optional episodes.
+// Detail-page renderer: args are independent view slots; grouping would just move the noise.
+#[allow(clippy::too_many_arguments)]
 pub fn media_detail_page<'a>(
     ui: UiTheme,
     title: &str,

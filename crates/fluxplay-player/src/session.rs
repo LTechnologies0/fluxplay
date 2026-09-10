@@ -56,6 +56,8 @@ pub struct StreamSession {
     /// Panel color base (brightness, contrast, saturation, gamma) without night.
     pub color_base: (i32, i32, i32, i32),
     pub bookmarks: Vec<Bookmark>,
+    /// Cache for `elapsed_label` — the text changes once per second, not per frame.
+    elapsed_label_cache: std::cell::RefCell<(i64, String)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -292,6 +294,7 @@ impl Default for StreamSession {
             panel_eq: None,
             color_base: (0, 0, 0, 0),
             bookmarks: Vec::new(),
+            elapsed_label_cache: std::cell::RefCell::new((-1, String::new())),
         }
     }
 }
@@ -299,10 +302,11 @@ impl Default for StreamSession {
 impl StreamSession {
     pub fn with_options(opts: PlayOptions) -> Self {
         debug!(preferred = ?opts.preferred, volume = opts.volume, "StreamSession::with_options");
-        let mut s = Self::default();
-        s.volume = opts.volume;
-        s.native = NativePlayer::new(opts);
-        s
+        Self {
+            volume: opts.volume,
+            native: NativePlayer::new(opts),
+            ..Default::default()
+        }
     }
 
     /// Align video stage size for embedded rendering (or CLI window geometry).
@@ -832,6 +836,8 @@ impl StreamSession {
 
     /// Apply persisted Settings defaults right after open (aspect / deint / scale / tone).
     /// Never injects a scale vf on Android Surface — that blacks MediaCodec embed.
+    // Bundling these prefs into a struct would churn all call sites for no gain.
+    #[allow(clippy::too_many_arguments)]
     pub fn apply_saved_video_prefs(
         &mut self,
         aspect: AspectMode,
@@ -893,6 +899,8 @@ impl StreamSession {
     }
 
     /// Re-apply soft vf chain after layout/rotate (keeps aspect-safe scale in sync).
+    // Unit error mirrors the internal filter-apply chain; callers only check is_err().
+    #[allow(clippy::result_unit_err)]
     pub fn refresh_soft_filters(&mut self) -> Result<(), ()> {
         self.apply_video_filters()
     }
@@ -959,6 +967,27 @@ impl StreamSession {
     }
 
     pub fn elapsed_label(&self) -> String {
+        // The label only changes when the displayed second flips — cache it
+        // (called per view rebuild, up to 120×/s while chrome is visible).
+        let key: i64 = if self.is_live() {
+            self.started_at
+                .map(|s| (Utc::now() - s).num_seconds().max(0))
+                .unwrap_or(0)
+        } else {
+            self.position_secs as i64
+        };
+        if let Ok(mut c) = self.elapsed_label_cache.try_borrow_mut() {
+            if c.0 == key && !c.1.is_empty() {
+                return c.1.clone();
+            }
+            let label = self.elapsed_label_uncached();
+            *c = (key, label.clone());
+            return label;
+        }
+        self.elapsed_label_uncached()
+    }
+
+    fn elapsed_label_uncached(&self) -> String {
         if let (Some(start), true) = (self.started_at, self.is_live()) {
             let secs = (Utc::now() - start).num_seconds().max(0) as u64;
             return format!("EN DIRECT · {}", format_hms(secs as f64));
