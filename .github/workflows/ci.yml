@@ -109,21 +109,23 @@ jobs:
         with:
           key: android-x86_64-linux-android
 
-      - name: Android check
-        run: |
-          rustup target add x86_64-linux-android
-          cargo check -p fluxplay --target x86_64-linux-android
-
-      - name: Setup Android NDK (optional APK)
+      - name: Setup Android NDK
         id: setup-ndk
         uses: nttld/setup-ndk@v1
         with:
           ndk-version: r28c
           link-to-sdk: true
-        continue-on-error: true
+
+      - name: Android check
+        env:
+          CC_x86_64_linux_android: ${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/x86_64-linux-android24-clang
+          AR_x86_64_linux_android: ${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar
+          CARGO_TARGET_X86_64_LINUX_ANDROID_LINKER: ${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/x86_64-linux-android24-clang
+        run: |
+          rustup target add x86_64-linux-android
+          cargo check -p fluxplay --target x86_64-linux-android
 
       - name: Setup Android SDK cmdline-tools (optional APK)
-        if: steps.setup-ndk.outcome == 'success'
         uses: android-actions/setup-android@v3
         continue-on-error: true
 
