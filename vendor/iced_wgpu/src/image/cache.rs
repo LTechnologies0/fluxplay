@@ -237,9 +237,15 @@ impl Cache {
         let image = memory.host()?;
 
         const MAX_SYNC_SIZE: usize = 2 * 1024 * 1024;
+        // Soft video uses Handle::Rgba with a new id every frame; syncing to the
+        // shared UI atlas reuses regions and mosaic posters sample stale UVs →
+        // tiles show the playing frame. Worker atlases are isolated per upload.
+        let rgba_soft_frame = matches!(handle, core::image::Handle::Rgba { .. });
 
         // TODO: Concurrent Wasm support
-        if image.len() < MAX_SYNC_SIZE || cfg!(target_arch = "wasm32") {
+        if !rgba_soft_frame
+            && (image.len() < MAX_SYNC_SIZE || cfg!(target_arch = "wasm32"))
+        {
             let entry = self.atlas.upload(
                 device,
                 encoder,

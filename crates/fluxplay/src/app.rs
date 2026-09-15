@@ -1623,6 +1623,10 @@ impl FluxPlay {
             self.video_allocation = None;
             self.video_allocation_hold = None;
             self.video_frame_wh = (0, 0);
+            // Soft RGBA used the shared GPU image cache — queue a mosaic art refresh
+            // so poster handles re-upload after playback (atlas region reuse).
+            self.art_warm_cursor = 0;
+            self.art_warm_active = !self.browse_index.is_empty();
         }
         #[cfg(target_os = "android")]
         {
@@ -5868,11 +5872,11 @@ impl FluxPlay {
             }
             Tab::Vod if self.vod_detail.is_none() => {
                 let v = self.bundle.vod.get(i)?;
-                crate::images::pick_art(None, v.poster.as_deref(), None, None)
+                crate::images::vod_poster_url(v)
             }
             Tab::Series if self.series_detail.is_none() => {
                 let s = self.bundle.series.get(i)?;
-                crate::images::pick_art(None, None, s.cover.as_deref(), s.banner.as_deref())
+                crate::images::series_cover_url(s)
             }
             _ => None,
         }
@@ -5975,9 +5979,7 @@ impl FluxPlay {
                         let Some(v) = self.bundle.vod.get(i) else {
                             continue;
                         };
-                        if let Some(u) =
-                            crate::images::pick_art(None, v.poster.as_deref(), None, None)
-                        {
+                        if let Some(u) = crate::images::vod_poster_url(v) {
                             self.images.promote(&u);
                             urls.push(u);
                         }
@@ -5996,12 +5998,7 @@ impl FluxPlay {
                         let Some(s) = self.bundle.series.get(i) else {
                             continue;
                         };
-                        if let Some(u) = crate::images::pick_art(
-                            None,
-                            None,
-                            s.cover.as_deref(),
-                            s.banner.as_deref(),
-                        ) {
+                        if let Some(u) = crate::images::series_cover_url(s) {
                             self.images.promote(&u);
                             urls.push(u);
                         }
@@ -7057,7 +7054,7 @@ impl FluxPlay {
                         v.rating.as_deref(),
                         "Film",
                     );
-                    let thumb = crate::images::pick_art(None, v.poster.as_deref(), None, None)
+                    let thumb = crate::images::vod_poster_url(v)
                         .and_then(|u| self.images.get(&u));
                     r = r.push(browser::mosaic_tile(
                         v.name.clone(),
@@ -7350,9 +7347,8 @@ impl FluxPlay {
                         s.rating.as_deref(),
                         "Série",
                     );
-                    let thumb =
-                        crate::images::pick_art(None, None, s.cover.as_deref(), s.banner.as_deref())
-                            .and_then(|u| self.images.get(&u));
+                    let thumb = crate::images::series_cover_url(s)
+                        .and_then(|u| self.images.get(&u));
                     r = r.push(browser::mosaic_tile(
                         s.name.clone(),
                         meta,

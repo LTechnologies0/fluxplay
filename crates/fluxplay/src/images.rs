@@ -630,6 +630,16 @@ pub fn pick_art(
         .map(normalized_cached)
 }
 
+/// VOD mosaic/detail poster URL (list payloads often only have `stream_icon`).
+pub fn vod_poster_url(v: &fluxplay_core::models::VodItem) -> Option<String> {
+    pick_art(None, v.poster.as_deref(), None, None)
+}
+
+/// Series mosaic/detail art (`cover` / `cover_big` banner).
+pub fn series_cover_url(s: &fluxplay_core::models::SeriesItem) -> Option<String> {
+    pick_art(None, None, s.cover.as_deref(), s.banner.as_deref())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
