@@ -176,6 +176,12 @@ jobs:
 
       - name: Setup Android SDK
         uses: android-actions/setup-android@v3
+        with:
+          # Default "tools" was removed from sdkmanager — install API 34 toolchain only.
+          packages: platform-tools build-tools;34.0.0 platforms;android-34
+
+      - name: Add Android build-tools to PATH
+        run: echo "$ANDROID_HOME/build-tools/34.0.0" >> "$GITHUB_PATH"
 
       - name: Install cargo-apk
         run: cargo install cargo-apk --locked
