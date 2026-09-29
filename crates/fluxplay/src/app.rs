@@ -2522,10 +2522,10 @@ impl FluxPlay {
                     } => {
                         *done = d;
                         *total = t;
-                        let links = if connections > 1 {
-                            format!(" · {connections} connexions")
-                        } else {
-                            String::new()
+                        let links = match connections {
+                            0 if rate == 0 => " · en attente d'une connexion libre".to_string(),
+                            0 | 1 => String::new(),
+                            n => format!(" · {n} connexions"),
                         };
                         self.status = format!(
                             "Téléchargement — {name} · {}{links}",

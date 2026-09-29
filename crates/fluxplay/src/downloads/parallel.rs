@@ -7,11 +7,9 @@
 //! [`Tuning::max_span`] so connection slots rotate between concurrent
 //! downloads of the same account.
 //!
-//! The file starts with [`Plan::connections`] and adds one every
-//! [`Tuning::probe_every`] while all of them transfer, up to
-//! [`Plan::ceiling`]. A refusal, or a connection cut right after one was
-//! added (panels that drop the oldest stream), sets the count back and caps
-//! the account.
+//! Every connection holds one of the account's slots ([`Account`]); the file
+//! keeps connections waiting for more, which is what lets the account try
+//! one more slot.
 //!
 //! Progress reaches the sidecar only after `sync_data`: the holes are
 //! snapshotted, the file synced, then the sidecar replaced atomically. A crash
@@ -35,7 +33,7 @@ pub(crate) struct Tuning {
     pub checkpoint: Duration,
     /// First wait before reusing a server that failed.
     pub server_backoff: Duration,
-    /// How long every connection must keep transferring before one more is tried.
+    /// How often the account settles a trial slot or tries one more.
     pub probe_every: Duration,
 }
 
@@ -46,19 +44,15 @@ impl Tuning {
         max_span: 256 * 1024 * 1024,
         checkpoint: Duration::from_secs(5),
         server_backoff: Duration::from_secs(3),
-        probe_every: Duration::from_secs(6),
+        probe_every: Duration::from_secs(8),
     };
 }
-
-/// A connection cut this soon after one more was opened means the panel
-/// dropped a stream to stay within its limit.
-const KICK_WINDOW: Duration = Duration::from_secs(5);
 
 /// The sequential attempt's `206` answer, handed over as the first connection.
 pub(crate) struct FirstResponse {
     pub resp: reqwest::Response,
     pub url_idx: usize,
-    pub slot: OwnedSemaphorePermit,
+    pub slot: Slot,
     pub pos: u64,
 }
 
@@ -206,17 +200,9 @@ struct Shared {
     file: std::fs::File,
     work: Mutex<Work>,
     servers: Mutex<Vec<ServerState>>,
-    /// Connections this file may use; lowered when a server refuses one more.
-    limit: AtomicUsize,
-    /// Connections holding a slot and a span right now.
-    running: AtomicUsize,
+    account: Arc<Account>,
     /// Connections whose server answered and that are transferring.
     flowing: AtomicUsize,
-    /// Cleared by the first refusal: the count only goes down from there.
-    probing: std::sync::atomic::AtomicBool,
-    last_raise: Mutex<Option<Instant>>,
-    ceiling: usize,
-    account: String,
     last_error: Mutex<Option<String>>,
     /// A server answered 200 to a range request (switch back to sequential).
     lost_ranges: std::sync::atomic::AtomicBool,
@@ -286,56 +272,6 @@ impl Shared {
         }
     }
 
-    /// The panel refused (or dropped) a connection while this file aimed at
-    /// `open`: the target, not the instantaneous count, since panels keep
-    /// counting a closed connection for a while. The first refusal sets the
-    /// account's limit, keeping one connection free for playback; later ones
-    /// only step this file down.
-    fn refused(&self, open: usize) {
-        if self.probing.swap(false, Ordering::SeqCst) {
-            super::note_refused(&self.account, open);
-            let cap = super::cap_below_refusal(open);
-            let _ = self
-                .limit
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |l| (l > cap).then_some(cap));
-        } else {
-            let _ = self
-                .limit
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |l| (l > 1).then(|| l - 1));
-        }
-    }
-
-    /// A connection ended before its span did.
-    fn cut(&self) {
-        let open = self.running.load(Ordering::SeqCst);
-        let target = self.limit.load(Ordering::SeqCst);
-        let after_raise = self
-            .last_raise
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .is_some_and(|t| t.elapsed() < KICK_WINDOW);
-        if open > 1 && after_raise {
-            self.refused(target);
-        }
-    }
-
-    /// Every `probe_every`: remember what the account served, and try one
-    /// more connection when all of them transfer.
-    fn probe(&self) {
-        let flowing = self.flowing.load(Ordering::SeqCst);
-        if flowing >= 2 {
-            super::note_served(&self.account, flowing);
-        }
-        let limit = self.limit.load(Ordering::SeqCst);
-        if self.probing.load(Ordering::SeqCst)
-            && flowing >= limit
-            && limit < self.ceiling
-            && self.work().has_work(&self.tuning)
-        {
-            self.limit.store(limit + 1, Ordering::SeqCst);
-            *self.last_raise.lock().unwrap_or_else(|p| p.into_inner()) = Some(Instant::now());
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -345,11 +281,10 @@ enum ServerOutcome {
     Bad,
 }
 
-/// Decrements [`Shared::running`] (or [`Shared::flowing`]) however the
-/// connection ends.
-struct Running<'a>(&'a AtomicUsize);
+/// Decrements [`Shared::flowing`] however the transfer ends.
+struct Flowing<'a>(&'a AtomicUsize);
 
-impl Drop for Running<'_> {
+impl Drop for Flowing<'_> {
     fn drop(&mut self) {
         self.0.fetch_sub(1, Ordering::SeqCst);
     }
@@ -384,13 +319,8 @@ pub(crate) async fn run(
         file,
         work: Mutex::new(Work::new(&holes)),
         servers: Mutex::new(vec![ServerState::default(); plan.urls.len()]),
-        limit: AtomicUsize::new(plan.connections.clamp(1, plan.ceiling.max(1))),
-        running: AtomicUsize::new(0),
+        account: Arc::clone(&plan.account),
         flowing: AtomicUsize::new(0),
-        probing: std::sync::atomic::AtomicBool::new(plan.ceiling > plan.connections),
-        last_raise: Mutex::new(None),
-        ceiling: plan.ceiling.max(1),
-        account: plan.account.clone(),
         last_error: Mutex::new(None),
         lost_ranges: Default::default(),
         tuning: plan.tuning,
@@ -403,7 +333,6 @@ pub(crate) async fn run(
             Arc::clone(&sh),
             client.clone(),
             Arc::clone(&urls),
-            Arc::clone(&plan.budget),
             handed,
         ));
     };
@@ -439,11 +368,11 @@ pub(crate) async fn run(
         .await;
     let mut ticker = tokio::time::interval(PROGRESS_EVERY);
     let mut last_checkpoint = Instant::now();
-    let mut last_probe = Instant::now();
 
     let result = loop {
-        let wanted = sh.limit.load(Ordering::SeqCst);
-        while set.len() < wanted && sh.work().has_work(&sh.tuning) && sh.server_available() {
+        // Connections beyond the account's slots wait for one: that demand is
+        // what lets the account try another.
+        while set.len() < MAX_CONNECTIONS && sh.work().has_work(&sh.tuning) && sh.server_available() {
             spawn(&mut set, None);
         }
         if set.is_empty() {
@@ -478,10 +407,7 @@ pub(crate) async fn run(
                         .send(DownloadEvent::Progress { done, total: Some(total), rate, connections })
                         .await;
                 }
-                if last_probe.elapsed() >= sh.tuning.probe_every {
-                    sh.probe();
-                    last_probe = Instant::now();
-                }
+                sh.account.probe(sh.tuning.probe_every);
                 if last_checkpoint.elapsed() >= sh.tuning.checkpoint {
                     checkpoint(&sh, d).await;
                     last_checkpoint = Instant::now();
@@ -515,7 +441,7 @@ async fn checkpoint(sh: &Arc<Shared>, d: &mut Dest) {
 struct Handed {
     resp: reqwest::Response,
     idx: usize,
-    slot: OwnedSemaphorePermit,
+    slot: Slot,
     id: u64,
 }
 
@@ -527,42 +453,25 @@ async fn connection(
     sh: Arc<Shared>,
     client: reqwest::Client,
     urls: Arc<Vec<String>>,
-    budget: Arc<Semaphore>,
     mut handed: Option<Handed>,
 ) -> Result<(), String> {
     loop {
         let (slot, id, pos, resp, idx) = if let Some(h) = handed.take() {
-            sh.running.fetch_add(1, Ordering::SeqCst);
             let pos = sh.work().holes_of(h.id).map_or(0, |(p, _)| p);
             (h.slot, h.id, pos, h.resp, h.idx)
         } else {
-            let Ok(slot) = Arc::clone(&budget).acquire_owned().await else {
-                return Ok(());
-            };
-            if sh.running.fetch_add(1, Ordering::SeqCst) >= sh.limit.load(Ordering::SeqCst) {
-                sh.running.fetch_sub(1, Ordering::SeqCst);
-                return Ok(());
-            }
+            let slot = sh.account.acquire().await;
             let claimed = sh.work().take(&sh.tuning);
             let Some((id, pos, end)) = claimed else {
-                sh.running.fetch_sub(1, Ordering::SeqCst);
                 return Ok(());
             };
-            match open(&sh, &client, &urls, id, pos, end).await {
-                Ok(Some((resp, idx))) => (slot, id, pos, resp, idx),
-                Ok(None) => {
-                    sh.running.fetch_sub(1, Ordering::SeqCst);
-                    return Ok(());
-                }
-                Err(e) => {
-                    sh.running.fetch_sub(1, Ordering::SeqCst);
-                    return Err(e);
-                }
+            match open(&sh, &client, &urls, id, pos, end).await? {
+                Some((resp, idx)) => (slot, id, pos, resp, idx),
+                None => return Ok(()),
             }
         };
-        let _running = Running(&sh.running);
         sh.flowing.fetch_add(1, Ordering::SeqCst);
-        let flowing = Running(&sh.flowing);
+        let flowing = Flowing(&sh.flowing);
 
         let fetched = fetch(&sh, resp, id, pos).await;
         drop(flowing);
@@ -577,7 +486,6 @@ async fn connection(
         sh.server_done(idx, outcome);
         if !finished {
             sh.work().release(id);
-            sh.cut();
             return Ok(());
         }
         drop(slot);
@@ -633,14 +541,14 @@ async fn open(
         let msg = format!("HTTP {status}");
         match status.as_u16() {
             400 | 401 | 404 | 405 | 410 | 416 | 451 => fail(ServerOutcome::Bad, msg),
-            _ => {
-                // Panels answer 403 / 429 / 458 / 509 / 503 when the account
-                // has no free connection: keep fewer for this file.
-                if sh.running.load(Ordering::SeqCst) > 1 {
-                    sh.refused(sh.limit.load(Ordering::SeqCst));
+            // How panels say the account has no free connection.
+            403 | 429 | 458 | 503 | 509 => {
+                if sh.account.in_use() > 1 {
+                    sh.account.refused();
                 }
                 fail(ServerOutcome::Failed, msg);
             }
+            _ => fail(ServerOutcome::Failed, msg),
         }
     }
     if sh.all_bad() && !sh.lost_ranges.load(Ordering::SeqCst) {
@@ -674,6 +582,7 @@ async fn fetch(
         if let Some(c) = chunk {
             buf.extend_from_slice(&c);
             moved += c.len() as u64;
+            sh.account.add_bytes(c.len() as u64);
         }
         if eof || buf.len() >= WRITE_BUFFER {
             if flush(sh, id, &mut pos, &mut buf).await? {

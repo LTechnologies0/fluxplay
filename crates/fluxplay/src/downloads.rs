@@ -12,17 +12,18 @@
 //! carries the account credentials.
 //!
 //! Large files that support ranges are fetched by several connections at once
-//! (spread over the account's servers) — see [`parallel`]. Panels announce a
-//! `max_connections` but often do not enforce it on VOD and cap each
-//! connection's speed instead, so it is only the starting count: a download
-//! adds one connection at a time while they all keep flowing, and the count
-//! where the panel refused or cut one is remembered for the account.
+//! (spread over the account's servers) — see [`parallel`]. How many
+//! connections the account's downloads hold together is decided by
+//! [`account`]: the panel's `max_connections` is only the starting count.
 
+mod account;
 mod parallel;
+
+use account::{Account, Slot};
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
 use fluxplay_core::models::MediaSource;
@@ -31,7 +32,6 @@ use iced::futures::{SinkExt, Stream};
 use reqwest::header;
 use reqwest::StatusCode;
 use tokio::io::AsyncWriteExt;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 /// Hard ceiling per file (a 4K remux is ~60 GiB). Guards against a server that
 /// streams forever.
@@ -52,9 +52,6 @@ const META_MAGIC: &str = "fluxplay-download 1";
 const META_MAGIC_SEGMENTED: &str = "fluxplay-download 2";
 /// Connections per account when the panel does not say (`max_connections`).
 const DEFAULT_CONNECTIONS: usize = 2;
-/// A refused or cut connection caps the account only this long: panels
-/// also answer 503 / 509 when briefly overloaded.
-const REFUSAL_MEMORY: Duration = Duration::from_secs(30 * 60);
 /// Never more than this per account, whatever the panel allows.
 const MAX_CONNECTIONS: usize = 8;
 const KNOWN_EXTENSIONS: &[&str] = &[
@@ -151,18 +148,12 @@ pub struct DownloadRequest {
     pub background: bool,
 }
 
-/// Resolved transfer plan: every server's URL for the file, and how many
-/// connections this file may hold.
+/// Resolved transfer plan: every server's URL for the file, and the account
+/// whose connection slots it shares.
 pub(crate) struct Plan {
     urls: Vec<String>,
-    /// Connections a file starts with.
-    connections: usize,
-    /// Most connections probing may reach.
-    ceiling: usize,
-    budget: Arc<Semaphore>,
+    account: Arc<Account>,
     tuning: parallel::Tuning,
-    /// Key of the account's learned limits (empty: nothing is learned).
-    account: String,
 }
 
 /// Stream the download described by `req`, reporting progress.
@@ -171,7 +162,7 @@ pub fn run(req: DownloadRequest) -> impl Stream<Item = DownloadEvent> {
         let (plan, referer, max_connections) = resolve_plan(&req).await;
         // Preloading while the viewer watches needs a second connection:
         // only when the panel announces one or was seen serving two.
-        if req.background && max_connections == Some(1) && learned(&plan.account).served < 2 {
+        if req.background && max_connections == Some(1) && plan.account.served() < 2 {
             let _ = tx
                 .send(DownloadEvent::Finished(Err(
                     "une seule connexion autorisée par le panel".into(),
@@ -205,26 +196,21 @@ async fn resolve_plan(req: &DownloadRequest) -> (Plan, Option<String>, Option<u3
         return (
             Plan {
                 urls: vec![req.url.clone()],
-                connections: DEFAULT_CONNECTIONS,
-                ceiling: DEFAULT_CONNECTIONS,
-                budget: account_budget("", DEFAULT_CONNECTIONS),
+                account: Account::shared("", DEFAULT_CONNECTIONS),
                 tuning: parallel::Tuning::DEFAULT,
-                account: String::new(),
             },
             None,
             None,
         );
     };
     let ranking = servers::rank_if_stale(source).await;
-    let account = source.id.to_string();
-    let (connections, ceiling) = connection_range(ranking.max_connections, learned(&account));
     let plan = Plan {
         urls: servers::media_candidates(source, &req.url),
-        connections,
-        ceiling,
-        budget: account_budget(&account, ceiling),
+        account: Account::shared(
+            &source.id.to_string(),
+            connections_for(ranking.max_connections),
+        ),
         tuning: parallel::Tuning::DEFAULT,
-        account,
     };
     let referer = source.http_referer.clone().filter(|r| !r.trim().is_empty());
     (plan, referer, ranking.max_connections)
@@ -237,93 +223,6 @@ fn connections_for(max_connections: Option<u32>) -> usize {
         Some(n) => (n as usize).saturating_sub(1).clamp(1, MAX_CONNECTIONS),
         None => DEFAULT_CONNECTIONS,
     }
-}
-
-/// What downloads of one account showed, whatever its panel announces.
-#[derive(Debug, Default, Clone, Copy)]
-pub(crate) struct Learned {
-    /// Most connections seen transferring together.
-    pub served: usize,
-    /// The panel refused or cut a connection when this many were open.
-    pub refused_at: Option<(usize, Instant)>,
-}
-
-fn learned_map() -> std::sync::MutexGuard<'static, HashMap<String, Learned>> {
-    static LEARNED: OnceLock<Mutex<HashMap<String, Learned>>> = OnceLock::new();
-    LEARNED
-        .get_or_init(Default::default)
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-}
-
-pub(crate) fn learned(account: &str) -> Learned {
-    if account.is_empty() {
-        return Learned::default();
-    }
-    let mut map = learned_map();
-    let entry = map.get_mut(account);
-    let Some(l) = entry else {
-        return Learned::default();
-    };
-    if l.refused_at.is_some_and(|(_, at)| at.elapsed() >= REFUSAL_MEMORY) {
-        l.refused_at = None;
-    }
-    *l
-}
-
-pub(crate) fn note_served(account: &str, n: usize) {
-    if account.is_empty() {
-        return;
-    }
-    let mut map = learned_map();
-    let l = map.entry(account.to_string()).or_default();
-    l.served = l.served.max(n);
-}
-
-pub(crate) fn note_refused(account: &str, n: usize) {
-    if account.is_empty() {
-        return;
-    }
-    let mut map = learned_map();
-    let l = map.entry(account.to_string()).or_default();
-    let n = l.refused_at.map_or(n, |(m, _)| m.min(n));
-    l.refused_at = Some((n, Instant::now()));
-    l.served = l.served.min(n.saturating_sub(1));
-}
-
-/// Downloads of an account that refused its `n`th connection: one fewer,
-/// and one more free for playback.
-pub(crate) fn cap_below_refusal(n: usize) -> usize {
-    n.saturating_sub(2).clamp(1, MAX_CONNECTIONS)
-}
-
-/// `(start, ceiling)` connections for one file.
-fn connection_range(max_connections: Option<u32>, l: Learned) -> (usize, usize) {
-    let ceiling = l
-        .refused_at
-        .map_or(MAX_CONNECTIONS, |(n, _)| cap_below_refusal(n));
-    let start = connections_for(max_connections).max(l.served).min(ceiling);
-    (start, ceiling)
-}
-
-/// Connection slots shared by every download of one account, so two files
-/// never exceed what the panel allows together.
-fn account_budget(account: &str, connections: usize) -> Arc<Semaphore> {
-    static BUDGETS: OnceLock<Mutex<HashMap<String, (Arc<Semaphore>, usize)>>> = OnceLock::new();
-    let mut map = BUDGETS
-        .get_or_init(Default::default)
-        .lock()
-        .unwrap_or_else(|p| p.into_inner());
-    let (sem, size) = map
-        .entry(account.to_string())
-        .or_insert_with(|| (Arc::new(Semaphore::new(connections)), connections));
-    if connections > *size {
-        sem.add_permits(connections - *size);
-    } else if connections < *size {
-        sem.forget_permits(*size - connections);
-    }
-    *size = connections;
-    Arc::clone(sem)
 }
 
 /// Stable, non-reversible key for a stream URL (the URL embeds credentials).
@@ -796,14 +695,6 @@ struct Session {
     validator_from: Option<usize>,
 }
 
-/// Wait for a free connection slot of the account.
-async fn connection_slot(plan: &Plan) -> Result<OwnedSemaphorePermit, AttemptError> {
-    Arc::clone(&plan.budget)
-        .acquire_owned()
-        .await
-        .map_err(|_| AttemptError::Fatal("téléchargements arrêtés".into()))
-}
-
 /// One HTTP request, appending to the `.part` from its current length. A
 /// large file served with byte ranges switches to [`parallel::run`], this
 /// response becoming its first connection.
@@ -826,7 +717,7 @@ async fn attempt(
         Some(d) => d.len().map_err(Fatal)?,
         None => 0,
     };
-    let slot = connection_slot(plan).await?;
+    let slot = plan.account.acquire().await;
     // `bytes=0-` too: a 206 answer proves the server can split the file.
     let mut req = client
         .get(url)
@@ -912,7 +803,7 @@ async fn attempt(
     d.meta.last_modified = last_modified;
     session.validator_from = Some(url_idx);
 
-    if status == StatusCode::PARTIAL_CONTENT && plan.ceiling > 1 {
+    if status == StatusCode::PARTIAL_CONTENT && plan.account.can_split() {
         if let Some(total) = total.filter(|t| t - offset >= plan.tuning.segmented_min) {
             // Preallocate (sparse) so every connection writes at its offset.
             d.lock.set_len(total).map_err(|e| Fatal(format!("écriture disque : {e}")))?;
@@ -952,6 +843,7 @@ async fn attempt(
                 if let Err(e) = out.write_all(&chunk).await {
                     break Err(Fatal(format!("écriture disque : {e}")));
                 }
+                plan.account.add_bytes(chunk.len() as u64);
                 if let Some(rate) = meter.tick(done) {
                     let _ = tx
                         .send(DownloadEvent::Progress {
@@ -1731,11 +1623,8 @@ mod tests {
     fn plan_with(urls: Vec<String>, connections: usize, tuning: parallel::Tuning) -> Plan {
         Plan {
             urls,
-            connections,
-            ceiling: connections,
-            budget: Arc::new(Semaphore::new(connections)),
+            account: Account::detached(connections, connections),
             tuning,
-            account: String::new(),
         }
     }
 
@@ -1854,16 +1743,13 @@ mod tests {
         let srv = range_server_paced(Arc::clone(&body), 3, Duration::from_millis(20));
         let dir = scratch_dir("probe");
         let (mut tx, _rx) = mpsc::channel(4096);
-        let account = "test-account-probe";
         let tuning = parallel::Tuning {
             max_span: 1024 * 1024,
-            probe_every: Duration::ZERO,
+            probe_every: Duration::from_millis(400),
             ..SMALL
         };
         let mut plan = plan_with(vec![srv.url.clone()], 1, tuning);
-        plan.ceiling = 6;
-        plan.budget = Arc::new(Semaphore::new(6));
-        plan.account = account.into();
+        plan.account = Account::detached(1, 6);
 
         let path = download_into(&dir, "Sonde", &plan, "UA", None, FAST, &mut tx)
             .await
@@ -1871,9 +1757,9 @@ mod tests {
         assert_eq!(std::fs::read(&path).unwrap(), *body);
         let peak = srv.peak.load(Ordering::SeqCst);
         assert!((2..=3).contains(&peak), "peak {peak}: grew from 1, never past the panel's 3");
-        let l = learned(account);
-        assert!(l.refused_at.is_some(), "the 509 is remembered");
-        assert!(l.served >= 2, "{l:?} peak {peak}");
+        let a = &plan.account;
+        assert!(a.cap() < 3, "the refused trial slot was given back (cap {})", a.cap());
+        assert!(a.served() >= 2, "served {} peak {peak}", a.served());
     }
 
     #[tokio::test]
@@ -1883,16 +1769,13 @@ mod tests {
         let srv = range_server_paced(Arc::clone(&body), 16, Duration::from_millis(20));
         let dir = scratch_dir("probe-open");
         let (mut tx, _rx) = mpsc::channel(4096);
-        let account = "test-account-open-panel";
         let tuning = parallel::Tuning {
             max_span: 64 * 1024 * 1024,
-            probe_every: Duration::ZERO,
+            probe_every: Duration::from_millis(400),
             ..SMALL
         };
         let mut plan = plan_with(vec![srv.url.clone()], 1, tuning);
-        plan.ceiling = 4;
-        plan.budget = Arc::new(Semaphore::new(4));
-        plan.account = account.into();
+        plan.account = Account::detached(1, 4);
 
         let path = download_into(&dir, "Ouvert", &plan, "UA", None, FAST, &mut tx)
             .await
@@ -1900,9 +1783,9 @@ mod tests {
         assert_eq!(std::fs::read(&path).unwrap(), *body);
         // The server still counts a connection for a moment after the client drops it.
         assert!(srv.peak.load(Ordering::SeqCst) >= 4, "grew from 1 to the ceiling");
-        let l = learned(account);
-        assert!(l.refused_at.is_none());
-        assert!(l.served >= 3, "{l:?}");
+        let a = &plan.account;
+        assert_eq!(a.ceiling(), 4, "nothing refused");
+        assert!(a.served() >= 3, "served {}", a.served());
     }
 
     #[tokio::test]
@@ -2013,6 +1896,81 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Live check against the first profile of `state.json` (never run by CI):
+    /// `FLUXPLAY_DIAG_TITLE=Matrix cargo test -p fluxplay --lib live_panel -- --ignored --nocapture`.
+    /// Prints rate and connection count only — no URL.
+    #[tokio::test]
+    #[ignore]
+    async fn live_panel_connection_probing() {
+        use iced::futures::StreamExt;
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter("fluxplay::downloads=info")
+            .with_test_writer()
+            .try_init();
+        let state = crate::storage::load();
+        let source = state.sources.into_iter().find(|s| s.enabled).expect("a profile");
+        let title = std::env::var("FLUXPLAY_DIAG_TITLE").unwrap_or_else(|_| "Matrix".into());
+        let db = crate::storage::data_dir()
+            .join("profiles")
+            .join(source.id.to_string())
+            .join("catalog.sqlite3");
+        let conn = rusqlite::Connection::open_with_flags(&db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        let payload: String = conn
+            .query_row(
+                "SELECT payload FROM vod WHERE name LIKE ?1 LIMIT 1",
+                [format!("%{title}%")],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let url = serde_json::from_str::<serde_json::Value>(&payload).unwrap()["stream_url"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let dir = std::env::temp_dir().join("fp-live-diag");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let events = run(DownloadRequest {
+            name: "diag".into(),
+            url,
+            source: Some(source),
+            user_agent: "VLC/3.0.20 LibVLC/3.0.20".into(),
+            dir: dir.clone(),
+            background: false,
+        });
+        tokio::pin!(events);
+        let started = Instant::now();
+        let mut last_print = Instant::now();
+        while started.elapsed() < Duration::from_secs(
+            std::env::var("FLUXPLAY_DIAG_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(70),
+        ) {
+            match tokio::time::timeout(Duration::from_secs(5), events.next()).await {
+                Ok(Some(DownloadEvent::Progress { done, rate, connections, .. })) => {
+                    if last_print.elapsed() >= Duration::from_secs(4) {
+                        last_print = Instant::now();
+                        eprintln!(
+                            "t={:>3}s  {:>6.1} Mo  {:>5.2} Mo/s  {connections} connexion(s)",
+                            started.elapsed().as_secs(),
+                            done as f64 / 1e6,
+                            rate as f64 / 1e6
+                        );
+                    }
+                }
+                Ok(Some(DownloadEvent::Retrying { attempt, error, .. })) => {
+                    eprintln!("retry {attempt}: {error}");
+                }
+                Ok(Some(DownloadEvent::Finished(r))) => {
+                    eprintln!("finished: {:?}", r.map(|_| ()));
+                    break;
+                }
+                Ok(Some(_)) => {}
+                Ok(None) => break,
+                Err(_) => eprintln!("(no event for 5 s)"),
+            }
+        }
+        drop(events);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn connection_count_keeps_one_for_playback() {
         assert_eq!(connections_for(None), DEFAULT_CONNECTIONS);
@@ -2020,40 +1978,5 @@ mod tests {
         assert_eq!(connections_for(Some(2)), 1);
         assert_eq!(connections_for(Some(4)), 3);
         assert_eq!(connections_for(Some(100)), MAX_CONNECTIONS);
-    }
-
-    #[test]
-    fn announced_limit_is_a_start_not_a_ceiling() {
-        let fresh = Learned::default();
-        assert_eq!(connection_range(Some(1), fresh), (1, MAX_CONNECTIONS));
-        assert_eq!(connection_range(None, fresh), (DEFAULT_CONNECTIONS, MAX_CONNECTIONS));
-        let served = Learned {
-            served: 4,
-            refused_at: None,
-        };
-        assert_eq!(connection_range(Some(1), served), (4, MAX_CONNECTIONS));
-        let refused = Learned {
-            served: 4,
-            refused_at: Some((5, Instant::now())),
-        };
-        assert_eq!(connection_range(Some(4), refused), (3, 3), "one kept for playback");
-        let strict = Learned {
-            served: 0,
-            refused_at: Some((2, Instant::now())),
-        };
-        assert_eq!(connection_range(Some(1), strict), (1, 1));
-    }
-
-    #[test]
-    fn refusal_caps_what_the_account_served() {
-        let account = "test-account-learning";
-        note_served(account, 5);
-        assert_eq!(learned(account).served, 5);
-        note_refused(account, 4);
-        note_refused(account, 6);
-        let l = learned(account);
-        assert_eq!(l.refused_at.map(|(n, _)| n), Some(4), "the lowest refusal wins");
-        assert_eq!(l.served, 3);
-        assert_eq!(learned("").served, 0);
     }
 }
