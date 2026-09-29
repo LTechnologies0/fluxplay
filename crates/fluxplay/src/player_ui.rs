@@ -36,6 +36,8 @@ pub struct PlayerChrome<'a> {
     pub meta: &'a str,
     pub status: &'a str,
     pub session: &'a StreamSession,
+    /// Seek bar position while dragged (the seek is sent on release).
+    pub seek_drag: Option<f64>,
     pub art: Option<&'a Handle>,
     pub video: Option<&'a Handle>,
     pub active: bool,
@@ -55,6 +57,8 @@ pub struct PlayerChrome<'a> {
     pub embedded_video: bool,
     /// Android MediaCodec Surface under iced (transparent stage punch-through).
     pub surface_video: bool,
+    /// The GPU video stage already shows a frame of this playback (desktop).
+    pub stage_picture: bool,
     pub backend_label: &'a str,
     pub caps: BackendCaps,
     /// System safe-area insets (l,t,r,b) — chrome overlays only, not the stage.
@@ -181,6 +185,114 @@ pub fn player_window(p: PlayerChrome<'_>) -> Element<'_, Message> {
     .into()
 }
 
+/// Centered pill while the embedded player holds to refill its network buffer.
+fn rebuffer_badge<'a>(ui: UiTheme, session: &StreamSession) -> Element<'a, Message> {
+    let Some(b) = session
+        .buffer
+        .filter(|b| b.rebuffering && session.state == PlaybackState::Buffering)
+    else {
+        return Space::new().width(Fill).height(Fill).into();
+    };
+    let mut body = column![text(format!("Mise en mémoire tampon… {} %", b.fill_percent()))
+        .size(TYPE_LABEL_L)
+        .color(ui.on_primary_container())]
+    .spacing(SPACE_XS)
+    .align_x(Alignment::Center);
+    if b.link_too_slow() {
+        body = body.push(
+            text(format!(
+                "Connexion {:.0} Mbit/s, ce film en demande {:.0} : \
+                 une version HD ou le téléchargement évitent les pauses.",
+                b.net_mbps, b.media_mbps
+            ))
+            .size(TYPE_LABEL_M)
+            .color(ui.on_primary_container()),
+        );
+    }
+    let pill = container(body)
+        .max_width(520)
+        .padding(Padding::from([14, 22]))
+        .style(move |_t: &Theme| container::Style {
+            background: Some(Background::Color(ui.primary_container())),
+            border: Border {
+                radius: RADIUS_EXTRA_LARGE.into(),
+                ..Default::default()
+            },
+            shadow: elevation_shadow(2, ui.day),
+            ..Default::default()
+        });
+    container(pill)
+        .width(Fill)
+        .height(Fill)
+        .center_x(Fill)
+        .center_y(Fill)
+        .into()
+}
+
+#[cfg(not(target_os = "android"))]
+fn gpu_stage_available() -> bool {
+    true
+}
+
+#[cfg(target_os = "android")]
+fn gpu_stage_available() -> bool {
+    false
+}
+
+#[cfg(not(target_os = "android"))]
+fn gpu_stage_view<'a>() -> Element<'a, Message> {
+    crate::video_stage::view()
+}
+
+#[cfg(target_os = "android")]
+fn gpu_stage_view<'a>() -> Element<'a, Message> {
+    Space::new().width(Fill).height(Fill).into()
+}
+
+/// Soft RGBA frame as an iced image (no GPU stage).
+fn soft_image<'a>(frame: &'a Handle) -> Element<'a, Message> {
+    // Soft RGBA is already letterboxed into the stage-shaped buffer (mpv keepaspect /
+    // aspect-safe vf). Contain would double-letterbox after rotate.
+    iced::widget::image(frame)
+        .width(Fill)
+        .height(Fill)
+        .content_fit(iced::ContentFit::Fill)
+        .filter_method(iced::widget::image::FilterMethod::Linear)
+        .into()
+}
+
+/// Loader until the first frame — avoid a black gap when the clock leads
+/// video, and never flip poster↔frame (scintillation).
+fn video_loader<'a>(p: &PlayerChrome<'a>) -> Element<'a, Message> {
+    let ui = p.ui;
+    container(
+        column![
+            text("◌")
+                .size(LOADING_SIZE * 0.55)
+                .color(ui.on_primary_container()),
+            text("Chargement vidéo…")
+                .size(TYPE_LABEL_L)
+                .color(ui.on_primary_container()),
+            text(p.backend_label)
+                .size(TYPE_LABEL_M)
+                .color(ui.on_primary_container()),
+        ]
+        .spacing(SPACE_SM)
+        .align_x(Alignment::Center)
+        .padding(Padding::from([20, 28])),
+    )
+    .style(move |_t: &Theme| container::Style {
+        background: Some(Background::Color(ui.primary_container())),
+        border: Border {
+            radius: RADIUS_EXTRA_LARGE.into(),
+            ..Default::default()
+        },
+        shadow: elevation_shadow(2, ui.day),
+        ..Default::default()
+    })
+    .into()
+}
+
 fn stage_panel<'a>(p: &PlayerChrome<'a>) -> Element<'a, Message> {
     let ui = p.ui;
     let session = p.session;
@@ -192,43 +304,34 @@ fn stage_panel<'a>(p: &PlayerChrome<'a>) -> Element<'a, Message> {
     let center: Element<'a, Message> = if p.surface_video {
         // SurfaceView under iced — never paint art/loader (opaque) over MediaCodec.
         Space::new().width(Fill).height(Fill).into()
+    } else if playing && p.embedded_video && gpu_stage_available() {
+        // The shader stage stays in the tree for the whole playback: drawing it
+        // once builds the pipeline, which switches the player to native YUV.
+        // Until its first frame the image path (or the loader) covers it.
+        let top: Element<'a, Message> = if p.stage_picture {
+            rebuffer_badge(ui, session)
+        } else if let Some(frame) = p.video {
+            stack![soft_image(frame), rebuffer_badge(ui, session)]
+                .width(Fill)
+                .height(Fill)
+                .into()
+        } else {
+            container(video_loader(p))
+                .width(Fill)
+                .height(Fill)
+                .center_x(Fill)
+                .center_y(Fill)
+                .into()
+        };
+        stack![gpu_stage_view(), top].width(Fill).height(Fill).into()
     } else if let Some(frame) = p.video {
-        // Soft RGBA is already letterboxed into the stage-shaped buffer (mpv keepaspect /
-        // aspect-safe vf). Contain would double-letterbox after rotate.
-        iced::widget::image(frame)
+        // Same tree with or without the badge: no image relayout when buffering toggles.
+        stack![soft_image(frame), rebuffer_badge(ui, session)]
             .width(Fill)
             .height(Fill)
-            .content_fit(iced::ContentFit::Fill)
             .into()
     } else if playing && p.embedded_video {
-        // Loader until first GPU frame — avoid black gap when clock leads video,
-        // and never flip poster↔frame (scintillation).
-        let indicator = container(
-            column![
-                text("◌")
-                    .size(LOADING_SIZE * 0.55)
-                    .color(ui.on_primary_container()),
-                text("Chargement vidéo…")
-                    .size(TYPE_LABEL_L)
-                    .color(ui.on_primary_container()),
-                text(p.backend_label)
-                    .size(TYPE_LABEL_M)
-                    .color(ui.on_primary_container()),
-            ]
-            .spacing(SPACE_SM)
-            .align_x(Alignment::Center)
-            .padding(Padding::from([20, 28])),
-        )
-        .style(move |_t: &Theme| container::Style {
-            background: Some(Background::Color(ui.primary_container())),
-            border: Border {
-                radius: RADIUS_EXTRA_LARGE.into(),
-                ..Default::default()
-            },
-            shadow: elevation_shadow(2, ui.day),
-            ..Default::default()
-        });
-        indicator.into()
+        video_loader(p)
     } else if playing && !p.embedded_video {
         // CLI mpv/ffplay fallback: video is in an external OS window — never spin forever here.
         let art_block: Element<'a, Message> = if let Some(handle) = p.art {
@@ -316,7 +419,7 @@ fn control_dock<'a>(p: &PlayerChrome<'a>, chrome_alpha: f32) -> Element<'a, Mess
     let _can_seek = active && !live && p.caps.seek_abs;
     let can_seek_rel = active && !live && p.caps.seek_rel;
     let mute_glyph = if s.muted { Icon::VolumeOff } else { Icon::VolumeUp };
-    let progress = s.progress_ratio();
+    let progress = p.seek_drag.unwrap_or_else(|| s.progress_ratio());
     let time_label = s.elapsed_label();
     let vol = s.volume;
     let vol_enabled = active && p.caps.volume_live;
@@ -393,7 +496,8 @@ fn control_dock<'a>(p: &PlayerChrome<'a>, chrome_alpha: f32) -> Element<'a, Mess
             .height(Length::Fixed(SLIDER_S_HEIGHT))
             .center_y(Fill),
             slider(0.0..=1.0, progress as f32, |v| Message::SeekPercent(v as f64))
-                .step(0.001)
+                .on_release(Message::SeekReleased)
+                .step(0.001_f32)
                 .width(Fill)
                 .height(SLIDER_S_HEIGHT)
                 .style(move |theme: &Theme, status| {
@@ -486,7 +590,7 @@ fn control_dock<'a>(p: &PlayerChrome<'a>, chrome_alpha: f32) -> Element<'a, Mess
 
         let vol_slider: Element<'a, Message> = if vol_enabled {
             container(
-                slider(0.0..=1.0, vol, Message::VolumeChanged)
+                slider(0.0..=1.0, vol, Message::VolumeChanged).on_release(Message::VolumeReleased)
                     .step(0.01_f32)
                     .height(32.0)
                     .style(move |theme: &Theme, status| {
@@ -585,7 +689,7 @@ fn control_dock<'a>(p: &PlayerChrome<'a>, chrome_alpha: f32) -> Element<'a, Mess
             toolbar_svg(ui, Icon::SkipPrevious, Message::PlaylistPrev, true, false),
             toolbar_svg(ui, mute_glyph, Message::ToggleMute, mute_enabled, s.muted),
             container(
-                slider(0.0..=1.0, vol, Message::VolumeChanged)
+                slider(0.0..=1.0, vol, Message::VolumeChanged).on_release(Message::VolumeReleased)
                     .step(0.01_f32)
                     .height(32.0)
                     .style(move |theme: &Theme, status| {

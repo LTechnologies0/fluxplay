@@ -10,12 +10,21 @@ use url::Url;
 
 use crate::{http_client, ProviderError, Result};
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct StalkerClient {
     pub portal: Url,
     pub mac: String,
     pub source_id: uuid::Uuid,
     pub token: Option<String>,
+}
+
+impl std::fmt::Debug for StalkerClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StalkerClient")
+            .field("portal", &self.portal.as_str())
+            .field("has_token", &self.token.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 impl StalkerClient {
@@ -37,15 +46,12 @@ impl StalkerClient {
             base = format!("http://{base}");
         }
         let mut portal = Url::parse(&base).map_err(|e| ProviderError::Message(e.to_string()))?;
-        // Ensure we point at portal.php if a directory was given.
+        // Ensure we point at the API script if a directory was given. `/c/` is the
+        // MAG web client; its API sits next to it, at `/portal.php`.
         let path = portal.path().trim_end_matches('/');
-        if !path.ends_with("portal.php") {
-            let new_path = if path.is_empty() || path == "/" {
-                "/portal.php".into()
-            } else {
-                format!("{path}/portal.php")
-            };
-            portal.set_path(&new_path);
+        if !path.ends_with("portal.php") && !path.ends_with("load.php") {
+            let dir = path.strip_suffix("/c").unwrap_or(path);
+            portal.set_path(&format!("{dir}/portal.php"));
         }
 
         // Never log MAC address.
@@ -62,12 +68,13 @@ impl StalkerClient {
         format!("mac={}", self.mac.replace(':', "%3A"))
     }
 
-    async fn request(&self, action: &str, extra: &[(&str, &str)]) -> Result<Value> {
+    /// `kind` is the Stalker module: `stb` (handshake, profile) or `itv` (live TV).
+    async fn request(&self, kind: &str, action: &str, extra: &[(&str, &str)]) -> Result<Value> {
         let client = http_client()?;
         let mut url = self.portal.clone();
         {
             let mut q = url.query_pairs_mut();
-            q.append_pair("type", "stb");
+            q.append_pair("type", kind);
             q.append_pair("action", action);
             q.append_pair("JsHttpRequest", "1-xml");
             for (k, v) in extra {
@@ -91,14 +98,14 @@ impl StalkerClient {
         let resp = match req.send().await {
             Ok(r) => r,
             Err(e) => {
-                warn!(%action, error = %e, "Stalker request network error");
+                warn!(%action, error = %crate::redact_error(&e), "Stalker request network error");
                 return Err(e.into());
             }
         };
         let resp = match resp.error_for_status() {
             Ok(r) => r,
             Err(e) => {
-                warn!(%action, error = %e, "Stalker request HTTP error");
+                warn!(%action, error = %crate::redact_error(&e), "Stalker request HTTP error");
                 return Err(e.into());
             }
         };
@@ -109,7 +116,7 @@ impl StalkerClient {
     pub async fn handshake(&mut self) -> Result<()> {
         let _prof = Stopwatch::start("stalker_handshake");
         debug!(portal = %self.portal, "Stalker handshake start");
-        let value = self.request("handshake", &[("token", "")]).await?;
+        let value = self.request("stb", "handshake", &[("token", "")]).await?;
         let token = value
             .pointer("/js/token")
             .and_then(|v| v.as_str())
@@ -125,6 +132,7 @@ impl StalkerClient {
         // get_profile is required by many portals after handshake.
         let _ = self
             .request(
+                "stb",
                 "get_profile",
                 &[
                     ("hd", "1"),
@@ -149,39 +157,77 @@ impl StalkerClient {
             self.handshake().await?;
         }
 
-        // Prefer ITV (live) ordered list.
-        let value = self
-            .request(
-                "get_ordered_list",
-                &[
-                    ("genre", "*"),
-                    ("force_ch_link_check", ""),
-                    ("fav", "0"),
-                    ("sortby", "number"),
-                    ("hd", "0"),
-                    ("p", "0"),
-                ],
-            )
-            .await?;
+        // Genre id → title, for channels that only carry `tv_genre_id`.
+        let genres: std::collections::HashMap<String, String> = self
+            .request("itv", "get_genres", &[])
+            .await
+            .ok()
+            .and_then(|v| v.pointer("/js").and_then(|j| j.as_array()).cloned())
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|g| {
+                let id = g.get("id").map(|v| match v {
+                    Value::String(s) => s.clone(),
+                    other => other.to_string(),
+                })?;
+                let title = g.get("title").and_then(|t| t.as_str())?.trim().to_string();
+                (!title.is_empty() && id != "*").then_some((id, title))
+            })
+            .collect();
 
-        // Some portals nest under /js/data, others /js
-        let data = value
-            .pointer("/js/data")
-            .or_else(|| value.pointer("/js"))
-            .cloned()
-            .unwrap_or(Value::Null);
+        // ITV ordered list, page by page (a page is 14–20 channels on most portals).
+        const MAX_PAGES: u32 = 500;
+        let mut arr = Vec::new();
+        for page in 1..=MAX_PAGES {
+            let p = page.to_string();
+            let value = self
+                .request(
+                    "itv",
+                    "get_ordered_list",
+                    &[
+                        ("genre", "*"),
+                        ("force_ch_link_check", ""),
+                        ("fav", "0"),
+                        ("sortby", "number"),
+                        ("hd", "0"),
+                        ("p", &p),
+                    ],
+                )
+                .await;
+            let value = match value {
+                Ok(v) => v,
+                Err(e) if page > 1 => {
+                    warn!(page, error = %e, "Stalker page failed — keeping the pages loaded");
+                    break;
+                }
+                Err(e) => return Err(e),
+            };
+            // Some portals nest under /js/data, others /js
+            let data = value
+                .pointer("/js/data")
+                .or_else(|| value.pointer("/js"))
+                .cloned()
+                .unwrap_or(Value::Null);
+            let items = data
+                .as_array()
+                .cloned()
+                .or_else(|| data.get("data").and_then(|d| d.as_array()).cloned())
+                .unwrap_or_default();
+            if items.is_empty() {
+                break;
+            }
+            arr.extend(items);
+            let total = value
+                .pointer("/js/total_items")
+                .and_then(|v| v.as_u64().or_else(|| v.as_str().and_then(|s| s.parse().ok())));
+            match total {
+                Some(t) if arr.len() as u64 >= t => break,
+                None => break,
+                _ => {}
+            }
+        }
 
         let mut channels = Vec::new();
-        let arr = data
-            .as_array()
-            .cloned()
-            .or_else(|| {
-                data.get("data")
-                    .and_then(|d| d.as_array())
-                    .cloned()
-            })
-            .unwrap_or_default();
-
         for item in arr {
             let name = item
                 .get("name")
@@ -205,15 +251,22 @@ impl StalkerClient {
                 .map(str::to_string);
             let group = item
                 .get("genre_title")
-                .or_else(|| item.get("tv_genre_id"))
                 .and_then(|v| v.as_str())
-                .map(str::to_string);
+                .map(str::to_string)
+                .or_else(|| {
+                    let gid = item.get("tv_genre_id").map(|v| match v {
+                        Value::String(s) => s.clone(),
+                        other => other.to_string(),
+                    })?;
+                    genres.get(&gid).cloned()
+                });
 
             // cmd may be "ffmpeg http://..." — strip player prefix.
             let stream_url = strip_cmd_prefix(&cmd);
             if stream_url.is_empty() {
                 continue;
             }
+            let scheme = StreamScheme::parse(&stream_url);
 
             channels.push(Channel {
                 id,
@@ -225,7 +278,7 @@ impl StalkerClient {
                 tvg_name: None,
                 tvg_logo: None,
                 epg_channel_id: None,
-                scheme: Some(StreamScheme::parse(&cmd)),
+                scheme: Some(scheme),
                 source_id: Some(self.source_id),
                 kind: ContentKind::Live,
                 catchup: None,
@@ -262,7 +315,7 @@ fn normalize_mac(raw: &str) -> Result<String> {
 
 fn strip_cmd_prefix(cmd: &str) -> String {
     let cmd = cmd.trim();
-    for prefix in ["ffmpeg ", "ffrt ", "rtp ", "rtsp "] {
+    for prefix in ["ffmpeg ", "ffrt ", "ffrt2 ", "ffrt3 ", "auto ", "rtp ", "rtsp "] {
         if let Some(rest) = cmd.strip_prefix(prefix) {
             return rest.trim().to_string();
         }

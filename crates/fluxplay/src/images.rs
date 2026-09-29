@@ -97,11 +97,14 @@ impl ImageCache {
 
     /// O(1) MRU bump — safe to call for every visible mosaic tile each frame.
     pub fn promote(&mut self, url: &str) {
-        if !self.handles.contains_key(url) {
+        self.clock = self.clock.wrapping_add(1);
+        if let Some(gen) = self.touch_gen.get_mut(url) {
+            *gen = self.clock;
             return;
         }
-        self.clock = self.clock.wrapping_add(1);
-        self.touch_gen.insert(url.to_string(), self.clock);
+        if self.handles.contains_key(url) {
+            self.touch_gen.insert(url.to_string(), self.clock);
+        }
     }
 
     fn evict_oldest(&mut self) {
@@ -186,6 +189,20 @@ impl ImageCache {
     }
 
     /// Insert bytes already prepared for UI (decoded/downscaled off-thread).
+    /// New `Handle` so iced/wgpu re-uploads after the shared UI atlas was reused (e.g. soft video).
+    pub fn refresh_gpu_texture(&mut self, url: &str, _source_id: Option<Uuid>) {
+        let url_n = normalized_cached(url);
+        // Same (already downscaled) bytes under a fresh id: the disk copy is the
+        // full-size original and would be decoded at full resolution.
+        let Some(Handle::Bytes(_, bytes)) = self.handles.get(&url_n) else {
+            return;
+        };
+        let fresh = Handle::from_bytes(bytes.clone());
+        self.handles.insert(url_n.clone(), fresh);
+        self.promote(&url_n);
+        debug!(target: "fluxplay::images", %url_n, "poster GPU texture refreshed");
+    }
+
     pub fn insert_ui_bytes(&mut self, url: String, bytes: Vec<u8>) {
         self.inflight.remove(&url);
         self.inflight_source.remove(&url);
@@ -338,11 +355,17 @@ fn warn_host_once(host: &str, msg: &str, detail: &str) {
 fn normalize_image_url(url: &str) -> String {
     let url = url.trim();
     let collapsed = if let Some((scheme, rest)) = url.split_once("://") {
-        let mut path = rest.replace("//", "/");
+        // Collapse `//` in the path only: the query may legitimately hold `//`
+        // (e.g. `?u=http://…`).
+        let (path, query) = match rest.find(['?', '#']) {
+            Some(i) => rest.split_at(i),
+            None => (rest, ""),
+        };
+        let mut path = path.replace("//", "/");
         while path.contains("//") {
             path = path.replace("//", "/");
         }
-        format!("{scheme}://{path}")
+        format!("{scheme}://{path}{query}")
     } else {
         url.to_string()
     };
@@ -473,7 +496,7 @@ pub async fn fetch_image_bytes(
         if attempt > 0 {
             tokio::time::sleep(Duration::from_millis(400)).await;
         }
-        let resp = match image_get(&url).await {
+        let mut resp = match image_get(&url).await {
             Ok(r) => r,
             Err(e) => {
                 last_err = e.to_string();
@@ -504,19 +527,40 @@ pub async fn fetch_image_bytes(
             }
             return Err((url, format!("HTTP {status}")));
         }
-        let bytes = match resp.bytes().await {
-            Ok(b) => b,
-            Err(e) => {
-                last_err = e.to_string();
-                warn_host_once(&host, "image body failed", &last_err);
-                break;
-            }
-        };
-        if bytes.len() > MAX_IMAGE_BYTES {
-            warn!(%url, len = bytes.len(), "image too large");
+        if resp.content_length().is_some_and(|n| n > MAX_IMAGE_BYTES as u64) {
+            warn!(%url, "image too large");
             return Err((url, "image too large".into()));
         }
-        let bytes = bytes.to_vec();
+        // Read under the cap: a server lying about (or omitting) the length must not
+        // make us buffer a video file as a "logo".
+        let mut bytes = Vec::new();
+        let mut too_large = false;
+        let mut body_err = None;
+        loop {
+            match resp.chunk().await {
+                Ok(Some(c)) => {
+                    if bytes.len() + c.len() > MAX_IMAGE_BYTES {
+                        too_large = true;
+                        break;
+                    }
+                    bytes.extend_from_slice(&c);
+                }
+                Ok(None) => break,
+                Err(e) => {
+                    body_err = Some(fluxplay_providers::redact_error(&e));
+                    break;
+                }
+            }
+        }
+        if let Some(e) = body_err {
+            last_err = e;
+            warn_host_once(&host, "image body failed", &last_err);
+            break;
+        }
+        if too_large {
+            warn!(%url, "image too large");
+            return Err((url, "image too large".into()));
+        }
         if looks_like_html(&bytes) {
             return Err((url, "html body".into()));
         }

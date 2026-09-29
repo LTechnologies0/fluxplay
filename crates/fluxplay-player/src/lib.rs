@@ -6,8 +6,11 @@
 
 mod android_quality;
 mod backend;
+mod external;
 #[cfg(all(feature = "native-ffmpeg", fluxplay_has_ffmpeg))]
 mod ffmpeg_ffi;
+#[cfg(all(feature = "native-ffmpeg", fluxplay_has_ffmpeg))]
+mod ffmpeg_pump;
 #[cfg(all(feature = "native-mpv", fluxplay_has_libmpv))]
 mod mpv_ffi;
 #[cfg(all(feature = "native-mpv", fluxplay_has_libmpv))]
@@ -15,6 +18,7 @@ mod soft_pump;
 mod native_log;
 mod platform;
 mod session;
+mod video_frame;
 
 use fluxplay_core::protocol::{DeliveryKind, StreamScheme, StreamUrl};
 use fluxplay_core::Channel;
@@ -28,11 +32,21 @@ pub use backend::{
     detect_backends, BackendCaps, BackendId, BackendInfo, NativePlayer, PlayOptions, PlayerEvent,
     VideoRect,
 };
+pub use external::{
+    detect_external_players, launch_external, pick_external_player, ExternalLaunch,
+    ExternalPlayer,
+};
 pub use native_log::{
     ffmpeg_av_log_level, log_native_verbosity_banner, mpv_msg_level, mpv_verbose_log_path,
     verbose_master,
 };
 pub use platform::{target_profile, Platform, TargetProfile};
+pub use video_frame::{
+    install_video_stage, video_stage_ready, yuv_to_rgb_coeffs, ColorMatrix, FrameData, GpuFrame,
+    GpuStage, PixelLayout, VideoFrame,
+};
+#[cfg(unix)]
+pub use video_frame::ExportedSlots;
 pub use session::{
     AspectMode, AudioChannelMode, Bookmark, DeinterlaceMode, EqPreset, PlaybackState,
     StreamSession, UpscaleMode,
@@ -58,6 +72,34 @@ pub enum PlayerError {
 
 pub type Result<T> = std::result::Result<T, PlayerError>;
 
+/// Network read-ahead of the embedded player (seconds of video already downloaded).
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct BufferState {
+    /// Playback holds because the queue ran dry (mpv `paused-for-cache`).
+    pub rebuffering: bool,
+    pub buffered_secs: f64,
+    /// Buffered seconds needed to resume.
+    pub goal_secs: f64,
+    /// Measured download rate (0 until known).
+    pub net_mbps: f64,
+    /// Average stream bitrate from the container (0 if unknown).
+    pub media_mbps: f64,
+}
+
+impl BufferState {
+    pub fn fill_percent(&self) -> u8 {
+        if self.goal_secs <= 0.0 {
+            return 0;
+        }
+        ((self.buffered_secs / self.goal_secs) * 100.0).clamp(0.0, 99.0) as u8
+    }
+
+    /// The link cannot sustain this stream: pauses will come back.
+    pub fn link_too_slow(&self) -> bool {
+        self.net_mbps > 0.0 && self.media_mbps > 0.0 && self.net_mbps < self.media_mbps * 0.97
+    }
+}
+
 /// Register Android `JavaVM` with the FFmpeg inside libmpv (MediaCodec Surface).
 /// Safe no-op when libmpv is not linked.
 pub fn register_android_java_vm(vm: *mut std::ffi::c_void) -> bool {
@@ -80,7 +122,28 @@ pub(crate) fn url_endpoint(raw: &str) -> String {
             (scheme, None) => scheme.to_string(),
         }
     } else {
-        raw.split(['?', '#']).next().unwrap_or(raw).to_string()
+        // Unparsable: the scheme at most (the path may hold `/user/pass/`).
+        raw.split_once("://")
+            .map(|(scheme, _)| format!("{scheme}://…"))
+            .unwrap_or_else(|| "<url>".into())
+    }
+}
+
+/// A `file:` URL naming an existing file under `FLUXPLAY_DOWNLOAD_ROOT` (a download of
+/// this app). Both sides are canonicalized, so `root/../../etc/…` does not qualify.
+pub(crate) fn is_downloaded_file(url: &str) -> bool {
+    let Some(path) = url.strip_prefix("file://").or_else(|| url.strip_prefix("file:")) else {
+        return false;
+    };
+    let Ok(root) = std::env::var("FLUXPLAY_DOWNLOAD_ROOT") else {
+        return false;
+    };
+    if root.trim().is_empty() {
+        return false;
+    }
+    match (std::fs::canonicalize(path), std::fs::canonicalize(root.trim())) {
+        (Ok(p), Ok(r)) => p.is_file() && p.starts_with(&r),
+        _ => false,
     }
 }
 
@@ -230,18 +293,11 @@ pub fn route(raw_url: &str) -> Result<RoutedStream> {
         let allow = std::env::var("FLUXPLAY_ALLOW_FILE")
             .map(|v| v == "1")
             .unwrap_or(false);
-        if !allow {
-            let path = raw_url
-                .strip_prefix("file://")
-                .or_else(|| raw_url.strip_prefix("file:"))
-                .unwrap_or(raw_url);
-            let p = std::path::Path::new(path);
-            if !p.is_file() {
-                return Err(PlayerError::Unsupported(
-                    "file:// refusé (fichier local introuvable; FLUXPLAY_ALLOW_FILE=1 pour forcer)"
-                        .into(),
-                ));
-            }
+        if !allow && !is_downloaded_file(raw_url) {
+            return Err(PlayerError::Unsupported(
+                "file:// refusé (hors du dossier de téléchargements; FLUXPLAY_ALLOW_FILE=1 pour forcer)"
+                    .into(),
+            ));
         }
     }
 

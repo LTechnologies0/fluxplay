@@ -16,13 +16,13 @@ chrono.workspace = true
 reqwest.workspace = true
 hickory-resolver.workspace = true
 tokio = { workspace = true, features = ["net", "io-util"] }
-tokio-socks = "0.5"
 tracing.workspace = true
 base64.workspace = true
 sha2.workspace = true
 hex.workspace = true
 uuid.workspace = true
 dirs.workspace = true
+flate2 = "1"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

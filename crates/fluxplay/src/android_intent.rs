@@ -98,15 +98,15 @@ pub fn open_url(url: &str, mime: Option<&str>) -> Result<(), String> {
             .map(|v| v == "1")
             .unwrap_or(false);
         if !allow {
-            warn!(%url, "external Intent blocked — tunnel/SOCKS active");
+            warn!(host = %url_host(url), "external Intent blocked — tunnel/SOCKS active");
             return Err(
                 "Lecteur externe ignore le tunnel SOCKS — utilisez libmpv".into(),
             );
         }
-        warn!(%url, "FLUXPLAY_ALLOW_CLEARNET_EXTERNAL=1 — external Intent on clearnet");
+        warn!(host = %url_host(url), "FLUXPLAY_ALLOW_CLEARNET_EXTERNAL=1 — external Intent on clearnet");
     }
 
-    info!(%url, mime = ?mime, "android ACTION_VIEW");
+    info!(host = %url_host(url), mime = ?mime, "android ACTION_VIEW");
     let ctx = ndk_context::android_context();
     let vm = unsafe { JavaVM::from_raw(ctx.vm().cast()) }.map_err(|e| e.to_string())?;
     let context = ctx.context() as jni::sys::jobject;
@@ -142,4 +142,12 @@ pub fn open_url(url: &str, mime: Option<&str>) -> Result<(), String> {
 /// Launch the platform player / chooser for a stream URL (`video/*`).
 pub fn open_stream_url(url: &str) -> Result<(), String> {
     open_url(url, Some("video/*"))
+}
+
+/// Host only: Xtream stream URLs carry `/user/pass/` in the path.
+fn url_host(url: &str) -> String {
+    url::Url::parse(url)
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_string))
+        .unwrap_or_else(|| "<url>".into())
 }

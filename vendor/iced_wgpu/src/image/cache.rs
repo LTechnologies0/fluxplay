@@ -472,8 +472,10 @@ mod worker {
                 jobs: jobs_receiver,
                 output: work_sender,
                 quit: quit_receiver,
-                atlases: [None, None],
+                atlases: [None, None, None, None, None],
+                atlas_binds: [None, None, None, None, None],
                 atlas_cursor: 0,
+                poster_atlas: None,
             };
 
             let handle = thread::spawn(move || instance.run());
@@ -524,10 +526,17 @@ mod worker {
         jobs: mpsc::Receiver<Job>,
         output: mpsc::SyncSender<Work>,
         quit: mpsc::Receiver<()>,
-        /// Persistent upload atlases (double-buffered) — avoids per-job
-        /// create_texture + VRAM churn for animated content (e.g. video frames).
-        atlases: [Option<Atlas>; 2],
+        /// Five video atlases: on-screen + iced present queue + in-flight upload.
+        /// Three still flashed when the compositor lagged a frame behind the
+        /// worker reset (full-frame blink).
+        atlases: [Option<Atlas>; 5],
+        /// Last bind group issued for each video atlas. Reset is deferred until
+        /// `Job::Drop` releases it — otherwise the compositor samples a wiped layer.
+        atlas_binds: [Option<Arc<wgpu::BindGroup>>; 5],
         atlas_cursor: usize,
+        /// Posters and logos. Never reset — video frames use `atlases` and wipe
+        /// them every frame, which made every mosaic tile show the last upload.
+        poster_atlas: Option<Atlas>,
     }
 
     #[derive(Debug)]
@@ -598,6 +607,15 @@ mod worker {
                         );
                     }
                     Job::Drop(bind_group) => {
+                        for slot in self.atlas_binds.iter_mut() {
+                            if slot
+                                .as_ref()
+                                .is_some_and(|live| Arc::ptr_eq(live, &bind_group))
+                            {
+                                *slot = None;
+                                break;
+                            }
+                        }
                         drop(bind_group);
                     }
                     Job::Quit => return,
@@ -619,38 +637,64 @@ mod worker {
                 },
             );
 
-            // Reuse a persistent atlas (double-buffered) instead of creating a new
-            // GPU texture per job — video frames were paying create_texture +
-            // create_view + create_bind_group (driver VRAM alloc) every frame.
-            // The other buffer may still be read by the in-flight previous frame;
-            // this one was presented ≥2 frames ago, so resetting it is safe.
+            // Video frames rotate worker atlases. Prefer a slot whose previous
+            // bind group was already dropped — resetting a live atlas is the
+            // full-frame blink. Posters stay on a separate never-reset atlas.
             let needed = width.max(height).max(2);
-            self.atlas_cursor = (self.atlas_cursor + 1) % 2;
-            let slot = &mut self.atlases[self.atlas_cursor];
-            let atlas = match slot {
-                Some(a) if a.size() >= needed => {
-                    a.reset();
-                    a
+            let is_frame = matches!(handle, image::Handle::Rgba { .. });
+            let mut frame_slot: Option<usize> = None;
+            let atlas = if is_frame {
+                let mut chosen = None;
+                for i in 0..5 {
+                    let idx = (self.atlas_cursor + 1 + i) % 5;
+                    if self.atlas_binds[idx].is_none() {
+                        chosen = Some(idx);
+                        break;
+                    }
                 }
-                // Frame exceeds the worker atlas cap (e.g. >8K): no atlas can
-                // hold it contiguously, so keep the existing one and let
-                // `upload` take the fragmented path instead of allocating a
-                // brand-new GPU texture every frame.
-                Some(a) if needed > atlas::WORKER_MAX_SIZE => {
-                    a.reset();
-                    a
+                let idx = chosen.unwrap_or_else(|| (self.atlas_cursor + 1) % 5);
+                self.atlas_cursor = idx;
+                frame_slot = Some(idx);
+                let slot = &mut self.atlases[idx];
+                match slot {
+                    Some(a) if a.size() >= needed => {
+                        a.reset();
+                        a
+                    }
+                    // Frame exceeds the worker atlas cap (e.g. >8K): no atlas can
+                    // hold it contiguously, so keep the existing one and let
+                    // `upload` take the fragmented path instead of allocating a
+                    // brand-new GPU texture every frame.
+                    Some(a) if needed > atlas::WORKER_MAX_SIZE => {
+                        a.reset();
+                        a
+                    }
+                    slot => {
+                        // Worker atlases may exceed the UI `MAX_SIZE` (2048) so a
+                        // 4K frame is reused every frame instead of recreating
+                        // the texture; `with_size_uncapped` clamps to 8192.
+                        let size = needed.next_power_of_two().max(atlas::DEFAULT_SIZE);
+                        slot.insert(Atlas::with_size_uncapped(
+                            &self.device,
+                            self.backend,
+                            self.texture_layout.clone(),
+                            size,
+                        ))
+                    }
                 }
-                slot => {
-                    // Worker atlases may exceed the UI `MAX_SIZE` (2048) so a
-                    // 4K frame is reused every frame instead of recreating
-                    // the texture; `with_size_uncapped` clamps to 8192.
-                    let size = needed.next_power_of_two().max(atlas::DEFAULT_SIZE);
-                    slot.insert(Atlas::with_size_uncapped(
-                        &self.device,
-                        self.backend,
-                        self.texture_layout.clone(),
-                        size,
-                    ))
+            } else {
+                let slot = &mut self.poster_atlas;
+                match slot {
+                    Some(a) if a.size() >= needed || needed > atlas::WORKER_MAX_SIZE => a,
+                    slot => {
+                        let size = needed.next_power_of_two().max(atlas::DEFAULT_SIZE);
+                        slot.insert(Atlas::with_size_uncapped(
+                            &self.device,
+                            self.backend,
+                            self.texture_layout.clone(),
+                            size,
+                        ))
+                    }
                 }
             };
 
@@ -662,6 +706,10 @@ mod worker {
                 height,
                 &rgba,
             ) else {
+                let _ = self.output.send(Work::Error {
+                    handle,
+                    error: image::Error::OutOfMemory,
+                });
                 return;
             };
 
@@ -673,6 +721,9 @@ mod worker {
             self.belt.recall();
 
             let bind_group = atlas.bind_group().clone();
+            if let Some(idx) = frame_slot {
+                self.atlas_binds[idx] = Some(bind_group.clone());
+            }
 
             self.queue.on_submitted_work_done(move || {
                 let _ = output.send(Work::Upload {

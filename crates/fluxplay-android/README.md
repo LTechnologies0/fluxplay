@@ -57,7 +57,7 @@ export FLUXPLAY_ANDROID_KEY_ALIAS=androiddebugkey
 export FLUXPLAY_ANDROID_KEY_PASS=android
 ```
 
-Cleartext HTTP is enabled for IPTV. WireGuard uses the same userspace `wg-socks` SOCKS path as desktop (app-scoped, not VpnService).
+Cleartext HTTP is enabled for IPTV. WireGuard uses the same in-process tunnel + loopback proxy as desktop (`crates/fluxplay/src/wg_proxy.rs`; app-scoped, not VpnService).
 Activity: `app.fluxplay.android.FluxPlayNativeActivity`.
 
 ## Install / logs

@@ -383,7 +383,8 @@ mod virtual_scroll_tests {
 pub fn mosaic_row_height(tile_w: f32) -> f32 {
     let w = tile_w.max(96.0);
     let poster_h = (w * 1.5).round();
-    poster_h + SPACE_SM + TYPE_LABEL_L + SPACE_SM + TYPE_LABEL_M + MOSAIC_GAP + 6.0
+    // iced line-height is taller than the font size; short rows overlap the next poster.
+    poster_h + SPACE_SM + TYPE_LABEL_L * 1.35 + SPACE_SM + TYPE_LABEL_M * 1.35 + MOSAIC_GAP + 8.0
 }
 
 /// Compact live / episode / category row stride (includes inter-row gap).
@@ -1508,7 +1509,8 @@ pub fn media_row<'a>(
         });
 
     let main: Element<'a, Message> = if let Some((is_fav, fav_msg)) = on_fav {
-        let star = if is_fav { "+" } else { "-" };
+        // The button says what a press does: remove when already a favorite.
+        let star = if is_fav { "−" } else { "+" };
         let fav_c = ui.tertiary();
         row![
             mark,
@@ -1983,6 +1985,36 @@ pub fn accent_mosaic(
     mosaic_grid(tiles, cols)
 }
 
+/// Tonal pill for the download action (detail hero, or `compact` on episode rows).
+pub fn download_pill<'a>(
+    ui: UiTheme,
+    label: String,
+    msg: Message,
+    compact: bool,
+) -> Element<'a, Message> {
+    let (size, pad) = if compact {
+        (12, Padding::from([8, 12]))
+    } else {
+        (14, Padding::from([12, 16]))
+    };
+    mouse_area(
+        container(text(label).size(size).color(ui.accent()))
+            .padding(pad)
+            .width(Length::Shrink)
+            .style(move |_t: &Theme| container::Style {
+                background: Some(Background::Color(ui.secondary_container())),
+                border: Border {
+                    radius: radius_fab(),
+                    color: ui.outline_variant(),
+                    width: 1.0,
+                },
+                ..Default::default()
+            }),
+    )
+    .on_press(msg)
+    .into()
+}
+
 /// Film / series detail: poster, synopsis, cast, primary play, optional episodes.
 // Detail-page renderer: args are independent view slots; grouping would just move the noise.
 #[allow(clippy::too_many_arguments)]
@@ -2003,10 +2035,17 @@ pub fn media_detail_page<'a>(
     imdb_query: String,
     play_label: Option<String>,
     play_msg: Option<Message>,
+    // Label follows the download state (Télécharger / 42 % · Annuler / Ouvrir le dossier),
+    // then the destination folder shown under the actions.
+    download: Option<(String, Message, String)>,
     back: Message,
     episodes: Option<Element<'a, Message>>,
     narrow: bool,
     loading_meta: bool,
+    // Extra facts under the crew (Pays, Langue, Récompenses).
+    facts: Vec<(&'static str, String)>,
+    // Shown under the synopsis ("Traduit automatiquement de l’anglais", "Traduction…").
+    plot_note: Option<String>,
 ) -> Element<'a, Message> {
     let poster_w = if narrow { 140.0 } else { 200.0 };
     let poster_h = poster_w * 1.5;
@@ -2032,7 +2071,7 @@ pub fn media_detail_page<'a>(
         })
         .into(),
         None => container(
-            text("No art")
+            text("Pas d’affiche")
                 .size(13)
                 .color(ui.ink_muted()),
         )
@@ -2060,7 +2099,10 @@ pub fn media_detail_page<'a>(
         meta_bits.push(g.to_string());
     }
     if let Some(r) = rating.filter(|s| !s.is_empty()) {
-        meta_bits.push(format!("* {r}"));
+        #[cfg(target_os = "android")]
+        meta_bits.push(format!("* {r}/10"));
+        #[cfg(not(target_os = "android"))]
+        meta_bits.push(format!("★ {r}/10"));
     }
     if let Some(rt) = runtime.filter(|s| !s.is_empty()) {
         meta_bits.push(rt.to_string());
@@ -2104,6 +2146,11 @@ pub fn media_detail_page<'a>(
             .into(),
         );
     }
+    let mut download_hint = None;
+    if let Some((label, msg, hint)) = download {
+        action_els.push(download_pill(ui, label, msg, false));
+        download_hint = Some(hint);
+    }
     let imdb_label = imdb_id
         .filter(|s| !s.is_empty())
         .map(|id| format!("IMDb · {id}"))
@@ -2126,6 +2173,9 @@ pub fn media_detail_page<'a>(
         .into(),
     );
     info = info.push(Row::with_children(action_els).spacing(SPACE_SM).wrap());
+    if let Some(hint) = download_hint {
+        info = info.push(text(hint).size(12).color(ui.ink_muted()));
+    }
 
     let hero: Element<'_, Message> = if narrow {
         column![art, info].spacing(SPACE_MD).width(Fill).into()
@@ -2142,6 +2192,9 @@ pub fn media_detail_page<'a>(
 
     if let Some(p) = plot.filter(|s| !s.trim().is_empty()) {
         body = body.push(section_block(ui, "Synopsis", p));
+        if let Some(note) = plot_note {
+            body = body.push(text(note).size(11).color(ui.ink_muted()));
+        }
     } else if loading_meta {
         body = body.push(section_block(
             ui,
@@ -2169,6 +2222,14 @@ pub fn media_detail_page<'a>(
     }
     if !crew.is_empty() {
         body = body.push(section_block(ui, "Équipe", &crew.join("\n")));
+    }
+    let facts: Vec<String> = facts
+        .into_iter()
+        .filter(|(_, v)| !v.trim().is_empty())
+        .map(|(k, v)| format!("{k} · {v}"))
+        .collect();
+    if !facts.is_empty() {
+        body = body.push(section_block(ui, "Informations", &facts.join("\n")));
     }
 
     let back = mouse_area(

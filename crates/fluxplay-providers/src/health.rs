@@ -34,13 +34,26 @@ pub async fn check_xtream_portal(portal: &str, username: &str, password: &str) -
     // Never log password — portal + username only.
     info!(portal = %base, user = %username, "portal health check start");
 
-    let auth_url = format!(
-        "{base}/player_api.php?username={username}&password={password}"
-    );
+    // Credentials go through the query encoder: `&`, `#` or `+` in a password must not
+    // split the query string.
+    let with_query = |script: &str, extra: &[(&str, &str)]| -> String {
+        let Ok(mut u) = url::Url::parse(&format!("{base}/{script}")) else {
+            return format!("{base}/{script}");
+        };
+        {
+            let mut q = u.query_pairs_mut();
+            q.append_pair("username", username).append_pair("password", password);
+            for (k, v) in extra {
+                q.append_pair(k, v);
+            }
+        }
+        u.to_string()
+    };
+    let auth_url = with_query("player_api.php", &[]);
     let auth_resp = match client.get(&auth_url).send().await {
         Ok(r) => r,
         Err(e) => {
-            error!(portal = %base, error = %e, "portal auth request failed");
+            error!(portal = %base, error = %crate::redact_error(&e), "portal auth request failed");
             return Err(e.into());
         }
     };
@@ -104,9 +117,7 @@ pub async fn check_xtream_portal(portal: &str, username: &str, password: &str) -
     }
 
     // get.php probe (often intentionally disabled → HTTP 885)
-    let get_url = format!(
-        "{base}/get.php?username={username}&password={password}&type=m3u_plus&output=ts"
-    );
+    let get_url = with_query("get.php", &[("type", "m3u_plus"), ("output", "ts")]);
     let get_php_ok = match client.get(&get_url).send().await {
         Ok(r) if r.status().is_success() => {
             let n = r.bytes().await.map(|b| b.len()).unwrap_or(0);
@@ -127,6 +138,7 @@ pub async fn check_xtream_portal(portal: &str, username: &str, password: &str) -
             false
         }
         Err(e) => {
+            let e = crate::redact_error(&e);
             notes.push(format!("get.php erreur: {e}"));
             warn!(error = %e, "get.php probe network error");
             false
@@ -136,9 +148,7 @@ pub async fn check_xtream_portal(portal: &str, username: &str, password: &str) -
     // Stream probe: skip PPV categories; try a few streams until HLS OK
     let mut stream_ok = false;
     let mut stream_final_url = None;
-    let cats_url = format!(
-        "{base}/player_api.php?username={username}&password={password}&action=get_live_categories"
-    );
+    let cats_url = with_query("player_api.php", &[("action", "get_live_categories")]);
     if let Ok(r) = client.get(&cats_url).send().await {
         if let Ok(v) = r.json::<serde_json::Value>().await {
             let cats = v.as_array().cloned().unwrap_or_default();
@@ -165,8 +175,9 @@ pub async fn check_xtream_portal(portal: &str, username: &str, password: &str) -
             debug!(categories = cat_ids.len(), "probing live streams for health");
 
             'probe: for (cid, _) in cat_ids {
-                let streams_url = format!(
-                    "{base}/player_api.php?username={username}&password={password}&action=get_live_streams&category_id={cid}"
+                let streams_url = with_query(
+                    "player_api.php",
+                    &[("action", "get_live_streams"), ("category_id", &cid)],
                 );
                 let Ok(sr) = client.get(&streams_url).send().await else {
                     continue;
@@ -190,7 +201,11 @@ pub async fn check_xtream_portal(portal: &str, username: &str, password: &str) -
 
                 for sid in ids {
                     // Stream URL embeds password — never log the full URL.
-                    let stream_url = format!("{base}/live/{username}/{password}/{sid}.m3u8");
+                    let stream_url = format!(
+                        "{base}/live/{}/{}/{sid}.m3u8",
+                        crate::xtream_url::path_segment(username),
+                        crate::xtream_url::path_segment(password)
+                    );
                     match client.get(&stream_url).send().await {
                         Ok(r) if r.status().is_success() => {
                             let final_u = r.url().to_string();
@@ -228,7 +243,7 @@ pub async fn check_xtream_portal(portal: &str, username: &str, password: &str) -
     }
 
     // xmltv size warning (often 50MB+)
-    let xml_url = format!("{base}/xmltv.php?username={username}&password={password}");
+    let xml_url = with_query("xmltv.php", &[]);
     if let Ok(head) = client.head(&xml_url).send().await {
         if let Some(len) = head.content_length() {
             if len > 8_000_000 {

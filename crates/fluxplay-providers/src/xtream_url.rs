@@ -8,11 +8,21 @@ use url::Url;
 
 use crate::ProviderError;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct XtreamCredentials {
     pub base: String,
     pub username: String,
     pub password: String,
+}
+
+impl std::fmt::Debug for XtreamCredentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("XtreamCredentials")
+            .field("base", &self.base)
+            .field("username", &self.username)
+            .field("password", &"***")
+            .finish()
+    }
 }
 
 /// If `endpoint` looks like `http(s)://host[:port]/get.php?username=&password=`, extract creds.
@@ -109,17 +119,29 @@ pub fn http_status_hint(status: u16) -> Option<&'static str> {
     hint
 }
 
+/// `s` as it appears in one URL path segment (how stream URLs embed user and password).
+pub fn path_segment(s: &str) -> String {
+    let mut u = Url::parse("http://x/").expect("static url");
+    if let Ok(mut seg) = u.path_segments_mut() {
+        seg.clear().push(s);
+    }
+    u.path().trim_start_matches('/').to_string()
+}
+
+/// Error for a non-success status, never carrying the request URL (it holds the credentials).
+pub fn status_error(code: u16) -> ProviderError {
+    match http_status_hint(code) {
+        Some(hint) => ProviderError::Message(format!("HTTP {code}: {hint}")),
+        None => ProviderError::Message(format!("HTTP {code}")),
+    }
+}
+
 pub fn map_http_error(err: reqwest::Error) -> ProviderError {
     if let Some(status) = err.status() {
-        let code = status.as_u16();
-        if let Some(hint) = http_status_hint(code) {
-            debug!(code, hint, "mapped HTTP error with hint");
-            return ProviderError::Message(format!("HTTP {code}: {hint}"));
-        }
-        debug!(code, "mapped HTTP error");
-        return ProviderError::Message(format!("HTTP {code}: {err}"));
+        debug!(code = status.as_u16(), "mapped HTTP error");
+        return status_error(status.as_u16());
     }
-    debug!(error = %err, "mapped network HTTP error");
+    debug!(error = %crate::redact_error(&err), "mapped network HTTP error");
     ProviderError::Http(err)
 }
 

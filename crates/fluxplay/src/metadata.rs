@@ -96,29 +96,20 @@ pub fn parse_title_query(raw: &str) -> TitleQuery {
     s = s.replace(['.', '_', '*'], " ");
     s = s.replace(':', " ");
     // Collapse "  " and trim punctuation leftovers
-    let mut cleaned = String::new();
-    for w in s.split_whitespace() {
-        let t = w.trim_matches(|c: char| matches!(c, '-' | ',' | ';' | '|' | '/'));
-        if t.is_empty() {
-            continue;
+    let mut words: Vec<&str> = s
+        .split_whitespace()
+        .map(|w| w.trim_matches(|c: char| matches!(c, '-' | ',' | ';' | '|' | '/')))
+        .filter(|t| !t.is_empty() && !is_noise_token(&t.to_ascii_lowercase()))
+        .collect();
+    // A bare number is a year only as the trailing word of a longer title:
+    // "1917", "2012" or "Blade Runner 2049 (2017)" keep their digits.
+    if year.is_none() && words.len() > 1 {
+        if let Some(y) = words.last().and_then(|t| parse_year_token(t)) {
+            year = Some(y);
+            words.pop();
         }
-        let lower = t.to_ascii_lowercase();
-        if is_noise_token(&lower) {
-            continue;
-        }
-        if year.is_none() {
-            if let Some(y) = parse_year_token(t) {
-                year = Some(y);
-                continue;
-            }
-        } else if parse_year_token(t).is_some() {
-            continue;
-        }
-        if !cleaned.is_empty() {
-            cleaned.push(' ');
-        }
-        cleaned.push_str(t);
     }
+    let cleaned = words.join(" ");
 
     let title = if cleaned.is_empty() {
         raw.trim().to_string()
@@ -360,6 +351,24 @@ fn is_noise_token(t: &str) -> bool {
     )
 }
 
+/// Below this many chars a synopsis is a blurb that a fuller source may replace.
+const SHORT_PLOT: usize = 80;
+
+fn has_text(s: &Option<String>) -> bool {
+    s.as_deref().map(|t| !t.trim().is_empty()).unwrap_or(false)
+}
+
+/// Keep the current synopsis unless it is missing / a blurb and the patch has more.
+fn keeps_plot(current: Option<&str>, patch: Option<&str>) -> bool {
+    let Some(new) = patch.filter(|p| !p.trim().is_empty()) else {
+        return true;
+    };
+    match current.map(str::trim).filter(|c| !c.is_empty()) {
+        None => false,
+        Some(cur) => cur.chars().count() >= SHORT_PLOT || cur.len() >= new.len(),
+    }
+}
+
 impl MetaPatch {
     fn merge(&mut self, other: MetaPatch) {
         macro_rules! fill {
@@ -372,12 +381,9 @@ impl MetaPatch {
         fill!(year);
         fill!(genre);
         fill!(poster);
-        if other.imdb_id.is_some() {
-            self.imdb_id = other.imdb_id.clone();
-        }
-        if other.rating.is_some() && (self.rating.is_none() || self.imdb_id.is_some()) {
-            self.rating = other.rating.clone();
-        }
+        // First match wins: a later title search must not swap in another film's id.
+        fill!(imdb_id);
+        fill!(rating);
         fill!(actors);
         fill!(director);
         fill!(writer);
@@ -386,9 +392,13 @@ impl MetaPatch {
         fill!(awards);
         fill!(language);
         fill!(country);
-        // Prefer longer / fuller plot (OMDb `plot=full` over short blurbs).
+        // Sources merge in trust order (OMDb → TVMaze → iTunes → Wikipedia): a later,
+        // longer text only replaces a blurb — a same-name Wikipedia article or a
+        // loose iTunes hit must not override the matched film's synopsis.
         match (&self.plot, &other.plot) {
-            (Some(a), Some(b)) if b.len() > a.len() => self.plot = other.plot,
+            (Some(a), Some(b)) if a.chars().count() < SHORT_PLOT && b.len() > a.len() => {
+                self.plot = other.plot
+            }
             (None, Some(_)) => self.plot = other.plot,
             _ => {}
         }
@@ -413,8 +423,13 @@ impl MetaPatch {
             };
         }
         set!(year);
-        set!(genre);
-        set!(plot);
+        // Portal genre / synopsis are often already in the viewer's language.
+        if !has_text(&item.genre) {
+            item.genre = self.genre.clone();
+        }
+        if !keeps_plot(item.plot.as_deref(), self.plot.as_deref()) {
+            item.plot = self.plot.clone();
+        }
         if self.poster.is_some() && item.poster.is_none() {
             item.poster = self.poster.clone();
         }
@@ -439,8 +454,12 @@ impl MetaPatch {
             };
         }
         set!(year);
-        set!(genre);
-        set!(plot);
+        if !has_text(&item.genre) {
+            item.genre = self.genre.clone();
+        }
+        if !keeps_plot(item.plot.as_deref(), self.plot.as_deref()) {
+            item.plot = self.plot.clone();
+        }
         if self.poster.is_some() && item.cover.is_none() {
             item.cover = self.poster.clone();
         }
@@ -559,53 +578,11 @@ pub fn imdb_title_url(imdb_id: &str) -> String {
 }
 
 pub async fn enrich_series(name: &str) -> Option<MetaPatch> {
-    let mut patch = enrich_title_full(name, "series", None)
-        .await
-        .unwrap_or_default();
-    let q = parse_title_query(name);
-    if needs_full_credits(patch.actors.as_deref(), patch.plot.as_deref()) {
-        if let Some(p) = tvmaze_show(&q.title).await {
-            patch.merge(p);
-        }
-    }
-    if patch.poster.is_none() || patch.year.is_none() {
-        if let Some(p) = itunes_lookup(&q, true).await {
-            patch.merge(p);
-        }
-    }
-    if patch.plot.as_ref().map(|p| p.len() < 40).unwrap_or(true) {
-        if let Some(p) = wikipedia_summary(&q.title).await {
-            patch.merge(p);
-        }
-    }
-    if patch.is_empty() {
-        None
-    } else {
-        Some(patch)
-    }
+    enrich_title_full(name, "series", None).await
 }
 
 pub async fn enrich_vod(name: &str) -> Option<MetaPatch> {
-    let mut patch = enrich_title_full(name, "movie", None)
-        .await
-        .unwrap_or_default();
-    if patch.poster.is_none() || patch.year.is_none() {
-        let q = parse_title_query(name);
-        if let Some(p) = itunes_lookup(&q, false).await {
-            patch.merge(p);
-        }
-    }
-    if patch.plot.as_ref().map(|p| p.len() < 40).unwrap_or(true) {
-        let q = parse_title_query(name);
-        if let Some(p) = wikipedia_summary(&q.title).await {
-            patch.merge(p);
-        }
-    }
-    if patch.is_empty() {
-        None
-    } else {
-        Some(patch)
-    }
+    enrich_title_full(name, "movie", None).await
 }
 
 /// Full IMDb-via-OMDb detail for the media page (synopsis + cast). Prefer `i=tt…`.
@@ -666,14 +643,14 @@ pub async fn enrich_title_full(
         }
     }
 
-    if patch.poster.is_none() {
+    if patch.poster.is_none() || patch.year.is_none() {
         if let Some(p) = itunes_lookup(&q, kind == "series").await {
             patch.merge(p);
         }
     }
 
     if patch.plot.as_ref().map(|p| p.len() < 40).unwrap_or(true) {
-        if let Some(p) = wikipedia_summary(&q.title).await {
+        if let Some(p) = wikipedia_summary(&q, kind == "series").await {
             patch.merge(p);
         }
     }
@@ -1049,7 +1026,8 @@ async fn omdb_get(url: &str, label: &str) -> Option<MetaPatch> {
     let body: OmdbResp = match resp.json().await {
         Ok(b) => b,
         Err(e) => {
-            warn!(%label, error = %e, "omdb JSON");
+            // The request URL carries the OMDb key.
+            warn!(%label, error = %fluxplay_providers::redact_error(&e), "omdb JSON");
             return None;
         }
     };
@@ -1111,7 +1089,7 @@ async fn itunes_lookup(q: &TitleQuery, series: bool) -> Option<MetaPatch> {
     let body: ItunesSearchResp = resp.json().await.ok()?;
     let results = body.results?;
     let want = q.title.to_ascii_lowercase();
-    let best = results.into_iter().max_by_key(|r| {
+    let (best_score, best) = results.into_iter().map(|r| {
         let name = r
             .track_name
             .as_deref()
@@ -1129,8 +1107,14 @@ async fn itunes_lookup(q: &TitleQuery, series: bool) -> Option<MetaPatch> {
                 score += 30;
             }
         }
-        score
-    })?;
+        (score, r)
+    })
+    .max_by_key(|(score, _)| *score)?;
+    // A year-only match is some other film: its art and synopsis would be wrong.
+    if best_score < 40 {
+        debug!(title = %q.title, best_score, "itunes: no title match");
+        return None;
+    }
     let poster = best.artwork_url_100.as_ref().map(|u| {
         u.replace("100x100bb", "600x600bb")
     });
@@ -1150,15 +1134,90 @@ async fn itunes_lookup(q: &TitleQuery, series: bool) -> Option<MetaPatch> {
     })
 }
 
-/// Wikipedia REST summary — plot-only fallback (no key).
-async fn wikipedia_summary(title: &str) -> Option<MetaPatch> {
-    let t = title.trim();
-    if t.len() < 2 {
+static PREF_LANG: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+
+/// Viewer language (settings) — localized Wikipedia is tried before English.
+pub fn set_pref_lang(lang: Option<String>) {
+    let cell = PREF_LANG.get_or_init(|| Mutex::new(None));
+    if let Ok(mut g) = cell.lock() {
+        *g = lang.map(|l| l.trim().to_ascii_lowercase()).filter(|l| l.len() == 2);
+    }
+}
+
+fn pref_lang() -> Option<String> {
+    PREF_LANG.get_or_init(|| Mutex::new(None)).lock().ok().and_then(|g| g.clone())
+}
+
+fn wiki_gate() -> &'static ApiGate {
+    static G: OnceLock<ApiGate> = OnceLock::new();
+    G.get_or_init(|| ApiGate::new("wikipedia", 150))
+}
+
+/// Disambiguated page titles per wiki (`Title (2016 film)`, `Titre (série télévisée)`).
+fn wiki_candidates(lang: &str, title: &str, year: Option<&str>, series: bool) -> Vec<String> {
+    let mut v = Vec::new();
+    let y = year.unwrap_or("");
+    match (lang, series) {
+        ("en", false) => {
+            if !y.is_empty() {
+                v.push(format!("{title} ({y} film)"));
+            }
+            v.push(format!("{title} (film)"));
+        }
+        ("en", true) => {
+            if !y.is_empty() {
+                v.push(format!("{title} ({y} TV series)"));
+            }
+            v.push(format!("{title} (TV series)"));
+        }
+        ("fr", false) => {
+            if !y.is_empty() {
+                v.push(format!("{title} (film, {y})"));
+            }
+            v.push(format!("{title} (film)"));
+        }
+        ("fr", true) => v.push(format!("{title} (série télévisée)")),
+        ("de", false) => v.push(format!("{title} (Film)")),
+        ("de", true) => v.push(format!("{title} (Fernsehserie)")),
+        ("es", false) => v.push(format!("{title} (película)")),
+        ("es", true) => v.push(format!("{title} (serie de televisión)")),
+        ("it", false) => {
+            if !y.is_empty() {
+                v.push(format!("{title} (film {y})"));
+            }
+            v.push(format!("{title} (film)"));
+        }
+        ("it", true) => v.push(format!("{title} (serie televisiva)")),
+        ("pt", false) => v.push(format!("{title} (filme)")),
+        ("pt", true) => v.push(format!("{title} (série de televisão)")),
+        ("nl", false) => v.push(format!("{title} (film)")),
+        ("nl", true) => v.push(format!("{title} (televisieserie)")),
+        _ => {}
+    }
+    v.push(title.to_string());
+    v
+}
+
+/// Wikidata short description names a film / series (any of the catalog languages).
+fn wiki_is_media(description: &str) -> bool {
+    const WORDS: &[&str] = &[
+        "film", "movie", "películ", "pelicul", "filme", "série", "serie", "sitcom", "anime",
+        "animated", "animé", "documentar", "telenovela", "fernseh", "miniseries", "show",
+        "dizi", "фильм", "сериал", "فيلم", "مسلسل", "ταινία", "σειρά",
+    ];
+    let d = description.to_lowercase();
+    WORDS.iter().any(|w| d.contains(w))
+}
+
+async fn wiki_fetch(lang: &str, page: &str) -> Option<WikiSummary> {
+    let gate = wiki_gate();
+    if gate.blocked() {
         return None;
     }
+    gate.wait_turn().await;
     let url = format!(
-        "https://en.wikipedia.org/api/rest_v1/page/summary/{}",
-        urlencoding_lite(t).replace('+', "_")
+        "https://{lang}.wikipedia.org/api/rest_v1/page/summary/{}",
+        urlencoding_lite(page).replace('+', "_")
     );
     let resp = http()
         .get(&url)
@@ -1166,21 +1225,58 @@ async fn wikipedia_summary(title: &str) -> Option<MetaPatch> {
         .send()
         .await
         .ok()?;
+    if resp.status().as_u16() == 429 {
+        gate.trip_429(60);
+        return None;
+    }
     if !resp.status().is_success() {
         return None;
     }
-    let body: WikiSummary = resp.json().await.ok()?;
-    if body.typ.as_deref() == Some("disambiguation") {
+    resp.json().await.ok()
+}
+
+/// Wikipedia REST summary — plot fallback (no key). Viewer-language wiki first,
+/// then English; the page must describe a film / series (plain titles like
+/// "Soul" otherwise land on the music genre).
+async fn wikipedia_summary(q: &TitleQuery, series: bool) -> Option<MetaPatch> {
+    let t = q.title.trim();
+    if t.chars().count() < 2 {
         return None;
     }
-    let plot = body.extract.filter(|s| s.len() >= 40)?;
-    let poster = body.thumbnail.and_then(|t| t.source);
-    debug!(%title, plot_len = plot.len(), "wikipedia hit");
-    Some(MetaPatch {
-        plot: Some(plot),
-        poster,
-        ..Default::default()
-    })
+    let mut wikis = Vec::new();
+    if let Some(l) = pref_lang().filter(|l| l != "en" && l != "sh") {
+        wikis.push(l);
+    }
+    wikis.push("en".to_string());
+    for lang in wikis {
+        let pages = wiki_candidates(&lang, t, q.year.as_deref(), series);
+        let n = pages.len();
+        for (i, page) in pages.into_iter().enumerate() {
+            let Some(body) = wiki_fetch(&lang, &page).await else {
+                continue;
+            };
+            if body.typ.as_deref() == Some("disambiguation") {
+                continue;
+            }
+            let plain = i + 1 == n;
+            let media = body.description.as_deref().map(wiki_is_media);
+            // Disambiguated pages are media by construction; plain titles must prove it.
+            if media == Some(false) || (plain && media != Some(true)) {
+                continue;
+            }
+            let Some(plot) = body.extract.filter(|s| s.len() >= 40) else {
+                continue;
+            };
+            let poster = body.thumbnail.and_then(|t| t.source);
+            debug!(title = %t, %lang, %page, plot_len = plot.len(), "wikipedia hit");
+            return Some(MetaPatch {
+                plot: Some(plot),
+                poster,
+                ..Default::default()
+            });
+        }
+    }
+    None
 }
 
 fn urlencoding_lite(s: &str) -> String {
@@ -1198,23 +1294,232 @@ fn urlencoding_lite(s: &str) -> String {
 }
 
 fn strip_html(raw: &str) -> String {
-    let mut out = String::with_capacity(raw.len());
-    let mut in_tag = false;
-    for c in raw.chars() {
-        match c {
-            '<' => in_tag = true,
-            '>' => in_tag = false,
-            _ if !in_tag => out.push(c),
-            _ => {}
+    clean_text(raw)
+}
+
+/// Decode HTML entities (`&amp;` `&#39;` `&#x27;` `&nbsp;` `&hellip;` …).
+fn decode_entities(s: &str) -> String {
+    if !s.contains('&') {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(i) = rest.find('&') {
+        out.push_str(&rest[..i]);
+        let tail = &rest[i..];
+        let end = tail[1..].find(';').map(|j| j + 1).filter(|j| *j <= 10);
+        let decoded = end.and_then(|j| {
+            let ent = &tail[1..j];
+            let c = match ent {
+                "amp" => '&',
+                "quot" => '"',
+                "apos" => '\'',
+                "lt" => '<',
+                "gt" => '>',
+                "nbsp" => ' ',
+                "hellip" => '…',
+                "ndash" => '–',
+                "mdash" => '—',
+                "rsquo" | "lsquo" => '\'',
+                "rdquo" | "ldquo" => '"',
+                "laquo" => '«',
+                "raquo" => '»',
+                "eacute" => 'é',
+                "egrave" => 'è',
+                "agrave" => 'à',
+                "ccedil" => 'ç',
+                _ => {
+                    let num = ent.strip_prefix('#')?;
+                    let code = match num.strip_prefix(['x', 'X']) {
+                        Some(hex) => u32::from_str_radix(hex, 16).ok()?,
+                        None => num.parse().ok()?,
+                    };
+                    char::from_u32(code)?
+                }
+            };
+            Some((c, j + 1))
+        });
+        match decoded {
+            Some((c, len)) => {
+                out.push(c);
+                rest = &tail[len..];
+            }
+            None => {
+                out.push('&');
+                rest = &tail[1..];
+            }
         }
     }
-    out.replace("&amp;", "&")
-        .replace("&quot;", "\"")
-        .replace("&#039;", "'")
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .trim()
-        .to_string()
+    out.push_str(rest);
+    out
+}
+
+/// Portal / API text → display text: tags removed (`<br>` → newline), entities
+/// decoded, blank runs collapsed, paragraph breaks kept.
+pub fn clean_text(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut chars = raw.char_indices().peekable();
+    while let Some((i, c)) = chars.next() {
+        if c == '<' {
+            if let Some(j) = raw[i..].find('>') {
+                let tag = raw[i + 1..i + j].trim().to_ascii_lowercase();
+                if tag.starts_with("br") || tag.starts_with("/p") || tag == "p" {
+                    out.push('\n');
+                }
+                while let Some((k, _)) = chars.peek() {
+                    if *k > i + j {
+                        break;
+                    }
+                    chars.next();
+                }
+                continue;
+            }
+        }
+        out.push(c);
+    }
+    let decoded = decode_entities(&out).replace('\r', "");
+    let mut lines: Vec<String> = Vec::new();
+    for line in decoded.split('\n') {
+        let l = line.split_whitespace().collect::<Vec<_>>().join(" ");
+        if l.is_empty() {
+            if lines.last().map(|p| !p.is_empty()).unwrap_or(false) {
+                lines.push(String::new());
+            }
+        } else {
+            lines.push(l);
+        }
+    }
+    while lines.last().map(|l| l.is_empty()).unwrap_or(false) {
+        lines.pop();
+    }
+    lines.join("\n")
+}
+
+fn is_placeholder_value(s: &str) -> bool {
+    matches!(
+        s.trim().to_ascii_lowercase().as_str(),
+        "" | "n/a" | "na" | "null" | "none" | "-" | "0" | "unknown" | "not rated" | "no description"
+            | "no plot" | "pas de description" | "aucune description"
+    )
+}
+
+/// Synopsis for display; placeholders (`N/A`, `0`) and title echoes dropped.
+pub fn fmt_plot(plot: Option<&str>, title: &str) -> Option<String> {
+    let p = clean_text(plot?);
+    if is_placeholder_value(&p) || p.chars().count() < 3 {
+        return None;
+    }
+    if p.eq_ignore_ascii_case(title.trim()) {
+        return None;
+    }
+    Some(p)
+}
+
+/// `7`, `6.5`, `7.2/10`, `72` (/100) → `7.2`; `0` / garbage → `None`.
+pub fn fmt_rating(r: Option<&str>) -> Option<String> {
+    let r = r?.trim();
+    let head = r.split('/').next().unwrap_or(r).trim().replace(',', ".");
+    let mut v: f32 = head.parse().ok()?;
+    if !v.is_finite() || v <= 0.0 {
+        return None;
+    }
+    if v > 10.0 && v <= 100.0 {
+        v /= 10.0;
+    }
+    if v > 10.0 {
+        return None;
+    }
+    let s = format!("{v:.1}");
+    Some(s.strip_suffix(".0").map(str::to_string).unwrap_or(s))
+}
+
+/// `02:16:18`, `136 min`, `136`, `PT2H16M` → `2 h 16`; `45 min` stays; zero → `None`.
+pub fn fmt_runtime(r: Option<&str>) -> Option<String> {
+    let r = r?.trim();
+    if is_placeholder_value(r) {
+        return None;
+    }
+    let minutes: u32 = if r.contains(':') {
+        let parts: Vec<u32> = r.split(':').filter_map(|p| p.trim().parse().ok()).collect();
+        match parts.as_slice() {
+            [h, m, _s] => h.saturating_mul(60).saturating_add(*m),
+            [a, b] if *a < 10 => a * 60 + b,
+            [a, _b] => *a,
+            _ => return Some(r.to_string()),
+        }
+    } else if let Some(iso) = r.strip_prefix("PT") {
+        let h = iso.split('H').next().filter(|_| iso.contains('H')).and_then(|x| x.parse::<u32>().ok()).unwrap_or(0);
+        let m = iso.rsplit('H').next().unwrap_or(iso).trim_end_matches('M').parse::<u32>().unwrap_or(0);
+        h.saturating_mul(60).saturating_add(m)
+    } else {
+        let digits: String = r.chars().take_while(|c| c.is_ascii_digit()).collect();
+        match digits.parse::<u32>() {
+            Ok(n) if r[digits.len()..].trim().is_empty() || r.to_ascii_lowercase().contains("min") => n,
+            _ => return Some(r.to_string()),
+        }
+    };
+    match minutes {
+        0 => None,
+        m if m < 60 => Some(format!("{m} min")),
+        m if m % 60 == 0 => Some(format!("{} h", m / 60)),
+        m => Some(format!("{} h {:02}", m / 60, m % 60)),
+    }
+}
+
+/// `2025-03-01` / `2019–2023` / `2024` → `2024`-style year (series keep ranges).
+pub fn fmt_year(y: Option<&str>) -> Option<String> {
+    let y = y?.trim();
+    let digits: String = y.chars().take(4).collect();
+    if digits.len() != 4 || !digits.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let n: u16 = digits.parse().ok()?;
+    if !(1900..=2100).contains(&n) {
+        return None;
+    }
+    // OMDb series range `2016–2025` / `2016–`
+    let rest = &y[4..];
+    if let Some(r) = rest.strip_prefix('–').or_else(|| rest.strip_prefix('-')) {
+        let end: String = r.chars().take(4).collect();
+        if r.is_empty() && !y.contains('-') {
+            return Some(format!("{digits}–"));
+        }
+        if end.len() == 4 && end.chars().all(|c| c.is_ascii_digit()) && r.len() == 4 {
+            return Some(format!("{digits}–{end}"));
+        }
+    }
+    Some(digits)
+}
+
+/// `Crime / Drama`, `Drama,Crime`, `Drama | Comedy` → `Crime, Drama`; deduped.
+pub fn fmt_genre(g: Option<&str>) -> Option<String> {
+    fmt_list(g, &[',', '/', '|', ';'])
+}
+
+/// Comma lists of people: trimmed, deduped, placeholders removed.
+pub fn fmt_people(p: Option<&str>) -> Option<String> {
+    fmt_list(p, &[','])
+}
+
+fn fmt_list(s: Option<&str>, seps: &[char]) -> Option<String> {
+    let s = decode_entities(s?);
+    let mut seen: Vec<String> = Vec::new();
+    for part in s.split(seps) {
+        let t = part.split_whitespace().collect::<Vec<_>>().join(" ");
+        if is_placeholder_value(&t) {
+            continue;
+        }
+        if !seen.iter().any(|x| x.eq_ignore_ascii_case(&t)) {
+            seen.push(t);
+        }
+    }
+    (!seen.is_empty()).then(|| seen.join(", "))
+}
+
+/// Content rating (`PG-13`, `TV-MA`, `16+`); `N/A` / `Not Rated` / `0` dropped.
+pub fn fmt_rated(r: Option<&str>) -> Option<String> {
+    let r = r?.trim();
+    (!is_placeholder_value(r)).then(|| r.to_string())
 }
 
 #[derive(Debug, Deserialize)]
@@ -1303,6 +1608,7 @@ struct ItunesResult {
 struct WikiSummary {
     #[serde(rename = "type")]
     typ: Option<String>,
+    description: Option<String>,
     extract: Option<String>,
     thumbnail: Option<WikiThumb>,
 }
@@ -1370,7 +1676,7 @@ struct OmdbSearchItem {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_title_query;
+    use super::*;
 
     #[test]
     fn strips_vod_lang_prefix_and_year() {
@@ -1424,5 +1730,91 @@ mod tests {
         let q = parse_title_query("The.Matrix.1999.1080p.BluRay.x264");
         assert_eq!(q.title, "The Matrix");
         assert_eq!(q.year.as_deref(), Some("1999"));
+    }
+
+    #[test]
+    fn numeric_titles_keep_their_digits() {
+        let q = parse_title_query("1917");
+        assert_eq!(q.title, "1917");
+        assert_eq!(q.year, None);
+        let q = parse_title_query("Blade Runner 2049 (2017)");
+        assert_eq!(q.title, "Blade Runner 2049");
+        assert_eq!(q.year.as_deref(), Some("2017"));
+        assert_eq!(fmt_runtime(Some("4294967295:00:00")).is_some(), true);
+    }
+
+    #[test]
+    fn display_formats() {
+        assert_eq!(fmt_rating(Some("0")), None);
+        assert_eq!(fmt_rating(Some("")), None);
+        assert_eq!(fmt_rating(Some("7")).as_deref(), Some("7"));
+        assert_eq!(fmt_rating(Some("6.54")).as_deref(), Some("6.5"));
+        assert_eq!(fmt_rating(Some("7.2/10")).as_deref(), Some("7.2"));
+        assert_eq!(fmt_rating(Some("72")).as_deref(), Some("7.2"));
+
+        assert_eq!(fmt_runtime(Some("02:16:18")).as_deref(), Some("2 h 16"));
+        assert_eq!(fmt_runtime(Some("01:40:00")).as_deref(), Some("1 h 40"));
+        assert_eq!(fmt_runtime(Some("136 min")).as_deref(), Some("2 h 16"));
+        assert_eq!(fmt_runtime(Some("45 min")).as_deref(), Some("45 min"));
+        assert_eq!(fmt_runtime(Some("120")).as_deref(), Some("2 h"));
+        assert_eq!(fmt_runtime(Some("00:00:00")), None);
+        assert_eq!(fmt_runtime(Some("N/A")), None);
+
+        assert_eq!(fmt_year(Some("2025-03-01")).as_deref(), Some("2025"));
+        assert_eq!(fmt_year(Some("2016–2025")).as_deref(), Some("2016–2025"));
+        assert_eq!(fmt_year(Some("")), None);
+
+        assert_eq!(fmt_genre(Some("Crime / Drama")).as_deref(), Some("Crime, Drama"));
+        assert_eq!(fmt_genre(Some("Drama,Drama, Comedy")).as_deref(), Some("Drama, Comedy"));
+        assert_eq!(fmt_people(Some("A, B ,, N/A, a")).as_deref(), Some("A, B"));
+        assert_eq!(fmt_rated(Some("N/A")), None);
+    }
+
+    #[test]
+    fn cleans_synopsis_text() {
+        assert_eq!(
+            clean_text("L&#39;histoire&nbsp;d&apos;un <b>homme</b>.<br>Suite &amp; fin&hellip;"),
+            "L'histoire d'un homme.\nSuite & fin…"
+        );
+        assert_eq!(clean_text("Tom &#x26; Jerry"), "Tom & Jerry");
+        assert_eq!(clean_text("AT&T rocks"), "AT&T rocks");
+        assert_eq!(fmt_plot(Some("N/A"), "X"), None);
+        assert_eq!(fmt_plot(Some("  "), "X"), None);
+        assert_eq!(fmt_plot(Some("Olga"), "Olga"), None);
+    }
+
+    #[test]
+    fn plot_merge_keeps_trusted_text() {
+        let mut p = MetaPatch {
+            plot: Some("A".repeat(120)),
+            ..Default::default()
+        };
+        p.merge(MetaPatch {
+            plot: Some("B".repeat(400)),
+            ..Default::default()
+        });
+        assert!(p.plot.as_deref().unwrap().starts_with('A'));
+
+        let mut short = MetaPatch {
+            plot: Some("Short blurb.".into()),
+            ..Default::default()
+        };
+        short.merge(MetaPatch {
+            plot: Some("B".repeat(200)),
+            ..Default::default()
+        });
+        assert!(short.plot.as_deref().unwrap().starts_with('B'));
+
+        assert!(keeps_plot(Some(&"Portail ".repeat(20)), Some(&"OMDb ".repeat(60))));
+        assert!(!keeps_plot(Some("Court."), Some(&"OMDb ".repeat(60))));
+        assert!(!keeps_plot(None, Some("x")));
+    }
+
+    #[test]
+    fn wiki_media_check() {
+        assert!(wiki_is_media("2020 American animated film"));
+        assert!(wiki_is_media("film d'animation américain"));
+        assert!(wiki_is_media("série télévisée américaine"));
+        assert!(!wiki_is_media("music genre"));
     }
 }

@@ -5,7 +5,7 @@
 
 use serde::{Deserialize, Serialize};
 
-/// How libmpv presents video on Android.
+/// How libmpv presents video (Android Surface / soft, desktop GPU window).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum AndroidPresentMode {
@@ -16,6 +16,8 @@ pub enum AndroidPresentMode {
     SurfaceEmbed,
     /// `vo=gpu` + egl-android on the same Surface (Phase D without Vulkan rebuild).
     GpuEgl,
+    /// Desktop: `vo=gpu-next` + OS window (Celluloid / Haruna / Jellyfin model).
+    NativeGpu,
 }
 
 impl AndroidPresentMode {
@@ -24,6 +26,7 @@ impl AndroidPresentMode {
             Self::SoftRgba => "soft-rgba",
             Self::SurfaceEmbed => "mediacodec-embed",
             Self::GpuEgl => "gpu-egl",
+            Self::NativeGpu => "native-gpu",
         }
     }
 
@@ -33,6 +36,10 @@ impl AndroidPresentMode {
 
     pub fn uses_soft_rgba(self) -> bool {
         matches!(self, Self::SoftRgba)
+    }
+
+    pub fn uses_native_window(self) -> bool {
+        matches!(self, Self::NativeGpu)
     }
 }
 

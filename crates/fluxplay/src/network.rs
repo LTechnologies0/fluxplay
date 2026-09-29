@@ -153,14 +153,14 @@ pub fn wireguard_status_line(net: &NetworkSettings) -> String {
         format!("bootstrap DNS : {}", net.wireguard_bootstrap_dns)
     };
     if net.wireguard_enabled {
-        if let Some(url) = crate::wg_tunnel::socks_proxy_url() {
+        if let Some(addr) = crate::wg_tunnel::proxy_display() {
             format!(
-                "Tunnel app SOCKS actif (« {name} ») — {url}. DNS app via tunnel ({bootstrap})."
+                "Tunnel app actif (« {name} ») — proxy local {addr} (SOCKS5 + HTTP). DNS résolu dans le tunnel ({bootstrap})."
             )
         } else if crate::wg_tunnel::tunnel_start_in_flight() {
-            format!("Profil « {name} » — démarrage tunnel app SOCKS… ({bootstrap})")
+            format!("Profil « {name} » — démarrage du tunnel, vérification du handshake… ({bootstrap})")
         } else {
-            format!("Profil « {name} » activé ({bootstrap}) — tunnel app SOCKS non joignable.")
+            format!("Profil « {name} » activé ({bootstrap}) — tunnel non établi.")
         }
     } else {
         format!("Profil « {name} » importé, tunnel off ({bootstrap}).")
@@ -176,12 +176,13 @@ pub fn dns_status_line(net: &NetworkSettings) -> String {
     };
     if crate::wg_tunnel::tunnel_is_up() {
         match net.dns_mode {
-            DnsMode::System => {
-                format!(
-                    "{base} Tunnel SOCKS ON → DoH Cloudflare dans le tunnel (pas le DNS= profil)."
-                )
-            }
-            _ => format!("{base} Tunnel SOCKS ON → DNS app via le tunnel."),
+            DnsMode::System => format!(
+                "{base} Tunnel ON → DNS du profil (DNS=) puis 1.1.1.1, interrogés dans le tunnel."
+            ),
+            DnsMode::Custom => format!("{base} Tunnel ON → ces serveurs, interrogés dans le tunnel."),
+            DnsMode::Doh | DnsMode::Dot => format!(
+                "{base} Tunnel ON → même fournisseur en DNS/TCP dans le tunnel (déjà chiffré par WireGuard)."
+            ),
         }
     } else {
         base

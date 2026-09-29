@@ -36,7 +36,6 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"
 quick-xml = { version = "0.37", features = ["serialize"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-regex = "1"
 base64 = "0.22"
 sha2 = "0.10"
 hex = "0.4"
@@ -53,6 +52,8 @@ iced = { path = "vendor/iced" }
 iced_winit = { path = "vendor/iced_winit" }
 iced_widget = { path = "vendor/iced_widget" }
 iced_wgpu = { path = "vendor/iced_wgpu" }
+# PresharedKey support (upstream 0.1.3 passes None to boringtun).
+tokio-wireguard = { path = "vendor/tokio-wireguard" }
 
 # ── Release binaries: max opt, dead-code elimination, stripped ──────────────
 # Default: `cargo build --release` / `cargo install`

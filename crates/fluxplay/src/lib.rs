@@ -6,16 +6,22 @@ mod browser;
 mod catalog_db;
 mod demo;
 mod display_caps;
+mod downloads;
 mod gpu_topology;
 mod icons;
 mod images;
 mod metadata;
+mod names;
 mod network;
+mod translate;
+mod wg_proxy;
 mod wg_tunnel;
 mod player_ui;
 mod profile_io;
 mod storage;
 mod theme;
+#[cfg(not(target_os = "android"))]
+mod video_stage;
 
 #[cfg(target_os = "android")]
 mod android_intent;

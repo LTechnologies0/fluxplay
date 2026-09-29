@@ -178,10 +178,16 @@ fn decode_maybe_b64(raw: &str) -> String {
     if t.is_empty() {
         return String::new();
     }
-    if let Ok(bytes) = B64.decode(t) {
-        if let Ok(s) = String::from_utf8(bytes) {
-            if !s.is_empty() && s.chars().any(|c| !c.is_control() || c == '\n' || c == '\t') {
-                return s;
+    // Plain words like "Film" are valid base64 too: only accept a decode that is padded
+    // to a multiple of 4 and reads as clean text.
+    if t.len() % 4 == 0 {
+        if let Ok(bytes) = B64.decode(t) {
+            if let Ok(s) = String::from_utf8(bytes) {
+                let clean = !s.trim().is_empty()
+                    && s.chars().all(|c| !c.is_control() || matches!(c, '\n' | '\t' | '\r'));
+                if clean {
+                    return s;
+                }
             }
         }
     }

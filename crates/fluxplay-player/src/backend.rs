@@ -16,6 +16,7 @@ use fluxplay_core::Stopwatch;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, error, info, trace, warn};
 
+use crate::video_frame::{ColorMatrix, FrameData, PixelLayout, VideoFrame};
 use crate::{url_endpoint, PlayerError, Result};
 
 #[cfg(not(target_os = "android"))] // CLI/IPC player path — desktop only
@@ -30,6 +31,10 @@ pub enum BackendId {
     ExoPlayer,
     AvPlayer,
 }
+
+
+const LAVF_RECONNECT: &str =
+    "reconnect_streamed=1,reconnect_delay_max=5,reconnect_on_network_error=1";
 
 impl BackendId {
     pub fn label(self) -> &'static str {
@@ -143,7 +148,7 @@ fn preferred_hwdec() -> &'static str {
     }
     #[cfg(not(target_os = "android"))]
     {
-        // Soft embed / hybrid: always copy path. Prefer auto-copy.
+        // Native GPU VO uses zero-copy `auto`. Soft RGBA forces *-copy at the call site.
         if let Ok(v) = std::env::var("FLUXPLAY_HWDEC") {
             let lower = v.to_ascii_lowercase();
             if matches!(
@@ -155,7 +160,7 @@ fn preferred_hwdec() -> &'static str {
                 return Box::leak(lower.into_boxed_str());
             }
         }
-        "auto-copy"
+        "auto"
     }
 }
 
@@ -234,6 +239,12 @@ pub struct PlayOptions {
     /// LED vs AMOLED tone.
     #[serde(default)]
     pub display_panel: fluxplay_core::models::DisplayPanelPref,
+    /// System player id for the External backend (`None` = OS default / best installed).
+    #[serde(default)]
+    pub external_player: Option<String>,
+    /// Window title handed to external players (hides the tokenised URL).
+    #[serde(default)]
+    pub media_title: Option<String>,
 }
 
 fn default_tonemap_on() -> bool {
@@ -312,6 +323,8 @@ impl Default for PlayOptions {
             video_max_wh: None,
             hdr_mode: Default::default(),
             display_panel: Default::default(),
+            external_player: None,
+            media_title: None,
         }
     }
 }
@@ -400,16 +413,36 @@ pub fn detect_backends() -> Vec<BackendInfo> {
         });
     }
 
-    out.push(BackendInfo {
-        id: BackendId::External,
-        available: true,
-        path: None,
-        detail: if cfg!(target_os = "android") {
-            "ACTION_VIEW Intent".into()
-        } else {
-            "OS default handler / VLC / IINA".into()
-        },
-    });
+    if cfg!(target_os = "android") {
+        out.push(BackendInfo {
+            id: BackendId::External,
+            available: true,
+            path: None,
+            detail: "ACTION_VIEW Intent".into(),
+        });
+    } else {
+        let players = crate::detect_external_players();
+        out.push(BackendInfo {
+            id: BackendId::External,
+            available: !players.is_empty(),
+            path: None,
+            detail: if players.is_empty() {
+                "aucun lecteur vidéo trouvé — installez VLC, mpv ou Haruna".into()
+            } else {
+                players
+                    .iter()
+                    .map(|p| {
+                        if p.is_default {
+                            format!("{} (par défaut)", p.label())
+                        } else {
+                            p.label()
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            },
+        });
+    }
 
     #[cfg(target_os = "ios")]
     out.push(BackendInfo {
@@ -655,6 +688,15 @@ fn pick_backend(pref: PlayerBackendPref) -> Result<BackendId> {
     result
 }
 
+/// Screenshot source kept from the embedded stream.
+enum SoftShot {
+    Rgba(u32, u32, Arc<[u8]>),
+    /// YUV planes copied from a CPU frame.
+    Frame(VideoFrame),
+    /// Zero-copy frame of this size: read back from the decoder on demand.
+    Gpu(u32, u32),
+}
+
 /// Controls native playback (in-process libmpv / FFmpeg, optional CLI child).
 pub struct NativePlayer {
     backend: Option<BackendId>,
@@ -663,18 +705,22 @@ pub struct NativePlayer {
     #[cfg(all(feature = "native-mpv", fluxplay_has_libmpv))]
     soft_pump: Option<crate::soft_pump::SoftPump>,
     #[cfg(all(feature = "native-ffmpeg", fluxplay_has_ffmpeg))]
-    libffmpeg: Option<crate::ffmpeg_ffi::LibFfmpeg>,
+    libffmpeg: Option<std::sync::Arc<crate::ffmpeg_ffi::LibFfmpeg>>,
+    #[cfg(all(feature = "native-ffmpeg", fluxplay_has_ffmpeg))]
+    ff_pump: Option<crate::ffmpeg_pump::FfmpegPump>,
     child: Option<Child>,
     ipc_path: Option<PathBuf>,
     opts: PlayOptions,
     /// Borderless mpv window locked to the iced player stage.
     video_rect: Option<VideoRect>,
+    /// Soft present cadence (monitor refresh). Decode thread drops above this.
+    present_hz: u32,
     /// Last mute state sent to ffplay CLI (`m` is a toggle — keep edge-only).
     ffplay_muted: bool,
     /// Last pause state for ffplay CLI (`space` is a toggle).
     ffplay_paused: bool,
-    /// Last soft RGBA frame (libmpv / libffmpeg) for screenshot fallback.
-    last_soft_rgba: Option<(u32, u32, Arc<[u8]>)>,
+    /// Last embedded frame (libmpv / libffmpeg) for screenshot fallback.
+    last_shot: Option<SoftShot>,
     soft_shot_tick: u32,
     /// Active Android present path (soft vs Surface).
     android_present: crate::AndroidPresentMode,
@@ -703,13 +749,16 @@ impl NativePlayer {
             soft_pump: None,
             #[cfg(all(feature = "native-ffmpeg", fluxplay_has_ffmpeg))]
             libffmpeg: None,
+            #[cfg(all(feature = "native-ffmpeg", fluxplay_has_ffmpeg))]
+            ff_pump: None,
             child: None,
             ipc_path: None,
             opts,
             video_rect: None,
+            present_hz: 60,
             ffplay_muted: false,
             ffplay_paused: false,
-            last_soft_rgba: None,
+            last_shot: None,
             soft_shot_tick: 0,
             android_present: crate::AndroidPresentMode::default(),
         }
@@ -775,16 +824,22 @@ impl NativePlayer {
     pub fn display_label(&self) -> &'static str {
         #[cfg(all(feature = "native-mpv", fluxplay_has_libmpv))]
         if self.libmpv.is_some() {
-            return "libmpv (embed)";
+            return if self.android_present.uses_native_window() {
+                "libmpv (GPU)"
+            } else if self.android_present.uses_surface() {
+                "libmpv (Surface)"
+            } else {
+                "libmpv (soft)"
+            };
         }
         if self.ipc_path.is_some() {
             return "mpv (CLI)";
         }
         if self.using_libffmpeg() {
-            return "FFmpeg (embed)";
+            return "FFmpeg (soft)";
         }
         if self.using_ffplay_cli() {
-            return "ffplay (CLI)";
+            return "ffplay (GPU)";
         }
         self.backend.map(|b| b.label()).unwrap_or("—")
     }
@@ -813,8 +868,20 @@ fn snapshot_scaled(w: u32, h: u32, pixels: &[u8]) -> (u32, u32, Arc<[u8]>) {
     (dw, dh, Arc::from(out.as_slice()))
 }
 
-/// mpv `paused-for-cache` — drives Buffering state.
+/// Embedded FFmpeg read-ahead; `None` for other backends.
+    pub fn buffer_state(&self) -> Option<crate::BufferState> {
+        #[cfg(all(feature = "native-ffmpeg", fluxplay_has_ffmpeg))]
+        if let Some(ff) = &self.libffmpeg {
+            return Some(ff.buffer_state());
+        }
+        None
+    }
+
+    /// mpv `paused-for-cache` / FFmpeg rebuffer — drives Buffering state.
     pub fn paused_for_cache(&self) -> bool {
+        if let Some(b) = self.buffer_state() {
+            return b.rebuffering;
+        }
         #[cfg(all(feature = "native-mpv", fluxplay_has_libmpv))]
         if let Some(mpv) = self.try_lock_mpv() {
             return mpv.get_property_flag("paused-for-cache").unwrap_or(false);
@@ -825,10 +892,51 @@ fn snapshot_scaled(w: u32, h: u32, pixels: &[u8]) -> (u32, u32, Arc<[u8]>) {
         false
     }
 
-    pub fn last_soft_rgba(&self) -> Option<(u32, u32, &[u8])> {
-        self.last_soft_rgba
-            .as_ref()
-            .map(|(w, h, b)| (*w, *h, b.as_ref()))
+    /// RGBA of the last embedded frame for PNG capture.
+    pub fn soft_snapshot_rgba(&self) -> Option<(u32, u32, Vec<u8>)> {
+        match self.last_shot.as_ref()? {
+            SoftShot::Rgba(w, h, px) => Some((*w, *h, px.to_vec())),
+            SoftShot::Frame(frame) => frame.to_rgba(),
+            SoftShot::Gpu(w, h) => {
+                #[cfg(all(feature = "native-ffmpeg", fluxplay_has_ffmpeg))]
+                if let Some(ff) = &self.libffmpeg {
+                    return ff.gpu_snapshot(*w, *h);
+                }
+                let _ = (w, h);
+                None
+            }
+        }
+    }
+
+    /// Keep a cheap copy of every 180th frame for [`Self::soft_snapshot_rgba`]:
+    /// RGBA downscaled, YUV planes as-is (converted only when captured).
+    fn remember_shot(&mut self, frame: &VideoFrame) {
+        self.soft_shot_tick = self.soft_shot_tick.wrapping_add(1);
+        if self.last_shot.is_some() && !self.soft_shot_tick.is_multiple_of(180) {
+            return;
+        }
+        self.last_shot = match &frame.data {
+            FrameData::Gpu(_) => Some(SoftShot::Gpu(frame.width, frame.height)),
+            FrameData::Cpu(px) if frame.layout == PixelLayout::Rgba && frame.pitch == frame.width * 4 => {
+                Some(Self::snapshot_scaled(frame.width, frame.height, px))
+                    .map(|(w, h, px)| SoftShot::Rgba(w, h, px))
+            }
+            FrameData::Cpu(px) => {
+                let mut copy = match self.last_shot.take() {
+                    Some(SoftShot::Frame(old)) => match old.data {
+                        FrameData::Cpu(buf) => buf,
+                        FrameData::Gpu(_) => Vec::new(),
+                    },
+                    _ => Vec::new(),
+                };
+                copy.clear();
+                copy.extend_from_slice(px);
+                Some(SoftShot::Frame(VideoFrame {
+                    data: FrameData::Cpu(copy),
+                    ..*frame
+                }))
+            }
+        };
     }
     fn using_ffplay_cli(&self) -> bool {
         if self.backend != Some(BackendId::Ffmpeg) || self.child.is_none() {
@@ -859,6 +967,35 @@ fn snapshot_scaled(w: u32, h: u32, pixels: &[u8]) -> (u32, u32, Arc<[u8]>) {
         &mut self.opts
     }
 
+    /// Hand `url` to the chosen / default system player. Returns its label.
+    ///
+    /// Refused while the app tunnel is up: external players would bypass it.
+    pub fn start_external(&self, url: &str) -> Result<String> {
+        let clearnet_ok = std::env::var("FLUXPLAY_ALLOW_CLEARNET_EXTERNAL")
+            .map(|v| v == "1")
+            .unwrap_or(false);
+        if self.opts.http_proxy.is_some() && !clearnet_ok {
+            return Err(PlayerError::Backend(
+                "Lecteur externe bloqué — tunnel actif (FLUXPLAY_ALLOW_CLEARNET_EXTERNAL=1 pour forcer)"
+                    .into(),
+            ));
+        }
+        let player = crate::pick_external_player(self.opts.external_player.as_deref())
+            .ok_or_else(|| {
+                PlayerError::Backend(
+                    "Aucun lecteur vidéo système trouvé — installez VLC, mpv ou Haruna".into(),
+                )
+            })?;
+        let launch = crate::ExternalLaunch {
+            user_agent: self.opts.user_agent.as_deref(),
+            referer: self.opts.referer.as_deref(),
+            title: self.opts.media_title.as_deref(),
+            cache_ms: Some(self.opts.cache_ms),
+        };
+        crate::launch_external(&player, url, &launch)?;
+        Ok(player.label())
+    }
+
     /// Pin the video surface size for embedded software rendering (logical stage).
     pub fn set_video_rect(&mut self, rect: VideoRect) {
         if !rect.is_usable() {
@@ -869,6 +1006,14 @@ fn snapshot_scaled(w: u32, h: u32, pixels: &[u8]) -> (u32, u32, Arc<[u8]>) {
         }
         debug!(?rect, "NativePlayer::set_video_rect");
         self.video_rect = Some(rect);
+        #[cfg(all(feature = "native-ffmpeg", fluxplay_has_ffmpeg))]
+        if let Some(ff) = self.libffmpeg.as_ref() {
+            let (rw, rh) = crate::ffmpeg_ffi::LibFfmpeg::soft_present_dims(rect.w, rect.h);
+            ff.set_output_size(rw, rh);
+            if let Some(pump) = self.ff_pump.as_ref() {
+                pump.set_target(rw, rh);
+            }
+        }
         if !self.has_embedded_video() {
             self.apply_video_geometry();
         }
@@ -878,52 +1023,95 @@ fn snapshot_scaled(w: u32, h: u32, pixels: &[u8]) -> (u32, u32, Arc<[u8]>) {
         self.video_rect
     }
 
-    /// Pull an RGBA frame for the iced stage (embedded libmpv / FFmpeg software render).
-    /// Returns `None` when there is no new frame — keep the previous ImageHandle.
+    /// Monitor refresh for soft present and native `display-fps-override`.
+    pub fn set_present_hz(&mut self, hz: u32) {
+        let hz = hz.clamp(24, 120);
+        self.present_hz = hz;
+        #[cfg(all(feature = "native-ffmpeg", fluxplay_has_ffmpeg))]
+        if let Some(ff) = self.libffmpeg.as_ref() {
+            ff.set_present_hz(hz);
+        }
+        #[cfg(all(feature = "native-mpv", fluxplay_has_libmpv))]
+        if self.android_present.uses_native_window() {
+            if let Some(mpv) = self.lock_mpv() {
+                let fps = format!("{hz}");
+                let _ = mpv.set_property("display-fps-override", &fps);
+            }
+        }
+    }
+
+    /// Next frame for the GPU video stage (embedded libmpv RGBA / FFmpeg YUV or
+    /// zero-copy). `None` when there is no new frame — keep the previous one.
+    /// `w`×`h` is the stage size in pixels (libmpv renders at that size).
     /// Android Surface present modes never produce soft frames.
-    pub fn pull_video_frame(&mut self, w: u32, h: u32) -> Option<(u32, u32, Vec<u8>)> {
+    pub fn pull_frame(&mut self, w: u32, h: u32) -> Option<VideoFrame> {
         if self.android_present.uses_surface() {
             return None;
         }
         let rw = (w.clamp(2, 3840) & !1).max(2);
         let rh = (h.clamp(2, 2160) & !1).max(2);
+        let frame = self.pull_embedded(rw, rh)?;
+        self.remember_shot(&frame);
+        Some(frame)
+    }
+
+    fn pull_embedded(&mut self, rw: u32, rh: u32) -> Option<VideoFrame> {
         #[cfg(all(feature = "native-mpv", fluxplay_has_libmpv))]
         if self.libmpv.is_some() {
-            if let Some(pump) = self.soft_pump.as_ref() {
+            let (fw, fh, pixels) = if let Some(pump) = self.soft_pump.as_ref() {
                 pump.set_target(rw, rh);
-                if let Some((fw, fh, pixels)) = pump.take_frame() {
-                    self.soft_shot_tick = self.soft_shot_tick.wrapping_add(1);
-                    if self.last_soft_rgba.is_none() || self.soft_shot_tick.is_multiple_of(180) {
-                        self.last_soft_rgba = Some(Self::snapshot_scaled(fw, fh, &pixels));
-                    }
-                    return Some((fw, fh, pixels));
-                }
-                return None;
-            }
-            let pixels = {
+                pump.take_frame()?
+            } else {
                 let mut mpv = self.lock_mpv()?;
-                mpv.render_sw_rgba(rw, rh)?
+                (rw, rh, mpv.render_sw_rgba(rw, rh)?)
             };
-            self.soft_shot_tick = self.soft_shot_tick.wrapping_add(1);
-            if self.last_soft_rgba.is_none() || self.soft_shot_tick.is_multiple_of(180) {
-                self.last_soft_rgba = Some(Self::snapshot_scaled(rw, rh, &pixels));
-            }
-            return Some((rw, rh, pixels));
+            return Some(VideoFrame {
+                layout: PixelLayout::Rgba,
+                width: fw,
+                height: fh,
+                pitch: fw * 4,
+                sar: (1, 1),
+                matrix: ColorMatrix::Bt709,
+                full_range: true,
+                data: FrameData::Cpu(pixels),
+            });
         }
         // Software fallback path — reachable when the FFmpeg backend is selected
         // at runtime (libmpv compiled but not the active backend).
         #[cfg(all(feature = "native-ffmpeg", fluxplay_has_ffmpeg))]
-        if let Some(ff) = self.libffmpeg.as_ref() {
-            let (rw, rh) = crate::ffmpeg_ffi::LibFfmpeg::soft_present_dims(w, h);
-            let pixels = ff.pull_rgba(rw, rh)?;
-            self.soft_shot_tick = self.soft_shot_tick.wrapping_add(1);
-            if self.last_soft_rgba.is_none() || self.soft_shot_tick.is_multiple_of(180) {
-                self.last_soft_rgba = Some(Self::snapshot_scaled(rw, rh, &pixels));
-            }
-            return Some((rw, rh, pixels));
+        if let Some(pump) = self.ff_pump.as_ref() {
+            pump.set_target(rw, rh);
+            return pump.take_frame();
         }
         let _ = (rw, rh);
         None
+    }
+
+    /// Pull an RGBA frame for the iced image stage (no GPU stage installed).
+    /// Returns `None` when there is no new frame — keep the previous ImageHandle.
+    pub fn pull_video_frame(&mut self, w: u32, h: u32) -> Option<(u32, u32, Vec<u8>)> {
+        let frame = self.pull_frame(w, h)?;
+        match frame.data {
+            FrameData::Cpu(px) if frame.layout == PixelLayout::Rgba && frame.pitch == frame.width * 4 => {
+                Some((frame.width, frame.height, px))
+            }
+            _ => None,
+        }
+    }
+
+    /// Hand a displayed frame back so its buffer is reused (GPU slots are
+    /// released when the frame drops).
+    pub fn recycle_video_frame(&mut self, frame: VideoFrame) {
+        if let FrameData::Cpu(buf) = frame.data {
+            if frame.layout == PixelLayout::Rgba {
+                self.recycle_soft_rgba(buf);
+            } else {
+                #[cfg(all(feature = "native-ffmpeg", fluxplay_has_ffmpeg))]
+                if let Some(pump) = self.ff_pump.as_ref() {
+                    pump.recycle(buf);
+                }
+            }
+        }
     }
 
     /// Return a discarded soft RGBA buffer to the embed pool (mpv capacity recycle).
@@ -957,16 +1145,18 @@ fn snapshot_scaled(w: u32, h: u32, pixels: &[u8]) -> (u32, u32, Arc<[u8]>) {
             }
         }
         #[cfg(all(feature = "native-ffmpeg", fluxplay_has_ffmpeg))]
-        if let Some(ff) = &self.libffmpeg {
-            return ff.has_frame();
+        if let Some(pump) = &self.ff_pump {
+            return pump.needs_redraw();
         }
         false
     }
 
     pub fn has_embedded_video(&self) -> bool {
+        // Only soft-RGBA feeds iced. Native GPU / Surface own their own present
+        // (Jellyfin / IPTVnator / Celluloid model) — no CPU frame pump.
         #[cfg(all(feature = "native-mpv", fluxplay_has_libmpv))]
         if self.libmpv.is_some() {
-            return true;
+            return self.android_present.uses_soft_rgba();
         }
         #[cfg(all(feature = "native-ffmpeg", fluxplay_has_ffmpeg))]
         if self.libffmpeg.is_some() {
@@ -1074,13 +1264,20 @@ fn snapshot_scaled(w: u32, h: u32, pixels: &[u8]) -> (u32, u32, Arc<[u8]>) {
         let Some(rect) = self.video_rect.filter(|r| r.is_usable()) else {
             return;
         };
-        // Only applies to CLI mpv fallback (separate window).
-        if self.has_embedded_video() {
+        // Soft iced stage owns layout — no OS video window to move.
+        if self.android_present.uses_soft_rgba() {
             return;
         }
         let geo = rect.to_geometry();
         let border = if rect.anchored { "no" } else { "yes" };
         let ontop = if rect.anchored { "yes" } else { "no" };
+        #[cfg(all(feature = "native-mpv", fluxplay_has_libmpv))]
+        if let Some(mpv) = self.lock_mpv() {
+            let _ = mpv.set_property("geometry", &geo);
+            let _ = mpv.set_property("border", border);
+            let _ = mpv.set_property("ontop", ontop);
+            return;
+        }
         if let Some(path) = &self.ipc_path {
             let _ = mpv_cmd(path, &["set_property", "geometry", &geo]);
             let _ = mpv_cmd(path, &["set_property", "border", border]);
@@ -1095,23 +1292,23 @@ fn snapshot_scaled(w: u32, h: u32, pixels: &[u8]) -> (u32, u32, Arc<[u8]>) {
     pub fn is_running(&mut self) -> bool {
         #[cfg(all(feature = "native-mpv", fluxplay_has_libmpv))]
         {
-            if let Some(mpv) = self.lock_mpv() {
-                // Avoid idle-active alone (flaps → black stage). Combine EOF + empty path.
-                if let Some(eof) = mpv.get_property_string("eof-reached") {
-                    if eof == "yes" || eof == "true" {
+            // Never block the UI behind soft-RGBA render. If the pump holds the
+            // mutex, keep the last alive bit instead of hitching picture + bar.
+            match self.try_lock_mpv() {
+                Some(mpv) => {
+                    if mpv.get_property_flag("eof-reached") == Some(true) {
                         return false;
                     }
-                }
-                let path = mpv.get_property_string("path").unwrap_or_default();
-                if path.is_empty() {
-                    if let Some(idle) = mpv.get_property_string("idle-active") {
-                        if idle == "yes" || idle == "true" {
-                            // Failed/stalled loadfile: idle with nothing loaded.
-                            return false;
-                        }
+                    let path = mpv.get_property_string("path").unwrap_or_default();
+                    if path.is_empty()
+                        && mpv.get_property_flag("idle-active") == Some(true)
+                    {
+                        return false;
                     }
+                    return true;
                 }
-                return true;
+                None if self.libmpv.is_some() => return true,
+                None => {}
             }
         }
         #[cfg(all(feature = "native-ffmpeg", fluxplay_has_ffmpeg))]
@@ -1186,7 +1383,7 @@ fn snapshot_scaled(w: u32, h: u32, pixels: &[u8]) -> (u32, u32, Arc<[u8]>) {
                     }
                     #[cfg(not(target_os = "android"))]
                     {
-                        open::that(url).map_err(|e| PlayerError::Backend(e.to_string()))
+                        this.start_external(url).map(|_| ())
                     }
                 }
                 BackendId::ExoPlayer | BackendId::AvPlayer => Err(PlayerError::Backend(
@@ -1210,7 +1407,7 @@ fn snapshot_scaled(w: u32, h: u32, pixels: &[u8]) -> (u32, u32, Arc<[u8]>) {
                 self.child = None;
                 self.backend = None;
                 self.ipc_path = None;
-                warn!(%status, %url, "player exited immediately — retry once");
+                warn!(%status, endpoint = %url_endpoint(url), "player exited immediately — retry once");
                 std::thread::sleep(std::time::Duration::from_millis(800));
                 if let Err(e) = attempt(self, backend, url) {
                     error!(?backend, %endpoint, error = %e, "native play retry failed");
@@ -1237,7 +1434,7 @@ fn snapshot_scaled(w: u32, h: u32, pixels: &[u8]) -> (u32, u32, Arc<[u8]>) {
             }
         }
         self.backend = Some(backend);
-        info!(?backend, %url, "native playback started");
+        info!(?backend, endpoint = %url_endpoint(url), "native playback started");
         Ok(backend)
     }
 
@@ -1263,9 +1460,10 @@ fn snapshot_scaled(w: u32, h: u32, pixels: &[u8]) -> (u32, u32, Arc<[u8]>) {
         }
         #[cfg(all(feature = "native-ffmpeg", fluxplay_has_ffmpeg))]
         {
+            self.ff_pump = None;
             if let Some(ff) = self.libffmpeg.take() {
                 debug!("NativePlayer::stop libffmpeg shutdown");
-                ff.shutdown();
+                drop(ff);
             }
         }
         if let Some(path) = self.ipc_path.take() {
@@ -1285,7 +1483,7 @@ fn snapshot_scaled(w: u32, h: u32, pixels: &[u8]) -> (u32, u32, Arc<[u8]>) {
         }
         self.backend = None;
         self.android_present = crate::AndroidPresentMode::default();
-        self.last_soft_rgba = None;
+        self.last_shot = None;
         self.soft_shot_tick = 0;
         self.ffplay_muted = false;
         self.ffplay_paused = false;
@@ -1445,8 +1643,12 @@ fn snapshot_scaled(w: u32, h: u32, pixels: &[u8]) -> (u32, u32, Arc<[u8]>) {
     pub fn toggle_fullscreen(&mut self) -> Result<()> {
         debug!("NativePlayer::toggle_fullscreen");
         // Soft embed: no OS video window — iced owns fullscreen.
-        if self.has_embedded_video() {
+        if self.android_present.uses_soft_rgba() && self.has_embedded_video() {
             return Ok(());
+        }
+        #[cfg(all(feature = "native-mpv", fluxplay_has_libmpv))]
+        if let Some(mpv) = self.lock_mpv() {
+            return mpv.command(&["cycle", "fullscreen"]);
         }
         if let Some(path) = &self.ipc_path {
             return mpv_cmd(path, &["cycle", "fullscreen"]);
@@ -1472,7 +1674,9 @@ fn snapshot_scaled(w: u32, h: u32, pixels: &[u8]) -> (u32, u32, Arc<[u8]>) {
             return mpv_cmd(path, &["cycle", "audio"]);
         }
         if self.using_libffmpeg() {
-            return Ok(());
+            return Err(PlayerError::Unsupported(
+                "choix de piste audio (moteur libav intégré)".into(),
+            ));
         }
         if self.using_ffplay_cli() {
             if !ffplay_send_key("a") {
@@ -1495,7 +1699,9 @@ fn snapshot_scaled(w: u32, h: u32, pixels: &[u8]) -> (u32, u32, Arc<[u8]>) {
             return mpv_cmd(path, &["cycle", "sub"]);
         }
         if self.using_libffmpeg() {
-            return Ok(());
+            return Err(PlayerError::Unsupported(
+                "sous-titres (moteur libav intégré)".into(),
+            ));
         }
         if self.using_ffplay_cli() {
             if !ffplay_send_key("t") {
@@ -1536,7 +1742,9 @@ fn snapshot_scaled(w: u32, h: u32, pixels: &[u8]) -> (u32, u32, Arc<[u8]>) {
             return mpv_cmd(path, &["frame-step"]);
         }
         if self.using_libffmpeg() {
-            return Ok(());
+            return Err(PlayerError::Unsupported(
+                "image par image (moteur libav intégré)".into(),
+            ));
         }
         if self.using_ffplay_cli() {
             if !ffplay_send_key("s") {
@@ -1761,8 +1969,8 @@ fn snapshot_scaled(w: u32, h: u32, pixels: &[u8]) -> (u32, u32, Arc<[u8]>) {
         if self.ipc_path.is_some() {
             return self.run_cmd(&["screenshot-to-file", path, "video"]);
         }
-        // Soft embed: app writes PNG from last_soft_rgba when this error is seen.
-        if self.last_soft_rgba.is_some() {
+        // Soft embed: app writes PNG from soft_snapshot_rgba when this error is seen.
+        if self.last_shot.is_some() {
             return Err(PlayerError::Backend("SOFT_RGBA".into()));
         }
         Err(PlayerError::Backend(
@@ -1842,6 +2050,10 @@ fn snapshot_scaled(w: u32, h: u32, pixels: &[u8]) -> (u32, u32, Arc<[u8]>) {
     pub fn set_aspect(&mut self, aspect: &str) -> Result<()> {
         // "-1" = auto, "16:9", "4:3", "2.35", …
         debug!(aspect, "NativePlayer::set_aspect");
+        if self.using_libffmpeg() && crate::video_stage_ready() {
+            // The app's GPU stage letterboxes with `StreamSession::aspect`.
+            return Ok(());
+        }
         self.set_prop("video-aspect-override", aspect)
     }
 
@@ -1939,6 +2151,21 @@ fn snapshot_scaled(w: u32, h: u32, pixels: &[u8]) -> (u32, u32, Arc<[u8]>) {
         }
     }
 
+    /// mpv key/value option: `[...]` keeps the comma list as one value.
+    /// Full `stream-lavf-o` value: setting that key-value list replaces it, so the
+    /// reconnect options must travel with the whitelist.
+    fn lavf_protocol_whitelist(url: &str, proxied: bool) -> String {
+        let whitelist = if crate::is_downloaded_file(url) {
+            "protocol_whitelist=[file,crypto,http,https,tcp,tls,rtmp,rtmps,rtsp,rtsps,rtp,udp,srt]"
+        } else if proxied {
+            // http-proxy only covers http(s); rtmp/rtsp/udp/srt would bypass the tunnel.
+            "protocol_whitelist=[crypto,http,https,httpproxy,tcp,tls]"
+        } else {
+            "protocol_whitelist=[crypto,http,https,tcp,tls,rtmp,rtmps,rtsp,rtsps,rtp,udp,srt]"
+        };
+        format!("{LAVF_RECONNECT},{whitelist}")
+    }
+
     #[cfg(all(feature = "native-mpv", fluxplay_has_libmpv))]
     fn start_libmpv(&mut self, url: &str) -> Result<()> {
         let _prof = Stopwatch::start("start_libmpv");
@@ -1991,7 +2218,17 @@ fn snapshot_scaled(w: u32, h: u32, pixels: &[u8]) -> (u32, u32, Arc<[u8]>) {
             mode
         };
         #[cfg(not(target_os = "android"))]
-        let present = crate::AndroidPresentMode::SoftRgba;
+        let present = {
+            // Default: soft RGBA into iced (video stays in FluxPlay Lecteur).
+            // Native GPU OS window (Celluloid-style) is opt-in — on Wayland it
+            // floats as a second window and leaves only a poster in the app.
+            // FLUXPLAY_NATIVE_VO=1 → vo=gpu-next + force-window.
+            if std::env::var_os("FLUXPLAY_NATIVE_VO").is_some() {
+                crate::AndroidPresentMode::NativeGpu
+            } else {
+                crate::AndroidPresentMode::SoftRgba
+            }
+        };
         self.android_present = present;
 
         #[cfg(target_os = "android")]
@@ -2051,7 +2288,8 @@ fn snapshot_scaled(w: u32, h: u32, pixels: &[u8]) -> (u32, u32, Arc<[u8]>) {
                     soft_set(&mpv, "force-window", "yes");
                     info!(%endpoint, wid, "android present=gpu-egl");
                 }
-                crate::AndroidPresentMode::SoftRgba => {
+                crate::AndroidPresentMode::SoftRgba | crate::AndroidPresentMode::NativeGpu => {
+                    // NativeGpu is desktop-only; treat as soft on Android.
                     mpv.set_option("vo", "libmpv").map_err(|e| {
                         PlayerError::Backend(format!(
                             "{e} — libmpv Android sans vo=libmpv (media-kit incomplet?)"
@@ -2067,21 +2305,47 @@ fn snapshot_scaled(w: u32, h: u32, pixels: &[u8]) -> (u32, u32, Arc<[u8]>) {
         }
         #[cfg(not(target_os = "android"))]
         {
-            // vo=libmpv is required for mpv_render SW → iced RGBA. Fail clearly if missing.
-            mpv.set_option("vo", "libmpv").map_err(|e| {
-                PlayerError::Backend(format!("{e} — vo=libmpv requis pour soft present"))
-            })?;
-            soft_set(&mpv, "force-window", "no");
-            if let Some((w, h)) = self.opts.video_max_wh {
-                let w = w.max(2) & !1;
-                let h = h.max(2) & !1;
-                let vf = if w >= h {
-                    format!("scale={w}:-2:flags=fast_bilinear,format=yuv420p")
-                } else {
-                    format!("scale=-2:{h}:flags=fast_bilinear,format=yuv420p")
-                };
-                if mpv.set_option("vf", &vf).is_err() {
-                    soft_set(&mpv, "vf", &vf);
+            match present {
+                crate::AndroidPresentMode::NativeGpu => {
+                    // Celluloid / Haruna / Jellyfin / community HQ: GPU presents.
+                    if mpv.set_option("vo", "gpu-next").is_err() {
+                        mpv.set_option("vo", "gpu").map_err(|e| {
+                            PlayerError::Backend(format!(
+                                "{e} — vo=gpu requis pour present natif"
+                            ))
+                        })?;
+                    }
+                    soft_set(&mpv, "force-window", "yes");
+                    soft_set(&mpv, "keepaspect", "yes");
+                    soft_set(&mpv, "panscan", "0");
+                    soft_set(&mpv, "osc", "no");
+                    soft_set(&mpv, "input-default-bindings", "no");
+                    if let Some(rect) = self.video_rect.filter(|r| r.is_usable()) {
+                        soft_set(&mpv, "geometry", &rect.to_geometry());
+                        soft_set(&mpv, "border", if rect.anchored { "no" } else { "yes" });
+                        soft_set(&mpv, "ontop", if rect.anchored { "yes" } else { "no" });
+                    }
+                    info!(%endpoint, "desktop present=native-gpu (vo=gpu-next, FLUXPLAY_NATIVE_VO)");
+                }
+                _ => {
+                    // Soft into iced — default desktop path.
+                    mpv.set_option("vo", "libmpv").map_err(|e| {
+                        PlayerError::Backend(format!("{e} — vo=libmpv requis pour soft present"))
+                    })?;
+                    soft_set(&mpv, "force-window", "no");
+                    if let Some((w, h)) = self.opts.video_max_wh {
+                        let w = w.max(2) & !1;
+                        let h = h.max(2) & !1;
+                        let vf = if w >= h {
+                            format!("scale={w}:-2:flags=fast_bilinear,format=yuv420p")
+                        } else {
+                            format!("scale=-2:{h}:flags=fast_bilinear,format=yuv420p")
+                        };
+                        if mpv.set_option("vf", &vf).is_err() {
+                            soft_set(&mpv, "vf", &vf);
+                        }
+                    }
+                    info!(%endpoint, "desktop present=soft-rgba");
                 }
             }
         }
@@ -2119,12 +2383,11 @@ fn snapshot_scaled(w: u32, h: u32, pixels: &[u8]) -> (u32, u32, Arc<[u8]>) {
         soft_set(&mpv, "osd-level", "0");
         soft_set(&mpv, "input-default-bindings", "no");
         soft_set(&mpv, "input-vo-keyboard", "no");
-        // Soft present uploads async via iced — a zero offset races audio ahead of GPU.
-        // Hard-set: soft_set can silently skip on media-kit → A/V desync.
+        // Soft present uploads async via iced — a large offset + framedrop=vo
+        // drops real pictures to chase audio (bar, picture, and sound hitch together).
         if present.uses_soft_rgba() {
-            // ~2 frames @48Hz soft — covers iced GPU allocate without starving VO.
-            if mpv.set_option("video-timing-offset", "0.040").is_err() {
-                soft_set(&mpv, "video-timing-offset", "0.040");
+            if mpv.set_option("video-timing-offset", "0").is_err() {
+                soft_set(&mpv, "video-timing-offset", "0");
             }
         }
         // Android NativeActivity audio + soft-only filters.
@@ -2233,11 +2496,7 @@ fn snapshot_scaled(w: u32, h: u32, pixels: &[u8]) -> (u32, u32, Arc<[u8]>) {
             ),
         );
         soft_set(&mpv, "cache", "yes");
-        soft_set(
-            &mpv,
-            "stream-lavf-o",
-            "reconnect_streamed=1,reconnect_delay_max=5,reconnect_on_network_error=1",
-        );
+        soft_set(&mpv, "stream-lavf-o", LAVF_RECONNECT);
         soft_set(&mpv, "demuxer-lavf-o", "reconnect_streamed=1");
 
         if mpeg_ts || vod {
@@ -2252,12 +2511,14 @@ fn snapshot_scaled(w: u32, h: u32, pixels: &[u8]) -> (u32, u32, Arc<[u8]>) {
             #[cfg(not(target_os = "android"))]
             let skip_hwdec = false;
             if !skip_hwdec {
-                let preferred = if self.opts.hwdec_force_copy {
-                    // Cross-GPU: never request zero-copy interop on the display GPU.
+                // Soft RGBA and hybrid GPUs need *-copy. Native GPU VO uses zero-copy auto
+                // (Jellyfin hardwareDecoding=enabled → hwdec=auto).
+                let preferred = if present.uses_soft_rgba() || self.opts.hwdec_force_copy {
                     match preferred_hwdec() {
                         "vaapi" => "vaapi-copy",
                         "cuda" | "nvdec" => "cuda-copy",
                         "vulkan" => "vulkan-copy",
+                        "auto" | "auto-safe" => "auto-copy",
                         other => other,
                     }
                 } else {
@@ -2278,19 +2539,43 @@ fn snapshot_scaled(w: u32, h: u32, pixels: &[u8]) -> (u32, u32, Arc<[u8]>) {
         } else if !present.uses_surface() {
             let _ = mpv.set_option("hwdec", "no");
         }
-        // Fast filters for CPU soft-render path (stage already matches window size).
-        soft_set(&mpv, "scale", "bilinear");
-        soft_set(&mpv, "cscale", "bilinear");
-        soft_set(&mpv, "dscale", "bilinear");
-        soft_set(&mpv, "correct-downscaling", "no");
-        soft_set(&mpv, "sigmoid-upscaling", "no");
-        soft_set(&mpv, "interpolation", "no");
-        if mpv.set_option("video-sync", "audio").is_err() {
-            soft_set(&mpv, "video-sync", "audio");
-        }
-        #[cfg(not(target_os = "android"))]
-        if mpv.set_option("framedrop", "vo").is_err() {
-            soft_set(&mpv, "framedrop", "vo");
+        if present.uses_soft_rgba() {
+            // Soft path: cheap scalers; audio master; drop at VO when iced lags.
+            soft_set(&mpv, "scale", "bilinear");
+            soft_set(&mpv, "cscale", "bilinear");
+            soft_set(&mpv, "dscale", "bilinear");
+            soft_set(&mpv, "correct-downscaling", "no");
+            soft_set(&mpv, "sigmoid-upscaling", "no");
+            soft_set(&mpv, "interpolation", "no");
+            if mpv.set_option("video-sync", "audio").is_err() {
+                soft_set(&mpv, "video-sync", "audio");
+            }
+            if mpv.set_option("framedrop", "vo").is_err() {
+                soft_set(&mpv, "framedrop", "vo");
+            }
+        } else {
+            // Native VO HQ — matches dexeonify/mpv-config + Jellyfin display sync.
+            soft_set(&mpv, "scale", "ewa_lanczos");
+            soft_set(&mpv, "cscale", "ewa_lanczos");
+            soft_set(&mpv, "dscale", "mitchell");
+            soft_set(&mpv, "correct-downscaling", "yes");
+            soft_set(&mpv, "sigmoid-upscaling", "yes");
+            soft_set(&mpv, "interpolation", "no");
+            if mpv.set_option("video-sync", "display-resample").is_err() {
+                soft_set(&mpv, "video-sync", "display-resample");
+                if mpv.set_option("video-sync", "audio").is_err() {
+                    soft_set(&mpv, "video-sync", "audio");
+                }
+            }
+            if self.present_hz >= 24 {
+                let fps = format!("{}", self.present_hz);
+                if mpv.set_option("display-fps-override", &fps).is_err() {
+                    soft_set(&mpv, "display-fps-override", &fps);
+                }
+            }
+            if mpv.set_option("framedrop", "vo").is_err() {
+                soft_set(&mpv, "framedrop", "vo");
+            }
         }
         soft_set(&mpv, "vd-lavc-threads", "0");
 
@@ -2314,18 +2599,10 @@ fn snapshot_scaled(w: u32, h: u32, pixels: &[u8]) -> (u32, u32, Arc<[u8]>) {
             let _ = soft_set(&mpv, "ytdl-raw-options", &format!("proxy={safe}"));
             // protocol_whitelist rejected on media-kit Android (code -7).
             #[cfg(not(target_os = "android"))]
-            let _ = soft_set(
-                &mpv,
-                "stream-lavf-o",
-                "protocol_whitelist=http,https,tcp,tls,rtmp,rtmps,rtsp,rtsps,rtp,udp,srt",
-            );
+            let _ = soft_set(&mpv, "stream-lavf-o", &Self::lavf_protocol_whitelist(url, true));
         } else {
             #[cfg(not(target_os = "android"))]
-            let _ = soft_set(
-                &mpv,
-                "stream-lavf-o",
-                "protocol_whitelist=http,https,tcp,tls,rtmp,rtmps,rtsp,rtsps,rtp,udp,srt",
-            );
+            let _ = soft_set(&mpv, "stream-lavf-o", &Self::lavf_protocol_whitelist(url, false));
         }
         if let Some(ref_r) = &self.opts.referer {
             let safe = sanitize_http_field(ref_r);
@@ -2372,8 +2649,10 @@ fn snapshot_scaled(w: u32, h: u32, pixels: &[u8]) -> (u32, u32, Arc<[u8]>) {
             let hw = mpv
                 .get_property_string("hwdec-current")
                 .unwrap_or_else(|| "none".into());
-            // After settle: if preferred never engaged, force software (avoid black soft VO).
-            if self.opts.hwdec
+            // Soft VO only: if preferred never engaged, force software (avoid black soft stage).
+            // Native GPU VO may still be attaching NVDEC/VAAPI — do not yank it to SW.
+            if present.uses_soft_rgba()
+                && self.opts.hwdec
                 && (hw.is_empty()
                     || hw.eq_ignore_ascii_case("no")
                     || hw.eq_ignore_ascii_case("none"))
@@ -2458,7 +2737,7 @@ fn snapshot_scaled(w: u32, h: u32, pixels: &[u8]) -> (u32, u32, Arc<[u8]>) {
                 if vod { 12.0 } else if mpeg_ts { 4.0 } else { 2.0 }
             ),
             "--cache=yes".into(),
-            "--stream-lavf-o=reconnect_streamed=1,reconnect_delay_max=5,reconnect_on_network_error=1".into(),
+            format!("--stream-lavf-o={LAVF_RECONNECT}"),
             "--demuxer-lavf-o=reconnect_streamed=1".into(),
             format!(
                 "--user-agent={}",
@@ -2468,8 +2747,8 @@ fn snapshot_scaled(w: u32, h: u32, pixels: &[u8]) -> (u32, u32, Arc<[u8]>) {
                     .unwrap_or("IPTVSmartersPlayer")
             ),
         ];
-        if let Some(proxy) = &self.opts.http_proxy {
-            args.push(format!("--http-proxy={proxy}"));
+        if self.opts.http_proxy.is_some() {
+            args.push(format!("--stream-lavf-o={}", Self::lavf_protocol_whitelist(url, true)));
         }
         if let Some(rect) = self.video_rect.filter(|r| r.is_usable()) {
             args.push(format!("--geometry={}", rect.to_geometry()));
@@ -2563,7 +2842,12 @@ fn snapshot_scaled(w: u32, h: u32, pixels: &[u8]) -> (u32, u32, Arc<[u8]>) {
         let log = std::env::temp_dir().join("fluxplay-mpv.log");
         let err_file = std::fs::File::create(&log).ok();
 
-        let child = Command::new(&mpv_bin)
+        let mut cmd = Command::new(&mpv_bin);
+        // Env, not argv: the proxy URL carries credentials and argv is world-readable.
+        if let Some(proxy) = &self.opts.http_proxy {
+            cmd.env("http_proxy", proxy).env_remove("no_proxy");
+        }
+        let child = cmd
             .args(&args)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -2581,15 +2865,20 @@ fn snapshot_scaled(w: u32, h: u32, pixels: &[u8]) -> (u32, u32, Arc<[u8]>) {
     fn start_ffmpeg(&mut self, url: &str) -> Result<()> {
         let endpoint = url_endpoint(url);
         debug!(%endpoint, "start_ffmpeg");
+        // Prefer in-process soft embed so video stays inside FluxPlay Lecteur.
+        // Opt into stock ffplay (separate OS window) with FLUXPLAY_NATIVE_VO=1.
         #[cfg(all(feature = "native-ffmpeg", fluxplay_has_ffmpeg))]
         {
-            match self.start_libffmpeg(url) {
-                Ok(()) => return Ok(()),
-                Err(e) => {
-                    warn!(error = %e, "libffmpeg start failed — trying ffplay CLI fallback");
-                    #[cfg(not(feature = "cli-player"))]
-                    {
-                        return Err(e);
+            let want_native = std::env::var_os("FLUXPLAY_NATIVE_VO").is_some();
+            if !want_native {
+                match self.start_libffmpeg(url) {
+                    Ok(()) => return Ok(()),
+                    Err(e) => {
+                        warn!(error = %e, "libffmpeg start failed — trying ffplay CLI fallback");
+                        #[cfg(not(feature = "cli-player"))]
+                        {
+                            return Err(e);
+                        }
                     }
                 }
             }
@@ -2620,13 +2909,18 @@ fn snapshot_scaled(w: u32, h: u32, pixels: &[u8]) -> (u32, u32, Arc<[u8]>) {
             self.opts.hwdec,
         )?;
         ff.set_volume(self.opts.volume);
-        if let Some(rect) = self.video_rect.filter(|r| r.is_usable()) {
-            // Same soft cap as iced pull — uncapped window size caused mismatch discards.
-            let (rw, rh) = crate::ffmpeg_ffi::LibFfmpeg::soft_present_dims(rect.w, rect.h);
-            ff.set_output_size(rw, rh);
-        }
+        let (rw, rh) = self
+            .video_rect
+            .filter(|r| r.is_usable())
+            .map(|r| crate::ffmpeg_ffi::LibFfmpeg::soft_present_dims(r.w, r.h))
+            .unwrap_or((1280, 720));
+        ff.set_output_size(rw, rh);
+        let ff = std::sync::Arc::new(ff);
+        let pump = crate::ffmpeg_pump::FfmpegPump::start(std::sync::Arc::clone(&ff));
+        pump.set_target(rw, rh);
+        self.ff_pump = Some(pump);
         self.libffmpeg = Some(ff);
-        info!(%endpoint, "libffmpeg embedded open ok");
+        info!(%endpoint, w = rw, h = rh, "libffmpeg embedded open ok");
         Ok(())
     }
 
@@ -2681,7 +2975,8 @@ fn snapshot_scaled(w: u32, h: u32, pixels: &[u8]) -> (u32, u32, Arc<[u8]>) {
                 }
             }
             if let Some(proxy) = &self.opts.http_proxy {
-                cmd.arg("-http_proxy").arg(proxy);
+                cmd.env("http_proxy", proxy).env_remove("no_proxy");
+                cmd.arg("-protocol_whitelist").arg("crypto,http,https,httpproxy,tcp,tls");
             }
 
             // Probe room for HEVC IPTV / VOD (before -i).
@@ -2702,9 +2997,10 @@ fn snapshot_scaled(w: u32, h: u32, pixels: &[u8]) -> (u32, u32, Arc<[u8]>) {
                     cmd.arg("-flags").arg("low_delay");
                     cmd.arg("-framedrop");
                 } else {
-                    // Sync video to audio (not external clock) so sound stays audible/locked.
+                    // Sync video to audio (ffplay master clock) + drop late frames.
                     cmd.arg("-fflags").arg("+genpts+discardcorrupt");
                     cmd.arg("-sync").arg("audio");
+                    cmd.arg("-framedrop");
                 }
                 // HTTP reconnect (input options; ignored if unsupported).
                 cmd.arg("-reconnect").arg("1");

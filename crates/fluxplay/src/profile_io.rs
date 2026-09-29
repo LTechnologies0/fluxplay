@@ -138,6 +138,9 @@ pub fn import_profile(archive: &Path) -> Result<MediaSource, String> {
     let file = File::open(archive).map_err(|e| format!("réouverture: {e}"))?;
     let mut zip = ZipArchive::new(file).map_err(|e| format!("zip: {e}"))?;
 
+    // A crafted archive must neither write outside the profile nor fill the disk.
+    const MAX_UNPACKED: u64 = 4 << 30;
+    let mut unpacked = 0u64;
     for i in 0..zip.len() {
         let mut entry = zip.by_index(i).map_err(|e| format!("zip entry: {e}"))?;
         let name = entry.name().to_string();
@@ -149,10 +152,14 @@ pub fn import_profile(archive: &Path) -> Result<MediaSource, String> {
         } else if name == "favorites.json" {
             dest_dir.join("favorites.json")
         } else if let Some(rest) = name.strip_prefix("images/") {
-            if rest.is_empty() || rest.contains("..") {
+            let rel = std::path::Path::new(rest);
+            let plain = rel
+                .components()
+                .all(|c| matches!(c, std::path::Component::Normal(_)));
+            if rest.is_empty() || !plain {
                 continue;
             }
-            crate::storage::profile_images_dir(new_id).join(rest)
+            crate::storage::profile_images_dir(new_id).join(rel)
         } else {
             continue;
         };
@@ -160,7 +167,15 @@ pub fn import_profile(archive: &Path) -> Result<MediaSource, String> {
             let _ = fs::create_dir_all(parent);
         }
         let mut out = File::create(&out_path).map_err(|e| format!("write {name}: {e}"))?;
-        std::io::copy(&mut entry, &mut out).map_err(|e| format!("copy {name}: {e}"))?;
+        let budget = MAX_UNPACKED - unpacked;
+        let n = std::io::copy(&mut (&mut entry).take(budget + 1), &mut out)
+            .map_err(|e| format!("copy {name}: {e}"))?;
+        if n > budget {
+            drop(out);
+            let _ = fs::remove_dir_all(&dest_dir);
+            return Err("archive trop volumineuse (> 4 Gio décompressés)".into());
+        }
+        unpacked += n;
     }
 
     // Rewrite source_id inside SQLite payloads is heavy; rows already tagged with old_id.
@@ -173,7 +188,9 @@ pub fn import_profile(archive: &Path) -> Result<MediaSource, String> {
 }
 
 fn remap_catalog_source_id(path: &Path, old: Uuid, new: Uuid) -> Result<(), String> {
-    let conn = rusqlite::Connection::open(path).map_err(|e| format!("sqlite: {e}"))?;
+    let mut db = rusqlite::Connection::open(path).map_err(|e| format!("sqlite: {e}"))?;
+    // One transaction: a commit per row makes big VOD catalogs take minutes.
+    let conn = db.transaction().map_err(|e| format!("sqlite: {e}"))?;
     let old_s = old.to_string();
     let new_s = new.to_string();
     for table in ["categories", "channels", "vod", "series"] {
@@ -202,12 +219,12 @@ fn remap_catalog_source_id(path: &Path, old: Uuid, new: Uuid) -> Result<(), Stri
             }
             updates
         };
-        let upd = format!("UPDATE {table} SET payload = ?1 WHERE id = ?2");
+        let upd = format!("UPDATE {table} SET payload = ?1 WHERE source_id = ?3 AND id = ?2");
         for (id, payload) in updates {
-            let _ = conn.execute(&upd, rusqlite::params![payload, id]);
+            let _ = conn.execute(&upd, rusqlite::params![payload, id, new_s]);
         }
     }
-    Ok(())
+    conn.commit().map_err(|e| format!("sqlite: {e}"))
 }
 
 /// Default export filename suggestion.

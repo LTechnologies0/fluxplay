@@ -31,13 +31,13 @@ pub async fn load_m3u_source(source: &MediaSource) -> Result<PlaylistBundle> {
         ));
     }
 
-    let mut bundle = m3u::parse_m3u(&body, Some(source.id))?;
+    // The XMLTV guide is attached once, by `load_source_with_epg`.
+    let bundle = m3u::parse_m3u(&body, Some(source.id))?;
     info!(
         source_id = %source.id,
         channels = bundle.channels.len(),
         "M3U parsed"
     );
-    bundle = crate::attach_epg(source, bundle).await?;
     Ok(bundle)
 }
 
@@ -79,6 +79,10 @@ pub async fn fetch_playlist_body(endpoint: &str, source: &MediaSource) -> Result
                         .unwrap_or_else(|| format!("HTTP {code}"));
                     // Rotate UA on WAF-ish / panel codes.
                     if matches!(code, 401 | 403 | 429 | 885 | 886 | 887) {
+                        if code == 429 {
+                            // Rate limited: hammering with the next UA only extends the ban.
+                            tokio::time::sleep(std::time::Duration::from_secs(1 << i.min(3))).await;
+                        }
                         continue;
                     }
                     return Err(crate::ProviderError::Message(last_err));
@@ -99,7 +103,7 @@ pub async fn fetch_playlist_body(endpoint: &str, source: &MediaSource) -> Result
                 return Ok(body);
             }
             Err(e) => {
-                last_err = e.to_string();
+                last_err = crate::redact_error(&e);
                 warn!(error = %last_err, %ua, attempt = i + 1, "playlist network error");
             }
         }

@@ -88,6 +88,9 @@ impl CatalogDb {
         }
         let _ = std::fs::create_dir_all(crate::storage::profile_images_dir(source_id));
         let conn = Connection::open(&path)?;
+        // Small page cache, no mmap of the whole file. Rows are read by query, not mapped in.
+        let _ = conn.pragma_update(None, "cache_size", -2048i64);
+        let _ = conn.pragma_update(None, "mmap_size", 0i64);
         migrate_schema(&conn)?;
         self.conns.insert(source_id, conn);
         debug!(%source_id, path = %path.display(), "profile catalog ready");
@@ -563,14 +566,71 @@ impl CatalogDb {
                 ])?;
             }
         }
+        // Past programmes are never shown again.
+        let cutoff = (chrono::Utc::now() - chrono::Duration::hours(24)).to_rfc3339();
+        tx.execute("DELETE FROM epg WHERE start_ts < ?1", params![cutoff])?;
         tx.commit()?;
         Ok(())
     }
 
+    /// One catalog row. `table` is `vod`, `series`, or `channels`.
+    pub fn payload_by_id(&self, table: &str, id: &str) -> Option<String> {
+        let table = match table {
+            "vod" | "series" | "channels" => table,
+            _ => return None,
+        };
+        let sql = format!("SELECT payload FROM {table} WHERE id = ?1 LIMIT 1");
+        for conn in self.conns.values() {
+            let raw: rusqlite::Result<String> =
+                conn.query_row(&sql, rusqlite::params![id], |row| row.get(0));
+            if let Ok(raw) = raw {
+                return Some(raw);
+            }
+        }
+        None
+    }
+
+    /// A window of payloads. `offset` is the row to start at, `limit` the page size.
+    pub fn page_payloads(&self, table: &str, offset: usize, limit: usize) -> Vec<String> {
+        let table = match table {
+            "vod" | "series" | "channels" | "epg" => table,
+            _ => return Vec::new(),
+        };
+        let sql = format!("SELECT payload FROM {table} LIMIT ?1 OFFSET ?2");
+        let mut out = Vec::new();
+        for conn in self.conns.values() {
+            if out.len() >= limit {
+                break;
+            }
+            let Ok(mut stmt) = conn.prepare(&sql) else {
+                continue;
+            };
+            let Ok(rows) = stmt.query_map(
+                rusqlite::params![limit as i64, offset as i64],
+                |row| row.get::<_, String>(0),
+            ) else {
+                continue;
+            };
+            for raw in rows.flatten() {
+                out.push(raw);
+                if out.len() >= limit {
+                    break;
+                }
+            }
+        }
+        out
+    }
+
     pub fn load_bundle(&self) -> rusqlite::Result<PlaylistBundle> {
+        self.load_bundle_of(&self.source_ids())
+    }
+
+    /// Catalog of these profiles only: every folder under `profiles/` is opened, including
+    /// removed, disabled or demo profiles whose rows must not reach the UI.
+    pub fn load_bundle_of(&self, ids: &[Uuid]) -> rusqlite::Result<PlaylistBundle> {
         let _prof = fluxplay_core::Stopwatch::start("catalog_load_bundle");
         let mut bundle = PlaylistBundle::default();
-        for id in self.source_ids() {
+        for &id in ids {
             let Ok(conn) = self.conn(id) else {
                 continue;
             };
@@ -628,16 +688,23 @@ impl CatalogDb {
             let mut stmt = conn.prepare("SELECT payload FROM series")?;
             let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
             for raw in rows.flatten() {
-                if let Ok(s) = serde_json::from_str::<SeriesItem>(&raw) {
+                if let Ok(mut s) = serde_json::from_str::<SeriesItem>(&raw) {
+                    // Episode trees stay in the row. Opening a series reads that one payload.
+                    s.seasons.clear();
                     bundle.series.push(s);
                 }
             }
         }
         {
+            // What is on now and next, not the far future: `DESC LIMIT` kept the last
+            // 8000 programmes of the guide and dropped today's.
+            let now = chrono::Utc::now();
+            let from = (now - chrono::Duration::hours(6)).to_rfc3339();
+            let to = (now + chrono::Duration::hours(48)).to_rfc3339();
             let mut stmt = conn.prepare(
-                "SELECT payload FROM epg ORDER BY start_ts DESC LIMIT 8000",
+                "SELECT payload FROM epg WHERE start_ts >= ?1 AND start_ts <= ?2 ORDER BY start_ts LIMIT 8000",
             )?;
-            let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+            let rows = stmt.query_map(params![from, to], |row| row.get::<_, String>(0))?;
             for raw in rows.flatten() {
                 if let Ok(p) = serde_json::from_str::<EpgProgramme>(&raw) {
                     bundle.epg.push(p);
@@ -647,36 +714,38 @@ impl CatalogDb {
         Ok(())
     }
 
-    pub fn search_vod(&self, query: &str, category_id: Option<&str>, limit: usize) -> Vec<VodItem> {
-        let items = self.search_fts_or_like("vod", query, category_id, limit);
-        trace!(%query, n = items.len(), "search_vod");
-        items
+    /// Ids only: the browse index maps them to rows already in RAM, so full
+    /// payloads (plot, cast, …) are never deserialized for a search.
+    pub fn search_vod_ids(&self, query: &str, category_id: Option<&str>, limit: usize) -> Vec<String> {
+        let ids = self.search_fts_or_like("vod", query, category_id, limit);
+        trace!(%query, n = ids.len(), "search_vod");
+        ids
     }
 
-    pub fn search_series(
+    pub fn search_series_ids(
         &self,
         query: &str,
         category_id: Option<&str>,
         limit: usize,
-    ) -> Vec<SeriesItem> {
-        let items = self.search_fts_or_like("series", query, category_id, limit);
-        trace!(%query, n = items.len(), "search_series");
-        items
+    ) -> Vec<String> {
+        let ids = self.search_fts_or_like("series", query, category_id, limit);
+        trace!(%query, n = ids.len(), "search_series");
+        ids
     }
 
-    fn search_fts_or_like<T: serde::de::DeserializeOwned>(
+    fn search_fts_or_like(
         &self,
         table: &str,
         query: &str,
         category_id: Option<&str>,
         limit: usize,
-    ) -> Vec<T> {
+    ) -> Vec<String> {
         let q = query.trim();
         if q.is_empty() {
             return Vec::new();
         }
         // Prefer FTS5; fall back to LIKE.
-        if let Some(items) = self.search_fts::<T>(table, q, category_id, limit) {
+        if let Some(items) = self.search_fts(table, q, category_id, limit) {
             if !items.is_empty() {
                 return items;
             }
@@ -684,34 +753,35 @@ impl CatalogDb {
         self.search_like(table, q, category_id, limit)
     }
 
-    fn search_fts<T: serde::de::DeserializeOwned>(
+    fn search_fts(
         &self,
         table: &str,
         query: &str,
         category_id: Option<&str>,
         limit: usize,
-    ) -> Option<Vec<T>> {
+    ) -> Option<Vec<String>> {
         let fts = format!("{table}_fts");
-        // Escape FTS special chars lightly.
-        let token = query
-            .chars()
-            .filter(|c| c.is_alphanumeric() || c.is_whitespace() || *c == '-' || *c == '\'')
-            .collect::<String>();
-        let token = token.trim();
-        if token.is_empty() {
+        // Every word must match (as a prefix), like the Live filter. Words are cut on
+        // anything non-alphanumeric so `-` or `'` never reach the FTS5 syntax.
+        let words: Vec<String> = query
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|w| !w.is_empty())
+            .map(|w| format!("\"{w}\"*"))
+            .collect();
+        if words.is_empty() {
             return None;
         }
-        let match_q = format!("{}*", token.split_whitespace().next().unwrap_or(token));
+        let match_q = words.join(" ");
         let sql = if category_id.is_some() {
             format!(
-                "SELECT t.payload FROM {table} t
+                "SELECT t.id FROM {table} t
                  JOIN {fts} f ON t.rowid = f.rowid
                  WHERE {fts} MATCH ?1 AND t.category_id = ?2
                  LIMIT ?3"
             )
         } else {
             format!(
-                "SELECT t.payload FROM {table} t
+                "SELECT t.id FROM {table} t
                  JOIN {fts} f ON t.rowid = f.rowid
                  WHERE {fts} MATCH ?1
                  LIMIT ?2"
@@ -726,7 +796,7 @@ impl CatalogDb {
             let Ok(mut stmt) = conn.prepare(&sql) else {
                 continue;
             };
-            let payloads: Vec<String> = if let Some(cid) = category_id {
+            let ids: Vec<String> = if let Some(cid) = category_id {
                 let Ok(mut rows) = stmt.query(params![match_q, cid, remain as i64]) else {
                     continue;
                 };
@@ -749,11 +819,7 @@ impl CatalogDb {
                 }
                 collected
             };
-            for raw in payloads {
-                if let Ok(item) = serde_json::from_str(&raw) {
-                    out.push(item);
-                }
-            }
+            out.extend(ids);
         }
         if out.is_empty() {
             None
@@ -762,13 +828,13 @@ impl CatalogDb {
         }
     }
 
-    fn search_like<T: serde::de::DeserializeOwned>(
+    fn search_like(
         &self,
         table: &str,
         query: &str,
         category_id: Option<&str>,
         limit: usize,
-    ) -> Vec<T> {
+    ) -> Vec<String> {
         let q = format!("%{}%", query.trim().to_ascii_lowercase());
         let mut out = Vec::new();
         for conn in self.conns.values() {
@@ -776,10 +842,10 @@ impl CatalogDb {
                 break;
             }
             let remain = limit - out.len();
-            let payloads = match category_id {
+            let ids = match category_id {
                 Some(cid) => {
                     let sql = format!(
-                        "SELECT payload FROM {table} WHERE lower(name) LIKE ?1 AND category_id = ?2 LIMIT ?3"
+                        "SELECT id FROM {table} WHERE lower(name) LIKE ?1 AND category_id = ?2 LIMIT ?3"
                     );
                     let Ok(mut stmt) = conn.prepare(&sql) else {
                         continue;
@@ -797,7 +863,7 @@ impl CatalogDb {
                 }
                 None => {
                     let sql =
-                        format!("SELECT payload FROM {table} WHERE lower(name) LIKE ?1 LIMIT ?2");
+                        format!("SELECT id FROM {table} WHERE lower(name) LIKE ?1 LIMIT ?2");
                     let Ok(mut stmt) = conn.prepare(&sql) else {
                         continue;
                     };
@@ -813,11 +879,7 @@ impl CatalogDb {
                     collected
                 }
             };
-            for raw in payloads {
-                if let Ok(item) = serde_json::from_str(&raw) {
-                    out.push(item);
-                }
-            }
+            out.extend(ids);
         }
         out
     }
@@ -1060,6 +1122,30 @@ impl CatalogDb {
         }
     }
 
+    /// Cached translation for [`crate::translate::cache_key`].
+    pub fn translation_get(&self, cache_key: &str) -> Option<String> {
+        self.conns.values().find_map(|conn| {
+            conn.query_row(
+                "SELECT text FROM translations WHERE cache_key = ?1",
+                params![cache_key],
+                |r| r.get::<_, String>(0),
+            )
+            .ok()
+        })
+    }
+
+    pub fn translation_put(&self, cache_key: &str, text: &str, source_lang: Option<&str>) {
+        if let Some(conn) = self.conns.values().next() {
+            let _ = conn.execute(
+                "INSERT INTO translations (cache_key, text, source_lang, fetched_at)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(cache_key) DO UPDATE SET
+                   text=excluded.text, source_lang=excluded.source_lang, fetched_at=excluded.fetched_at",
+                params![cache_key, text, source_lang, now_secs() as i64],
+            );
+        }
+    }
+
     pub fn meta_cache_get_imdb(
         &self,
         imdb_id: &str,
@@ -1106,15 +1192,14 @@ impl CatalogDb {
 }
 
 fn migrate_schema(conn: &Connection) -> rusqlite::Result<()> {
-    // Performance PRAGMAs: WAL + NORMAL + page cache. mmap/cache sized for Android RAM.
+    // WAL + NORMAL sync. Page cache / mmap are set per connection in `ensure_source`
+    // (small cache, no mmap): the OS page cache already holds hot pages.
     #[cfg(target_os = "android")]
     let pragmas = r#"
         PRAGMA journal_mode=WAL;
         PRAGMA synchronous=NORMAL;
         PRAGMA temp_store=MEMORY;
         PRAGMA busy_timeout=5000;
-        PRAGMA cache_size=-8192;
-        PRAGMA mmap_size=33554432;
         PRAGMA foreign_keys=OFF;
         PRAGMA analysis_limit=400;
         "#;
@@ -1124,8 +1209,6 @@ fn migrate_schema(conn: &Connection) -> rusqlite::Result<()> {
         PRAGMA synchronous=NORMAL;
         PRAGMA temp_store=MEMORY;
         PRAGMA busy_timeout=5000;
-        PRAGMA cache_size=-32768;
-        PRAGMA mmap_size=268435456;
         PRAGMA foreign_keys=OFF;
         PRAGMA analysis_limit=400;
         "#;
@@ -1197,11 +1280,23 @@ fn migrate_schema(conn: &Connection) -> rusqlite::Result<()> {
             is_miss INTEGER NOT NULL DEFAULT 0,
             fetched_at INTEGER NOT NULL
         );
+        "#,
+    )?;
+
+    // Columns added in later revisions — before the indexes that use them, or an
+    // old catalog fails to open.
+    let _ = conn
+        .execute("ALTER TABLE vod ADD COLUMN meta_ok INTEGER NOT NULL DEFAULT 0", []);
+    let _ = conn
+        .execute("ALTER TABLE series ADD COLUMN meta_ok INTEGER NOT NULL DEFAULT 0", []);
+    conn.execute_batch(
+        r#"
         CREATE INDEX IF NOT EXISTS idx_vod_cat ON vod(category_id);
         CREATE INDEX IF NOT EXISTS idx_series_cat ON series(category_id);
         CREATE INDEX IF NOT EXISTS idx_vod_meta ON vod(meta_ok);
         CREATE INDEX IF NOT EXISTS idx_series_meta ON series(meta_ok);
         CREATE INDEX IF NOT EXISTS idx_meta_cache_imdb ON meta_cache(imdb_id);
+        CREATE INDEX IF NOT EXISTS idx_epg_start ON epg(start_ts);
         "#,
     )?;
 
@@ -1222,6 +1317,17 @@ fn migrate_schema(conn: &Connection) -> rusqlite::Result<()> {
         "#,
     );
 
+    let _ = conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS translations (
+            cache_key TEXT PRIMARY KEY,
+            text TEXT NOT NULL,
+            source_lang TEXT,
+            fetched_at INTEGER NOT NULL
+        );
+        "#,
+    );
+
     // FTS5 — ignore errors if already present / unsupported.
     let _ = conn.execute_batch(
         r#"
@@ -1233,12 +1339,6 @@ fn migrate_schema(conn: &Connection) -> rusqlite::Result<()> {
         );
         "#,
     );
-
-    // Columns added in later revisions.
-    let _ = conn
-        .execute("ALTER TABLE vod ADD COLUMN meta_ok INTEGER NOT NULL DEFAULT 0", []);
-    let _ = conn
-        .execute("ALTER TABLE series ADD COLUMN meta_ok INTEGER NOT NULL DEFAULT 0", []);
 
     Ok(())
 }
@@ -1591,7 +1691,7 @@ pub fn ingest_one_blocking(
 /// Load merged bundle off the UI thread (read path; WAL-friendly).
 pub fn load_bundle_blocking(source_ids: &[Uuid]) -> Result<PlaylistBundle, String> {
     let db = CatalogDb::open(source_ids).ok_or_else(|| "catalog db open failed".to_string())?;
-    db.load_bundle().map_err(|e| e.to_string())
+    db.load_bundle_of(source_ids).map_err(|e| e.to_string())
 }
 
 pub fn portal_checksum(part: &PlaylistBundle) -> String {

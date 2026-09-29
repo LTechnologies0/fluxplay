@@ -85,9 +85,11 @@ impl GpuTopology {
     /// Hybrid multi-GPU is a desktop probe; Android is always single-SoC.
     #[cfg(any(test, not(target_os = "android")))]
     pub fn requires_copy_path(&self) -> bool {
+        // Two identical cards still sit on different render nodes: either difference
+        // means frames cross devices.
         self.policy == GpuDecodePolicy::StrongDecodeCopy
             || self.decode.render_node != self.display.render_node
-                && self.decode.name != self.display.name
+            || self.decode.name != self.display.name
     }
 
     pub fn summary(&self) -> String {
@@ -164,16 +166,12 @@ pub fn topology_from_devices(mut devices: Vec<GpuDevice>) -> GpuTopology {
         }
     }
 
-    // Default hybrid policy matching the product rule:
-    // - Cap quality to **display** (weaker / iGPU).
-    // - Prefer **strong** decode only when we will use a copy path (soft / *-copy).
-    //   For zero-copy Surface we keep SameAsDisplay (Android path sets that itself).
-    let (decode, policy) = if let (Some(d), Some(_)) = (discrete, integrated) {
-        // Soft RGBA / embed always copies through CPU on desktop → strong decode OK.
-        (d, GpuDecodePolicy::StrongDecodeCopy)
-    } else {
-        (display.clone(), GpuDecodePolicy::SameAsDisplay)
-    };
+    // One GPU does decode and display. The panel is wired to `display`
+    // (the integrated GPU on a hybrid laptop). A second GPU is only used
+    // when the user picks it in the settings.
+    let _ = discrete;
+    let decode = display.clone();
+    let policy = GpuDecodePolicy::SameAsDisplay;
 
     let topo = GpuTopology {
         devices,

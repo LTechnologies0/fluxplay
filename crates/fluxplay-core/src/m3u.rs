@@ -1,6 +1,5 @@
 //! M3U / M3U Plus / M3U8 playlist parser (IPTV `#EXTINF` dialect).
 
-use regex::Regex;
 use tracing::{debug, info, trace, warn};
 use uuid::Uuid;
 
@@ -30,10 +29,11 @@ pub fn parse_m3u(body: &str, source_id: Option<Uuid>) -> Result<PlaylistBundle> 
         ));
     }
 
-    let attr_re = Regex::new(r#"([\w-]+)\s*=\s*"([^"]*)""#).expect("regex");
     let mut channels = Vec::new();
     let mut pending_meta: Option<ExtInf> = None;
     let mut catchup: Option<String> = None;
+    // HD/SD variants often share one tvg-id; each still needs its own channel id.
+    let mut seen_ids: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
 
     for raw_line in text.lines() {
         let line = raw_line.trim();
@@ -53,7 +53,7 @@ pub fn parse_m3u(body: &str, source_id: Option<Uuid>) -> Result<PlaylistBundle> 
             continue;
         }
         if line.starts_with("#EXTINF:") {
-            pending_meta = Some(parse_extinf(line, &attr_re));
+            pending_meta = Some(parse_extinf(line));
             continue;
         }
         if line.starts_with('#') {
@@ -72,13 +72,18 @@ pub fn parse_m3u(body: &str, source_id: Option<Uuid>) -> Result<PlaylistBundle> 
 
         let meta = pending_meta.take().unwrap_or_default();
         let scheme = StreamScheme::parse(&url);
-        let id = meta
+        let base_id = meta
             .tvg_id
             .clone()
             .unwrap_or_else(|| format!("ch-{}", channels.len() + 1));
+        let dup = seen_ids.entry(base_id.clone()).or_insert(0);
+        *dup += 1;
+        let id = if *dup == 1 { base_id } else { format!("{base_id}#{dup}") };
 
+        // A catchup tag line belongs to the entry it precedes, never to the next one.
+        let tag = catchup.take();
         let catchup_info = meta.catchup.or_else(|| {
-            catchup.take().map(|raw| CatchupInfo {
+            tag.map(|raw| CatchupInfo {
                 mode: "tag".into(),
                 source: Some(raw),
                 days: meta.catchup_days,
@@ -126,12 +131,23 @@ struct ExtInf {
     catchup_days: Option<u32>,
 }
 
-fn parse_extinf(line: &str, attr_re: &Regex) -> ExtInf {
+fn parse_extinf(line: &str) -> ExtInf {
     // #EXTINF:-1 tvg-id="..." group-title="...", Channel Name
     let mut meta = ExtInf::default();
     let after = line.trim_start_matches("#EXTINF:");
-    let (attrs_part, name_part) = match after.rsplit_once(',') {
-        Some((a, n)) => (a, n.trim()),
+    // The title starts after the first comma outside quotes: it may itself hold commas
+    // ("Movie, The") and attribute values may too (group-title="News, FR").
+    let mut in_quotes = false;
+    let split = after.char_indices().find_map(|(i, c)| {
+        match c {
+            '"' => in_quotes = !in_quotes,
+            ',' if !in_quotes => return Some(i),
+            _ => {}
+        }
+        None
+    });
+    let (attrs_part, name_part) = match split {
+        Some(i) => (&after[..i], after[i + 1..].trim()),
         None => (after, ""),
     };
     if !name_part.is_empty() {
@@ -139,21 +155,25 @@ fn parse_extinf(line: &str, attr_re: &Regex) -> ExtInf {
     }
     let mut catchup_mode: Option<String> = None;
     let mut catchup_source: Option<String> = None;
-    for cap in attr_re.captures_iter(attrs_part) {
-        let key = cap[1].to_ascii_lowercase();
-        let val = cap[2].to_string();
-        match key.as_str() {
-            "tvg-id" => meta.tvg_id = Some(val),
-            "tvg-name" => meta.tvg_name = Some(val),
-            "tvg-logo" => meta.tvg_logo = Some(val),
-            "group-title" => meta.group = Some(val),
-            "logo" => meta.logo = Some(val),
-            "catchup" => catchup_mode = Some(val),
-            "catchup-source" => catchup_source = Some(val),
-            "catchup-days" => meta.catchup_days = val.parse().ok(),
+    for_each_quoted_attr(attrs_part, |key, val| {
+        let val = val.trim();
+        if val.is_empty() {
+            return;
+        }
+        match key {
+            k if k.eq_ignore_ascii_case("tvg-id") => meta.tvg_id = Some(val.to_string()),
+            k if k.eq_ignore_ascii_case("tvg-name") => meta.tvg_name = Some(val.to_string()),
+            k if k.eq_ignore_ascii_case("tvg-logo") => meta.tvg_logo = Some(val.to_string()),
+            k if k.eq_ignore_ascii_case("group-title") => meta.group = Some(val.to_string()),
+            k if k.eq_ignore_ascii_case("logo") => meta.logo = Some(val.to_string()),
+            k if k.eq_ignore_ascii_case("catchup") => catchup_mode = Some(val.to_string()),
+            k if k.eq_ignore_ascii_case("catchup-source") => catchup_source = Some(val.to_string()),
+            k if k.eq_ignore_ascii_case("catchup-days") || k.eq_ignore_ascii_case("timeshift") => {
+                meta.catchup_days = val.parse().ok()
+            }
             _ => {}
         }
-    }
+    });
     if catchup_mode.is_some() || catchup_source.is_some() {
         meta.catchup = Some(CatchupInfo {
             mode: catchup_mode.unwrap_or_else(|| "default".into()),
@@ -162,6 +182,51 @@ fn parse_extinf(line: &str, attr_re: &Regex) -> ExtInf {
         });
     }
     meta
+}
+
+/// Scan `key="value"` pairs without compiling a regex per playlist.
+fn for_each_quoted_attr(attrs: &str, mut f: impl FnMut(&str, &str)) {
+    let bytes = attrs.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        let key_start = i;
+        while i < bytes.len()
+            && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'-' || bytes[i] == b'_')
+        {
+            i += 1;
+        }
+        if i == key_start {
+            i += 1;
+            continue;
+        }
+        let key = &attrs[key_start..i];
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= bytes.len() || bytes[i] != b'=' {
+            continue;
+        }
+        i += 1;
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= bytes.len() || bytes[i] != b'"' {
+            continue;
+        }
+        i += 1;
+        let val_start = i;
+        while i < bytes.len() && bytes[i] != b'"' {
+            i += 1;
+        }
+        let val = &attrs[val_start..i];
+        if i < bytes.len() {
+            i += 1;
+        }
+        f(key, val);
+    }
 }
 
 fn looks_like_url(s: &str) -> bool {
@@ -219,5 +284,25 @@ http://cdn.example.com/bein.ts
         assert_eq!(bundle.channels[0].name, "TF1");
         assert_eq!(bundle.channels[0].group.as_deref(), Some("France"));
         assert_eq!(bundle.channels[0].tvg_id.as_deref(), Some("tf1.fr"));
+    }
+
+    #[test]
+    fn titles_with_commas_and_shared_or_empty_ids() {
+        let body = r#"#EXTM3U
+#EXTINF:-1 tvg-id="tf1.fr" group-title="News, FR",Movie, The
+http://cdn.example/1.ts
+#EXTINF:-1 tvg-id="tf1.fr",TF1 SD
+http://cdn.example/2.ts
+#EXTINF:-1 tvg-id="",Radio
+http://cdn.example/3.ts
+"#;
+        let ch = parse_m3u(body, None).unwrap().channels;
+        assert_eq!(ch[0].name, "Movie, The");
+        assert_eq!(ch[0].group.as_deref(), Some("News, FR"));
+        assert_eq!(ch[0].id, "tf1.fr");
+        assert_eq!(ch[1].id, "tf1.fr#2");
+        assert_eq!(ch[1].epg_channel_id.as_deref(), Some("tf1.fr"));
+        assert_eq!(ch[2].tvg_id, None);
+        assert_eq!(ch[2].id, "ch-3");
     }
 }

@@ -19,7 +19,7 @@ use crate::{ProviderError, Result};
 /// Same UA string IPTV Smarters Pro sends on many panels.
 pub const SMARTERS_UA: &str = "IPTVSmartersPlayer";
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct XtreamClient {
     /// Portal base used for API calls (may include :8080 and path prefix `/c`).
     pub portal: Url,
@@ -31,6 +31,18 @@ pub struct XtreamClient {
     pub prefer_m3u8: bool,
     /// True after a successful auth + `apply_server_info`.
     server_info_loaded: bool,
+}
+
+impl std::fmt::Debug for XtreamClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("XtreamClient")
+            .field("portal", &self.portal.as_str())
+            .field("stream_base", &self.stream_base.as_str())
+            .field("username", &self.username)
+            .field("password", &"***")
+            .field("prefer_m3u8", &self.prefer_m3u8)
+            .finish_non_exhaustive()
+    }
 }
 
 impl XtreamClient {
@@ -115,12 +127,9 @@ impl XtreamClient {
             extras = extras.len(),
             "xtream get_json"
         );
-        let key = crate::api_cache::key(
-            self.portal.as_str(),
-            &self.username,
-            action_label,
-            extras,
-        );
+        // The password is part of the key: after a credential change the old answer is not ours.
+        let account = format!("{}\0{}", self.username, self.password);
+        let key = crate::api_cache::key(self.portal.as_str(), &account, action_label, extras);
         let ttl = crate::api_cache::ttl_for_action(action);
         if let Some(cached) = crate::api_cache::get_fresh(&key, ttl) {
             tracing::info!(
@@ -198,16 +207,23 @@ impl XtreamClient {
             }
             if !status.is_success() {
                 warn!(%action_label, status = %status, "xtream API HTTP error");
-                return Err(crate::xtream_url::map_http_error(
-                    resp.error_for_status().unwrap_err(),
-                ));
+                return Err(crate::xtream_url::status_error(status.as_u16()));
             }
             Ok(resp.json::<Value>().await?)
         };
 
         match crate::api_cache::with_portal_limit(fetch).await {
             Ok(value) => {
-                crate::api_cache::put(&key, &value);
+                if action.is_some() {
+                    crate::api_cache::put(&key, &value);
+                } else if check_auth(&value).is_ok() {
+                    // The auth answer echoes the password; the disk cache does not need it.
+                    let mut stored = value.clone();
+                    if let Some(ui) = stored.get_mut("user_info").and_then(|u| u.as_object_mut()) {
+                        ui.remove("password");
+                    }
+                    crate::api_cache::put(&key, &stored);
+                }
                 trace!(%action_label, "xtream get_json OK");
                 Ok(value)
             }
@@ -228,16 +244,41 @@ impl XtreamClient {
             return Ok(());
         }
         let auth = self.get_json(None).await?;
-        if auth.pointer("/user_info/auth").and_then(|v| v.as_u64()) == Some(0)
-            || auth.pointer("/user_info/auth").and_then(|v| v.as_i64()) == Some(0)
-        {
-            return Err(ProviderError::Auth(
-                "Xtream auth failed (identifiants ou panel)".into(),
-            ));
-        }
+        check_auth(&auth)?;
         self.apply_server_info(&auth);
         self.server_info_loaded = true;
         Ok(())
+    }
+
+    /// Live auth round-trip (never the API cache: a dead server must look dead).
+    /// Applies `server_info`; returns `user_info.max_connections` when known.
+    pub async fn probe_auth(&mut self, timeout: std::time::Duration) -> Result<Option<u32>> {
+        let client = crate::api_cache::shared_http()?;
+        let resp = client
+            .get(self.api_url(None)?)
+            .header(reqwest::header::USER_AGENT, SMARTERS_UA)
+            .timeout(timeout)
+            .send()
+            .await
+            .map_err(|e| ProviderError::Message(crate::redact_error(&e)))?;
+        if !resp.status().is_success() {
+            return Err(ProviderError::Message(format!("HTTP {}", resp.status())));
+        }
+        let auth: Value = resp
+            .json()
+            .await
+            .map_err(|e| ProviderError::Message(crate::redact_error(&e)))?;
+        if auth_flag(&auth) != Some(1) {
+            return Err(ProviderError::Auth("Xtream auth failed".into()));
+        }
+        check_auth(&auth)?;
+        self.apply_server_info(&auth);
+        self.server_info_loaded = true;
+        Ok(auth
+            .pointer("/user_info/max_connections")
+            .and_then(|v| v.as_u64().or_else(|| v.as_str().and_then(|s| s.trim().parse().ok())))
+            .and_then(|n| u32::try_from(n).ok())
+            .filter(|n| *n > 0))
     }
 
     /// Apply `server_info` like Smarters (host/port/protocol for media paths).
@@ -257,10 +298,16 @@ impl XtreamClient {
             .get("server_protocol")
             .and_then(|v| v.as_str())
             .unwrap_or("http");
-        let port = si
-            .get("port")
-            .and_then(|v| v.as_str().map(|s| s.to_string()).or_else(|| v.as_u64().map(|n| n.to_string())))
-            .unwrap_or_else(|| "80".into());
+        let port_of = |key: &str| {
+            si.get(key)
+                .and_then(|v| v.as_str().map(|s| s.trim().to_string()).or_else(|| v.as_u64().map(|n| n.to_string())))
+                .filter(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
+        };
+        let port = if proto.eq_ignore_ascii_case("https") {
+            port_of("https_port").unwrap_or_else(|| "443".into())
+        } else {
+            port_of("port").unwrap_or_else(|| "80".into())
+        };
 
         // Keep portal port if server advertises :80 but we reached API on :8080
         // and streams also work on the portal port (common CDN split). Prefer portal
@@ -304,45 +351,35 @@ impl XtreamClient {
         }
     }
 
-    fn base_str(&self) -> String {
-        let mut s = self.stream_base.as_str().to_string();
-        if !s.ends_with('/') {
-            s.push('/');
+    /// Movies and episodes are files: HLS is a live-only output on most panels.
+    fn vod_ext<'a>(&self, container: Option<&'a str>) -> &'a str {
+        container.map(str::trim).filter(|c| !c.is_empty()).unwrap_or("mp4")
+    }
+
+    /// `{stream_base}/{kind}/{user}/{pass}/{id}.{ext}` with each segment percent-encoded,
+    /// so credentials containing `/`, `?`, `#` or spaces still produce a valid path.
+    fn media_url(&self, kind: &str, stream_id: &str, ext: &str) -> String {
+        let mut u = self.stream_base.clone();
+        u.set_query(None);
+        u.set_fragment(None);
+        let file = format!("{stream_id}.{ext}");
+        if let Ok(mut seg) = u.path_segments_mut() {
+            seg.pop_if_empty()
+                .extend([kind, self.username.as_str(), self.password.as_str(), file.as_str()]);
         }
-        s
+        u.to_string()
     }
 
     pub fn live_stream_url(&self, stream_id: &str, ext: &str) -> String {
-        format!(
-            "{}live/{}/{}/{}.{}",
-            self.base_str(),
-            self.username,
-            self.password,
-            stream_id,
-            ext
-        )
+        self.media_url("live", stream_id, ext)
     }
 
     pub fn vod_stream_url(&self, stream_id: &str, ext: &str) -> String {
-        format!(
-            "{}movie/{}/{}/{}.{}",
-            self.base_str(),
-            self.username,
-            self.password,
-            stream_id,
-            ext
-        )
+        self.media_url("movie", stream_id, ext)
     }
 
     pub fn series_stream_url(&self, stream_id: &str, ext: &str) -> String {
-        format!(
-            "{}series/{}/{}/{}.{}",
-            self.base_str(),
-            self.username,
-            self.password,
-            stream_id,
-            ext
-        )
+        self.media_url("series", stream_id, ext)
     }
 
     pub async fn load_bundle(&mut self) -> Result<PlaylistBundle> {
@@ -355,17 +392,9 @@ impl XtreamClient {
         );
         // Auth + server_info first (exactly like Smarters login).
         let auth = self.get_json(None).await?;
-        if auth.pointer("/user_info/auth").and_then(|v| v.as_u64()) == Some(0)
-            || auth.pointer("/user_info/auth").and_then(|v| v.as_i64()) == Some(0)
-        {
-            error!(
-                portal = %self.portal,
-                user = %self.username,
-                "Xtream auth failed"
-            );
-            return Err(ProviderError::Auth(
-                "Xtream auth failed (identifiants ou panel)".into(),
-            ));
+        if let Err(e) = check_auth(&auth) {
+            error!(portal = %self.portal, user = %self.username, error = %e, "Xtream auth failed");
+            return Err(e);
         }
         debug!(portal = %self.portal, "Xtream auth OK");
         self.apply_server_info(&auth);
@@ -600,7 +629,7 @@ impl XtreamClient {
             let Ok(s) = serde_json::from_value::<XcVodStream>(item) else {
                 continue;
             };
-            let ext = self.media_ext(s.container_extension.as_deref());
+            let ext = self.vod_ext(s.container_extension.as_deref());
             let url = if let Some(ds) = s.direct_source.filter(|d| !d.is_empty()) {
                 ds
             } else {
@@ -612,7 +641,7 @@ impl XtreamClient {
                 stream_url: url,
                 poster: s.stream_icon,
                 plot: s.plot,
-                year: s.year.or(s.release_date),
+                year: s.year.or(s.release_date).or(s.release_date_camel),
                 rating: s.rating,
                 genre: s.genre,
                 imdb_id: s.imdb_id.filter(|id| !id.is_empty() && id != "0"),
@@ -666,7 +695,7 @@ impl XtreamClient {
                 cover: s.cover.or(s.cover_big.clone()),
                 banner: s.cover_big,
                 plot: s.plot,
-                year: s.year.or(s.release_date),
+                year: s.year.or(s.release_date).or(s.release_date_camel),
                 rating: s.rating,
                 genre: s.genre,
                 imdb_id: s.imdb_id.filter(|id| !id.is_empty() && id != "0"),
@@ -723,7 +752,7 @@ impl XtreamClient {
             let Ok(s) = serde_json::from_value::<XcVodStream>(item) else {
                 continue;
             };
-            let ext = self.media_ext(s.container_extension.as_deref());
+            let ext = self.vod_ext(s.container_extension.as_deref());
             let url = if let Some(ds) = s.direct_source.filter(|d| !d.is_empty()) {
                 ds
             } else {
@@ -735,7 +764,7 @@ impl XtreamClient {
                 stream_url: url,
                 poster: s.stream_icon,
                 plot: s.plot,
-                year: s.year.or(s.release_date),
+                year: s.year.or(s.release_date).or(s.release_date_camel),
                 rating: s.rating,
                 genre: s.genre,
                 imdb_id: s.imdb_id.filter(|id| !id.is_empty() && id != "0"),
@@ -776,7 +805,7 @@ impl XtreamClient {
                 cover: s.cover.or(s.cover_big.clone()),
                 banner: s.cover_big,
                 plot: s.plot,
-                year: s.year.or(s.release_date),
+                year: s.year.or(s.release_date).or(s.release_date_camel),
                 rating: s.rating,
                 genre: s.genre,
                 imdb_id: s.imdb_id.filter(|id| !id.is_empty() && id != "0"),
@@ -835,15 +864,22 @@ impl XtreamClient {
                     .and_then(|v| v.as_str())
                     .map(str::to_string)
             });
+        // Empty strings are common here and must not blank a known synopsis.
         let plot = info
             .get("plot")
+            .or_else(|| info.get("description"))
             .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("n/a"))
             .map(str::to_string);
+        // "2025-03-01" → "2025"
         let year = info
             .get("releaseDate")
             .or_else(|| info.get("release_date"))
             .or_else(|| info.get("year"))
-            .and_then(|v| v.as_str().map(str::to_string).or_else(|| v.as_u64().map(|n| n.to_string())));
+            .and_then(|v| v.as_str().map(str::to_string).or_else(|| v.as_u64().map(|n| n.to_string())))
+            .map(|s| s.trim().chars().take(4).collect::<String>())
+            .filter(|s| s.len() == 4 && s.chars().all(|c| c.is_ascii_digit()));
         let rating = info
             .get("rating")
             .and_then(|v| v.as_str().map(str::to_string).or_else(|| v.as_f64().map(|n| format!("{n:.1}"))));
@@ -899,9 +935,15 @@ impl XtreamClient {
                             .and_then(|v| v.as_str())
                             .unwrap_or("Episode")
                             .to_string();
-                        let episode_num =
-                            ep.get("episode_num").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-                        let ext = self.media_ext(
+                        // Panels send `"episode_num": 3` or `"3"`.
+                        let episode_num = ep
+                            .get("episode_num")
+                            .and_then(|v| {
+                                v.as_u64().or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()))
+                            })
+                            .and_then(|n| u32::try_from(n).ok())
+                            .unwrap_or(0);
+                        let ext = self.vod_ext(
                             ep.get("container_extension")
                                 .and_then(|v| v.as_str())
                                 .map(str::trim)
@@ -927,6 +969,7 @@ impl XtreamClient {
                         });
                     }
                 }
+                list.sort_by_key(|e| e.episode_num);
                 seasons.push(SeriesSeason {
                     season_number,
                     episodes: list,
@@ -997,10 +1040,7 @@ impl XtreamClient {
             .and_then(|v| v.as_str())
             .unwrap_or(vod_id)
             .to_string();
-        let ext = movie
-            .get("container_extension")
-            .and_then(|v| v.as_str())
-            .unwrap_or_else(|| self.media_ext(None));
+        let ext = self.vod_ext(movie.get("container_extension").and_then(|v| v.as_str()));
         let stream_url = self.vod_stream_url(vod_id, ext);
 
         let poster = info
@@ -1015,7 +1055,7 @@ impl XtreamClient {
             .or_else(|| info.get("description"))
             .and_then(|v| v.as_str())
             .map(str::trim)
-            .filter(|s| !s.is_empty())
+            .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("n/a"))
             .map(str::to_string);
 
         let year = info
@@ -1218,6 +1258,7 @@ async fn parallel_map_categories(
 struct XcCategory {
     #[serde(deserialize_with = "de_id")]
     category_id: String,
+    #[serde(default, deserialize_with = "de_name")]
     category_name: String,
 }
 
@@ -1225,16 +1266,17 @@ struct XcCategory {
 struct XcLiveStream {
     #[serde(deserialize_with = "de_id")]
     stream_id: String,
+    #[serde(default, deserialize_with = "de_name")]
     name: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_opt_strish")]
     stream_icon: Option<String>,
     #[serde(default, deserialize_with = "de_opt_id")]
     category_id: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_opt_strish")]
     epg_channel_id: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_opt_strish")]
     container_extension: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_opt_strish")]
     direct_source: Option<String>,
 }
 
@@ -1242,26 +1284,30 @@ struct XcLiveStream {
 struct XcVodStream {
     #[serde(deserialize_with = "de_id")]
     stream_id: String,
+    #[serde(default, deserialize_with = "de_name")]
     name: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_opt_strish")]
     stream_icon: Option<String>,
     #[serde(default, deserialize_with = "de_opt_id")]
     category_id: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_opt_strish")]
     container_extension: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_opt_strish")]
     direct_source: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_opt_strish")]
     plot: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_opt_strish")]
     year: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_opt_strish")]
     release_date: Option<String>,
-    #[serde(default)]
+    /// `get_series` spells it `releaseDate`.
+    #[serde(default, rename = "releaseDate", deserialize_with = "de_opt_strish")]
+    release_date_camel: Option<String>,
+    #[serde(default, deserialize_with = "de_opt_strish")]
     rating: Option<String>,
     #[serde(default, deserialize_with = "de_opt_strish")]
     genre: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_opt_strish")]
     imdb_id: Option<String>,
 }
 
@@ -1269,25 +1315,54 @@ struct XcVodStream {
 struct XcSeries {
     #[serde(deserialize_with = "de_id")]
     series_id: String,
+    #[serde(default, deserialize_with = "de_name")]
     name: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_opt_strish")]
     cover: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_opt_strish")]
     cover_big: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_opt_strish")]
     plot: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_opt_strish")]
     year: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_opt_strish")]
     release_date: Option<String>,
-    #[serde(default)]
+    /// `get_series` spells it `releaseDate`.
+    #[serde(default, rename = "releaseDate", deserialize_with = "de_opt_strish")]
+    release_date_camel: Option<String>,
+    #[serde(default, deserialize_with = "de_opt_strish")]
     rating: Option<String>,
     #[serde(default, deserialize_with = "de_opt_strish")]
     genre: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_opt_strish")]
     imdb_id: Option<String>,
     #[serde(default, deserialize_with = "de_opt_id")]
     category_id: Option<String>,
+}
+
+/// `user_info.auth` as a number, whether the panel sends `1` or `"1"`.
+fn auth_flag(auth: &Value) -> Option<i64> {
+    auth.pointer("/user_info/auth")
+        .and_then(|v| v.as_i64().or_else(|| v.as_str().and_then(|s| s.trim().parse().ok())))
+}
+
+/// Refused credentials (`auth: 0`) and dead accounts (Expired / Banned / Disabled) fail here
+/// instead of producing a catalog whose every stream answers 401/403.
+fn check_auth(auth: &Value) -> Result<()> {
+    if auth_flag(auth) == Some(0) {
+        return Err(ProviderError::Auth("Xtream auth failed (identifiants ou panel)".into()));
+    }
+    let status = auth
+        .pointer("/user_info/status")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .unwrap_or("");
+    for dead in ["expired", "banned", "disabled"] {
+        if status.eq_ignore_ascii_case(dead) {
+            return Err(ProviderError::Auth(format!("compte Xtream {status}")));
+        }
+    }
+    Ok(())
 }
 
 fn de_id<'de, D>(deserializer: D) -> std::result::Result<String, D::Error>
@@ -1296,10 +1371,19 @@ where
 {
     let v = Value::deserialize(deserializer)?;
     match v {
-        Value::String(s) => Ok(s),
+        Value::String(s) if !s.trim().is_empty() => Ok(s),
         Value::Number(n) => Ok(n.to_string()),
-        other => Ok(other.to_string()),
+        // An item without id cannot be played: drop it rather than build `…/null.ts`.
+        other => Err(serde::de::Error::custom(format!("invalid id: {other}"))),
     }
+}
+
+/// Names may arrive as `null` or a number on some panels; never drop the item for it.
+fn de_name<'de, D>(deserializer: D) -> std::result::Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(de_opt_strish(deserializer)?.unwrap_or_default())
 }
 
 fn de_opt_id<'de, D>(deserializer: D) -> std::result::Result<Option<String>, D::Error>
@@ -1353,4 +1437,66 @@ where
             }
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn client() -> XtreamClient {
+        XtreamClient::from_credentials(uuid::Uuid::nil(), "http://panel.example:8080", "u".into(), "p".into())
+            .unwrap()
+    }
+
+    #[test]
+    fn odd_field_types_keep_the_item() {
+        let vod: XcVodStream = serde_json::from_value(json!({
+            "stream_id": 7, "name": null, "rating": 7.5, "year": 2021,
+            "stream_icon": "", "category_id": 3, "container_extension": ""
+        }))
+        .unwrap();
+        assert_eq!(vod.name, "");
+        assert_eq!(vod.rating.as_deref(), Some("7.5"));
+        assert_eq!(vod.year.as_deref(), Some("2021"));
+        assert_eq!(vod.stream_icon, None);
+        assert_eq!(client().vod_ext(vod.container_extension.as_deref()), "mp4");
+
+        let series: XcSeries = serde_json::from_value(json!({
+            "series_id": "9", "name": 1917, "release_date": "2019", "releaseDate": "2019-12-25"
+        }))
+        .unwrap();
+        assert_eq!(series.name, "1917");
+        assert_eq!(series.release_date_camel.as_deref(), Some("2019-12-25"));
+
+        assert!(serde_json::from_value::<XcVodStream>(json!({ "stream_id": null })).is_err());
+    }
+
+    #[test]
+    fn credentials_are_encoded_in_stream_urls() {
+        let mut c = client();
+        c.password = "a/b?c#d e".into();
+        let url = c.vod_stream_url("42", "mkv");
+        assert!(url.ends_with("/movie/u/a%2Fb%3Fc%23d%20e/42.mkv"), "{url}");
+        assert!(url.contains(&format!("/u/{}/", crate::xtream_url::path_segment(&c.password))));
+        c.password = "p".into();
+        assert!(c.live_stream_url("1", "ts").ends_with(":8080/live/u/p/1.ts"));
+    }
+
+    #[test]
+    fn dead_accounts_are_refused() {
+        assert!(check_auth(&json!({ "user_info": { "auth": 1, "status": "Active" } })).is_ok());
+        assert!(check_auth(&json!({ "user_info": { "auth": "0" } })).is_err());
+        assert!(check_auth(&json!({ "user_info": { "auth": 1, "status": "Expired" } })).is_err());
+        assert!(check_auth(&json!({ "user_info": { "auth": 1, "status": "Banned" } })).is_err());
+    }
+
+    #[test]
+    fn https_server_info_uses_the_https_port() {
+        let mut c = client();
+        c.apply_server_info(&json!({ "server_info": {
+            "url": "cdn.example", "port": "80", "https_port": "8443", "server_protocol": "https"
+        }}));
+        assert_eq!(c.stream_base.as_str(), "https://cdn.example:8443/");
+    }
 }

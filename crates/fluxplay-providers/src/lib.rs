@@ -4,6 +4,7 @@ pub mod api_cache;
 pub mod health;
 pub mod http_client;
 pub mod m3u_source;
+pub mod servers;
 pub mod stalker;
 pub mod user_agents;
 pub mod xtream;
@@ -19,7 +20,7 @@ use tracing::{debug, info, warn};
 pub use health::{check_xtream_portal, format_health, PortalHealth};
 pub use http_client::{
     app_http, apply_network_settings, bootstrap_lookup_ip, current_network_settings, probe_dns,
-    set_socks_proxy, shared_http, socks_proxy,
+    required_proxy, set_socks_proxy, shared_http, socks_proxy,
 };
 pub use m3u_source::load_m3u_source;
 pub use stalker::StalkerClient;
@@ -39,10 +40,14 @@ pub async fn load_xtream_vod_categories(
         parallel,
         "load_xtream_vod_categories"
     );
-    let Some(client) = xtream_client_for(source) else {
+    let Some(mut client) = xtream_client_for(source) else {
         warn!(source_id = %source.id, "no Xtream client for VOD categories");
         return Vec::new();
     };
+    if let Err(e) = client.ensure_stream_base().await {
+        warn!(source_id = %source.id, error = %e, "Xtream auth before category load failed");
+        return Vec::new();
+    }
     client
         .load_vod_categories_parallel(category_ids, parallel)
         .await
@@ -61,10 +66,14 @@ pub async fn load_xtream_series_categories(
         parallel,
         "load_xtream_series_categories"
     );
-    let Some(client) = xtream_client_for(source) else {
+    let Some(mut client) = xtream_client_for(source) else {
         warn!(source_id = %source.id, "no Xtream client for series categories");
         return Vec::new();
     };
+    if let Err(e) = client.ensure_stream_base().await {
+        warn!(source_id = %source.id, error = %e, "Xtream auth before category load failed");
+        return Vec::new();
+    }
     client
         .load_series_categories_parallel(category_ids, parallel)
         .await
@@ -76,9 +85,11 @@ pub async fn load_xtream_vod_category(
     category_id: &str,
 ) -> Result<Vec<fluxplay_core::models::VodItem>> {
     debug!(source_id = %source.id, %category_id, "load_xtream_vod_category");
-    let client = xtream_client_for(source).ok_or_else(|| {
+    let mut client = xtream_client_for(source).ok_or_else(|| {
         ProviderError::Message("source Xtream requise pour charger le VOD".into())
     })?;
+    // Without `server_info` the URLs point at the API portal instead of the media CDN.
+    client.ensure_stream_base().await?;
     client.load_vod_category(category_id).await
 }
 
@@ -88,9 +99,11 @@ pub async fn load_xtream_series_category(
     category_id: &str,
 ) -> Result<Vec<fluxplay_core::models::SeriesItem>> {
     debug!(source_id = %source.id, %category_id, "load_xtream_series_category");
-    let client = xtream_client_for(source).ok_or_else(|| {
+    let mut client = xtream_client_for(source).ok_or_else(|| {
         ProviderError::Message("source Xtream requise pour charger les séries".into())
     })?;
+    // Without `server_info` the URLs point at the API portal instead of the media CDN.
+    client.ensure_stream_base().await?;
     client.load_series_category(category_id).await
 }
 
@@ -122,7 +135,7 @@ pub async fn load_xtream_vod_info(
 
 #[derive(Debug, Error)]
 pub enum ProviderError {
-    #[error("http: {0}")]
+    #[error("http: {}", crate::redact_error(.0))]
     Http(#[from] reqwest::Error),
     #[error("core: {0}")]
     Core(#[from] fluxplay_core::Error),
@@ -136,6 +149,34 @@ pub enum ProviderError {
 
 pub type Result<T> = std::result::Result<T, ProviderError>;
 
+/// Error text without the request URL (Xtream URLs carry the credentials).
+pub fn redact_error(e: &reqwest::Error) -> String {
+    redact_urls(&e.to_string())
+}
+
+/// Replace every `http(s)://…` token in `text` with `<url>`.
+pub fn redact_urls(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    loop {
+        let next = ["http://", "https://"]
+            .iter()
+            .filter_map(|p| rest.find(p))
+            .min();
+        let Some(start) = next else {
+            out.push_str(rest);
+            return out;
+        };
+        out.push_str(&rest[..start]);
+        out.push_str("<url>");
+        let tail = &rest[start..];
+        let end = tail
+            .find(|c: char| c.is_whitespace() || matches!(c, ')' | '"' | '\'' | '>'))
+            .unwrap_or(tail.len());
+        rest = &tail[end..];
+    }
+}
+
 pub(crate) fn http_client() -> Result<reqwest::Client> {
     api_cache::shared_http()
 }
@@ -146,8 +187,28 @@ pub fn clear_xtream_cache() {
     api_cache::clear_all();
 }
 
-/// Load a [`MediaSource`] into a unified [`PlaylistBundle`].
+/// Load a [`MediaSource`] into a unified [`PlaylistBundle`]. With mirrors,
+/// the servers are ranked first and tried fastest first until one answers.
 pub async fn load_source(source: &MediaSource) -> Result<PlaylistBundle> {
+    if !servers::has_mirrors(source) {
+        return load_single(source).await;
+    }
+    let order = servers::rank_if_stale(source).await.endpoint_order();
+    let mut first_err = None;
+    for ep in order {
+        let one = servers::source_for_endpoint(source, &ep);
+        match load_single(&one).await {
+            Ok(bundle) => return Ok(bundle),
+            Err(e) => {
+                warn!(source_id = %source.id, error = %e, "server failed — trying the next one");
+                first_err.get_or_insert(e);
+            }
+        }
+    }
+    Err(first_err.unwrap_or_else(|| ProviderError::Message("aucun serveur configuré".into())))
+}
+
+async fn load_single(source: &MediaSource) -> Result<PlaylistBundle> {
     let _prof = Stopwatch::start("load_source");
     info!(source_id = %source.id, kind = ?source.kind, "load_source start");
     match source.kind {
@@ -246,7 +307,7 @@ pub async fn attach_epg(source: &MediaSource, mut bundle: PlaylistBundle) -> Res
     }
     // Full xmltv.php on big panels is often 50–70MB — refuse rather than OOM.
     if epg_url.contains("xmltv.php") {
-        warn!(%epg_url, "skipping full xmltv.php attach (use Xtream short EPG)");
+        warn!(source_id = %source.id, "skipping full xmltv.php attach (use Xtream short EPG)");
         return Ok(bundle);
     }
     debug!(source_id = %source.id, "attach_epg fetch");
@@ -254,7 +315,7 @@ pub async fn attach_epg(source: &MediaSource, mut bundle: PlaylistBundle) -> Res
     let resp = match client.get(epg_url).send().await {
         Ok(r) => r,
         Err(e) => {
-            warn!(error = %e, "EPG attach fetch failed");
+            warn!(error = %redact_error(&e), "EPG attach fetch failed");
             return Ok(bundle);
         }
     };
@@ -267,7 +328,7 @@ pub async fn attach_epg(source: &MediaSource, mut bundle: PlaylistBundle) -> Res
     let bytes = match resp.bytes().await {
         Ok(b) => b,
         Err(e) => {
-            warn!(error = %e, "EPG body failed");
+            warn!(error = %redact_error(&e), "EPG body failed");
             return Ok(bundle);
         }
     };
@@ -275,6 +336,29 @@ pub async fn attach_epg(source: &MediaSource, mut bundle: PlaylistBundle) -> Res
         warn!(len = bytes.len(), "EPG too large — skipped");
         return Ok(bundle);
     }
+    // `epg.xml.gz` served as a file (`application/gzip`, no Content-Encoding) is not
+    // decoded by reqwest.
+    let bytes: std::borrow::Cow<'_, [u8]> = if bytes.starts_with(&[0x1f, 0x8b]) {
+        use std::io::Read;
+        const MAX_XML: u64 = 64_000_000;
+        let mut out = Vec::new();
+        let read = flate2::read::MultiGzDecoder::new(&bytes[..])
+            .take(MAX_XML + 1)
+            .read_to_end(&mut out);
+        match read {
+            Ok(n) if n as u64 <= MAX_XML => std::borrow::Cow::Owned(out),
+            Ok(_) => {
+                warn!("EPG gzip expands past 64 MB — skipped");
+                return Ok(bundle);
+            }
+            Err(e) => {
+                warn!(error = %e, "EPG gzip decode failed");
+                return Ok(bundle);
+            }
+        }
+    } else {
+        std::borrow::Cow::Borrowed(&bytes[..])
+    };
     let text = String::from_utf8_lossy(&bytes);
     if let Ok(epg) = xmltv::parse_xmltv(&text) {
         let n = epg.len();
@@ -366,6 +450,9 @@ pub async fn fetch_short_epg(
 }
 
 fn xtream_client_for(source: &MediaSource) -> Option<XtreamClient> {
+    if servers::has_mirrors(source) {
+        return servers::xtream_client(source, &servers::best_endpoint(source));
+    }
     if let Some(creds) = parse_xtream_get_php(&source.endpoint) {
         return XtreamClient::from_credentials(
             source.id,

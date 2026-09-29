@@ -77,12 +77,12 @@ impl SoftPump {
                     // Lock-free dirty read (shared atomic) — the old path locked the
                     // mpv Mutex here 250-500×/s and stalled UI property reads.
                     let needs = frame_dirty.load(Ordering::Acquire);
-                    // UI still holding a frame and mpv not dirty — park; don't spin.
-                    if pending && !needs {
-                        thread::sleep(Duration::from_millis(4));
+                    // One frame in hand until the UI takes it. Overwriting the slot
+                    // dropped pictures and made soft mpv surge then hitch.
+                    if pending {
+                        thread::sleep(Duration::from_millis(2));
                         continue;
                     }
-                    // Pending but dirty: overwrite slot (drop old) so latency stays low.
                     if !needs {
                         thread::sleep(Duration::from_millis(2));
                         continue;
@@ -111,14 +111,12 @@ impl SoftPump {
                             let gen_u32 = (local_gen & 0xffff_ffff) as u32;
                             produced_t.store(gen_u32, Ordering::Release);
                             if let Ok(mut slot) = latest_t.lock() {
-                                if let Some(old) = slot.replace(SoftFrame {
+                                slot.replace(SoftFrame {
                                     w,
                                     h,
                                     pixels,
                                     gen: local_gen,
-                                }) {
-                                    local_recycle = Some(old.pixels);
-                                }
+                                });
                             }
                             // Brief yield so UI can take the frame / lock mpv props.
                             thread::sleep(Duration::from_millis(1));

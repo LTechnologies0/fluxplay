@@ -140,9 +140,9 @@ Chaque `update`/`view`/`Stopwatch` : `wall_ns`/`wall_ms`, `% CPU/cœur`, RSS. Le
 - SQLite : `~/.local/share/fluxplay/catalog.sqlite3` (live / VOD / séries)
 - Au démarrage : hydrate depuis la DB, puis sync Xtream **seulement si le cache a >12h**
 - Recherche VOD/Séries = FTS5 locale (pas d’API portal)
-- Images : cache disque `~/.cache/fluxplay/images/` + LRU RAM (96)
+- Images : cache disque `~/.cache/fluxplay/images/` + LRU RAM (jusqu’à 768 handles)
 - Métadonnées : TVMaze + OMDb (`OMDB_API_KEY`), une seule fois (`meta_ok`)
-- UI mosaïque (24 tuiles/page) type MYTV Online
+- UI mosaïque virtualisée type MYTV Online (posters ré-uploadés après lecture soft si l’atlas GPU a été réutilisé)
 - La démo n’est chargée que s’il n’y a **aucune** vraie source
 
 ### Optimisations appliquées (recherche EN)

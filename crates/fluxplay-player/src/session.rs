@@ -21,6 +21,8 @@ pub enum PlaybackState {
 
 pub struct StreamSession {
     pub state: PlaybackState,
+    /// Embedded FFmpeg read-ahead, refreshed with the buffering state.
+    pub buffer: Option<crate::BufferState>,
     pub channel: Option<Channel>,
     pub routed: Option<RoutedStream>,
     pub started_at: Option<DateTime<Utc>>,
@@ -159,6 +161,16 @@ impl AspectMode {
         }
     }
 
+    /// Forced display aspect ratio, `None` for the stream's own.
+    pub fn ratio(self) -> Option<f32> {
+        match self {
+            Self::Auto => None,
+            Self::R16x9 => Some(16.0 / 9.0),
+            Self::R4x3 => Some(4.0 / 3.0),
+            Self::R235 => Some(2.35),
+        }
+    }
+
     pub fn mpv_value(self) -> &'static str {
         match self {
             Self::Auto => "-1",
@@ -264,6 +276,7 @@ impl Default for StreamSession {
     fn default() -> Self {
         Self {
             state: PlaybackState::Idle,
+            buffer: None,
             channel: None,
             routed: None,
             started_at: None,
@@ -323,12 +336,25 @@ impl StreamSession {
         let _ = self.native.raise_video_window();
     }
 
+    pub fn set_present_hz(&mut self, hz: u32) {
+        self.native.set_present_hz(hz);
+    }
+
     pub fn pull_video_frame(&mut self, w: u32, h: u32) -> Option<(u32, u32, Vec<u8>)> {
         self.native.pull_video_frame(w, h)
     }
 
     pub fn recycle_soft_rgba(&mut self, buf: Vec<u8>) {
         self.native.recycle_soft_rgba(buf);
+    }
+
+    /// Next frame for the GPU video stage; see [`crate::NativePlayer::pull_frame`].
+    pub fn pull_frame(&mut self, w: u32, h: u32) -> Option<crate::VideoFrame> {
+        self.native.pull_frame(w, h)
+    }
+
+    pub fn recycle_video_frame(&mut self, frame: crate::VideoFrame) {
+        self.native.recycle_video_frame(frame);
     }
 
     pub fn frame_needs_redraw(&self) -> bool {
@@ -353,8 +379,10 @@ impl StreamSession {
             self.state,
             PlaybackState::Playing | PlaybackState::Buffering
         ) {
+            self.buffer = None;
             return;
         }
+        self.buffer = self.native.buffer_state();
         if self.native.paused_for_cache() {
             self.state = PlaybackState::Buffering;
         } else if self.state == PlaybackState::Buffering {
@@ -386,6 +414,7 @@ impl StreamSession {
             Ok(routed) => {
                 self.routed = Some(routed);
                 let url = channel.stream_url.clone();
+                self.native.options_mut().media_title = Some(channel.name.trim().to_string());
                 match self.native.play(&url) {
                     Ok(backend) => {
                         self.backend = Some(backend);
@@ -426,6 +455,18 @@ impl StreamSession {
                 Err(e)
             }
         }
+    }
+
+    /// Current stream in the system player (headers + title kept). Returns its label.
+    #[cfg(not(target_os = "android"))]
+    pub fn open_external(&mut self) -> crate::Result<String> {
+        let channel = self
+            .channel
+            .as_ref()
+            .ok_or_else(|| crate::PlayerError::Message("aucun flux en cours".into()))?;
+        let url = channel.stream_url.clone();
+        self.native.options_mut().media_title = Some(channel.name.trim().to_string());
+        self.native.start_external(&url)
     }
 
     pub fn pause(&mut self) {
@@ -507,6 +548,10 @@ impl StreamSession {
     }
 
     pub fn seek_relative(&mut self, secs: f64) {
+        if self.is_live() {
+            trace!("StreamSession::seek_relative skipped (live)");
+            return;
+        }
         if matches!(
             self.state,
             PlaybackState::Playing | PlaybackState::Paused | PlaybackState::Buffering
@@ -545,6 +590,12 @@ impl StreamSession {
                 self.error = None;
                 self.started_at = Some(Utc::now());
                 self.backend = self.native.active_backend();
+                // The engine was rebuilt at `opts.volume`: re-apply the user's mute.
+                if self.muted {
+                    if let Err(e) = self.native.set_mute(true) {
+                        warn!(error = %e, "mute after restart failed");
+                    }
+                }
             }
             Err(e) => {
                 error!(error = %e, "StreamSession::restart failed");
@@ -950,9 +1001,7 @@ impl StreamSession {
 
     /// Soft RGBA bytes for PNG capture when mpv screenshot is unavailable.
     pub fn soft_rgba_snapshot(&self) -> Option<(u32, u32, Vec<u8>)> {
-        self.native
-            .last_soft_rgba()
-            .map(|(w, h, b)| (w, h, b.to_vec()))
+        self.native.soft_snapshot_rgba()
     }
 
     pub fn refresh_times(&mut self) {
@@ -1026,7 +1075,14 @@ impl StreamSession {
             (PlaybackState::Paused, Some(ch), _) => {
                 format!("Pause — {} · {}", ch.name, self.backend_display_label())
             }
-            (PlaybackState::Buffering, Some(ch), _) => format!("Buffer — {}", ch.name),
+            (PlaybackState::Buffering, Some(ch), _) => match self.buffer {
+                Some(b) if b.goal_secs > 0.0 => format!(
+                    "Mise en mémoire tampon {} % — {}",
+                    b.fill_percent(),
+                    ch.name
+                ),
+                _ => format!("Buffer — {}", ch.name),
+            },
             (PlaybackState::Error, _, _) => self
                 .error
                 .clone()

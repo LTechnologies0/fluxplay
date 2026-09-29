@@ -1,52 +1,67 @@
 //! Userspace WireGuard tunnel scoped to FluxPlay (no system routes).
 //!
-//! Desktop + Android: `wg-socks` builds an in-process WireGuard datapath and
-//! exposes a local SOCKS5 proxy. HTTP clients + mpv are pointed at that proxy
-//! so only FluxPlay traffic exits through the tunnel (no VpnService required).
+//! Desktop + Android: [`crate::wg_proxy`] runs the WireGuard datapath in-process
+//! and exposes one authenticated loopback port (SOCKS5 for HTTP clients, HTTP
+//! proxy for mpv / FFmpeg), so only FluxPlay traffic exits through the tunnel
+//! (no VpnService required).
 //!
 //! DNS policy:
-//! - Profile `DNS=` resolves the peer **Endpoint** only (bootstrap, clearnet).
-//! - App day-to-day DNS is the user's Custom / DoH / DoT (queries tunnelled via SOCKS).
+//! - Profile `DNS=` resolves the peer **Endpoint** (bootstrap, clearnet) and is a
+//!   fallback resolver inside the tunnel.
+//! - Every app / player hostname is resolved by the proxy, inside the tunnel,
+//!   with the user's Custom / DoH / DoT provider first.
 
 use std::path::Path;
 use std::sync::{Mutex, OnceLock};
 
-use tracing::{info, warn};
+use tracing::info;
 
-static SOCKS_URL: OnceLock<Mutex<Option<String>>> = OnceLock::new();
-static PROXY: OnceLock<Mutex<Option<wg_socks::WgSocksProxy>>> = OnceLock::new();
+use crate::wg_proxy::{parse_profile, WgProxy};
+
+static PROXY: OnceLock<Mutex<Option<WgProxy>>> = OnceLock::new();
 static START_IN_FLIGHT: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-fn socks_lock() -> &'static Mutex<Option<String>> {
-    SOCKS_URL.get_or_init(|| Mutex::new(None))
+fn proxy_lock() -> &'static Mutex<Option<WgProxy>> {
+    PROXY.get_or_init(|| Mutex::new(None))
+}
+
+fn with_proxy<R>(f: impl FnOnce(&WgProxy) -> R) -> Option<R> {
+    proxy_lock().lock().ok().and_then(|g| g.as_ref().map(f))
 }
 
 pub fn tunnel_start_in_flight() -> bool {
     START_IN_FLIGHT.load(std::sync::atomic::Ordering::SeqCst)
 }
 
-/// Current SOCKS5 URL for app HTTP / player, if the tunnel is up.
-pub fn socks_proxy_url() -> Option<String> {
-    socks_lock().lock().ok().and_then(|g| g.clone())
+/// `http://` URL (with credentials) for mpv / FFmpeg, which ignore SOCKS proxies.
+pub fn player_proxy_url() -> Option<String> {
+    with_proxy(WgProxy::http_url)
 }
 
-pub fn set_socks_proxy_url(url: Option<String>) {
-    if let Ok(mut g) = socks_lock().lock() {
-        *g = url.clone();
+/// `127.0.0.1:port` — safe to show (no credentials).
+pub fn proxy_display() -> Option<String> {
+    with_proxy(|p| p.addr().to_string())
+}
+
+/// Settings "Test DNS": through the tunnel resolver when up, else the app resolver.
+pub async fn probe_dns(host: &str) -> String {
+    let Some((servers, lookup)) = with_proxy(|p| {
+        let servers = p.dns_servers();
+        let host = host.to_string();
+        let dns = p.resolver();
+        (servers, async move { dns.resolve(&host).await })
+    }) else {
+        return fluxplay_providers::probe_dns(host).await;
+    };
+    let first = servers.first().map(|s| s.ip().to_string()).unwrap_or_else(|| "-".into());
+    match lookup.await {
+        Ok(ips) => {
+            let list: Vec<_> = ips.iter().map(|ip| ip.to_string()).collect();
+            format!("{host} → {} (dans le tunnel, résolveur {first})", list.join(", "))
+        }
+        Err(e) => format!("échec DNS dans le tunnel pour {host} : {e}"),
     }
-    fluxplay_providers::set_socks_proxy(url);
-}
-
-async fn reserve_local_socks_addr() -> Result<std::net::SocketAddr, String> {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .map_err(|e| format!("bind SOCKS local: {e}"))?;
-    let addr = listener
-        .local_addr()
-        .map_err(|e| format!("local_addr: {e}"))?;
-    drop(listener);
-    Ok(addr)
 }
 
 /// Rewrite `Endpoint = hostname:port` → IP using bootstrap DNS (profile `DNS=`).
@@ -125,7 +140,7 @@ fn bootstrap_from_conf_or_settings(conf: &str, settings_bootstrap: &str) -> Stri
     crate::network::parse_wg_dns(conf).unwrap_or_default()
 }
 
-/// Start userspace WG from a `.conf` file. Returns `socks5h://127.0.0.1:port`.
+/// Start userspace WG from a `.conf` file. Returns the loopback proxy address.
 pub async fn start_tunnel_from_file(path: &Path, bootstrap_dns: &str) -> Result<String, String> {
     START_IN_FLIGHT.store(true, std::sync::atomic::Ordering::SeqCst);
     let result = async {
@@ -149,47 +164,31 @@ pub async fn start_tunnel_from_str(conf: &str, bootstrap_dns: &str) -> Result<St
 }
 
 async fn start_tunnel_from_prepared(conf: &str) -> Result<String, String> {
-    let mut last_err = String::new();
-    for _ in 0..5 {
-        let bind = match reserve_local_socks_addr().await {
-            Ok(a) => a,
-            Err(e) => {
-                last_err = e;
-                continue;
-            }
-        };
-        match wg_socks::WgSocksProxy::start_from_str(conf, bind).await {
-            Ok(proxy) => {
-                // socks5h = remote DNS through the proxy (avoids clearnet DNS leak).
-                let url = format!("socks5h://{bind}");
-                info!(%url, "WireGuard userspace SOCKS proxy up (app-only, remote DNS)");
-                if let Ok(mut g) = PROXY.get_or_init(|| Mutex::new(None)).lock() {
-                    *g = Some(proxy);
-                }
-                set_socks_proxy_url(Some(url.clone()));
-                return Ok(url);
-            }
-            Err(e) => {
-                last_err = format!("{e:#}");
-                warn!(error = %last_err, %bind, "WG SOCKS bind retry");
-            }
+    let profile = parse_profile(conf).map_err(|e| format!("profil WireGuard : {e}"))?;
+    let proxy = WgProxy::start(&profile)
+        .await
+        .map_err(|e| format!("démarrage tunnel WireGuard : {e}"))?;
+    let local_addr = proxy.addr().to_string();
+    let socks = proxy.socks_url();
+    if let Ok(mut g) = proxy_lock().lock() {
+        if let Some(old) = g.replace(proxy) {
+            old.shutdown();
         }
     }
-    Err(format!("démarrage tunnel WireGuard: {last_err}"))
+    fluxplay_providers::set_socks_proxy(Some(socks));
+    info!(proxy = %local_addr, mtu = profile.mtu(), "WireGuard app proxy up (SOCKS5 + HTTP, tunnel DNS)");
+    Ok(local_addr)
 }
 
 pub fn stop_tunnel() {
-    if let Some(lock) = PROXY.get() {
-        if let Ok(mut g) = lock.lock() {
-            if let Some(proxy) = g.take() {
-                proxy.shutdown();
-                info!("WireGuard userspace proxy stopped");
-            }
-        }
+    let old = proxy_lock().lock().ok().and_then(|mut g| g.take());
+    fluxplay_providers::set_socks_proxy(None);
+    if let Some(proxy) = old {
+        proxy.shutdown();
+        info!("WireGuard userspace proxy stopped");
     }
-    set_socks_proxy_url(None);
 }
 
 pub fn tunnel_is_up() -> bool {
-    socks_proxy_url().is_some()
+    proxy_lock().lock().map(|g| g.is_some()).unwrap_or(false)
 }

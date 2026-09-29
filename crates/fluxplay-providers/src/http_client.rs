@@ -1,10 +1,9 @@
 //! Shared reqwest clients with optional custom DNS (UDP / DoH / DoT).
 //!
-//! When an app-scoped WireGuard SOCKS proxy is active:
-//! - traffic uses `socks5://` (local resolve, connect by IP through the tunnel)
-//! - hostname lookups use the user's Custom / DoH / DoT prefs **through the tunnel**
-//! - System mode + tunnel falls back to Cloudflare DoH through the tunnel
-//!   (profile `DNS=` is never used here — bootstrap only, see fluxplay `network` / `wg_tunnel`)
+//! When the app-scoped WireGuard proxy is active, traffic uses `socks5h://`:
+//! hostnames are resolved by the proxy inside the tunnel (see fluxplay `wg_proxy`),
+//! so no local resolver is attached. While WireGuard is enabled but not up yet,
+//! requests are pointed at a dead proxy instead of leaking to the clearnet.
 
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -13,12 +12,8 @@ use std::time::Duration;
 use fluxplay_core::{DnsMode, NetworkSettings};
 use hickory_resolver::config::{NameServerConfigGroup, ResolverConfig, ResolverOpts};
 use hickory_resolver::name_server::TokioConnectionProvider;
-use hickory_resolver::proto::op::{Message, MessageType, OpCode, Query};
-use hickory_resolver::proto::rr::{Name as DnsName, RData, RecordType};
 use hickory_resolver::TokioResolver;
 use reqwest::dns::{Addrs, Name, Resolve, Resolving};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio_socks::tcp::Socks5Stream;
 use tracing::{debug, info, warn};
 
 use crate::{ProviderError, Result};
@@ -62,6 +57,19 @@ pub fn socks_proxy() -> Option<String> {
     socks_lock().lock().ok().and_then(|g| g.clone())
 }
 
+/// Discard port: connections are refused, so nothing leaves the machine.
+const DEAD_PROXY: &str = "socks5h://127.0.0.1:9";
+
+/// Proxy every app request must use: the tunnel, or a dead end while it is
+/// enabled but not established (fail closed).
+pub fn required_proxy() -> Option<String> {
+    socks_proxy().or_else(|| {
+        current_network_settings()
+            .wireguard_enabled
+            .then(|| DEAD_PROXY.to_string())
+    })
+}
+
 /// Apply DNS / network prefs and drop cached HTTP clients (next call rebuilds).
 pub fn apply_network_settings(settings: &NetworkSettings) {
     if let Ok(mut g) = net_lock().lock() {
@@ -76,7 +84,7 @@ pub fn apply_network_settings(settings: &NetworkSettings) {
     info!(
         dns = settings.dns_mode.label(),
         wg = settings.wireguard_enabled,
-        socks = socks_proxy().as_deref().unwrap_or("-"),
+        tunnel = socks_proxy().is_some(),
         "network settings applied (HTTP clients reset)"
     );
 }
@@ -142,43 +150,28 @@ fn build_client(
         .timeout(timeout)
         .connect_timeout(connect_timeout)
         .redirect(reqwest::redirect::Policy::limited(8))
+        // A redirect must not forward `?username=&password=` to the next host as Referer.
+        .referer(false)
         .gzip(true)
         .pool_max_idle_per_host(4);
 
-    let socks = socks_proxy();
+    let socks = required_proxy();
 
-    // App-scoped WireGuard SOCKS takes priority over "no env proxy".
+    // App-scoped WireGuard proxy takes priority over "no env proxy".
     if let Some(ref socks) = socks {
-        match reqwest::Proxy::all(socks) {
-            Ok(p) => {
-                b = b.proxy(p);
-                debug!(%socks, "HTTP client routed via WireGuard SOCKS");
-            }
-            Err(e) => {
-                warn!(error = %e, %socks, "invalid SOCKS proxy URL — building without");
-                if no_proxy {
-                    b = b.no_proxy();
-                }
-            }
+        let proxy = reqwest::Proxy::all(socks)
+            .map_err(|e| ProviderError::Message(format!("tunnel proxy URL: {e}")))?;
+        b = b.proxy(proxy);
+        debug!("HTTP client routed via WireGuard proxy (tunnel DNS)");
+    } else {
+        if no_proxy {
+            // Portals / CDNs often reject Tor exit IPs — never inherit HTTP(S)_PROXY.
+            b = b.no_proxy();
         }
-    } else if no_proxy {
-        // Portals / CDNs often reject Tor exit IPs — never inherit HTTP(S)_PROXY.
-        b = b.no_proxy();
-    }
-
-    if let Some(ref socks) = socks {
-        // Local resolve with user DNS prefs; queries go through the tunnel.
-        b = b.dns_resolver(Arc::new(TunneledResolve {
-            net: net.clone(),
-            socks: socks.clone(),
-        }));
-        debug!(
-            mode = net.dns_mode.label(),
-            "tunneled DNS resolver attached (socks5 + user DNS)"
-        );
-    } else if let Some(resolver) = build_dns_resolver(net) {
-        b = b.dns_resolver(resolver);
-        debug!(mode = net.dns_mode.label(), "custom DNS resolver attached");
+        if let Some(resolver) = build_dns_resolver(net) {
+            b = b.dns_resolver(resolver);
+            debug!(mode = net.dns_mode.label(), "custom DNS resolver attached");
+        }
     }
 
     b.build()
@@ -201,294 +194,6 @@ impl Resolve for HickoryResolve {
             Ok(addrs)
         })
     }
-}
-
-/// Resolve hostnames using the user's DNS prefs over the WireGuard SOCKS proxy.
-struct TunneledResolve {
-    net: NetworkSettings,
-    socks: String,
-}
-
-impl Resolve for TunneledResolve {
-    fn resolve(&self, name: Name) -> Resolving {
-        let host = name.as_str().trim_end_matches('.').to_string();
-        let net = self.net.clone();
-        let socks = self.socks.clone();
-        Box::pin(async move {
-            let ips = resolve_through_tunnel(&net, &socks, &host)
-                .await
-                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
-            if ips.is_empty() {
-                return Err(format!("no addresses for {host}").into());
-            }
-            let addrs: Addrs = Box::new(ips.into_iter().map(|ip| SocketAddr::new(ip, 0)));
-            Ok(addrs)
-        })
-    }
-}
-
-fn parse_socks_addr(socks: &str) -> std::io::Result<SocketAddr> {
-    let rest = socks
-        .trim()
-        .strip_prefix("socks5://")
-        .or_else(|| socks.trim().strip_prefix("socks5h://"))
-        .unwrap_or(socks.trim());
-    rest.parse::<SocketAddr>().map_err(|e| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!("bad SOCKS addr {socks}: {e}"),
-        )
-    })
-}
-
-async fn resolve_through_tunnel(
-    net: &NetworkSettings,
-    socks: &str,
-    host: &str,
-) -> std::io::Result<Vec<IpAddr>> {
-    if let Ok(ip) = host.parse::<IpAddr>() {
-        return Ok(vec![ip]);
-    }
-    let proxy = parse_socks_addr(socks)?;
-    match net.dns_mode {
-        DnsMode::Custom => {
-            let servers = custom_dns_socket_addrs(&net.dns_servers);
-            if servers.is_empty() {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "no custom DNS servers configured",
-                ));
-            }
-            let mut last_err = None;
-            for dns in servers {
-                match dns_tcp_lookup(proxy, dns, host).await {
-                    Ok(ips) if !ips.is_empty() => return Ok(ips),
-                    Ok(_) => last_err = Some(format!("empty answer from {dns}")),
-                    Err(e) => last_err = Some(e.to_string()),
-                }
-            }
-            Err(std::io::Error::other(
-                last_err.unwrap_or_else(|| "custom DNS via tunnel failed".into()),
-            ))
-        }
-        DnsMode::Doh => doh_lookup_via_socks(socks, &net.doh_url, host).await,
-        DnsMode::Dot => {
-            // Prefer TCP/53 to the DoT IP through the tunnel (same resolver IPs).
-            if let Some(dns) = first_dot_tcp_target(&net.dot_server) {
-                if let Ok(ips) = dns_tcp_lookup(proxy, dns, host).await {
-                    if !ips.is_empty() {
-                        return Ok(ips);
-                    }
-                }
-            }
-            // Fallback: provider DoH through SOCKS (still tunnelled, not profile DNS).
-            doh_lookup_via_socks(socks, doh_fallback_for_dot(&net.dot_server), host).await
-        }
-        DnsMode::System => {
-            // Not profile DNS=: Cloudflare DoH inside the tunnel.
-            doh_lookup_via_socks(socks, "https://cloudflare-dns.com/dns-query", host).await
-        }
-    }
-}
-
-fn custom_dns_socket_addrs(raw: &str) -> Vec<SocketAddr> {
-    let mut out = Vec::new();
-    for token in parse_server_tokens(raw) {
-        let (host, port) = split_host_port(&token, 53);
-        if let Ok(ip) = host.parse::<IpAddr>() {
-            out.push(SocketAddr::new(ip, port));
-        }
-    }
-    out
-}
-
-fn first_dot_tcp_target(server: &str) -> Option<SocketAddr> {
-    let (host, _) = split_host_port(server.trim(), 853);
-    let ip = host.parse::<IpAddr>().ok()?;
-    Some(SocketAddr::new(ip, 53))
-}
-
-fn doh_fallback_for_dot(server: &str) -> &'static str {
-    let s = server.trim().to_ascii_lowercase();
-    if s.contains("google") || s.starts_with("8.8.") || s.contains("dns.google") {
-        "https://dns.google/dns-query"
-    } else if s.contains("quad9") || s.starts_with("9.9.9.9") {
-        "https://dns.quad9.net/dns-query"
-    } else {
-        "https://cloudflare-dns.com/dns-query"
-    }
-}
-
-async fn dns_tcp_lookup(
-    proxy: SocketAddr,
-    dns: SocketAddr,
-    host: &str,
-) -> std::io::Result<Vec<IpAddr>> {
-    let mut ips = Vec::new();
-    for qtype in [RecordType::A, RecordType::AAAA] {
-        match dns_tcp_query(proxy, dns, host, qtype).await {
-            Ok(mut got) => ips.append(&mut got),
-            Err(e) => {
-                debug!(%dns, ?qtype, error = %e, "DNS-over-TCP via SOCKS query failed");
-            }
-        }
-    }
-    if ips.is_empty() {
-        Err(std::io::Error::other(
-            format!("no A/AAAA for {host} via {dns}"),
-        ))
-    } else {
-        Ok(ips)
-    }
-}
-
-async fn dns_tcp_query(
-    proxy: SocketAddr,
-    dns: SocketAddr,
-    host: &str,
-    qtype: RecordType,
-) -> std::io::Result<Vec<IpAddr>> {
-    let mut stream = Socks5Stream::connect(proxy, dns)
-        .await
-        .map_err(|e| std::io::Error::other(e.to_string()))?;
-    let qname = DnsName::from_utf8(host)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string()))?;
-    let mut msg = Message::new();
-    msg.set_id(0xF1A7)
-        .set_message_type(MessageType::Query)
-        .set_op_code(OpCode::Query)
-        .set_recursion_desired(true)
-        .add_query(Query::query(qname, qtype));
-    let payload = msg
-        .to_vec()
-        .map_err(|e| std::io::Error::other(e.to_string()))?;
-    let len = (payload.len() as u16).to_be_bytes();
-    stream.write_all(&len).await?;
-    stream.write_all(&payload).await?;
-    let mut len_buf = [0u8; 2];
-    stream.read_exact(&mut len_buf).await?;
-    let n = u16::from_be_bytes(len_buf) as usize;
-    if n == 0 || n > 65_535 {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "invalid DNS TCP length",
-        ));
-    }
-    let mut buf = vec![0u8; n];
-    stream.read_exact(&mut buf).await?;
-    let response = Message::from_vec(&buf)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
-    Ok(extract_ips(&response))
-}
-
-fn extract_ips(msg: &Message) -> Vec<IpAddr> {
-    let mut ips = Vec::new();
-    for rec in msg.answers() {
-        match rec.data() {
-            RData::A(a) => ips.push(IpAddr::V4(**a)),
-            RData::AAAA(a) => ips.push(IpAddr::V6(**a)),
-            _ => {}
-        }
-    }
-    ips
-}
-
-async fn doh_lookup_via_socks(
-    socks: &str,
-    doh_url: &str,
-    host: &str,
-) -> std::io::Result<Vec<IpAddr>> {
-    let mut ips = Vec::new();
-    for qtype in [RecordType::A, RecordType::AAAA] {
-        match doh_query_via_socks(socks, doh_url, host, qtype).await {
-            Ok(mut got) => ips.append(&mut got),
-            Err(e) => debug!(?qtype, error = %e, "DoH via SOCKS failed"),
-        }
-    }
-    if ips.is_empty() {
-        Err(std::io::Error::other(
-            format!("DoH via tunnel returned no addresses for {host}"),
-        ))
-    } else {
-        Ok(ips)
-    }
-}
-
-fn doh_resolve_override(doh_url: &str) -> Option<(String, SocketAddr)> {
-    let u = doh_url.trim().to_ascii_lowercase();
-    if u.contains("cloudflare") || u.contains("1.1.1.1") || u.contains("mozilla") {
-        return Some((
-            "cloudflare-dns.com".into(),
-            "1.1.1.1:443".parse().ok()?,
-        ));
-    }
-    if u.contains("dns.google") || u.contains("8.8.8.8") || u.contains("google") {
-        return Some(("dns.google".into(), "8.8.8.8:443".parse().ok()?));
-    }
-    if u.contains("quad9") || u.contains("9.9.9.9") {
-        return Some(("dns.quad9.net".into(), "9.9.9.9:443".parse().ok()?));
-    }
-    None
-}
-
-async fn doh_query_via_socks(
-    socks: &str,
-    doh_url: &str,
-    host: &str,
-    qtype: RecordType,
-) -> std::io::Result<Vec<IpAddr>> {
-    let qname = DnsName::from_utf8(host)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string()))?;
-    let mut msg = Message::new();
-    msg.set_id(0xD011)
-        .set_message_type(MessageType::Query)
-        .set_op_code(OpCode::Query)
-        .set_recursion_desired(true)
-        .add_query(Query::query(qname, qtype));
-    let payload = msg
-        .to_vec()
-        .map_err(|e| std::io::Error::other(e.to_string()))?;
-    let b64 = base64_url_nopad(&payload);
-    let base = doh_url.trim().trim_end_matches('/');
-    let url = format!("{base}?dns={b64}");
-
-    let mut builder = reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .connect_timeout(Duration::from_secs(8))
-        .pool_max_idle_per_host(2);
-    let proxy = reqwest::Proxy::all(socks)
-        .map_err(|e| std::io::Error::other(e.to_string()))?;
-    builder = builder.proxy(proxy);
-    if let Some((name, addr)) = doh_resolve_override(doh_url) {
-        builder = builder.resolve(&name, addr);
-    }
-
-    let client = builder
-        .build()
-        .map_err(|e| std::io::Error::other(e.to_string()))?;
-    let resp = client
-        .get(&url)
-        .header("Accept", "application/dns-message")
-        .send()
-        .await
-        .map_err(|e| std::io::Error::other(e.to_string()))?;
-    if !resp.status().is_success() {
-        return Err(std::io::Error::other(
-            format!("DoH HTTP {}", resp.status()),
-        ));
-    }
-    let bytes = resp
-        .bytes()
-        .await
-        .map_err(|e| std::io::Error::other(e.to_string()))?;
-    let response = Message::from_vec(&bytes)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
-    Ok(extract_ips(&response))
-}
-
-fn base64_url_nopad(data: &[u8]) -> String {
-    use base64::Engine;
-    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(data)
 }
 
 fn build_dns_resolver(net: &NetworkSettings) -> Option<Arc<HickoryResolve>> {
@@ -638,21 +343,6 @@ pub async fn bootstrap_lookup_ip(bootstrap_dns: &str, host: &str) -> std::io::Re
 pub async fn probe_dns(hostname: &str) -> String {
     let net = current_network_settings();
     let host = hostname.trim_end_matches('.').to_string();
-    if let Some(socks) = socks_proxy() {
-        return match resolve_through_tunnel(&net, &socks, &host).await {
-            Ok(ips) if !ips.is_empty() => {
-                let list: Vec<_> = ips.iter().map(|ip| ip.to_string()).collect();
-                format!(
-                    "{} → {} (via tunnel, mode {})",
-                    host,
-                    list.join(", "),
-                    net.dns_mode.label()
-                )
-            }
-            Ok(_) => format!("tunnel DNS OK mais aucune adresse pour {host}"),
-            Err(e) => format!("échec DNS tunnelisé {host}: {e}"),
-        };
-    }
     let Some(resolver) = build_dns_resolver(&net) else {
         return format!("DNS système — résolution déléguée à l’OS ({host})");
     };

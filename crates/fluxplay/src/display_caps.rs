@@ -789,7 +789,7 @@ fn probe_gpu_topology() -> GpuTopology {
     {
         let out = run_cmd("lspci", &["-nn"]);
         let mut devices = parse_lspci_gpus(&out);
-        attach_drm_render_nodes(&mut devices);
+        attach_drm_render_nodes(&mut devices, &lspci_gpu_slots(&out));
         if devices.is_empty() {
             return GpuTopology::single("GPU", GpuTier::Unknown);
         }
@@ -809,10 +809,7 @@ pub fn parse_lspci_gpus(out: &str) -> Vec<GpuDevice> {
     let mut devices = Vec::new();
     for line in out.lines() {
         let lower = line.to_ascii_lowercase();
-        if !(lower.contains("vga compatible")
-            || lower.contains("3d controller")
-            || lower.contains("display controller"))
-        {
+        if !is_lspci_gpu_line(&lower) {
             continue;
         }
         let name = line
@@ -843,36 +840,72 @@ pub fn parse_lspci_gpu(out: &str) -> Option<(String, GpuTier)> {
     Some((topo.display.name, tier))
 }
 
-/// Best-effort: map PCI GPUs to `/dev/dri/renderD*` via sorted node list.
+#[cfg(any(test, not(target_os = "android")))]
+fn is_lspci_gpu_line(lower: &str) -> bool {
+    lower.contains("vga compatible")
+        || lower.contains("3d controller")
+        || lower.contains("display controller")
+}
+
+/// PCI slot (`01:00.0`) of each GPU line, same order as [`parse_lspci_gpus`].
+#[cfg(any(test, not(target_os = "android")))]
+fn lspci_gpu_slots(out: &str) -> Vec<String> {
+    out.lines()
+        .filter(|line| is_lspci_gpu_line(&line.to_ascii_lowercase()))
+        .map(|line| line.split_whitespace().next().unwrap_or("").to_string())
+        .collect()
+}
+
+/// Map each GPU to its `/dev/dri/renderD*` by PCI slot (sysfs `device` link).
+/// Node numbering does not follow lspci order (hybrid laptops list the dGPU
+/// first while the iGPU owns renderD128). Unknown stays `None` — a wrong node
+/// makes libva load the other vendor's driver and decode falls back to CPU.
 #[cfg(not(target_os = "android"))]
-fn attach_drm_render_nodes(devices: &mut [GpuDevice]) {
-    let Ok(entries) = std::fs::read_dir("/dev/dri") else {
+fn attach_drm_render_nodes(devices: &mut [GpuDevice], slots: &[String]) {
+    let Ok(entries) = std::fs::read_dir("/sys/class/drm") else {
         return;
     };
-    let mut nodes: Vec<String> = entries
+    let nodes: Vec<(String, String)> = entries
         .flatten()
         .filter_map(|e| {
             let n = e.file_name().into_string().ok()?;
-            if n.starts_with("renderD") {
-                Some(format!("/dev/dri/{n}"))
-            } else {
-                None
+            if !n.starts_with("renderD") {
+                return None;
             }
+            let pci = std::fs::read_link(e.path().join("device")).ok()?;
+            let pci = pci.file_name()?.to_str()?.to_string();
+            Some((pci, format!("/dev/dri/{n}")))
         })
         .collect();
-    nodes.sort();
-    for (dev, node) in devices.iter_mut().zip(nodes.into_iter()) {
-        dev.render_node = Some(node);
+    for (dev, slot) in devices.iter_mut().zip(slots) {
+        dev.render_node = render_node_for_slot(&nodes, slot);
     }
+}
+
+/// `slot` is lspci's short form (`01:00.0`); sysfs uses `0000:01:00.0`.
+#[cfg(any(test, not(target_os = "android")))]
+fn render_node_for_slot(nodes: &[(String, String)], slot: &str) -> Option<String> {
+    if slot.is_empty() {
+        return None;
+    }
+    nodes
+        .iter()
+        .find(|(pci, _)| pci == slot || pci.ends_with(&format!(":{slot}")))
+        .map(|(_, node)| node.clone())
 }
 
 #[cfg(any(test, not(target_os = "android")))]
 fn classify_gpu(lower: &str) -> (GpuTier, u8) {
+    // Whole words: "ati" is also in "Corporation".
+    let word = |w: &str| lower.split(|c: char| !c.is_ascii_alphanumeric()).any(|t| t == w);
     let nvidia = lower.contains("nvidia");
-    let amd = lower.contains("amd") || lower.contains("ati");
+    let amd = word("amd") || word("ati") || lower.contains("radeon");
     let intel = lower.contains("intel");
     if nvidia {
         return (GpuTier::Discrete, 0);
+    }
+    if intel && (word("arc") || lower.contains("dg2") || lower.contains("battlemage")) {
+        return (GpuTier::Discrete, 1);
     }
     if amd
         && (lower.contains("radeon 6")
@@ -911,8 +944,8 @@ fn truncate_gpu_name(name: &str) -> String {
             s = s.trim().to_string();
         }
     }
-    if s.len() > 64 {
-        s.truncate(61);
+    if s.chars().count() > 64 {
+        s = s.chars().take(61).collect();
         s.push('…');
     }
     s
@@ -982,8 +1015,8 @@ eDP-1 "BOE 0x0A1C"
         let topo = topology_from_devices(parse_lspci_gpus(out));
         assert!(topo.is_hybrid());
         assert_eq!(topo.display.tier, GpuTier::Integrated);
-        assert_eq!(topo.decode.tier, GpuTier::Discrete);
-        assert!(topo.requires_copy_path());
+        assert_eq!(topo.decode.tier, GpuTier::Integrated);
+        assert!(!topo.requires_copy_path());
     }
 
     #[test]
@@ -1014,5 +1047,26 @@ eDP-1 "BOE 0x0A1C"
         assert!(t.meta_parallel <= 6);
         assert_eq!(t.portal_parallel, 2);
         assert!(t.image_inflight >= 4);
+    }
+
+    #[test]
+    fn render_nodes_follow_pci_slot_not_lspci_order() {
+        let out = "01:00.0 VGA compatible controller [0300]: NVIDIA Corporation AD107M [GeForce RTX 4050 Max-Q / Mobile] [10de:28a1] (rev a1)\n\
+                   75:00.0 VGA compatible controller [0300]: Advanced Micro Devices, Inc. [AMD/ATI] Rembrandt [Radeon 680M] [1002:1681] (rev 0b)\n";
+        let slots = lspci_gpu_slots(out);
+        assert_eq!(slots, vec!["01:00.0".to_string(), "75:00.0".to_string()]);
+        let nodes = vec![
+            ("0000:75:00.0".to_string(), "/dev/dri/renderD128".to_string()),
+            ("0000:01:00.0".to_string(), "/dev/dri/renderD129".to_string()),
+        ];
+        assert_eq!(
+            render_node_for_slot(&nodes, &slots[0]).as_deref(),
+            Some("/dev/dri/renderD129")
+        );
+        assert_eq!(
+            render_node_for_slot(&nodes, &slots[1]).as_deref(),
+            Some("/dev/dri/renderD128")
+        );
+        assert_eq!(render_node_for_slot(&nodes, "02:00.0"), None);
     }
 }

@@ -31,12 +31,16 @@ impl SourceKind {
 }
 
 /// Persisted IPTV source (playlist / portal / EPG).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct MediaSource {
     pub id: Uuid,
     pub name: String,
     pub kind: SourceKind,
     pub endpoint: String,
+    /// Other servers of the same subscription (same credentials, same stream
+    /// ids). Used for failover and to spread downloads; `endpoint` stays first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mirrors: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub username: Option<String>,
     /// Never log this field.
@@ -52,7 +56,7 @@ pub struct MediaSource {
     pub user_agent: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub http_referer: Option<String>,
-    #[serde(default)]
+    #[serde(default = "default_source_enabled")]
     pub auto_refresh: bool,
     pub created_at: DateTime<Utc>,
     #[serde(default = "default_source_enabled")]
@@ -63,6 +67,21 @@ fn default_source_enabled() -> bool {
     true
 }
 
+/// Endpoints (`get.php?username=&password=`), password and MAC are secrets: `{:?}` omits them.
+impl std::fmt::Debug for MediaSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MediaSource")
+            .field("id", &self.id)
+            .field("name", &self.name)
+            .field("kind", &self.kind)
+            .field("mirrors", &self.mirrors.len())
+            .field("username", &self.username)
+            .field("has_password", &self.password.is_some())
+            .field("enabled", &self.enabled)
+            .finish_non_exhaustive()
+    }
+}
+
 impl MediaSource {
     pub fn new(name: impl Into<String>, kind: SourceKind, endpoint: impl Into<String>) -> Self {
         Self {
@@ -70,6 +89,7 @@ impl MediaSource {
             name: name.into(),
             kind,
             endpoint: endpoint.into(),
+            mirrors: Vec::new(),
             username: None,
             password: None,
             mac: None,
@@ -80,6 +100,29 @@ impl MediaSource {
             created_at: Utc::now(),
             enabled: true,
         }
+    }
+
+    /// `endpoint` then the mirrors: trimmed, non-empty, without duplicates
+    /// (compared case-insensitively, ignoring a trailing `/`).
+    pub fn endpoints(&self) -> Vec<&str> {
+        let mut out: Vec<&str> = Vec::with_capacity(1 + self.mirrors.len());
+        for e in std::iter::once(&self.endpoint).chain(&self.mirrors) {
+            let e = e.trim();
+            let norm = |s: &str| s.trim_end_matches('/').to_ascii_lowercase();
+            if !e.is_empty() && !out.iter().any(|o| norm(o) == norm(e)) {
+                out.push(e);
+            }
+        }
+        out
+    }
+
+    /// Parse a user-typed server list (commas, spaces, `;` or new lines).
+    pub fn parse_mirror_list(text: &str) -> Vec<String> {
+        text.split(|c: char| c == ',' || c == ';' || c.is_whitespace())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect()
     }
 }
 
@@ -502,12 +545,12 @@ impl DnsMode {
 }
 
 /// App-scoped network prefs (HTTP DNS + optional WireGuard profile).
+/// Missing fields take the values of `Default` (an old file keeps working).
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct NetworkSettings {
-    #[serde(default)]
     pub dns_mode: DnsMode,
     /// Comma/space separated hosts, e.g. `1.1.1.1, 9.9.9.9` or `1.1.1.1:53`.
-    #[serde(default)]
     pub dns_servers: String,
     /// DoH endpoint, e.g. `https://cloudflare-dns.com/dns-query`.
     #[serde(default = "default_doh_url")]
@@ -1016,7 +1059,10 @@ impl GpuTier {
     }
 }
 
+/// Missing fields take the values of `Default`: one absent key must not reset
+/// the whole settings block (and the favorites with it).
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct AppSettings {
     pub theme: ThemeMode,
     #[serde(default)]
@@ -1026,6 +1072,9 @@ pub struct AppSettings {
     pub remember_position: bool,
     #[serde(default)]
     pub player_backend: PlayerBackendPref,
+    /// System player for the "Système" backend (`""` = OS default / best installed).
+    #[serde(default)]
+    pub external_player: String,
     #[serde(default = "default_true")]
     pub hwdec: bool,
     #[serde(default = "default_cache_ms")]
@@ -1078,6 +1127,23 @@ pub struct AppSettings {
     /// DNS / WireGuard prefs for app HTTP (catalog, art, metadata).
     #[serde(default)]
     pub network: NetworkSettings,
+    /// One GPU for decode and display. Empty = the GPU wired to the screen.
+    #[serde(default)]
+    pub gpu_choice: String,
+    /// Root folder for film / episode downloads. Empty = platform default
+    /// (`~/Téléchargements/FluxPlay` on desktop).
+    #[serde(default)]
+    pub download_dir: String,
+    /// Viewer language (ISO 639-1, e.g. `fr`). Empty = no preference:
+    /// synopses stay as fetched and the catalog keeps the portal order.
+    #[serde(default)]
+    pub pref_lang: String,
+    /// Translate synopses / genres into `pref_lang` (Google Translate, no key).
+    #[serde(default = "default_true")]
+    pub translate_meta: bool,
+    /// Hide live channels, films and series not available in `pref_lang`.
+    #[serde(default)]
+    pub only_pref_lang: bool,
 }
 
 fn default_true() -> bool {
@@ -1107,6 +1173,7 @@ impl Default for AppSettings {
             volume: 0.85,
             remember_position: true,
             player_backend: PlayerBackendPref::Auto,
+            external_player: String::new(),
             hwdec: true,
             cache_ms: 4000,
             demux_secs: 8.0,
@@ -1127,6 +1194,11 @@ impl Default for AppSettings {
             recent: Vec::new(),
             omdb_api_key: String::new(),
             network: NetworkSettings::default(),
+            gpu_choice: String::new(),
+            download_dir: String::new(),
+            pref_lang: String::new(),
+            translate_meta: true,
+            only_pref_lang: false,
         }
     }
 }

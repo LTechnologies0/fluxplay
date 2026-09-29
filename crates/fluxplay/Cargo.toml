@@ -34,7 +34,11 @@ serde.workspace = true
 serde_json.workspace = true
 chrono.workspace = true
 uuid.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["net", "io-util"] }
+# Userspace WireGuard datapath behind the app-only proxy (see src/wg_proxy.rs).
+tokio-wireguard = "0.1.3"
+ipnet = "2"
+base64.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 dirs.workspace = true
@@ -48,10 +52,13 @@ zip.workspace = true
 
 [target.'cfg(not(target_os = "android"))'.dependencies]
 iced = { workspace = true, features = ["x11", "wayland", "linux-theme-detection", "tiny-skia"] }
+mimalloc = { version = "0.1", default-features = false }
 rfd.workspace = true
 dark-light = "2"
-# Userspace WireGuard → local SOCKS5 (app-only tunnel, no system routes).
-wg-socks = "0.1.1"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# Same ash as wgpu-hal: exportable VRAM for the CUDA zero-copy video stage.
+ash = { version = "0.38", default-features = false }
 
 [target.'cfg(target_os = "android")'.dependencies]
 # advanced-shaping: iced docs — Auto uses Basic for ASCII (no font fallback),
@@ -63,5 +70,3 @@ log = "0.4"
 tracing-log = "0.2"
 jni = "0.21"
 ndk-context = "0.1"
-# Same userspace WG → SOCKS as desktop (no VpnService required for app-scoped egress).
-wg-socks = "0.1.1"

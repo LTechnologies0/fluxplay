@@ -6,6 +6,7 @@ use std::ptr;
 
 use tracing::{debug, error, info};
 
+use crate::video_frame::{ColorMatrix, PixelLayout};
 use crate::{PlayerError, Result};
 
 #[repr(C)]
@@ -23,6 +24,24 @@ struct FluxFfmpegOpenOpts {
     hwdec: c_int,
 }
 
+#[repr(C)]
+#[derive(Default)]
+struct FluxFrameInfo {
+    kind: c_int,
+    format: c_int,
+    width: c_int,
+    height: c_int,
+    pitch: c_int,
+    sar_num: c_int,
+    sar_den: c_int,
+    matrix: c_int,
+    full_range: c_int,
+    slot: c_int,
+    bytes: u64,
+}
+
+const FLUX_FRAME_GPU: c_int = 2;
+
 extern "C" {
     fn flux_ffmpeg_open(opts: *const FluxFfmpegOpenOpts) -> *mut FluxFfmpegPlayer;
     fn flux_ffmpeg_close(p: *mut FluxFfmpegPlayer);
@@ -32,8 +51,12 @@ extern "C" {
         out: *mut u8,
         out_w: c_int,
         out_h: c_int,
+        got_w: *mut c_int,
+        got_h: *mut c_int,
     ) -> c_int;
+    fn flux_ffmpeg_frame_size(p: *mut FluxFfmpegPlayer, w: *mut c_int, h: *mut c_int) -> c_int;
     fn flux_ffmpeg_set_output_size(p: *mut FluxFfmpegPlayer, w: c_int, h: c_int);
+    fn flux_ffmpeg_set_present_hz(p: *mut FluxFfmpegPlayer, hz: c_int);
     fn flux_ffmpeg_is_alive(p: *mut FluxFfmpegPlayer) -> c_int;
     fn flux_ffmpeg_has_frame(p: *mut FluxFfmpegPlayer) -> c_int;
     fn flux_ffmpeg_pause(p: *mut FluxFfmpegPlayer, paused: c_int);
@@ -41,6 +64,61 @@ extern "C" {
     fn flux_ffmpeg_position_secs(p: *mut FluxFfmpegPlayer) -> f64;
     fn flux_ffmpeg_duration_secs(p: *mut FluxFfmpegPlayer) -> f64;
     fn flux_ffmpeg_seek(p: *mut FluxFfmpegPlayer, secs: f64);
+    fn flux_ffmpeg_buffer_state(
+        p: *mut FluxFfmpegPlayer,
+        buffered_secs: *mut f64,
+        goal_secs: *mut f64,
+        net_mbps: *mut f64,
+        media_mbps: *mut f64,
+    ) -> c_int;
+    fn flux_ffmpeg_set_yuv_output(p: *mut FluxFfmpegPlayer, on: c_int);
+    fn flux_ffmpeg_frame_info(p: *mut FluxFfmpegPlayer, info: *mut FluxFrameInfo) -> c_int;
+    fn flux_ffmpeg_pull_frame(
+        p: *mut FluxFfmpegPlayer,
+        info: *mut FluxFrameInfo,
+        out: *mut u8,
+        cap: u64,
+    ) -> c_int;
+    fn flux_ffmpeg_gpu_need(
+        p: *mut FluxFfmpegPlayer,
+        w: *mut c_int,
+        h: *mut c_int,
+        bpc: *mut c_int,
+    ) -> c_int;
+    #[cfg(unix)]
+    fn flux_ffmpeg_gpu_attach(
+        p: *mut FluxFfmpegPlayer,
+        fds: *const c_int,
+        n: c_int,
+        slot_bytes: u64,
+        pitch: c_int,
+        w: c_int,
+        h: c_int,
+        bpc: c_int,
+        uuid: *const u8,
+    ) -> c_int;
+    fn flux_ffmpeg_gpu_release(p: *mut FluxFfmpegPlayer, slot: c_int);
+    fn flux_ffmpeg_gpu_snapshot(
+        p: *mut FluxFfmpegPlayer,
+        out: *mut u8,
+        cap: u64,
+        w: *mut c_int,
+        h: *mut c_int,
+    ) -> c_int;
+}
+
+/// Frame description from [`LibFfmpeg::pull_frame`].
+pub(crate) struct PulledFrame {
+    pub layout: PixelLayout,
+    pub width: u32,
+    pub height: u32,
+    pub pitch: u32,
+    pub sar: (u32, u32),
+    pub matrix: ColorMatrix,
+    pub full_range: bool,
+    /// Zero-copy slot holding the planes; `None` when they were copied into
+    /// the caller's buffer.
+    pub gpu_slot: Option<u32>,
 }
 
 /// Embedded FFmpeg player owned by the UI tick thread.
@@ -50,9 +128,14 @@ pub struct LibFfmpeg {
     _keepalive: Vec<CString>,
     /// Recycled pull destination — avoid `vec![0; w*h*4]` every present.
     pull_buf: std::sync::Mutex<Vec<u8>>,
+    last_out_w: std::sync::atomic::AtomicU32,
+    last_out_h: std::sync::atomic::AtomicU32,
+    /// Stage buffers CUDA writes into; dropped only after the decoder closed.
+    gpu_slots: std::sync::Mutex<Option<std::sync::Arc<dyn std::any::Any + Send + Sync>>>,
 }
 
 unsafe impl Send for LibFfmpeg {}
+unsafe impl Sync for LibFfmpeg {}
 
 impl LibFfmpeg {
     pub fn open(
@@ -114,6 +197,9 @@ impl LibFfmpeg {
             ptr,
             _keepalive: keepalive,
             pull_buf: std::sync::Mutex::new(Vec::new()),
+            last_out_w: std::sync::atomic::AtomicU32::new(0),
+            last_out_h: std::sync::atomic::AtomicU32::new(0),
+            gpu_slots: std::sync::Mutex::new(None),
         })
     }
 
@@ -128,35 +214,68 @@ impl LibFfmpeg {
 
     pub fn set_output_size(&self, w: u32, h: u32) {
         let (w, h) = Self::soft_present_dims(w, h);
+        use std::sync::atomic::Ordering;
+        if self.last_out_w.load(Ordering::Relaxed) == w
+            && self.last_out_h.load(Ordering::Relaxed) == h
+        {
+            return;
+        }
+        self.last_out_w.store(w, Ordering::Relaxed);
+        self.last_out_h.store(h, Ordering::Relaxed);
         unsafe { flux_ffmpeg_set_output_size(self.ptr, w as c_int, h as c_int) };
     }
 
-    pub fn pull_rgba(&self, w: u32, h: u32) -> Option<Vec<u8>> {
+    pub fn set_present_hz(&self, hz: u32) {
+        let hz = hz.clamp(24, 120);
+        unsafe { flux_ffmpeg_set_present_hz(self.ptr, hz as c_int) };
+    }
+
+    pub fn pull_rgba(&self, w: u32, h: u32) -> Option<(u32, u32, Vec<u8>)> {
         let (w, h) = Self::soft_present_dims(w, h);
-        // Don't pay for a buffer when nothing is ready.
+        self.set_output_size(w, h);
         if !self.has_frame() {
-            self.set_output_size(w, h);
             return None;
         }
-        self.set_output_size(w, h);
-        let need = (w as usize).saturating_mul(h as usize).saturating_mul(4);
+        // Size the buffer to the ready frame — never drop it (black screen) or
+        // overflow a smaller pull buffer (SEGV).
+        let (fw, fh) = {
+            let mut fw = 0;
+            let mut fh = 0;
+            let ok = unsafe { flux_ffmpeg_frame_size(self.ptr, &mut fw, &mut fh) };
+            if ok != 1 || fw < 2 || fh < 2 {
+                return None;
+            }
+            (fw as u32, fh as u32)
+        };
+        let aw = fw.max(w);
+        let ah = fh.max(h);
+        let need = (aw as usize).saturating_mul(ah as usize).saturating_mul(4);
         let mut slot = self.pull_buf.lock().ok()?;
         if slot.capacity() < need {
             *slot = Vec::with_capacity(need);
         }
-        // SAFETY: C memcpy writes all `need` bytes on success; on failure we don't expose.
+        // SAFETY: C memcpy writes all got_w*got_h*4 bytes on success.
         unsafe {
             slot.set_len(need);
         }
+        let mut got_w = 0;
+        let mut got_h = 0;
         let ok = unsafe {
-            flux_ffmpeg_pull_rgba(self.ptr, slot.as_mut_ptr(), w as c_int, h as c_int)
+            flux_ffmpeg_pull_rgba(
+                self.ptr,
+                slot.as_mut_ptr(),
+                aw as c_int,
+                ah as c_int,
+                &mut got_w,
+                &mut got_h,
+            )
         };
-        if ok == 1 {
-            // Hand buffer to caller; keep capacity for the next pull (no zero-fill).
+        if ok == 1 && got_w >= 2 && got_h >= 2 {
+            let n = (got_w as usize).saturating_mul(got_h as usize).saturating_mul(4);
+            slot.truncate(n);
             let out = std::mem::replace(&mut *slot, Vec::with_capacity(need));
-            Some(out)
+            Some((got_w as u32, got_h as u32, out))
         } else {
-            // Keep capacity for the next attempt; don't leave a "full" len of stale bytes.
             slot.clear();
             None
         }
@@ -188,6 +307,127 @@ impl LibFfmpeg {
 
     pub fn seek(&self, secs: f64) {
         unsafe { flux_ffmpeg_seek(self.ptr, secs.max(0.0)) };
+    }
+
+    pub fn buffer_state(&self) -> crate::BufferState {
+        let (mut buffered, mut goal, mut net, mut media) = (0.0, 0.0, 0.0, 0.0);
+        let rebuffering = unsafe {
+            flux_ffmpeg_buffer_state(self.ptr, &mut buffered, &mut goal, &mut net, &mut media)
+        } != 0;
+        crate::BufferState {
+            rebuffering,
+            buffered_secs: buffered,
+            goal_secs: goal,
+            net_mbps: net,
+            media_mbps: media,
+        }
+    }
+
+    /// Native YUV at decoded size (GPU stage) instead of RGBA scaled to the
+    /// output size.
+    pub fn set_yuv_output(&self, on: bool) {
+        unsafe { flux_ffmpeg_set_yuv_output(self.ptr, on as c_int) };
+    }
+
+    /// Take the published frame. CPU planes are copied into `buf` (resized).
+    pub(crate) fn pull_frame(&self, buf: &mut Vec<u8>) -> Option<PulledFrame> {
+        let mut info = FluxFrameInfo::default();
+        if unsafe { flux_ffmpeg_frame_info(self.ptr, &mut info) } != 1 {
+            return None;
+        }
+        let gpu = info.kind == FLUX_FRAME_GPU;
+        let need = if gpu { 0 } else { usize::try_from(info.bytes).ok()? };
+        if buf.len() < need {
+            buf.resize(need, 0);
+        }
+        let ok = unsafe {
+            flux_ffmpeg_pull_frame(self.ptr, &mut info, buf.as_mut_ptr(), buf.len() as u64)
+        };
+        if ok != 1 || info.width < 2 || info.height < 2 || info.pitch <= 0 {
+            return None;
+        }
+        if !gpu {
+            buf.truncate(info.bytes as usize);
+        }
+        let layout = match info.format {
+            1 => PixelLayout::Nv12,
+            2 => PixelLayout::P010,
+            _ => PixelLayout::Rgba,
+        };
+        let matrix = match info.matrix {
+            1 => ColorMatrix::Bt709,
+            2 => ColorMatrix::Bt2020,
+            _ => ColorMatrix::Bt601,
+        };
+        Some(PulledFrame {
+            layout,
+            width: info.width as u32,
+            height: info.height as u32,
+            pitch: info.pitch as u32,
+            sar: (info.sar_num.max(1) as u32, info.sar_den.max(1) as u32),
+            matrix,
+            full_range: info.full_range != 0,
+            gpu_slot: (gpu && info.slot >= 0).then_some(info.slot as u32),
+        })
+    }
+
+    /// Size and depth (1 = NV12, 2 = P010) of CUDA frames waiting for GPU slots.
+    pub(crate) fn gpu_need(&self) -> Option<(u32, u32, u32)> {
+        let (mut w, mut h, mut bpc) = (0, 0, 0);
+        let need = unsafe { flux_ffmpeg_gpu_need(self.ptr, &mut w, &mut h, &mut bpc) } == 1;
+        (need && w >= 2 && h >= 2 && bpc >= 1).then_some((w as u32, h as u32, bpc as u32))
+    }
+
+    /// Hand exported stage buffers to CUDA. Ownership of the fds moves to C.
+    #[cfg(unix)]
+    pub(crate) fn gpu_attach(
+        &self,
+        slots: crate::video_frame::ExportedSlots,
+        w: u32,
+        h: u32,
+        bpc: u32,
+    ) -> bool {
+        use std::os::fd::IntoRawFd;
+        let n = slots.fds.len();
+        let fds: Vec<c_int> = slots.fds.into_iter().map(IntoRawFd::into_raw_fd).collect();
+        let ok = unsafe {
+            flux_ffmpeg_gpu_attach(
+                self.ptr,
+                fds.as_ptr(),
+                n as c_int,
+                slots.slot_bytes,
+                slots.pitch as c_int,
+                w as c_int,
+                h as c_int,
+                bpc as c_int,
+                slots.device_uuid.as_ptr(),
+            )
+        } == 1;
+        if ok {
+            if let Ok(mut keep) = self.gpu_slots.lock() {
+                *keep = Some(slots.slots);
+            }
+        }
+        ok
+    }
+
+    /// The UI finished reading `slot`; decode may overwrite it.
+    pub(crate) fn gpu_release(&self, slot: u32) {
+        unsafe { flux_ffmpeg_gpu_release(self.ptr, slot as c_int) };
+    }
+
+    /// RGBA copy of the last zero-copy frame (`w`×`h` known from its info).
+    pub(crate) fn gpu_snapshot(&self, w: u32, h: u32) -> Option<(u32, u32, Vec<u8>)> {
+        let mut out = vec![0u8; (w as usize) * (h as usize) * 4];
+        let (mut gw, mut gh) = (0, 0);
+        let ok = unsafe {
+            flux_ffmpeg_gpu_snapshot(self.ptr, out.as_mut_ptr(), out.len() as u64, &mut gw, &mut gh)
+        } == 1;
+        if !ok || gw < 2 || gh < 2 {
+            return None;
+        }
+        out.truncate((gw as usize) * (gh as usize) * 4);
+        Some((gw as u32, gh as u32, out))
     }
 
     pub fn shutdown(self) {

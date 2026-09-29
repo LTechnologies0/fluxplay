@@ -88,10 +88,29 @@ impl Compositor {
             force_fallback_adapter: false,
         };
 
-        let adapter =
+        let wanted = std::env::var("FLUXPLAY_GPU").ok().filter(|s| !s.is_empty());
+        let adapters = instance.enumerate_adapters(settings.backends);
+        let chosen = wanted.as_deref().and_then(|want| {
+            let want = want.to_lowercase();
+            adapters.into_iter().find(|adapter| {
+                let name = adapter.get_info().name.to_lowercase();
+                let nvidia = want.contains("nvidia") || want.contains("geforce");
+                let amd = want.contains("amd") || want.contains("radeon") || want.contains("rembrandt");
+                (nvidia && name.contains("nvidia"))
+                    || (amd && (name.contains("amd") || name.contains("radeon")))
+                    || want.split(|c: char| !c.is_ascii_alphanumeric()).any(|tok| {
+                        tok.len() >= 4 && name.contains(tok)
+                    })
+            })
+        });
+
+        let adapter = if let Some(adapter) = chosen {
+            adapter
+        } else {
             instance.request_adapter(&adapter_options).await.map_err(
                 |_error| Error::NoAdapterFound(format!("{adapter_options:?}")),
-            )?;
+            )?
+        };
 
         log::info!("Selected: {:#?}", adapter.get_info());
 
