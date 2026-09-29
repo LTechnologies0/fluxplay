@@ -2518,11 +2518,17 @@ impl FluxPlay {
                         done: d,
                         total: t,
                         rate,
+                        connections,
                     } => {
                         *done = d;
                         *total = t;
+                        let links = if connections > 1 {
+                            format!(" · {connections} connexions")
+                        } else {
+                            String::new()
+                        };
                         self.status = format!(
-                            "Téléchargement — {name} · {}",
+                            "Téléchargement — {name} · {}{links}",
                             crate::downloads::progress_detail(d, t, rate)
                         );
                     }

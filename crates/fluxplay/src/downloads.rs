@@ -12,8 +12,11 @@
 //! carries the account credentials.
 //!
 //! Large files that support ranges are fetched by several connections at once
-//! (spread over the account's servers) — see [`parallel`]. The connection
-//! count follows the account's `max_connections`, one slot kept for playback.
+//! (spread over the account's servers) — see [`parallel`]. Panels announce a
+//! `max_connections` but often do not enforce it on VOD and cap each
+//! connection's speed instead, so it is only the starting count: a download
+//! adds one connection at a time while they all keep flowing, and the count
+//! where the panel refused or cut one is remembered for the account.
 
 mod parallel;
 
@@ -49,6 +52,9 @@ const META_MAGIC: &str = "fluxplay-download 1";
 const META_MAGIC_SEGMENTED: &str = "fluxplay-download 2";
 /// Connections per account when the panel does not say (`max_connections`).
 const DEFAULT_CONNECTIONS: usize = 2;
+/// A refused or cut connection caps the account only this long: panels
+/// also answer 503 / 509 when briefly overloaded.
+const REFUSAL_MEMORY: Duration = Duration::from_secs(30 * 60);
 /// Never more than this per account, whatever the panel allows.
 const MAX_CONNECTIONS: usize = 8;
 const KNOWN_EXTENSIONS: &[&str] = &[
@@ -64,6 +70,8 @@ pub enum DownloadEvent {
         done: u64,
         total: Option<u64>,
         rate: u64,
+        /// Connections transferring right now.
+        connections: usize,
     },
     /// Connection lost; reconnecting after `wait` (resumes where it stopped).
     Retrying {
@@ -147,16 +155,23 @@ pub struct DownloadRequest {
 /// connections this file may hold.
 pub(crate) struct Plan {
     urls: Vec<String>,
+    /// Connections a file starts with.
     connections: usize,
+    /// Most connections probing may reach.
+    ceiling: usize,
     budget: Arc<Semaphore>,
     tuning: parallel::Tuning,
+    /// Key of the account's learned limits (empty: nothing is learned).
+    account: String,
 }
 
 /// Stream the download described by `req`, reporting progress.
 pub fn run(req: DownloadRequest) -> impl Stream<Item = DownloadEvent> {
     iced::stream::channel(16, async move |mut tx: mpsc::Sender<DownloadEvent>| {
         let (plan, referer, max_connections) = resolve_plan(&req).await;
-        if req.background && max_connections == Some(1) {
+        // Preloading while the viewer watches needs a second connection:
+        // only when the panel announces one or was seen serving two.
+        if req.background && max_connections == Some(1) && learned(&plan.account).served < 2 {
             let _ = tx
                 .send(DownloadEvent::Finished(Err(
                     "une seule connexion autorisée par le panel".into(),
@@ -191,32 +206,104 @@ async fn resolve_plan(req: &DownloadRequest) -> (Plan, Option<String>, Option<u3
             Plan {
                 urls: vec![req.url.clone()],
                 connections: DEFAULT_CONNECTIONS,
+                ceiling: DEFAULT_CONNECTIONS,
                 budget: account_budget("", DEFAULT_CONNECTIONS),
                 tuning: parallel::Tuning::DEFAULT,
+                account: String::new(),
             },
             None,
             None,
         );
     };
     let ranking = servers::rank_if_stale(source).await;
-    let connections = connections_for(ranking.max_connections);
+    let account = source.id.to_string();
+    let (connections, ceiling) = connection_range(ranking.max_connections, learned(&account));
     let plan = Plan {
         urls: servers::media_candidates(source, &req.url),
         connections,
-        budget: account_budget(&source.id.to_string(), connections),
+        ceiling,
+        budget: account_budget(&account, ceiling),
         tuning: parallel::Tuning::DEFAULT,
+        account,
     };
     let referer = source.http_referer.clone().filter(|r| !r.trim().is_empty());
     (plan, referer, ranking.max_connections)
 }
 
-/// Connections for downloads of an account allowing `max_connections`
+/// Connections for downloads of an account announcing `max_connections`
 /// streams: one stays free for playback.
 fn connections_for(max_connections: Option<u32>) -> usize {
     match max_connections {
         Some(n) => (n as usize).saturating_sub(1).clamp(1, MAX_CONNECTIONS),
         None => DEFAULT_CONNECTIONS,
     }
+}
+
+/// What downloads of one account showed, whatever its panel announces.
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct Learned {
+    /// Most connections seen transferring together.
+    pub served: usize,
+    /// The panel refused or cut a connection when this many were open.
+    pub refused_at: Option<(usize, Instant)>,
+}
+
+fn learned_map() -> std::sync::MutexGuard<'static, HashMap<String, Learned>> {
+    static LEARNED: OnceLock<Mutex<HashMap<String, Learned>>> = OnceLock::new();
+    LEARNED
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+}
+
+pub(crate) fn learned(account: &str) -> Learned {
+    if account.is_empty() {
+        return Learned::default();
+    }
+    let mut map = learned_map();
+    let entry = map.get_mut(account);
+    let Some(l) = entry else {
+        return Learned::default();
+    };
+    if l.refused_at.is_some_and(|(_, at)| at.elapsed() >= REFUSAL_MEMORY) {
+        l.refused_at = None;
+    }
+    *l
+}
+
+pub(crate) fn note_served(account: &str, n: usize) {
+    if account.is_empty() {
+        return;
+    }
+    let mut map = learned_map();
+    let l = map.entry(account.to_string()).or_default();
+    l.served = l.served.max(n);
+}
+
+pub(crate) fn note_refused(account: &str, n: usize) {
+    if account.is_empty() {
+        return;
+    }
+    let mut map = learned_map();
+    let l = map.entry(account.to_string()).or_default();
+    let n = l.refused_at.map_or(n, |(m, _)| m.min(n));
+    l.refused_at = Some((n, Instant::now()));
+    l.served = l.served.min(n.saturating_sub(1));
+}
+
+/// Downloads of an account that refused its `n`th connection: one fewer,
+/// and one more free for playback.
+pub(crate) fn cap_below_refusal(n: usize) -> usize {
+    n.saturating_sub(2).clamp(1, MAX_CONNECTIONS)
+}
+
+/// `(start, ceiling)` connections for one file.
+fn connection_range(max_connections: Option<u32>, l: Learned) -> (usize, usize) {
+    let ceiling = l
+        .refused_at
+        .map_or(MAX_CONNECTIONS, |(n, _)| cap_below_refusal(n));
+    let start = connections_for(max_connections).max(l.served).min(ceiling);
+    (start, ceiling)
 }
 
 /// Connection slots shared by every download of one account, so two files
@@ -825,7 +912,7 @@ async fn attempt(
     d.meta.last_modified = last_modified;
     session.validator_from = Some(url_idx);
 
-    if status == StatusCode::PARTIAL_CONTENT && plan.connections > 1 {
+    if status == StatusCode::PARTIAL_CONTENT && plan.ceiling > 1 {
         if let Some(total) = total.filter(|t| t - offset >= plan.tuning.segmented_min) {
             // Preallocate (sparse) so every connection writes at its offset.
             d.lock.set_len(total).map_err(|e| Fatal(format!("écriture disque : {e}")))?;
@@ -851,6 +938,7 @@ async fn attempt(
             done,
             total,
             rate: 0,
+            connections: 1,
         })
         .await;
 
@@ -865,7 +953,14 @@ async fn attempt(
                     break Err(Fatal(format!("écriture disque : {e}")));
                 }
                 if let Some(rate) = meter.tick(done) {
-                    let _ = tx.send(DownloadEvent::Progress { done, total, rate }).await;
+                    let _ = tx
+                        .send(DownloadEvent::Progress {
+                            done,
+                            total,
+                            rate,
+                            connections: 1,
+                        })
+                        .await;
                 }
             }
             Ok(None) => break Ok(()),
@@ -1637,8 +1732,10 @@ mod tests {
         Plan {
             urls,
             connections,
+            ceiling: connections,
             budget: Arc::new(Semaphore::new(connections)),
             tuning,
+            account: String::new(),
         }
     }
 
@@ -1648,6 +1745,7 @@ mod tests {
         max_span: 512 * 1024,
         checkpoint: Duration::from_millis(50),
         server_backoff: Duration::from_millis(5),
+        probe_every: Duration::from_secs(60),
     };
 
     /// Concurrent range server: one thread per connection, slow enough that
@@ -1659,6 +1757,11 @@ mod tests {
     }
 
     fn range_server(body: Arc<Vec<u8>>, cap: usize) -> RangeServer {
+        range_server_paced(body, cap, Duration::from_millis(2))
+    }
+
+    /// `pause` after every 32 KiB sent: 20 ms ≈ 1.6 MB/s per connection.
+    fn range_server_paced(body: Arc<Vec<u8>>, cap: usize, pause: Duration) -> RangeServer {
         use std::sync::atomic::{AtomicUsize, Ordering};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1709,7 +1812,7 @@ mod tests {
                             if s.write_all(piece).is_err() {
                                 break;
                             }
-                            std::thread::sleep(Duration::from_millis(2));
+                            std::thread::sleep(pause);
                         }
                     }
                     live.fetch_sub(1, Ordering::SeqCst);
@@ -1742,6 +1845,64 @@ mod tests {
         assert!(!a.ranges.lock().unwrap().is_empty() && !b.ranges.lock().unwrap().is_empty());
         assert!(a.peak.load(Ordering::SeqCst) + b.peak.load(Ordering::SeqCst) >= 3);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn probing_adds_connections_until_the_panel_refuses() {
+        use std::sync::atomic::Ordering;
+        let body = Arc::new(body(8_000_000));
+        let srv = range_server_paced(Arc::clone(&body), 3, Duration::from_millis(20));
+        let dir = scratch_dir("probe");
+        let (mut tx, _rx) = mpsc::channel(4096);
+        let account = "test-account-probe";
+        let tuning = parallel::Tuning {
+            max_span: 1024 * 1024,
+            probe_every: Duration::ZERO,
+            ..SMALL
+        };
+        let mut plan = plan_with(vec![srv.url.clone()], 1, tuning);
+        plan.ceiling = 6;
+        plan.budget = Arc::new(Semaphore::new(6));
+        plan.account = account.into();
+
+        let path = download_into(&dir, "Sonde", &plan, "UA", None, FAST, &mut tx)
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), *body);
+        let peak = srv.peak.load(Ordering::SeqCst);
+        assert!((2..=3).contains(&peak), "peak {peak}: grew from 1, never past the panel's 3");
+        let l = learned(account);
+        assert!(l.refused_at.is_some(), "the 509 is remembered");
+        assert!(l.served >= 2, "{l:?} peak {peak}");
+    }
+
+    #[tokio::test]
+    async fn probing_reaches_the_ceiling_when_the_announced_limit_is_not_enforced() {
+        use std::sync::atomic::Ordering;
+        let body = Arc::new(body(12_000_000));
+        let srv = range_server_paced(Arc::clone(&body), 16, Duration::from_millis(20));
+        let dir = scratch_dir("probe-open");
+        let (mut tx, _rx) = mpsc::channel(4096);
+        let account = "test-account-open-panel";
+        let tuning = parallel::Tuning {
+            max_span: 64 * 1024 * 1024,
+            probe_every: Duration::ZERO,
+            ..SMALL
+        };
+        let mut plan = plan_with(vec![srv.url.clone()], 1, tuning);
+        plan.ceiling = 4;
+        plan.budget = Arc::new(Semaphore::new(4));
+        plan.account = account.into();
+
+        let path = download_into(&dir, "Ouvert", &plan, "UA", None, FAST, &mut tx)
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), *body);
+        // The server still counts a connection for a moment after the client drops it.
+        assert!(srv.peak.load(Ordering::SeqCst) >= 4, "grew from 1 to the ceiling");
+        let l = learned(account);
+        assert!(l.refused_at.is_none());
+        assert!(l.served >= 3, "{l:?}");
     }
 
     #[tokio::test]
@@ -1859,5 +2020,40 @@ mod tests {
         assert_eq!(connections_for(Some(2)), 1);
         assert_eq!(connections_for(Some(4)), 3);
         assert_eq!(connections_for(Some(100)), MAX_CONNECTIONS);
+    }
+
+    #[test]
+    fn announced_limit_is_a_start_not_a_ceiling() {
+        let fresh = Learned::default();
+        assert_eq!(connection_range(Some(1), fresh), (1, MAX_CONNECTIONS));
+        assert_eq!(connection_range(None, fresh), (DEFAULT_CONNECTIONS, MAX_CONNECTIONS));
+        let served = Learned {
+            served: 4,
+            refused_at: None,
+        };
+        assert_eq!(connection_range(Some(1), served), (4, MAX_CONNECTIONS));
+        let refused = Learned {
+            served: 4,
+            refused_at: Some((5, Instant::now())),
+        };
+        assert_eq!(connection_range(Some(4), refused), (3, 3), "one kept for playback");
+        let strict = Learned {
+            served: 0,
+            refused_at: Some((2, Instant::now())),
+        };
+        assert_eq!(connection_range(Some(1), strict), (1, 1));
+    }
+
+    #[test]
+    fn refusal_caps_what_the_account_served() {
+        let account = "test-account-learning";
+        note_served(account, 5);
+        assert_eq!(learned(account).served, 5);
+        note_refused(account, 4);
+        note_refused(account, 6);
+        let l = learned(account);
+        assert_eq!(l.refused_at.map(|(n, _)| n), Some(4), "the lowest refusal wins");
+        assert_eq!(l.served, 3);
+        assert_eq!(learned("").served, 0);
     }
 }

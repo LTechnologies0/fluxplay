@@ -7,6 +7,12 @@
 //! [`Tuning::max_span`] so connection slots rotate between concurrent
 //! downloads of the same account.
 //!
+//! The file starts with [`Plan::connections`] and adds one every
+//! [`Tuning::probe_every`] while all of them transfer, up to
+//! [`Plan::ceiling`]. A refusal, or a connection cut right after one was
+//! added (panels that drop the oldest stream), sets the count back and caps
+//! the account.
+//!
 //! Progress reaches the sidecar only after `sync_data`: the holes are
 //! snapshotted, the file synced, then the sidecar replaced atomically. A crash
 //! can lose recent progress (re-downloaded), never mark unwritten bytes done.
@@ -29,6 +35,8 @@ pub(crate) struct Tuning {
     pub checkpoint: Duration,
     /// First wait before reusing a server that failed.
     pub server_backoff: Duration,
+    /// How long every connection must keep transferring before one more is tried.
+    pub probe_every: Duration,
 }
 
 impl Tuning {
@@ -38,8 +46,13 @@ impl Tuning {
         max_span: 256 * 1024 * 1024,
         checkpoint: Duration::from_secs(5),
         server_backoff: Duration::from_secs(3),
+        probe_every: Duration::from_secs(6),
     };
 }
+
+/// A connection cut this soon after one more was opened means the panel
+/// dropped a stream to stay within its limit.
+const KICK_WINDOW: Duration = Duration::from_secs(5);
 
 /// The sequential attempt's `206` answer, handed over as the first connection.
 pub(crate) struct FirstResponse {
@@ -197,6 +210,13 @@ struct Shared {
     limit: AtomicUsize,
     /// Connections holding a slot and a span right now.
     running: AtomicUsize,
+    /// Connections whose server answered and that are transferring.
+    flowing: AtomicUsize,
+    /// Cleared by the first refusal: the count only goes down from there.
+    probing: std::sync::atomic::AtomicBool,
+    last_raise: Mutex<Option<Instant>>,
+    ceiling: usize,
+    account: String,
     last_error: Mutex<Option<String>>,
     /// A server answered 200 to a range request (switch back to sequential).
     lost_ranges: std::sync::atomic::AtomicBool,
@@ -266,11 +286,55 @@ impl Shared {
         }
     }
 
-    /// One connection fewer for this file (a panel refused one more).
-    fn lower_limit(&self) {
-        let _ = self
-            .limit
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |l| (l > 1).then(|| l - 1));
+    /// The panel refused (or dropped) a connection while this file aimed at
+    /// `open`: the target, not the instantaneous count, since panels keep
+    /// counting a closed connection for a while. The first refusal sets the
+    /// account's limit, keeping one connection free for playback; later ones
+    /// only step this file down.
+    fn refused(&self, open: usize) {
+        if self.probing.swap(false, Ordering::SeqCst) {
+            super::note_refused(&self.account, open);
+            let cap = super::cap_below_refusal(open);
+            let _ = self
+                .limit
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |l| (l > cap).then_some(cap));
+        } else {
+            let _ = self
+                .limit
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |l| (l > 1).then(|| l - 1));
+        }
+    }
+
+    /// A connection ended before its span did.
+    fn cut(&self) {
+        let open = self.running.load(Ordering::SeqCst);
+        let target = self.limit.load(Ordering::SeqCst);
+        let after_raise = self
+            .last_raise
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .is_some_and(|t| t.elapsed() < KICK_WINDOW);
+        if open > 1 && after_raise {
+            self.refused(target);
+        }
+    }
+
+    /// Every `probe_every`: remember what the account served, and try one
+    /// more connection when all of them transfer.
+    fn probe(&self) {
+        let flowing = self.flowing.load(Ordering::SeqCst);
+        if flowing >= 2 {
+            super::note_served(&self.account, flowing);
+        }
+        let limit = self.limit.load(Ordering::SeqCst);
+        if self.probing.load(Ordering::SeqCst)
+            && flowing >= limit
+            && limit < self.ceiling
+            && self.work().has_work(&self.tuning)
+        {
+            self.limit.store(limit + 1, Ordering::SeqCst);
+            *self.last_raise.lock().unwrap_or_else(|p| p.into_inner()) = Some(Instant::now());
+        }
     }
 }
 
@@ -281,7 +345,8 @@ enum ServerOutcome {
     Bad,
 }
 
-/// Decrements [`Shared::running`] however the connection ends.
+/// Decrements [`Shared::running`] (or [`Shared::flowing`]) however the
+/// connection ends.
 struct Running<'a>(&'a AtomicUsize);
 
 impl Drop for Running<'_> {
@@ -319,8 +384,13 @@ pub(crate) async fn run(
         file,
         work: Mutex::new(Work::new(&holes)),
         servers: Mutex::new(vec![ServerState::default(); plan.urls.len()]),
-        limit: AtomicUsize::new(plan.connections.max(1)),
+        limit: AtomicUsize::new(plan.connections.clamp(1, plan.ceiling.max(1))),
         running: AtomicUsize::new(0),
+        flowing: AtomicUsize::new(0),
+        probing: std::sync::atomic::AtomicBool::new(plan.ceiling > plan.connections),
+        last_raise: Mutex::new(None),
+        ceiling: plan.ceiling.max(1),
+        account: plan.account.clone(),
         last_error: Mutex::new(None),
         lost_ranges: Default::default(),
         tuning: plan.tuning,
@@ -364,10 +434,12 @@ pub(crate) async fn run(
             done: sh.done(),
             total: Some(total),
             rate: 0,
+            connections: 0,
         })
         .await;
     let mut ticker = tokio::time::interval(PROGRESS_EVERY);
     let mut last_checkpoint = Instant::now();
+    let mut last_probe = Instant::now();
 
     let result = loop {
         let wanted = sh.limit.load(Ordering::SeqCst);
@@ -401,9 +473,14 @@ pub(crate) async fn run(
             _ = ticker.tick() => {
                 let done = sh.done();
                 if let Some(rate) = meter.tick(done) {
+                    let connections = sh.flowing.load(Ordering::SeqCst);
                     let _ = tx
-                        .send(DownloadEvent::Progress { done, total: Some(total), rate })
+                        .send(DownloadEvent::Progress { done, total: Some(total), rate, connections })
                         .await;
+                }
+                if last_probe.elapsed() >= sh.tuning.probe_every {
+                    sh.probe();
+                    last_probe = Instant::now();
                 }
                 if last_checkpoint.elapsed() >= sh.tuning.checkpoint {
                     checkpoint(&sh, d).await;
@@ -484,8 +561,11 @@ async fn connection(
             }
         };
         let _running = Running(&sh.running);
+        sh.flowing.fetch_add(1, Ordering::SeqCst);
+        let flowing = Running(&sh.flowing);
 
         let fetched = fetch(&sh, resp, id, pos).await;
+        drop(flowing);
         let (outcome, finished) = match fetched {
             Ok(r) => r,
             Err(fatal) => {
@@ -497,6 +577,7 @@ async fn connection(
         sh.server_done(idx, outcome);
         if !finished {
             sh.work().release(id);
+            sh.cut();
             return Ok(());
         }
         drop(slot);
@@ -556,7 +637,7 @@ async fn open(
                 // Panels answer 403 / 429 / 458 / 509 / 503 when the account
                 // has no free connection: keep fewer for this file.
                 if sh.running.load(Ordering::SeqCst) > 1 {
-                    sh.lower_limit();
+                    sh.refused(sh.limit.load(Ordering::SeqCst));
                 }
                 fail(ServerOutcome::Failed, msg);
             }
@@ -670,6 +751,7 @@ mod tests {
         max_span: 100,
         checkpoint: Duration::from_secs(5),
         server_backoff: Duration::from_millis(1),
+        probe_every: Duration::from_secs(60),
     };
 
     #[test]
