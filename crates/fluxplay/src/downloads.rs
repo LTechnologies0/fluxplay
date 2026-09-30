@@ -12,14 +12,17 @@
 //! carries the account credentials.
 //!
 //! Large files that support ranges are fetched by several connections at once
-//! (spread over the account's servers) — see [`parallel`]. How many
+//! — see [`parallel`] — sharing the stream token of one server ([`links`]);
+//! the account's other servers take over when it fails. How many titles and
 //! connections the account's downloads hold together is decided by
-//! [`account`]: the panel's `max_connections` is only the starting count.
+//! [`account`].
 
 mod account;
+mod links;
 mod parallel;
 
 use account::{Account, Slot};
+use links::Links;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -54,6 +57,8 @@ const META_MAGIC_SEGMENTED: &str = "fluxplay-download 2";
 const DEFAULT_CONNECTIONS: usize = 2;
 /// Never more than this per account, whatever the panel allows.
 const MAX_CONNECTIONS: usize = 8;
+/// First wait before renewing a stream token another player keeps taking back.
+const RENEW_WAIT: Duration = Duration::from_secs(15);
 const KNOWN_EXTENSIONS: &[&str] = &[
     "mkv", "mp4", "m4v", "avi", "mov", "webm", "ts", "m2ts", "mpg", "mpeg", "flv", "wmv",
 ];
@@ -70,6 +75,8 @@ pub enum DownloadEvent {
         /// Connections transferring right now.
         connections: usize,
     },
+    /// The account already fetches as many titles as its panel allows.
+    Waiting,
     /// Connection lost; reconnecting after `wait` (resumes where it stopped).
     Retrying {
         attempt: u32,
@@ -148,10 +155,10 @@ pub struct DownloadRequest {
     pub background: bool,
 }
 
-/// Resolved transfer plan: every server's URL for the file, and the account
-/// whose connection slots it shares.
+/// Resolved transfer plan: every server of the file, and the account whose
+/// streams and connection slots it shares.
 pub(crate) struct Plan {
-    urls: Vec<String>,
+    links: Arc<Links>,
     account: Arc<Account>,
     tuning: parallel::Tuning,
 }
@@ -160,16 +167,29 @@ pub(crate) struct Plan {
 pub fn run(req: DownloadRequest) -> impl Stream<Item = DownloadEvent> {
     iced::stream::channel(16, async move |mut tx: mpsc::Sender<DownloadEvent>| {
         let (plan, referer, max_connections) = resolve_plan(&req).await;
-        // Preloading while the viewer watches needs a second connection:
-        // only when the panel announces one or was seen serving two.
-        if req.background && max_connections == Some(1) && plan.account.served() < 2 {
-            let _ = tx
-                .send(DownloadEvent::Finished(Err(
-                    "une seule connexion autorisée par le panel".into(),
-                )))
-                .await;
-            return;
-        }
+        // Preloading while the viewer watches is a second stream: the panel
+        // would revoke playback's on a single-stream account.
+        let lease = if req.background {
+            match plan.account.try_lease().filter(|_| max_connections != Some(1)) {
+                Some(lease) => lease,
+                None => {
+                    let _ = tx
+                        .send(DownloadEvent::Finished(Err(
+                            "connexions du compte déjà occupées".into(),
+                        )))
+                        .await;
+                    return;
+                }
+            }
+        } else {
+            match plan.account.try_lease() {
+                Some(lease) => lease,
+                None => {
+                    let _ = tx.send(DownloadEvent::Waiting).await;
+                    plan.account.lease().await
+                }
+            }
+        };
         let ua = req
             .source
             .as_ref()
@@ -186,6 +206,7 @@ pub fn run(req: DownloadRequest) -> impl Stream<Item = DownloadEvent> {
             &mut tx,
         )
         .await;
+        drop(lease);
         let _ = tx.send(DownloadEvent::Finished(result)).await;
     })
 }
@@ -195,8 +216,8 @@ async fn resolve_plan(req: &DownloadRequest) -> (Plan, Option<String>, Option<u3
     let Some(source) = &req.source else {
         return (
             Plan {
-                urls: vec![req.url.clone()],
-                account: Account::shared("", DEFAULT_CONNECTIONS),
+                links: Arc::new(Links::new(vec![req.url.clone()], RENEW_WAIT)),
+                account: Account::shared("", DEFAULT_CONNECTIONS, MAX_PARALLEL),
                 tuning: parallel::Tuning::DEFAULT,
             },
             None,
@@ -205,10 +226,11 @@ async fn resolve_plan(req: &DownloadRequest) -> (Plan, Option<String>, Option<u3
     };
     let ranking = servers::rank_if_stale(source).await;
     let plan = Plan {
-        urls: servers::media_candidates(source, &req.url),
+        links: Arc::new(Links::new(servers::media_candidates(source, &req.url), RENEW_WAIT)),
         account: Account::shared(
             &source.id.to_string(),
             connections_for(ranking.max_connections),
+            streams_for(ranking.max_connections),
         ),
         tuning: parallel::Tuning::DEFAULT,
     };
@@ -216,12 +238,21 @@ async fn resolve_plan(req: &DownloadRequest) -> (Plan, Option<String>, Option<u3
     (plan, referer, ranking.max_connections)
 }
 
-/// Connections for downloads of an account announcing `max_connections`
-/// streams: one stays free for playback.
+/// Connections a download starts with. They share one stream, so the
+/// announced limit only scales the start; probing finds the rest.
 fn connections_for(max_connections: Option<u32>) -> usize {
     match max_connections {
-        Some(n) => (n as usize).saturating_sub(1).clamp(1, MAX_CONNECTIONS),
+        Some(n) => (n as usize).clamp(DEFAULT_CONNECTIONS, MAX_CONNECTIONS),
         None => DEFAULT_CONNECTIONS,
+    }
+}
+
+/// Titles the account's downloads fetch at once: one stream stays free for
+/// playback, unless the panel allows a single one.
+fn streams_for(max_connections: Option<u32>) -> usize {
+    match max_connections {
+        Some(n) => (n as usize).saturating_sub(1).max(1),
+        None => MAX_PARALLEL,
     }
 }
 
@@ -595,7 +626,7 @@ async fn download_into(
     policy: RetryPolicy,
     tx: &mut mpsc::Sender<DownloadEvent>,
 ) -> Result<PathBuf, String> {
-    let url = plan.urls.first().ok_or("URL vide")?;
+    let url = plan.links.first().ok_or("URL vide")?;
     tokio::fs::create_dir_all(dir)
         .await
         .map_err(|e| format!("dossier {} : {e}", dir.display()))?;
@@ -634,7 +665,7 @@ async fn download_into(
         url_idx: 0,
         // A validator read back from disk came from an unknown server: only
         // trust it when there is a single one.
-        validator_from: (plan.urls.len() == 1).then_some(0),
+        validator_from: (plan.links.len() == 1).then_some(0),
     };
     let mut failures = 0u32;
     loop {
@@ -669,7 +700,7 @@ async fn download_into(
                 }
                 failures += 1;
                 // Next server of the account for the next sequential attempt.
-                session.url_idx = (session.url_idx + 1) % plan.urls.len();
+                session.url_idx = (session.url_idx + 1) % plan.links.len();
                 if failures > policy.max_attempts {
                     // The `.part` stays: the next click resumes from here.
                     return Err(e);
@@ -711,26 +742,29 @@ async fn attempt(
 ) -> Result<(), AttemptError> {
     use AttemptError::{Fatal, Retry};
 
-    let url_idx = session.url_idx.min(plan.urls.len() - 1);
-    let url = &plan.urls[url_idx];
+    let url_idx = session.url_idx.min(plan.links.len() - 1);
     let offset = match dest {
         Some(d) => d.len().map_err(Fatal)?,
         None => 0,
     };
     let slot = plan.account.acquire().await;
-    // `bytes=0-` too: a 206 answer proves the server can split the file.
-    let mut req = client
-        .get(url)
-        .header(header::RANGE, format!("bytes={offset}-"));
-    if offset > 0 && session.validator_from == Some(url_idx) {
-        if let Some(v) = dest.as_ref().and_then(|d| d.meta.validator()) {
-            req = req.header(header::IF_RANGE, v);
-        }
-    }
-    let mut resp = req
-        .send()
+    let validator = dest
+        .as_ref()
+        .filter(|_| offset > 0 && session.validator_from == Some(url_idx))
+        .and_then(|d| d.meta.validator().map(str::to_owned));
+    let sent = plan
+        .links
+        .send(client, url_idx, |req| {
+            // `bytes=0-` too: a 206 answer proves the server can split the file.
+            let req = req.header(header::RANGE, format!("bytes={offset}-"));
+            match &validator {
+                Some(v) => req.header(header::IF_RANGE, v.as_str()),
+                None => req,
+            }
+        })
         .await
         .map_err(|e| Retry(fluxplay_providers::redact_error(&e)))?;
+    let mut resp = sent.resp;
     let status = resp.status();
 
     if status == StatusCode::RANGE_NOT_SATISFIABLE && offset > 0 {
@@ -750,7 +784,7 @@ async fn attempt(
     if !status.is_success() {
         let msg = format!("HTTP {status}");
         return match status.as_u16() {
-            400 | 401 | 404 | 405 | 410 | 451 => Err(Fatal(msg)),
+            400 | 401 | 404 | 405 | 410 | 451 if sent.fresh => Err(Fatal(msg)),
             _ => Err(Retry(msg)),
         };
     }
@@ -1622,7 +1656,7 @@ mod tests {
 
     fn plan_with(urls: Vec<String>, connections: usize, tuning: parallel::Tuning) -> Plan {
         Plan {
-            urls,
+            links: Arc::new(Links::new(urls, Duration::from_millis(1))),
             account: Account::detached(connections, connections),
             tuning,
         }
@@ -1635,6 +1669,8 @@ mod tests {
         checkpoint: Duration::from_millis(50),
         server_backoff: Duration::from_millis(5),
         probe_every: Duration::from_secs(60),
+        recycle_window: Duration::from_secs(3),
+        recycle_age: Duration::from_secs(3600),
     };
 
     /// Concurrent range server: one thread per connection, slow enough that
@@ -1651,6 +1687,20 @@ mod tests {
 
     /// `pause` after every 32 KiB sent: 20 ms ≈ 1.6 MB/s per connection.
     fn range_server_paced(body: Arc<Vec<u8>>, cap: usize, pause: Duration) -> RangeServer {
+        range_server_gated(body, cap, Arc::new(move |_| pause), Arc::new(|_: &str| true))
+    }
+
+    /// Pause after each 32 KiB piece, given the bytes this connection already sent.
+    type Pace = Arc<dyn Fn(usize) -> Duration + Send + Sync>;
+
+    /// Like [`range_server_paced`], answering 509 when `admit` rejects the
+    /// request path.
+    fn range_server_gated(
+        body: Arc<Vec<u8>>,
+        cap: usize,
+        pace: Pace,
+        admit: Arc<dyn Fn(&str) -> bool + Send + Sync>,
+    ) -> RangeServer {
         use std::sync::atomic::{AtomicUsize, Ordering};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1661,8 +1711,14 @@ mod tests {
         std::thread::spawn(move || {
             for conn in listener.incoming() {
                 let Ok(mut s) = conn else { return };
-                let (body, log, top, live) =
-                    (Arc::clone(&body), Arc::clone(&log), Arc::clone(&top), Arc::clone(&live));
+                let (body, log, top, live, admit, pace) = (
+                    Arc::clone(&body),
+                    Arc::clone(&log),
+                    Arc::clone(&top),
+                    Arc::clone(&live),
+                    Arc::clone(&admit),
+                    Arc::clone(&pace),
+                );
                 std::thread::spawn(move || {
                     let mut req = Vec::new();
                     let mut buf = [0u8; 1024];
@@ -1673,6 +1729,11 @@ mod tests {
                         }
                     }
                     let req = String::from_utf8_lossy(&req).to_ascii_lowercase();
+                    let path = req.split_whitespace().nth(1).unwrap_or("");
+                    if !admit(path) {
+                        let _ = write!(s, "HTTP/1.1 509 X\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                        return;
+                    }
                     let range = req
                         .lines()
                         .find_map(|l| l.strip_prefix("range: bytes="))
@@ -1697,11 +1758,13 @@ mod tests {
                         end - start
                     );
                     if s.write_all(head.as_bytes()).is_ok() {
+                        let mut sent = 0;
                         for piece in body[start..end].chunks(32 * 1024) {
                             if s.write_all(piece).is_err() {
                                 break;
                             }
-                            std::thread::sleep(pause);
+                            sent += piece.len();
+                            std::thread::sleep(pace(sent));
                         }
                     }
                     live.fetch_sub(1, Ordering::SeqCst);
@@ -1716,7 +1779,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn parallel_download_spreads_over_connections_and_servers() {
+    async fn parallel_download_uses_several_connections_of_one_server() {
         use std::sync::atomic::Ordering;
         let body = Arc::new(body(3_000_000));
         let a = range_server(Arc::clone(&body), 8);
@@ -1731,8 +1794,152 @@ mod tests {
         assert_eq!(path, dir.join("Parallèle.mkv"));
         assert!(std::fs::read(&path).unwrap() == *body, "bytes identical");
         assert!(leftovers(&dir).is_empty());
-        assert!(!a.ranges.lock().unwrap().is_empty() && !b.ranges.lock().unwrap().is_empty());
-        assert!(a.peak.load(Ordering::SeqCst) + b.peak.load(Ordering::SeqCst) >= 3);
+        assert!(a.peak.load(Ordering::SeqCst) >= 3);
+        assert!(b.ranges.lock().unwrap().is_empty(), "a mirror would be one more stream");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_failing_server_hands_over_to_the_next() {
+        let body = Arc::new(body(2_000_000));
+        let a = range_server(Arc::clone(&body), 0);
+        let b = range_server(Arc::clone(&body), 8);
+        let dir = scratch_dir("failover");
+        let (mut tx, _rx) = mpsc::channel(1024);
+        let plan = plan_with(vec![a.url.clone(), b.url.clone()], 3, SMALL);
+
+        let path = download_into(&dir, "Relais", &plan, "UA", None, FAST, &mut tx)
+            .await
+            .unwrap();
+        assert!(std::fs::read(&path).unwrap() == *body);
+        assert!(!b.ranges.lock().unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// XUI-style panel: every media request is redirected to the node with a
+    /// new token, and the node only honours the latest token issued.
+    struct XuiPanel {
+        url: String,
+        tokens: Arc<std::sync::atomic::AtomicUsize>,
+        node: RangeServer,
+    }
+
+    fn xui_panel(body: Arc<Vec<u8>>, pace: Pace) -> XuiPanel {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let tokens = Arc::new(AtomicUsize::new(0));
+        let latest = Arc::clone(&tokens);
+        let node = range_server_gated(
+            body,
+            16,
+            pace,
+            Arc::new(move |path: &str| {
+                let n = latest.load(Ordering::SeqCst);
+                path.split('/').any(|seg| seg == format!("tok{n}"))
+            }),
+        );
+        let node_base = node.url.split("/movie/").next().unwrap().to_string();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let issued = Arc::clone(&tokens);
+        std::thread::spawn(move || {
+            for conn in listener.incoming() {
+                let Ok(mut s) = conn else { return };
+                let mut req = Vec::new();
+                let mut buf = [0u8; 1024];
+                while !req.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match s.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => req.extend_from_slice(&buf[..n]),
+                    }
+                }
+                let n = issued.fetch_add(1, Ordering::SeqCst) + 1;
+                let _ = write!(
+                    s,
+                    "HTTP/1.1 302 Found\r\nLocation: {node_base}/live/play/tok{n}/7\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                );
+            }
+        });
+        XuiPanel {
+            url: format!("http://{addr}/movie/u/p/7.mkv"),
+            tokens,
+            node,
+        }
+    }
+
+    #[tokio::test]
+    async fn connections_share_the_stream_token_of_the_panel() {
+        use std::sync::atomic::Ordering;
+        let body = Arc::new(body(4_000_000));
+        let panel = xui_panel(Arc::clone(&body), Arc::new(|_| Duration::from_millis(5)));
+        let dir = scratch_dir("xui");
+        let (mut tx, _rx) = mpsc::channel(4096);
+        let plan = plan_with(vec![panel.url.clone()], 4, SMALL);
+
+        let path = download_into(&dir, "Jeton", &plan, "UA", None, FAST, &mut tx)
+            .await
+            .unwrap();
+        assert!(std::fs::read(&path).unwrap() == *body);
+        assert_eq!(panel.tokens.load(Ordering::SeqCst), 1, "one token for every connection and span");
+        assert!(panel.node.peak.load(Ordering::SeqCst) >= 3);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn throttled_connections_reopen_on_the_same_token() {
+        use std::sync::atomic::Ordering;
+        let body = Arc::new(body(3_000_000));
+        // Busy node: 256 KiB at full speed per connection, then ~160 KB/s.
+        let panel = xui_panel(
+            Arc::clone(&body),
+            Arc::new(|sent| Duration::from_millis(if sent < 256 * 1024 { 1 } else { 200 })),
+        );
+        let dir = scratch_dir("recycle");
+        let (mut tx, _rx) = mpsc::channel(4096);
+        let tuning = parallel::Tuning {
+            max_span: 64 * 1024 * 1024,
+            recycle_window: Duration::from_millis(100),
+            recycle_age: Duration::from_millis(150),
+            ..SMALL
+        };
+        let plan = plan_with(vec![panel.url.clone()], 2, tuning);
+
+        let started = Instant::now();
+        let path = download_into(&dir, "Recyclé", &plan, "UA", None, FAST, &mut tx)
+            .await
+            .unwrap();
+        assert!(std::fs::read(&path).unwrap() == *body);
+        // Without reopening: ~1.4 MB per connection at 160 KB/s, ~9 s.
+        assert!(started.elapsed() < Duration::from_secs(5), "took {:?}", started.elapsed());
+        assert!(panel.node.ranges.lock().unwrap().len() > 4, "connections reopened");
+        assert_eq!(panel.tokens.load(Ordering::SeqCst), 1, "on the same token");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_revoked_token_is_renewed_once() {
+        use std::sync::atomic::Ordering;
+        let body = Arc::new(body(4_000_000));
+        let panel = xui_panel(Arc::clone(&body), Arc::new(|_| Duration::from_millis(20)));
+        let dir = scratch_dir("xui-revoked");
+        let (mut tx, _rx) = mpsc::channel(4096);
+        let plan = plan_with(vec![panel.url.clone()], 4, SMALL);
+        let tokens = Arc::clone(&panel.tokens);
+        // Another stream of the account (playback) takes the token over.
+        let revoke = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            tokens.fetch_add(1, Ordering::SeqCst);
+        });
+
+        let path = download_into(&dir, "Révoqué", &plan, "UA", None, FAST, &mut tx)
+            .await
+            .unwrap();
+        revoke.await.unwrap();
+        assert!(std::fs::read(&path).unwrap() == *body);
+        assert_eq!(
+            panel.tokens.load(Ordering::SeqCst),
+            3,
+            "first token, the other stream's, one renewal shared by every connection"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1795,8 +2002,8 @@ mod tests {
         let dir = scratch_dir("holes");
         std::fs::create_dir_all(&dir).unwrap();
         // A crashed segmented download: [0, 700000) and [1200000, 2000000) on
-        // disk, the middle still zeros.
-        let mut partial = body.to_vec();
+        // disk (marked, to see they are never rewritten), the middle zeros.
+        let mut partial: Vec<u8> = body.iter().map(|b| b ^ 0x55).collect();
         partial[700_000..1_200_000].fill(0);
         let part = dir.join("Trous.mkv.part");
         std::fs::write(&part, &partial).unwrap();
@@ -1820,11 +2027,12 @@ mod tests {
         let path = download_into(&dir, "Trous", &plan, "UA", None, FAST, &mut tx)
             .await
             .unwrap();
-        assert!(std::fs::read(&path).unwrap() == *body);
+        let mut expected = partial.clone();
+        expected[700_000..1_200_000].copy_from_slice(&body[700_000..1_200_000]);
+        assert!(std::fs::read(&path).unwrap() == expected, "only the hole is written");
         for r in srv.ranges.lock().unwrap().iter() {
-            let (a, b) = r.split_once('-').unwrap();
-            let (a, b): (u64, u64) = (a.parse().unwrap(), b.parse().unwrap());
-            assert!(a >= 700_000 && b < 1_200_000, "only the hole is fetched: {r}");
+            let start: u64 = r.split_once('-').unwrap().0.parse().unwrap();
+            assert!((700_000..1_200_000).contains(&start), "only the hole is requested: {r}");
         }
         assert!(leftovers(&dir).is_empty());
         let _ = std::fs::remove_dir_all(&dir);
@@ -1904,7 +2112,7 @@ mod tests {
     async fn live_panel_connection_probing() {
         use iced::futures::StreamExt;
         let _ = tracing_subscriber::fmt()
-            .with_env_filter("fluxplay::downloads=info")
+            .with_env_filter("fluxplay::downloads=debug")
             .with_test_writer()
             .try_init();
         let state = crate::storage::load();
@@ -1972,11 +2180,14 @@ mod tests {
     }
 
     #[test]
-    fn connection_count_keeps_one_for_playback() {
+    fn streams_keep_one_for_playback_and_connections_share_them() {
+        assert_eq!(streams_for(None), MAX_PARALLEL);
+        assert_eq!(streams_for(Some(1)), 1);
+        assert_eq!(streams_for(Some(2)), 1);
+        assert_eq!(streams_for(Some(4)), 3);
         assert_eq!(connections_for(None), DEFAULT_CONNECTIONS);
-        assert_eq!(connections_for(Some(1)), 1);
-        assert_eq!(connections_for(Some(2)), 1);
-        assert_eq!(connections_for(Some(4)), 3);
+        assert_eq!(connections_for(Some(1)), DEFAULT_CONNECTIONS);
+        assert_eq!(connections_for(Some(4)), 4);
         assert_eq!(connections_for(Some(100)), MAX_CONNECTIONS);
     }
 }

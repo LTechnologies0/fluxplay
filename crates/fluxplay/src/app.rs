@@ -2532,6 +2532,11 @@ impl FluxPlay {
                             crate::downloads::progress_detail(d, t, rate)
                         );
                     }
+                    DownloadEvent::Waiting => {
+                        self.status = format!(
+                            "Téléchargement — {name} · en attente : le compte télécharge déjà autant de titres que le panel l'autorise"
+                        );
+                    }
                     DownloadEvent::Retrying {
                         attempt,
                         wait,

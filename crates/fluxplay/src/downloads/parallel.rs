@@ -9,7 +9,13 @@
 //!
 //! Every connection holds one of the account's slots ([`Account`]); the file
 //! keeps connections waiting for more, which is what lets the account try
-//! one more slot.
+//! one more slot. All of them talk to the first working server, sharing its
+//! stream token: each server of the account would be one more stream.
+//!
+//! Busy CDN nodes throttle each request to about 1 MB/s after a first burst
+//! at full speed, while a new request starts at full speed again: a
+//! connection that falls well below its own best speed reopens at the same
+//! position, keeping its span and slot.
 //!
 //! Progress reaches the sidecar only after `sync_data`: the holes are
 //! snapshotted, the file synced, then the sidecar replaced atomically. A crash
@@ -35,6 +41,10 @@ pub(crate) struct Tuning {
     pub server_backoff: Duration,
     /// How often the account settles a trial slot or tries one more.
     pub probe_every: Duration,
+    /// A connection's speed is measured over this long…
+    pub recycle_window: Duration,
+    /// …and once it is at least this old, a clear drop reopens it.
+    pub recycle_age: Duration,
 }
 
 impl Tuning {
@@ -45,6 +55,8 @@ impl Tuning {
         checkpoint: Duration::from_secs(5),
         server_backoff: Duration::from_secs(3),
         probe_every: Duration::from_secs(8),
+        recycle_window: Duration::from_secs(2),
+        recycle_age: Duration::from_secs(4),
     };
 }
 
@@ -226,16 +238,13 @@ impl Shared {
         *self.last_error.lock().unwrap_or_else(|p| p.into_inner()) = Some(e);
     }
 
-    /// Least busy usable server (ranking order breaks ties).
+    /// First usable server in ranking order.
     fn pick_server(&self) -> Option<usize> {
         let now = Instant::now();
         let mut servers = self.servers();
         let i = servers
             .iter()
-            .enumerate()
-            .filter(|(_, s)| !s.bad && s.retry_at.is_none_or(|t| t <= now))
-            .min_by_key(|(i, s)| (s.active, *i))
-            .map(|(i, _)| i)?;
+            .position(|s| !s.bad && s.retry_at.is_none_or(|t| t <= now))?;
         servers[i].active += 1;
         Some(i)
     }
@@ -318,21 +327,19 @@ pub(crate) async fn run(
         total,
         file,
         work: Mutex::new(Work::new(&holes)),
-        servers: Mutex::new(vec![ServerState::default(); plan.urls.len()]),
+        servers: Mutex::new(vec![ServerState::default(); plan.links.len()]),
         account: Arc::clone(&plan.account),
         flowing: AtomicUsize::new(0),
         last_error: Mutex::new(None),
         lost_ranges: Default::default(),
         tuning: plan.tuning,
     });
-    let urls = Arc::new(plan.urls.clone());
-
     let mut set = JoinSet::new();
     let spawn = |set: &mut JoinSet<Result<(), String>>, handed: Option<Handed>| {
         set.spawn(connection(
             Arc::clone(&sh),
             client.clone(),
-            Arc::clone(&urls),
+            Arc::clone(&plan.links),
             handed,
         ));
     };
@@ -452,20 +459,33 @@ struct Handed {
 async fn connection(
     sh: Arc<Shared>,
     client: reqwest::Client,
-    urls: Arc<Vec<String>>,
+    links: Arc<Links>,
     mut handed: Option<Handed>,
 ) -> Result<(), String> {
+    // A slowed-down connection's slot and span, to reopen.
+    let mut reopen: Option<(Slot, u64)> = None;
     loop {
         let (slot, id, pos, resp, idx) = if let Some(h) = handed.take() {
             let pos = sh.work().holes_of(h.id).map_or(0, |(p, _)| p);
             (h.slot, h.id, pos, h.resp, h.idx)
         } else {
-            let slot = sh.account.acquire().await;
-            let claimed = sh.work().take(&sh.tuning);
-            let Some((id, pos, end)) = claimed else {
-                return Ok(());
+            let (slot, id, pos) = match reopen.take() {
+                Some((slot, id)) => {
+                    let Some((pos, _)) = sh.work().holes_of(id) else {
+                        continue;
+                    };
+                    (slot, id, pos)
+                }
+                None => {
+                    let slot = sh.account.acquire().await;
+                    let claimed = sh.work().take(&sh.tuning);
+                    let Some((id, pos, _)) = claimed else {
+                        return Ok(());
+                    };
+                    (slot, id, pos)
+                }
             };
-            match open(&sh, &client, &urls, id, pos, end).await? {
+            match open(&sh, &client, &links, id, pos).await? {
                 Some((resp, idx)) => (slot, id, pos, resp, idx),
                 None => return Ok(()),
             }
@@ -475,49 +495,51 @@ async fn connection(
 
         let fetched = fetch(&sh, resp, id, pos).await;
         drop(flowing);
-        let (outcome, finished) = match fetched {
-            Ok(r) => r,
+        match fetched {
             Err(fatal) => {
                 sh.server_done(idx, ServerOutcome::Ok);
                 sh.work().release(id);
                 return Err(fatal);
             }
-        };
-        sh.server_done(idx, outcome);
-        if !finished {
-            sh.work().release(id);
-            return Ok(());
+            Ok(Ended::Complete) => sh.server_done(idx, ServerOutcome::Ok),
+            Ok(Ended::Slowed) => {
+                sh.server_done(idx, ServerOutcome::Ok);
+                reopen = Some((slot, id));
+            }
+            Ok(Ended::Dropped(outcome)) => {
+                sh.server_done(idx, outcome);
+                sh.work().release(id);
+                return Ok(());
+            }
         }
-        drop(slot);
     }
 }
 
-/// Request `[pos, end)` from the least busy server. `Ok(None)`: the span went
-/// back to the pool (no server now, or this one failed).
+/// Request span `id` from `pos` on the first usable server. `Ok(None)`: the
+/// span went back to the pool (no server now, or this one failed).
 async fn open(
     sh: &Shared,
     client: &reqwest::Client,
-    urls: &[String],
+    links: &Links,
     id: u64,
     pos: u64,
-    end: u64,
 ) -> Result<Option<(reqwest::Response, usize)>, String> {
     let Some(idx) = sh.pick_server() else {
         sh.work().release(id);
         return Ok(None);
     };
-    let sent = client
-        .get(&urls[idx])
-        .header(header::RANGE, format!("bytes={pos}-{}", end - 1))
-        .send()
+    // Open-ended: CDN nodes let such a request run at full speed for ~256 MiB
+    // but a bounded one for ~16 MiB. The connection stops at its span's end.
+    let sent = links
+        .send(client, idx, |req| req.header(header::RANGE, format!("bytes={pos}-")))
         .await;
     let fail = |outcome: ServerOutcome, e: String| {
         sh.note_error(e);
         sh.server_done(idx, outcome);
         sh.work().release(id);
     };
-    let resp = match sent {
-        Ok(r) => r,
+    let (resp, fresh) = match sent {
+        Ok(s) => (s.resp, s.fresh),
         Err(e) => {
             fail(ServerOutcome::Failed, fluxplay_providers::redact_error(&e));
             return Ok(None);
@@ -540,9 +562,9 @@ async fn open(
     } else {
         let msg = format!("HTTP {status}");
         match status.as_u16() {
-            400 | 401 | 404 | 405 | 410 | 416 | 451 => fail(ServerOutcome::Bad, msg),
+            400 | 401 | 404 | 405 | 410 | 416 | 451 if fresh => fail(ServerOutcome::Bad, msg),
             // How panels say the account has no free connection.
-            403 | 429 | 458 | 503 | 509 => {
+            403 | 429 | 458 | 503 | 509 if fresh => {
                 if sh.account.in_use() > 1 {
                     sh.account.refused();
                 }
@@ -558,39 +580,69 @@ async fn open(
     Ok(None)
 }
 
-/// Stream `resp` into span `id` from `pos`. Returns how the server behaved and
-/// whether the span is complete (stolen tail included); `Err` on a disk error.
+/// How a transfer into a span ended.
+enum Ended {
+    /// The span is complete (stolen tail included).
+    Complete,
+    /// Far slower than it was: reopen at the same position.
+    Slowed,
+    /// Connection lost; how the server behaved.
+    Dropped(ServerOutcome),
+}
+
+/// Stream `resp` into span `id` from `pos`; `Err` on a disk error.
 async fn fetch(
     sh: &Arc<Shared>,
     mut resp: reqwest::Response,
     id: u64,
     mut pos: u64,
-) -> Result<(ServerOutcome, bool), String> {
+) -> Result<Ended, String> {
     let mut buf: Vec<u8> = Vec::with_capacity(WRITE_BUFFER);
     let mut moved = 0u64;
+    let opened = Instant::now();
+    let mut window = (opened, 0u64);
+    let mut best = 0u64;
     loop {
         let chunk = match resp.chunk().await {
             Ok(Some(c)) => Some(c),
             Ok(None) => None,
             Err(e) => {
                 sh.note_error(fluxplay_providers::redact_error(&e));
-                let finished = flush(sh, id, &mut pos, &mut buf).await?;
-                return Ok((outcome_after(moved), finished));
+                if flush(sh, id, &mut pos, &mut buf).await? {
+                    return Ok(Ended::Complete);
+                }
+                return Ok(Ended::Dropped(outcome_after(moved)));
             }
         };
         let eof = chunk.is_none();
+        let mut slowed = false;
         if let Some(c) = chunk {
             buf.extend_from_slice(&c);
             moved += c.len() as u64;
+            window.1 += c.len() as u64;
             sh.account.add_bytes(c.len() as u64);
+            let span = window.0.elapsed();
+            if span >= sh.tuning.recycle_window {
+                let rate = (window.1 as f64 / span.as_secs_f64()) as u64;
+                best = best.max(rate);
+                window = (Instant::now(), 0);
+                slowed = opened.elapsed() >= sh.tuning.recycle_age
+                    && rate.saturating_mul(10) < best.saturating_mul(4);
+                if slowed {
+                    tracing::debug!(rate, best, "downloads: connection slowed down, reopening");
+                }
+            }
         }
-        if eof || buf.len() >= WRITE_BUFFER {
+        if eof || slowed || buf.len() >= WRITE_BUFFER {
             if flush(sh, id, &mut pos, &mut buf).await? {
-                return Ok((ServerOutcome::Ok, true));
+                return Ok(Ended::Complete);
             }
             if eof {
                 sh.note_error("connexion interrompue".into());
-                return Ok((outcome_after(moved), false));
+                return Ok(Ended::Dropped(outcome_after(moved)));
+            }
+            if slowed {
+                return Ok(Ended::Slowed);
             }
         }
     }
@@ -661,6 +713,8 @@ mod tests {
         checkpoint: Duration::from_secs(5),
         server_backoff: Duration::from_millis(1),
         probe_every: Duration::from_secs(60),
+        recycle_window: Duration::from_secs(3),
+        recycle_age: Duration::from_secs(3600),
     };
 
     #[test]

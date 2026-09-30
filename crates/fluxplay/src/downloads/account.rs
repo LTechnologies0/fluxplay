@@ -1,8 +1,15 @@
-//! Connection slots of one IPTV account, shared by every download of it.
+//! Streams and connection slots of one IPTV account, shared by every download
+//! of it.
 //!
-//! Panels announce a `max_connections` but often do not enforce it on VOD
-//! and cap each connection's speed instead, so the announced value is only
-//! where the slot count starts. Every [`Tuning::probe_every`](super::parallel::Tuning)
+//! The panel's `max_connections` counts streams — one per title being
+//! fetched, each with its own token ([`super::links`]) — and revokes the
+//! oldest when one too many starts. Downloads therefore hold a [`Lease`] for
+//! their whole run: one stream fewer than announced (playback needs one), at
+//! least one.
+//!
+//! Connections sharing a stream are not counted by such panels, but CDN nodes
+//! cap each connection's speed when busy, and other panels do count them, so
+//! the connection count is probed. Every [`Tuning::probe_every`](super::parallel::Tuning)
 //! [`Account::probe`] adds a slot when all of them are busy and a download
 //! waits for one; the next probe keeps it if the account's throughput grew,
 //! and gives it back otherwise (line already full, per-IP caps, panels
@@ -68,6 +75,9 @@ struct State {
     /// Account throughput (bytes/s) before the slot on trial was added.
     trial: Option<u64>,
     last_probe: Option<(Instant, u64)>,
+    /// Titles the account's downloads may fetch at once.
+    streams_max: usize,
+    streams: usize,
 }
 
 impl State {
@@ -102,6 +112,19 @@ impl Drop for Slot {
     }
 }
 
+/// One of the account's streams, held by a download for its whole run.
+pub(crate) struct Lease(Arc<Account>);
+
+impl Drop for Lease {
+    fn drop(&mut self) {
+        {
+            let mut st = self.0.state();
+            st.streams = st.streams.saturating_sub(1);
+        }
+        self.0.freed.notify_waiters();
+    }
+}
+
 struct Waiting<'a>(&'a Account);
 
 impl Drop for Waiting<'_> {
@@ -112,7 +135,7 @@ impl Drop for Waiting<'_> {
 }
 
 impl Account {
-    fn new(key: &str, start: usize, max: usize) -> Arc<Self> {
+    fn new(key: &str, start: usize, max: usize, streams: usize) -> Arc<Self> {
         let max = max.clamp(1, MAX_CONNECTIONS);
         Arc::new(Self {
             key: key.to_string(),
@@ -130,6 +153,8 @@ impl Account {
                 no_gain: 0,
                 trial: None,
                 last_probe: None,
+                streams_max: streams.max(1),
+                streams: 0,
             }),
             freed: Notify::new(),
             bytes: AtomicU64::new(0),
@@ -137,26 +162,53 @@ impl Account {
     }
 
     /// The account's slots, created with `start` of them the first time;
-    /// later downloads keep what earlier ones learned.
-    pub(crate) fn shared(key: &str, start: usize) -> Arc<Self> {
+    /// later downloads keep what earlier ones learned. `streams`: titles at
+    /// once, as the panel announces now.
+    pub(crate) fn shared(key: &str, start: usize, streams: usize) -> Arc<Self> {
         if key.is_empty() {
-            return Self::new(key, start, start);
+            return Self::new(key, start, start, streams);
         }
         static ACCOUNTS: OnceLock<Mutex<HashMap<String, Arc<Account>>>> = OnceLock::new();
         let mut map = ACCOUNTS
             .get_or_init(Default::default)
             .lock()
             .unwrap_or_else(|p| p.into_inner());
-        Arc::clone(
+        let account = Arc::clone(
             map.entry(key.to_string())
-                .or_insert_with(|| Self::new(key, start, MAX_CONNECTIONS)),
-        )
+                .or_insert_with(|| Self::new(key, start, MAX_CONNECTIONS, streams)),
+        );
+        drop(map);
+        account.state().streams_max = streams.max(1);
+        account.freed.notify_waiters();
+        account
     }
 
     /// Slots fixed to `start`, growing up to `max`, known to no other download.
     #[cfg(test)]
     pub(crate) fn detached(start: usize, max: usize) -> Arc<Self> {
-        Self::new("", start, max)
+        Self::new("", start, max, usize::MAX)
+    }
+
+    /// Wait until the account may fetch one more title.
+    pub(crate) async fn lease(self: &Arc<Self>) -> Lease {
+        loop {
+            let freed = self.freed.notified();
+            tokio::pin!(freed);
+            freed.as_mut().enable();
+            if let Some(lease) = self.try_lease() {
+                return lease;
+            }
+            freed.await;
+        }
+    }
+
+    pub(crate) fn try_lease(self: &Arc<Self>) -> Option<Lease> {
+        let mut st = self.state();
+        if st.streams >= st.streams_max {
+            return None;
+        }
+        st.streams += 1;
+        Some(Lease(Arc::clone(self)))
     }
 
     fn state(&self) -> MutexGuard<'_, State> {
@@ -178,6 +230,7 @@ impl Account {
         self.state().cap
     }
 
+    #[cfg(test)]
     pub(crate) fn served(&self) -> usize {
         self.state().served
     }
@@ -426,11 +479,31 @@ mod tests {
 
     #[test]
     fn shared_accounts_keep_what_they_learned() {
-        let a = Account::shared("test-shared-account", 1);
+        let a = Account::shared("test-shared-account", 1, 1);
         a.state().cap = 4;
-        let b = Account::shared("test-shared-account", 1);
+        let b = Account::shared("test-shared-account", 1, 2);
         assert_eq!(b.cap(), 4);
+        assert_eq!(a.state().streams_max, 2, "the latest announcement applies");
         assert!(Arc::ptr_eq(&a, &b));
-        assert!(!Arc::ptr_eq(&Account::shared("", 2), &Account::shared("", 2)));
+        assert!(!Arc::ptr_eq(&Account::shared("", 2, 1), &Account::shared("", 2, 1)));
+    }
+
+    #[tokio::test]
+    async fn one_title_at_a_time_on_a_single_stream_account() {
+        let a = Account::new("", 2, 8, 1);
+        let first = a.lease().await;
+        assert!(a.try_lease().is_none());
+        let second = {
+            let a = Arc::clone(&a);
+            tokio::spawn(async move { a.lease().await })
+        };
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!second.is_finished(), "the second title waits");
+        drop(first);
+        let _second = tokio::time::timeout(Duration::from_secs(1), second)
+            .await
+            .expect("handed over when the first ends")
+            .unwrap();
+        assert_eq!(a.state().streams, 1);
     }
 }
