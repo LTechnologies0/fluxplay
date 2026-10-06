@@ -154,8 +154,9 @@ fn preferred_hwdec() -> &'static str {
             if matches!(
                 lower.as_str(),
                 "no" | "none" | "software" | "auto" | "auto-safe" | "auto-copy"
-                    | "vaapi" | "vaapi-copy" | "cuda" | "nvdec" | "vulkan" | "d3d11va"
-                    | "dxva2" | "videotoolbox"
+                    | "vaapi" | "vaapi-copy" | "cuda" | "cuda-copy" | "nvdec" | "nvdec-copy"
+                    | "vulkan" | "d3d11va" | "d3d11va-copy" | "dxva2" | "dxva2-copy"
+                    | "videotoolbox"
             ) {
                 return Box::leak(lower.into_boxed_str());
             }
@@ -342,11 +343,14 @@ pub fn detect_backends() -> Vec<BackendInfo> {
 
     #[cfg(all(feature = "native-mpv", fluxplay_has_libmpv))]
     {
+        let loaded = crate::mpv_ffi::libmpv_available();
         out.push(BackendInfo {
             id: BackendId::Mpv,
-            available: true,
+            available: loaded,
             path: Some("libmpv".into()),
-            detail: if cfg!(feature = "static-link") {
+            detail: if !loaded {
+                "libmpv-2.dll absente — placez-la à côté de fluxplay.exe".into()
+            } else if cfg!(feature = "static-link") {
                 "libmpv lié statiquement — HLS/DASH/RTSP/HW".into()
             } else {
                 "libmpv natif (FFI) — HLS/DASH/RTSP/RTMP/SRT, HW accel".into()
@@ -581,6 +585,17 @@ fn resolve_relative_url(base: &str, loc: &str) -> String {
 }
 
 fn which(bin: &str) -> Option<String> {
+    // Windows: scan PATH in-process — spawning `where` from a GUI-subsystem exe
+    // flashes a console window on every backend probe.
+    #[cfg(windows)]
+    {
+        let path = std::env::var_os("PATH")?;
+        return std::env::split_paths(&path)
+            .flat_map(|dir| [dir.join(format!("{bin}.exe")), dir.join(bin)])
+            .find(|p| p.is_file())
+            .map(|p| p.display().to_string());
+    }
+    #[allow(unreachable_code)]
     let from_cmd = Command::new("which")
         .arg(bin)
         .output()
@@ -2460,6 +2475,13 @@ fn snapshot_scaled(w: u32, h: u32, pixels: &[u8]) -> (u32, u32, Arc<[u8]>) {
             soft_set(&mpv, "demuxer-max-bytes", "64MiB");
             soft_set(&mpv, "demuxer-max-back-bytes", "16MiB");
         }
+        #[cfg(not(target_os = "android"))]
+        {
+            // mpv defaults (150 + 50 MiB) let a long live session hoard ~200 MiB.
+            // 96 MiB still holds the 12 s VOD readahead of a ~60 Mb/s 4K stream.
+            soft_set(&mpv, "demuxer-max-bytes", "96MiB");
+            soft_set(&mpv, "demuxer-max-back-bytes", "24MiB");
+        }
         soft_set(
             &mpv,
             "volume",
@@ -2517,6 +2539,8 @@ fn snapshot_scaled(w: u32, h: u32, pixels: &[u8]) -> (u32, u32, Arc<[u8]>) {
                     match preferred_hwdec() {
                         "vaapi" => "vaapi-copy",
                         "cuda" | "nvdec" => "cuda-copy",
+                        "d3d11va" => "d3d11va-copy",
+                        "dxva2" => "dxva2-copy",
                         "vulkan" => "vulkan-copy",
                         "auto" | "auto-safe" => "auto-copy",
                         other => other,
@@ -2641,9 +2665,12 @@ fn snapshot_scaled(w: u32, h: u32, pixels: &[u8]) -> (u32, u32, Arc<[u8]>) {
             "volume",
             &format!("{}", (self.opts.volume * 100.0).clamp(0.0, 100.0) as u32),
         );
-        // Desktop only: brief settle so hwdec-current is meaningful. Never sleep on
-        // Android UI thread (ANR / frozen NativeActivity).
-        #[cfg(not(target_os = "android"))]
+        // Linux only: brief settle so hwdec-current is meaningful. Never sleep on
+        // Android UI thread (ANR / frozen NativeActivity). On Windows/macOS the
+        // `*-copy` hwdec falls back to software by itself, and 200 ms after `loadfile`
+        // a network stream has not opened its decoder yet: this check always fired
+        // and pinned every stream to CPU decode (TF1 4K: ~62 % of all cores vs ~30 %).
+        #[cfg(target_os = "linux")]
         {
             std::thread::sleep(std::time::Duration::from_millis(200));
             let hw = mpv
@@ -2653,6 +2680,7 @@ fn snapshot_scaled(w: u32, h: u32, pixels: &[u8]) -> (u32, u32, Arc<[u8]>) {
             // Native GPU VO may still be attaching NVDEC/VAAPI — do not yank it to SW.
             if present.uses_soft_rgba()
                 && self.opts.hwdec
+                && std::env::var_os("FLUXPLAY_HWDEC").is_none()
                 && (hw.is_empty()
                     || hw.eq_ignore_ascii_case("no")
                     || hw.eq_ignore_ascii_case("none"))

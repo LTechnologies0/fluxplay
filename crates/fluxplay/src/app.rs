@@ -83,6 +83,15 @@ pub(crate) fn run_daemon_android(app: android_activity::AndroidApp) -> iced::Res
         .run_android(app)
 }
 
+/// Quiet time after the last scroll event before a fling counts as stopped.
+const BROWSE_SETTLE_AFTER: std::time::Duration = std::time::Duration::from_millis(180);
+
+/// Window / taskbar icon (the `.exe` icon itself is embedded by `build.rs`).
+#[cfg(not(target_os = "android"))]
+fn app_icon() -> Option<window::Icon> {
+    window::icon::from_file_data(include_bytes!("../assets/fluxplay-256.png"), None).ok()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Tab {
     Live,
@@ -168,6 +177,8 @@ struct FluxPlay {
     loading: bool,
     // Add-source form
     form_name: String,
+    /// Inline validation message shown in the source form (status bar is easy to miss).
+    form_error: Option<String>,
     form_kind: SourceKind,
     form_endpoint: String,
     form_user: String,
@@ -617,6 +628,8 @@ pub(crate) enum Message {
     LoadMore,
     /// Virtualized browse scroll: absolute Y + viewport height.
     BrowseScrolled(f32, f32),
+    /// Deferred check after scrolling: wheel/trackpad sends no "stopped" event.
+    BrowseSettle,
     /// Wheel / trackpad on mosaic overlay → scroll the stable spacer surface.
     BrowseScrollBy(f32),
     BrowseDragStart,
@@ -797,8 +810,12 @@ impl FluxPlay {
         #[cfg(not(target_os = "android"))]
         let (main_id, open_main) = {
             let (id, open) = window::open(window::Settings {
-                size: Size::new(1920.0, 1080.0),
+                // Fits a 1080p screen minus the taskbar; start maximized.
+                size: Size::new(1280.0, 800.0),
+                min_size: Some(Size::new(720.0, 480.0)),
+                maximized: true,
                 position: window::Position::Centered,
+                icon: app_icon(),
                 exit_on_close_request: true,
                 ..Default::default()
             });
@@ -824,6 +841,7 @@ impl FluxPlay {
             status,
             loading: true, // cache load / sync always off-UI; cleared in BundleCacheReady / ingest done
             form_name: String::new(),
+            form_error: None,
             form_kind: SourceKind::M3uPlus,
             form_endpoint: String::new(),
             form_user: String::new(),
@@ -1518,7 +1536,9 @@ impl FluxPlay {
             }
             let (_id, open) = window::open(window::Settings {
                 size: Size::new(1120.0, 720.0),
+                min_size: Some(Size::new(480.0, 270.0)),
                 position: window::Position::Centered,
+                icon: app_icon(),
                 exit_on_close_request: true,
                 level: if std::env::var_os("FLUXPLAY_AUTO_PLAY").is_some() {
                     window::Level::AlwaysOnTop
@@ -2149,6 +2169,10 @@ impl FluxPlay {
                 self.browse_drag_moved = false;
                 self.browse_dragging = false;
                 self.cat_filter.clear();
+                // Each tab has its own search ("Rechercher une série…"): a query typed
+                // in Séries silently filtered Films / TV too.
+                self.search.clear();
+                self.search_debounce_gen = self.search_debounce_gen.wrapping_add(1);
                 self.list_limit = LIST_PAGE;
                 self.series_detail = None;
                 self.vod_detail = None;
@@ -2232,6 +2256,9 @@ impl FluxPlay {
 
                 let slice = self.content_virtual_slice(y, view_h);
                 if slice == self.browse_slice {
+                    if flinging {
+                        return Self::browse_settle_task();
+                    }
                     if settled {
                         return Task::batch([
                             self.flush_pending_images(),
@@ -2242,13 +2269,34 @@ impl FluxPlay {
                 }
                 self.browse_slice = slice;
                 // During fling: remount window (state already updated) but skip art storm.
+                // Velocity only decays on new scroll events, so schedule a settle check:
+                // without it the last fast wheel turn left art loading off for good.
                 if flinging {
-                    return Task::none();
+                    return Self::browse_settle_task();
                 }
                 return Task::batch([
                     self.flush_pending_images(),
                     self.refresh_browse_art(),
                 ]);
+            }
+            Message::BrowseSettle => {
+                tracing::debug!(
+                    vy = self.browse_scroll_vy,
+                    pending = self.pending_images.len(),
+                    "browse settle check"
+                );
+                let idle = self
+                    .browse_scroll_at
+                    .is_none_or(|at| at.elapsed() >= BROWSE_SETTLE_AFTER);
+                if !idle {
+                    // Still scrolling: a later scroll event re-arms the check.
+                    return Task::none();
+                }
+                self.browse_scroll_vy = 0.0;
+                self.browse_was_flinging = false;
+                self.browse_slice =
+                    self.content_virtual_slice(self.browse_scroll_y, self.browse_view_h);
+                return Task::batch([self.flush_pending_images(), self.refresh_browse_art()]);
             }
             Message::BrowseScrollBy(dy) => {
                 if dy.abs() < 0.01 {
@@ -2262,10 +2310,16 @@ impl FluxPlay {
                     (self.browse_scroll_y + dy).clamp(0.0, max_scroll);
                 self.browse_slice =
                     self.content_virtual_slice(self.browse_scroll_y, self.browse_view_h);
-                return iced::widget::operation::scroll_by(
-                    iced::widget::Id::from(self.browse_scroll_widget_id()),
-                    AbsoluteOffset { x: 0.0, y: dy },
-                );
+                // The follow-up BrowseScrolled sees this slice as unchanged and loads
+                // nothing: art for the new rows is fetched once the wheel rests.
+                self.browse_scroll_at = Some(std::time::Instant::now());
+                return Task::batch([
+                    iced::widget::operation::scroll_by(
+                        iced::widget::Id::from(self.browse_scroll_widget_id()),
+                        AbsoluteOffset { x: 0.0, y: dy },
+                    ),
+                    Self::browse_settle_task(),
+                ]);
             }
             Message::BrowseDragStart => {
                 // iced mouse_area: content (tiles) update first; tiles use on_release
@@ -4075,7 +4129,12 @@ impl FluxPlay {
                 self.persist();
             }
             Message::FormName(s) => self.form_name = s,
-            Message::FormKind(k) => self.form_kind = k,
+            Message::FormKind(k) => {
+                self.form_kind = k;
+                self.form_error = None;
+            }
+            // The error banner stays until the next submit: dropping it on the first
+            // keystroke reflowed the form and moved focus to the next field mid-typing.
             Message::FormEndpoint(s) => self.form_endpoint = s,
             Message::FormUser(s) => self.form_user = s,
             Message::FormPass(s) => self.form_pass = s,
@@ -4433,17 +4492,36 @@ impl FluxPlay {
                 return self.reload_one_task(id);
             }
             Message::AddSource => {
-                if self.form_name.trim().is_empty() || self.form_endpoint.trim().is_empty() {
-                    tracing::warn!("add source rejected — name/endpoint required");
-                    self.status = "Nom et endpoint requis".into();
-                    return Task::none();
-                }
-                if matches!(self.form_kind, SourceKind::Xtream)
+                let missing = if self.form_endpoint.trim().is_empty() {
+                    Some(match self.form_kind {
+                        SourceKind::Xtream => "Indiquez l’URL du serveur Xtream.",
+                        SourceKind::Stalker => "Indiquez l’URL du portail Stalker.",
+                        SourceKind::Xmltv => "Indiquez l’URL du guide XMLTV.",
+                        _ => "Indiquez l’URL ou le fichier de la playlist M3U.",
+                    })
+                } else if matches!(self.form_kind, SourceKind::Xtream)
                     && (self.form_user.trim().is_empty() || self.form_pass.trim().is_empty())
                 {
-                    tracing::warn!("add Xtream rejected — username/password required");
-                    self.status = "Xtream : identifiant et mot de passe requis".into();
+                    Some("Xtream : identifiant et mot de passe requis.")
+                } else if self.form_kind == SourceKind::Stalker && self.form_mac.trim().is_empty() {
+                    Some("Stalker : adresse MAC requise.")
+                } else {
+                    None
+                };
+                if let Some(msg) = missing {
+                    tracing::warn!(%msg, "add source rejected");
+                    self.form_error = Some(msg.into());
+                    self.status = msg.into();
                     return Task::none();
+                }
+                self.form_error = None;
+                // Name is optional: derive one from the endpoint instead of blocking.
+                if self.form_name.trim().is_empty() {
+                    self.form_name = default_source_name(
+                        &self.form_endpoint,
+                        &self.form_user,
+                        self.sources.len() + 1,
+                    );
                 }
                 let opt = |s: &str| {
                     let s = s.trim();
@@ -5663,6 +5741,7 @@ impl FluxPlay {
                 if self.pending_images.len() >= 10 {
                     return Task::batch([
                         self.flush_pending_images(),
+                        self.prefetch_visible_art(),
                         self.continue_art_warm(),
                     ]);
                 }
@@ -5702,6 +5781,7 @@ impl FluxPlay {
                 }
                 return Task::batch([
                     self.flush_pending_images(),
+                    self.prefetch_visible_art(),
                     self.continue_art_warm(),
                 ]);
             }
@@ -6459,6 +6539,13 @@ impl FluxPlay {
         self.cat_slice = (cs.start, cs.end);
     }
 
+    fn browse_settle_task() -> Task<Message> {
+        Task::perform(
+            async { tokio::time::sleep(BROWSE_SETTLE_AFTER).await },
+            |_| Message::BrowseSettle,
+        )
+    }
+
     /// Fast fling → defer *new* art fetches (LOD). Threshold in scroll px/s.
     fn browse_flinging(&self) -> bool {
         self.browse_scroll_vy.abs() >= 2_400.0
@@ -6525,6 +6612,25 @@ impl FluxPlay {
             }
             _ => (0, 0),
         }
+    }
+
+    /// Browse positions actually inside the viewport (no overscan / lookahead).
+    fn onscreen_browse_range(&self, cols: usize, tile_w: f32) -> std::ops::Range<usize> {
+        let cols = cols.max(1);
+        let len = self.browse_index.len();
+        let (row_h, per_row) = match self.tab {
+            Tab::Vod | Tab::Series => (browser::mosaic_row_height(tile_w), cols),
+            _ => (browser::list_row_height(0.0), 1),
+        };
+        let rows = len.div_ceil(per_row);
+        let slice = browser::virtual_slice(
+            self.browse_scroll_y,
+            self.browse_view_h,
+            row_h,
+            rows,
+            0,
+        );
+        (slice.start * per_row).min(len)..(slice.end * per_row).min(len)
     }
 
     fn visible_browse_window(&self, cols: usize, tile_w: f32) -> std::ops::Range<usize> {
@@ -6597,6 +6703,10 @@ impl FluxPlay {
             return Task::none();
         }
         let batch = std::mem::take(&mut self.pending_images);
+        // Warm-ahead batches are newer than what is on screen: bump the visible art
+        // first so LRU eviction drops off-screen posters, not the ones being shown
+        // (they were never re-requested and stayed as letter placeholders).
+        self.promote_visible_art();
         for (url, source_id, bytes) in batch {
             let n = bytes.len();
             self.images.insert_ui_bytes(url.clone(), bytes);
@@ -6615,6 +6725,19 @@ impl FluxPlay {
         Task::none()
     }
 
+    fn promote_visible_art(&mut self) {
+        if self.vod_detail.is_some() || self.series_detail.is_some() {
+            return;
+        }
+        let m = self.layout_metrics();
+        let win = self.visible_browse_window(m.cols, m.tile_w);
+        for pos in win.start..win.end.min(self.browse_index.len()) {
+            if let Some(url) = self.art_url_for_browse_pos(pos) {
+                self.images.promote(&url);
+            }
+        }
+    }
+
     fn prefetch_urls(&mut self, urls: impl IntoIterator<Item = String>) -> Task<Message> {
         // Fast scroll: fill the mosaic window quickly (cap via ImageCache inflight).
         let max = self.display_caps.tuning.image_prefetch;
@@ -6631,6 +6754,12 @@ impl FluxPlay {
             .saturating_sub(self.images.inflight_len())
             .min(max);
         if room == 0 {
+            tracing::debug!(
+                target: "fluxplay::images",
+                inflight = self.images.inflight_len(),
+                pending = self.pending_images.len(),
+                "prefetch skipped — no inflight room"
+            );
             return Task::none();
         }
         for url in urls {
@@ -6795,6 +6924,34 @@ impl FluxPlay {
         let mut urls = Vec::new();
         let m = self.layout_metrics();
         let win = self.visible_browse_window(m.cols, m.tile_w);
+        let in_grid = match self.tab {
+            Tab::Vod => self.vod_detail.is_none(),
+            Tab::Series => self.series_detail.is_none(),
+            Tab::Live | Tab::Favorites => true,
+            _ => false,
+        };
+        if in_grid {
+            // On-screen tiles first, then the overscan/lookahead band; the request
+            // cap covers at least a full screen. Walking the band top-down spent the
+            // whole budget on rows above the viewport, so visible tiles never loaded.
+            let screen = self.onscreen_browse_range(m.cols, m.tile_w);
+            let order = screen
+                .clone()
+                .chain(win.start..screen.start.max(win.start))
+                .chain(screen.end.min(win.end)..win.end);
+            for pos in order {
+                if let Some(u) = self.art_url_for_browse_pos(pos) {
+                    self.images.promote(&u);
+                    urls.push(u);
+                }
+            }
+            let cap = self
+                .display_caps
+                .tuning
+                .image_prefetch
+                .max(screen.len());
+            return self.prefetch_urls_capped(urls, cap);
+        }
         match self.tab {
             Tab::Live | Tab::Favorites => {
                 for i in self.browse_index.window(win.start, win.end) {
@@ -7460,6 +7617,7 @@ impl FluxPlay {
     }
 
     fn clear_source_form(&mut self) {
+        self.form_error = None;
         self.form_name.clear();
         self.form_endpoint.clear();
         self.form_user.clear();
@@ -8054,15 +8212,16 @@ impl FluxPlay {
             }
         };
 
-        let header = browser::content_header(
+        let header = browser::content_header_with(
             ui,
             self.selected_group
                 .as_deref()
                 .filter(|g| !matches!(*g, "*" | "Tous"))
                 .map(crate::names::category_label)
                 .unwrap_or_else(|| "Toutes les chaînes".into()),
-            format!("{total} chaînes · scroll virtuel"),
+            format!("{total} chaînes"),
             &self.search,
+            "Rechercher une chaîne…",
             m.search_w,
             m.title_size,
             m.stack_header,
@@ -8191,11 +8350,12 @@ impl FluxPlay {
                 .unwrap_or_else(|| "Films".into())
         };
 
-        let header = browser::content_header(
+        let header = browser::content_header_with(
             ui,
             cat_name,
-            format!("{total} titres · scroll virtuel"),
+            format!("{total} films"),
             &self.search,
+            "Rechercher un film…",
             m.search_w,
             m.title_size,
             m.stack_header,
@@ -8920,11 +9080,12 @@ impl FluxPlay {
                 .map(|c| crate::names::category_label(&c.name))
                 .unwrap_or_else(|| "Séries".into())
         };
-        let header = browser::content_header(
+        let header = browser::content_header_with(
             ui,
             cat_name,
-            format!("{total} séries · scroll virtuel"),
+            format!("{total} séries"),
             &self.search,
+            "Rechercher une série…",
             m.search_w,
             m.title_size,
             m.stack_header,
@@ -8987,9 +9148,13 @@ impl FluxPlay {
                     None,
                 )
                 .and_then(|k| self.images.get(&k));
+                // Same cleaned labels as the Live list ("|FR| TF1 FHD" → "TF1 FHD").
                 rows.push(browser::media_row(
-                    ch.name.clone(),
-                    ch.group.clone().unwrap_or_else(|| "Live".into()),
+                    crate::names::display_channel(&ch.name),
+                    ch.group
+                        .as_deref()
+                        .map(crate::names::category_label)
+                        .unwrap_or_else(|| "Live".into()),
                     Message::PlayChannelId(ch.id.clone(), ch.source_id),
                     Some((true, Message::ToggleFavorite(ch.id.clone()))),
                     ui,
@@ -9049,7 +9214,7 @@ impl FluxPlay {
                 browser::content_header(
                     ui,
                     "Mes favoris".into(),
-                    format!("{total} chaînes · scroll virtuel"),
+                    format!("{total} chaînes"),
                     &self.search,
                     m.search_w,
                     m.title_size,
@@ -9073,10 +9238,15 @@ impl FluxPlay {
         }
         let players = &self.external_players;
         if players.is_empty() {
-            return text(
+            return text(if cfg!(windows) {
+                "Lecteur externe (optionnel) : aucun trouvé — le lecteur intégré suffit ; \
+                 VLC ou mpv installés apparaîtront ici."
+            } else if cfg!(target_os = "macos") {
+                "Lecteur externe (optionnel) : aucun trouvé — installez VLC, mpv ou IINA."
+            } else {
                 "Lecteur système : aucun lecteur vidéo trouvé — installez VLC, mpv ou Haruna \
-                 (paquet de la distribution ou Flatpak).",
-            )
+                 (paquet de la distribution ou Flatpak)."
+            })
             .size(12)
             .color(ui.ink_muted())
             .into();
@@ -9172,7 +9342,6 @@ impl FluxPlay {
                 m.title_size,
                 m.stack_header,
             ),
-            text(profile.notes).size(12).color(ui.ink_muted()),
             section(
                 "1. Apparence",
                 "Thème clair/sombre et couleur d’accent de l’interface.",
@@ -9391,29 +9560,6 @@ impl FluxPlay {
                 ui,
                 false,
             ),
-            text("3. Material 3 Expressive")
-                .size(13)
-                .color(ui.ink()),
-            {
-                #[cfg(target_os = "android")]
-                {
-                    text(
-                        "Android : profondeur tonale (surface containers), icônes raster PNG, \
-                         pas d’ombres d’élévation desktop — contour outline_variant pour le relief GLES.",
-                    )
-                    .size(12)
-                    .color(ui.ink_muted())
-                }
-                #[cfg(not(target_os = "android"))]
-                {
-                    text(
-                        "Tokens branchés : rôles typo, dock asymétrique, motion tick, sélection secondary \
-                         (chips / rail) — pas du marketing vapor.",
-                    )
-                    .size(12)
-                    .color(ui.ink_muted())
-                }
-            },
             section(
                 "4. Moteur de lecture",
                 "Choix du décodeur et accélération matérielle. Appliqué au prochain flux.",
@@ -9593,15 +9739,20 @@ impl FluxPlay {
             .spacing(8)
             .wrap(),
             row![
-                pill_button(
-                    text(format!(
-                        "Présent Android : {}",
-                        self.settings.android_present.label()
-                    )),
-                    Message::CycleAndroidPresentPref,
-                    ui,
-                    false,
-                ),
+                // Android-only presentation path: hidden on desktop.
+                if cfg!(target_os = "android") {
+                    pill_button(
+                        text(format!(
+                            "Présent Android : {}",
+                            self.settings.android_present.label()
+                        )),
+                        Message::CycleAndroidPresentPref,
+                        ui,
+                        false,
+                    )
+                } else {
+                    Space::new().width(0).into()
+                },
                 pill_button(
                     text(if self.settings.tonemap_hdr {
                         "Tonemap HDR→SDR : activé"
@@ -9758,9 +9909,16 @@ impl FluxPlay {
                 .filter(|c| &c.id == id)
                 .collect()
         } else {
+            // The header search box filters the guide too (it used to be ignored).
+            let q = self.search.trim().to_lowercase();
             self.bundle
                 .live_in_group(self.selected_group.as_deref())
                 .into_iter()
+                .filter(|c| {
+                    q.is_empty()
+                        || c.name.to_lowercase().contains(&q)
+                        || crate::names::display_channel(&c.name).to_lowercase().contains(&q)
+                })
                 .take(40)
                 .collect()
         };
@@ -9793,7 +9951,7 @@ impl FluxPlay {
                 })
                 .unwrap_or_default();
             items = items.push(browser::media_row(
-                ch.name.clone(),
+                crate::names::display_channel(&ch.name),
                 format!("{cur_s}  {next_s}"),
                 Message::PlayChannelId(ch.id.clone(), ch.source_id),
                 None,
@@ -9806,7 +9964,8 @@ impl FluxPlay {
                     None,
                 )
                 .and_then(|u| self.images.get(&u)),
-                m.thumb,
+                // Same logo size as the Live list: larger thumbs overflowed the rows.
+                40.0,
                 m.content_w.max(120.0),
             ));
         }
@@ -9815,11 +9974,12 @@ impl FluxPlay {
             ui,
             Length::Fill,
             column![
-                browser::content_header(
+                browser::content_header_with(
                     ui,
-                    "Guide EPG".into(),
+                    "Guide TV".into(),
                     format!("{} programmes en cache", self.bundle.epg.len()),
                     &self.search,
+                    "Rechercher une chaîne…",
                     m.search_w,
                     m.title_size,
                     m.stack_header,
@@ -9880,7 +10040,29 @@ impl FluxPlay {
         let form = column![
             text(form_title).size(16),
             kind_row,
-            field("Nom", &self.form_name, Message::FormName, Some(PasteTarget::FormName), ui),
+            match &self.form_error {
+                Some(err) => Element::from(
+                    container(text(err.clone()).size(13).color(ui.error()))
+                        .padding([8, 12])
+                        .width(Length::Fill)
+                        .style(move |_| container::Style {
+                            background: Some(Background::Color(ui.error_container())),
+                            border: Border {
+                                radius: 10.0.into(),
+                                ..Border::default()
+                            },
+                            ..container::Style::default()
+                        }),
+                ),
+                None => Space::new().height(0).into(),
+            },
+            field(
+                "Nom (optionnel — déduit de l’URL)",
+                &self.form_name,
+                Message::FormName,
+                Some(PasteTarget::FormName),
+                ui,
+            ),
             field(
                 match self.form_kind {
                     SourceKind::Xtream => "URL serveur",
@@ -10893,6 +11075,7 @@ fn profile_message_label(message: &Message) -> &'static str {
         #[cfg(not(target_os = "android"))]
         Message::PlaylistFilePicked(_) => "async.file_pick",
         Message::BrowseScrolled(_, _) => "scroll.browse",
+        Message::BrowseSettle => "scroll.browse_settle",
         Message::BrowseScrollBy(_) => "scroll.browse_by",
         Message::BrowseDragStart | Message::BrowseDragAt(_) | Message::BrowseDragEnd => {
             "scroll.browse_drag"
@@ -11331,3 +11514,45 @@ fn android_sync_size(id: window::Id) -> Task<Message> {
     window::size(id).map(move |size| Message::WindowResized { id, size })
 }
 
+
+/// Display name for a source added without one: the server host (`www.` dropped),
+/// the playlist file name, or the account name — else "Source N".
+fn default_source_name(endpoint: &str, user: &str, n: usize) -> String {
+    let endpoint = endpoint.trim();
+    if let Ok(u) = url::Url::parse(endpoint) {
+        if let Some(host) = u.host_str().filter(|h| !h.is_empty()) {
+            return host.trim_start_matches("www.").to_string();
+        }
+    }
+    let path = std::path::Path::new(endpoint);
+    if !endpoint.contains('\n') && path.extension().is_some() {
+        if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+            return stem.to_string();
+        }
+    }
+    let user = user.trim();
+    if !user.is_empty() {
+        return user.to_string();
+    }
+    format!("Source {n}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::default_source_name;
+
+    #[test]
+    fn source_name_defaults_from_endpoint() {
+        assert_eq!(
+            default_source_name("http://www.example.tv:8080/get.php?username=a&password=b", "", 1),
+            "example.tv"
+        );
+        assert_eq!(default_source_name("/home/me/france.m3u", "", 2), "france");
+        #[cfg(windows)]
+        assert_eq!(default_source_name(r"C:\Playlists\france.m3u", "", 2), "france");
+        // Pasted playlist body: no host, no file name.
+        assert_eq!(default_source_name("#EXTM3U\n#EXTINF:-1,x\nhttp://a/b", "", 3), "Source 3");
+        assert_eq!(default_source_name("not a url", "bob", 4), "bob");
+        assert_eq!(default_source_name("not a url", " ", 5), "Source 5");
+    }
+}
