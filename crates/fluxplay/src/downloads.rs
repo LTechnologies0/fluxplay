@@ -854,7 +854,10 @@ async fn attempt(
     }
     d.save_meta();
 
-    let file = d.lock.try_clone().map_err(|e| Fatal(e.to_string()))?;
+    let mut file = d.lock.try_clone().map_err(|e| Fatal(e.to_string()))?;
+    // Sequential `.part`s grow at the end (the handle is not opened in append mode).
+    std::io::Seek::seek(&mut file, std::io::SeekFrom::End(0))
+        .map_err(|e| Fatal(format!("écriture disque : {e}")))?;
     let mut out = tokio::io::BufWriter::with_capacity(WRITE_BUFFER, tokio::fs::File::from_std(file));
     let mut done = d.len().map_err(Fatal)?;
     let mut meter = RateMeter::new(done);
@@ -993,11 +996,7 @@ fn find_resumable(dir: &Path, keys: &[String], stem: &str) -> Result<Option<Dest
 
 fn open_existing(part: PathBuf, meta: Meta) -> Result<Dest, String> {
     let path = final_path_for(&part).ok_or("nom de fichier invalide")?;
-    let lock = std::fs::OpenOptions::new()
-        .append(true)
-        .open(&part)
-        .map_err(|e| e.to_string())?;
-    lock_exclusive(&lock)?;
+    let lock = open_part(&part)?;
     let dest = Dest {
         path,
         part,
@@ -1010,11 +1009,7 @@ fn open_existing(part: PathBuf, meta: Meta) -> Result<Dest, String> {
 
 async fn create_destination(dir: &Path, stem: &str, ext: &str, key: &str) -> Result<Dest, String> {
     let (path, part) = reserve_destination(dir, stem, ext).await?;
-    let lock = std::fs::OpenOptions::new()
-        .append(true)
-        .open(&part)
-        .map_err(|e| e.to_string())?;
-    lock_exclusive(&lock)?;
+    let lock = open_part(&part)?;
     Ok(Dest {
         path,
         part,
@@ -1024,6 +1019,21 @@ async fn create_destination(dir: &Path, stem: &str, ext: &str, key: &str) -> Res
             ..Meta::default()
         },
     })
+}
+
+/// Open a `.part` read+write (not `append`) and lock it for this process.
+///
+/// Windows: an append-only handle lacks `FILE_WRITE_DATA`, so `set_len` (segmented
+/// preallocation) failed with "Accès refusé"; and `LockFileEx` is per file object,
+/// so every writer must be a clone of this handle (`try_clone`), never a new open.
+fn open_part(part: &Path) -> Result<std::fs::File, String> {
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(part)
+        .map_err(|e| e.to_string())?;
+    lock_exclusive(&lock)?;
+    Ok(lock)
 }
 
 fn lock_exclusive(file: &std::fs::File) -> Result<(), String> {

@@ -14,6 +14,8 @@
 //!
 //! Env overrides still win: `FLUXPLAY_MONITOR_HZ`, `FLUXPLAY_GUI_FPS`,
 //! `FLUXPLAY_VIDEO_FPS`, `FLUXPLAY_META_PARALLEL`, `FLUXPLAY_IMAGE_INFLIGHT`.
+// Linux probes (xrandr / DRM sysfs / lspci) stay compiled for their tests; Windows uses user32.
+#![cfg_attr(windows, allow(dead_code))]
 
 #[cfg(not(target_os = "android"))]
 use std::process::Command;
@@ -61,7 +63,11 @@ impl DisplaySession {
 
 use crate::gpu_topology::GpuTopology;
 #[cfg(any(test, not(target_os = "android")))]
-use crate::gpu_topology::{topology_from_devices, GpuDevice};
+use crate::gpu_topology::GpuDevice;
+// Linux/macOS probe + tests only (Windows builds the topology from user32; the
+// function does not exist on Android).
+#[cfg(any(test, all(not(windows), not(target_os = "android"))))]
+use crate::gpu_topology::topology_from_devices;
 
 #[derive(Debug, Clone)]
 pub struct DisplayProbe {
@@ -305,14 +311,13 @@ fn derive_tuning(probe: &DisplayProbe, gui_hz: u32) -> RuntimeTuning {
         virtual_overscan = virtual_overscan.saturating_sub(4usize).max(6usize);
     }
 
-    let decode_edge_px = if probe.monitor_w >= 2560
-        || probe.gpu_topology.display_tier() == GpuTier::Discrete
-    {
-        480
+    // Posters render at ~200–300 px tall: decoding bigger only burns RAM/VRAM.
+    let decode_edge_px = if probe.monitor_w >= 2560 {
+        420
     } else if probe.monitor_w > 0 && probe.monitor_w <= 1366 {
-        320
+        300
     } else {
-        400
+        360
     };
 
     RuntimeTuning {
@@ -569,7 +574,18 @@ fn probe_monitor() -> Option<(String, u32, u32, u32, &'static str)> {
         }
         return Some(("Android".into(), DEFAULT_HZ, 0, 0, "android"));
     }
-    #[cfg(not(target_os = "android"))]
+    #[cfg(windows)]
+    {
+        // xrandr / wlr-randr / DRM sysfs are Linux-only: ask user32 directly.
+        let (w, h, hz) = win_display::primary_mode()?;
+        let name = win_display::adapters()
+            .into_iter()
+            .find(|a| a.primary)
+            .map(|a| a.name)
+            .unwrap_or_else(|| "Écran principal".into());
+        return Some((name, hz.clamp(MIN_HZ, MAX_HZ), w, h, "win32"));
+    }
+    #[cfg(all(not(target_os = "android"), not(windows)))]
     {
         if let Some(v) = parse_xrandr(&run_cmd("xrandr", &[])) {
             return Some((v.0, v.1, v.2, v.3, "xrandr"));
@@ -785,7 +801,32 @@ fn probe_gpu_topology() -> GpuTopology {
         };
         return GpuTopology::single(name, GpuTier::Integrated);
     }
-    #[cfg(not(target_os = "android"))]
+    #[cfg(windows)]
+    {
+        // `adapters()` lists the adapter driving the primary display first: use it
+        // as display + decode GPU instead of the Linux "iGPU drives the panel" guess.
+        let devices: Vec<GpuDevice> = win_display::adapters()
+            .into_iter()
+            .map(|a| {
+                let (tier, _) = classify_gpu(&a.name.to_ascii_lowercase());
+                GpuDevice {
+                    name: truncate_gpu_name(&a.name),
+                    tier,
+                    render_node: None,
+                }
+            })
+            .collect();
+        let Some(display) = devices.first().cloned() else {
+            return GpuTopology::single("GPU", GpuTier::Unknown);
+        };
+        return GpuTopology {
+            devices,
+            decode: display.clone(),
+            display,
+            policy: crate::gpu_topology::GpuDecodePolicy::SameAsDisplay,
+        };
+    }
+    #[cfg(all(not(target_os = "android"), not(windows)))]
     {
         let out = run_cmd("lspci", &["-nn"]);
         let mut devices = parse_lspci_gpus(&out);
@@ -1068,5 +1109,101 @@ eDP-1 "BOE 0x0A1C"
             Some("/dev/dri/renderD128")
         );
         assert_eq!(render_node_for_slot(&nodes, "02:00.0"), None);
+    }
+}
+
+/// Monitor mode and display adapters through user32 (no external tools on Windows).
+#[cfg(windows)]
+mod win_display {
+    /// `DEVMODEW` (220 bytes); only `dmSize` and the display fields are touched.
+    #[repr(C, align(4))]
+    struct DevModeW([u8; 220]);
+
+    #[repr(C)]
+    struct DisplayDeviceW {
+        cb: u32,
+        device_name: [u16; 32],
+        device_string: [u16; 128],
+        state_flags: u32,
+        device_id: [u16; 128],
+        device_key: [u16; 128],
+    }
+
+    #[link(name = "user32")]
+    extern "system" {
+        fn EnumDisplaySettingsW(device: *const u16, mode_num: u32, mode: *mut DevModeW) -> i32;
+        fn EnumDisplayDevicesW(
+            device: *const u16,
+            index: u32,
+            out: *mut DisplayDeviceW,
+            flags: u32,
+        ) -> i32;
+    }
+
+    const ENUM_CURRENT_SETTINGS: u32 = 0xFFFF_FFFF;
+    const DISPLAY_DEVICE_ATTACHED_TO_DESKTOP: u32 = 0x1;
+    const DISPLAY_DEVICE_PRIMARY_DEVICE: u32 = 0x4;
+    const DISPLAY_DEVICE_MIRRORING_DRIVER: u32 = 0x8;
+
+    fn read_u32(b: &[u8], at: usize) -> u32 {
+        u32::from_le_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]])
+    }
+
+    /// (width, height, refresh Hz) of the primary display's current mode.
+    pub fn primary_mode() -> Option<(u32, u32, u32)> {
+        let mut dm = DevModeW([0; 220]);
+        dm.0[68..70].copy_from_slice(&220u16.to_le_bytes()); // dmSize
+        // SAFETY: `dm` is a zeroed DEVMODEW-sized buffer with dmSize set.
+        if unsafe { EnumDisplaySettingsW(std::ptr::null(), ENUM_CURRENT_SETTINGS, &mut dm) } == 0 {
+            return None;
+        }
+        let (w, h, hz) = (read_u32(&dm.0, 172), read_u32(&dm.0, 176), read_u32(&dm.0, 184));
+        // 0/1 mean "hardware default" — not a usable rate.
+        (hz > 1).then_some((w, h, hz))
+    }
+
+    pub struct Adapter {
+        pub name: String,
+        pub primary: bool,
+    }
+
+    /// Physical display adapters, primary first; mirror/basic-render drivers skipped.
+    pub fn adapters() -> Vec<Adapter> {
+        let mut out: Vec<Adapter> = Vec::new();
+        for index in 0..16 {
+            let mut dd = DisplayDeviceW {
+                cb: std::mem::size_of::<DisplayDeviceW>() as u32,
+                device_name: [0; 32],
+                device_string: [0; 128],
+                state_flags: 0,
+                device_id: [0; 128],
+                device_key: [0; 128],
+            };
+            // SAFETY: `dd.cb` is set to the struct size as the API requires.
+            if unsafe { EnumDisplayDevicesW(std::ptr::null(), index, &mut dd, 0) } == 0 {
+                break;
+            }
+            if dd.state_flags & DISPLAY_DEVICE_MIRRORING_DRIVER != 0 {
+                continue;
+            }
+            let end = dd.device_string.iter().position(|&c| c == 0).unwrap_or(128);
+            let name = String::from_utf16_lossy(&dd.device_string[..end]).trim().to_string();
+            let lower = name.to_ascii_lowercase();
+            if name.is_empty() || lower.contains("basic render") || lower.contains("remote display")
+            {
+                continue;
+            }
+            let primary = dd.state_flags & DISPLAY_DEVICE_PRIMARY_DEVICE != 0;
+            let attached = dd.state_flags & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP != 0;
+            if let Some(a) = out.iter_mut().find(|a| a.name == name) {
+                a.primary |= primary;
+                continue;
+            }
+            if attached || primary || out.is_empty() {
+                out.push(Adapter { name, primary });
+            }
+        }
+        out.sort_by_key(|a| !a.primary);
+        out
     }
 }

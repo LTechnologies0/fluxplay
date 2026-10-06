@@ -18,7 +18,7 @@ use std::borrow::Cow;
 use crate::theme::{
     elevation_shadow, radius_fab, radius_list_item, radius_nav_pill, radius_poster, type_font,
     type_style, TypeRole, UiTheme, MOSAIC_GAP, CARD_RADIUS, RADIUS_FULL, RADIUS_LARGE_INCREASED,
-    RADIUS_LG, RADIUS_MD, RADIUS_XL, RADIUS_XXL, SPACE_MD, SPACE_SM, SPACE_XL, SPACE_XS, SPACE_XXS,
+    RADIUS_LG, RADIUS_MD, RADIUS_SM, RADIUS_XL, RADIUS_XXL, SPACE_MD, SPACE_SM, SPACE_XL, SPACE_XS, SPACE_XXS,
     TYPE_BODY_M, TYPE_LABEL_L, TYPE_LABEL_M, TYPE_TITLE_M,
 };
 use crate::app::{Message, PasteTarget};
@@ -979,15 +979,17 @@ pub fn category_sidebar<'a>(
     scroll_y: f32,
     view_h: f32,
 ) -> Element<'a, Message> {
-    let filter_input = text_input("Filtrer…", filter)
+    // Deliberately unlike the content search pill (rounded-rect, smaller, no icon):
+    // this narrows the category list, not the catalogue.
+    let filter_input = text_input("Filtrer les catégories…", filter)
         .on_input(Message::CatFilterChanged)
-        .padding(SPACE_SM as u16)
-        .size(13)
+        .padding(Padding::from([6, 10]))
+        .size(12)
         .style(move |theme: &Theme, status| {
             let mut s = text_input::default(theme, status);
-            s.border.radius = RADIUS_FULL.into(); // SearchBar / FilterChip field
+            s.border.radius = RADIUS_SM.into();
             s.border.color = ui.outline_variant();
-            s.background = Background::Color(ui.surface_container_low());
+            s.background = Background::Color(ui.surface_container());
             s
         });
     let filter_row = row![
@@ -1031,7 +1033,17 @@ pub fn category_sidebar<'a>(
         ui,
         Length::Fixed(width.max(120.0)),
         column![
-            text(title).size(13).color(ui.ink_muted()),
+            row![
+                text(format!("Catégories · {title}"))
+                    .size(TYPE_LABEL_L)
+                    .font(type_style(TypeRole::TitleM, true).1)
+                    .color(ui.on_surface())
+                    .width(Fill),
+                text(format!("{}", total.saturating_sub(1)))
+                    .size(TYPE_LABEL_M)
+                    .color(ui.ink_muted()),
+            ]
+            .align_y(Alignment::Center),
             filter_row,
             soft_scroll_on(ui, list.width(Fill), "flux-cats", Message::CatScrolled),
         ]
@@ -1049,14 +1061,14 @@ pub fn category_chips<'a>(
 ) -> Element<'a, Message> {
     use crate::theme::TOUCH_TARGET;
     let strip_h = TOUCH_TARGET + 8.0;
-    let filter_input = text_input("Filtrer…", filter)
+    let filter_input = text_input("Catégorie…", filter)
         .on_input(Message::CatFilterChanged)
         .padding(SPACE_SM as u16)
         .size(13)
         .width(Length::Fixed(112.0))
         .style(move |theme: &Theme, status| {
             let mut s = text_input::default(theme, status);
-            s.border.radius = RADIUS_FULL.into();
+            s.border.radius = RADIUS_SM.into();
             s.border.color = ui.outline_variant();
             s.background = Background::Color(ui.surface_container_low());
             s
@@ -1184,6 +1196,21 @@ pub fn content_header<'a>(
     title_size: f32,
     stack: bool,
 ) -> Element<'a, Message> {
+    content_header_with(ui, title, subtitle, search, "Rechercher…", search_width, title_size, stack)
+}
+
+/// [`content_header`] with a contextual search placeholder ("Rechercher une série…").
+#[allow(clippy::too_many_arguments)]
+pub fn content_header_with<'a>(
+    ui: UiTheme,
+    title: String,
+    subtitle: String,
+    search: &str,
+    placeholder: &str,
+    search_width: f32,
+    title_size: f32,
+    stack: bool,
+) -> Element<'a, Message> {
     #[cfg(target_os = "android")]
     let title = sanitize_android_ui_text(&title);
     #[cfg(target_os = "android")]
@@ -1209,7 +1236,8 @@ pub fn content_header<'a>(
     .spacing(SPACE_XXS)
     .width(Fill);
 
-    let search_el = text_input("Rechercher…", search)
+    let active = !search.is_empty();
+    let search_el = text_input(placeholder, search)
         .on_input(Message::SearchChanged)
         .padding(if stack { 12 } else { 14 })
         .size(TYPE_BODY_M)
@@ -1217,22 +1245,39 @@ pub fn content_header<'a>(
         .style(move |theme: &Theme, status| {
             let mut s = text_input::default(theme, status);
             s.border.radius = RADIUS_FULL.into();
-            s.border.color = if matches!(status, text_input::Status::Focused { .. }) {
-                ui.outline()
+            let focused = matches!(status, text_input::Status::Focused { .. });
+            s.border.width = if focused || active { 2.0 } else { 1.0 };
+            s.border.color = if focused || active {
+                ui.primary()
             } else {
-                ui.outline_variant()
+                ui.outline()
             };
             s.background = Background::Color(ui.surface_container_highest());
             s
         });
+    let clear: Element<'a, Message> = if active {
+        mouse_area(
+            container(crate::icons::icon(
+                crate::icons::Icon::Close,
+                18.0,
+                ui.on_surface_variant(),
+            ))
+            .padding(Padding::from([0, 4])),
+        )
+        .on_press(Message::SearchChanged(String::new()))
+        .into()
+    } else {
+        Space::new().width(0).into()
+    };
     let search_row = row![
         container(crate::icons::icon(
             crate::icons::Icon::Search,
-            20.0,
-            ui.on_surface_variant(),
+            22.0,
+            if active { ui.primary() } else { ui.on_surface_variant() },
         ))
         .padding(Padding::from([0, 4])),
         container(search_el).width(Fill),
+        clear,
         paste_affix(ui, PasteTarget::Search),
     ]
     .spacing(SPACE_XS)
@@ -1509,9 +1554,15 @@ pub fn media_row<'a>(
         });
 
     let main: Element<'a, Message> = if let Some((is_fav, fav_msg)) = on_fav {
-        // The button says what a press does: remove when already a favorite.
-        let star = if is_fav { "−" } else { "+" };
-        let fav_c = ui.tertiary();
+        // Heart icon (the old "+"/"−" glyph was ~8 px and easy to miss): filled
+        // accent when a favorite, muted otherwise.
+        let fav_c = if is_fav {
+            ui.tertiary()
+        } else {
+            let mut c = ui.on_surface_variant();
+            c.a *= 0.45;
+            c
+        };
         row![
             mark,
             Space::new().width(SPACE_SM),
@@ -1520,7 +1571,7 @@ pub fn media_row<'a>(
             labels,
             Space::new().width(SPACE_SM),
             mouse_area(
-                container(text(star).size(TYPE_TITLE_M).color(fav_c))
+                container(crate::icons::icon(crate::icons::Icon::Favorite, 22.0, fav_c))
                     .width(Length::Fixed(TOUCH_TARGET - 8.0))
                     .height(Length::Fixed(TOUCH_TARGET - 8.0))
                     .center_x(Fill)
