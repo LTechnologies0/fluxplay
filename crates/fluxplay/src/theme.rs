@@ -999,7 +999,11 @@ impl LayoutMetrics {
             rail_size,
             thumb,
             player_chrome_h,
-            stack_header: matches!(bp, Breakpoint::Phone) || search_w >= content_w * 0.85,
+            // Below ~240 px the search pill (icon + clear + paste) leaves no room to
+            // type: put it full-width under the title instead.
+            stack_header: matches!(bp, Breakpoint::Phone)
+                || search_w >= content_w * 0.85
+                || search_w < 240.0,
             top_nav,
             short,
             nav_strip: top_nav && short && landscape,
