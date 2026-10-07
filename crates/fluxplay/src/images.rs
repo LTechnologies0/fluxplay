@@ -20,6 +20,7 @@ use url::Url;
 use uuid::Uuid;
 
 /// Cap RAM handles — keep several mosaic viewports warm during fast flings.
+/// Handles hold the compressed (downscaled) file, ~15–40 KB each.
 const MAX_RAM_HANDLES: usize = 768;
 const MAX_IMAGE_BYTES: usize = 2_500_000;
 /// Default soft cap when host caps are not applied yet.

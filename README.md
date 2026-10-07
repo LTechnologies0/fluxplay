@@ -10,11 +10,23 @@ Inspiré de **IPTVnator** (M3U/Xtream/Stalker, EPG, favoris, User-Agent, catch-u
 |---|---|---|---|
 | **Linux** | iced | libmpv / libav* → CLI → externe | ✅ app desktop |
 | **macOS** | iced | libmpv / libav* (VideoToolbox) → CLI → IINA | ✅ |
-| **Windows** | iced | libmpv / libav* (D3D11VA) → CLI → VLC | ✅ |
+| **Windows** | iced | libmpv embarqué (`libmpv-2.dll`, D3D11VA) → VLC/mpv externes | ✅ |
 | **Android** | iced NativeActivity (`fluxplay-android`) | vendored libmpv RGBA + ACTION_VIEW | ✅ APK via `scripts/build-android-apk.sh` |
 | **iOS** | SwiftUI shell | AVPlayer | 🧪 FFI expérimental |
 
 Voir [`crates/fluxplay-android/README.md`](crates/fluxplay-android/README.md) pour l’APK iced. `mobile/` + `fluxplay-ffi` restent expérimentaux.
+
+## Windows
+
+L’archive `fluxplay-windows-x86_64.zip` contient `fluxplay.exe` **et** `libmpv-2.dll` : gardez-les dans le même dossier — la DLL fournit le lecteur intégré (fenêtre « FluxPlay Lecteur », décodage matériel D3D11VA/NVDEC). Sans elle l’app démarre quand même (chargement différé) mais ne peut lire qu’avec un lecteur externe installé (VLC, mpv…).
+
+```powershell
+# Build local (toolchain MSVC + Build Tools Visual Studio)
+cargo build -p fluxplay --release
+./scripts/fetch-libmpv-windows.ps1 -Dest target/release   # libmpv-2.dll (shinchiro)
+```
+
+Logs : `%LOCALAPPDATA%luxplayluxplay.log` (réécrit à chaque lancement — l’exe n’a pas de console).
 
 ## Lancer (desktop)
 
@@ -117,14 +129,14 @@ Profils dans le `Cargo.toml` racine : `lto=fat`, `codegen-units=1`, `panic=abort
 
 Niveaux `tracing` : **TRACE** / **DEBUG** / **INFO** / **WARN** / **ERROR**.
 
-Par défaut (sans `RUST_LOG`) : profilage d’interactions **ON**, logs réseau `fluxplay::net`, profiler `info`.
+Par défaut (sans `RUST_LOG`) : niveau `info`, profilage **OFF** (il coûte CPU et RAM). Diagnostic complet : `FLUXPLAY_FULL_LOGS=1` (debug partout + mpv/FFmpeg verbeux).
 
 ```bash
 cargo run -p fluxplay
 # → net.request / net.response, fluxplay::profile interactions, player backend
 
-# Couper le profilage
-FLUXPLAY_PROFILE=0 cargo run -p fluxplay
+# Profilage d’interactions (wall/CPU/RSS)
+FLUXPLAY_PROFILE=1 cargo run -p fluxplay
 
 # Overlay FPS dans la barre de statut
 FLUXPLAY_FPS=1 cargo run -p fluxplay

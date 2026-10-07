@@ -17,10 +17,39 @@ fn main() {
         println!("cargo:rustc-link-arg=-Wl,-rpath,@loader_path/lib");
     }
 
+    // Windows: delay-load libmpv so the exe starts (and falls back) without the DLL —
+    // link args from fluxplay-player's build.rs never reach this binary.
+    let target = env::var("TARGET").unwrap_or_default();
+    if target.contains("windows-msvc") {
+        // All targets, not just bins: test executables import libmpv too and would
+        // fail to start (STATUS_DLL_NOT_FOUND) on a machine without the DLL.
+        println!("cargo:rustc-link-arg=/DELAYLOAD:libmpv-2.dll");
+        println!("cargo:rustc-link-arg=delayimp.lib");
+    }
+    // `winresource` is a Windows-host build-dependency (needs rc.exe): only a
+    // Windows host embeds the icon; Linux/macOS hosts must not reference it.
+    #[cfg(windows)]
+    if target.contains("windows") {
+        embed_windows_icon();
+    }
+
     if let Some(lib) = discover_lib_dir() {
         if cfg!(target_os = "linux") || cfg!(target_os = "macos") {
             println!("cargo:rustc-link-arg=-Wl,-rpath,{}", lib.display());
         }
+    }
+}
+
+/// Embed the app icon + version info in `fluxplay.exe` (Explorer, taskbar, Alt-Tab).
+#[cfg(windows)]
+fn embed_windows_icon() {
+    println!("cargo:rerun-if-changed=assets/fluxplay.ico");
+    let mut res = winresource::WindowsResource::new();
+    res.set_icon("assets/fluxplay.ico")
+        .set("ProductName", "FluxPlay")
+        .set("FileDescription", "FluxPlay — lecteur IPTV");
+    if let Err(e) = res.compile() {
+        println!("cargo:warning=icon resource not embedded: {e}");
     }
 }
 

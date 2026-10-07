@@ -78,16 +78,34 @@ fn init_tracing() {
              iced=info,iced_winit=info,iced_wgpu=warn,iced_runtime=info,profiler=trace",
         );
     }
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-            if fluxplay_core::full_logs_enabled() {
-                fluxplay_core::FULL_ENV_FILTER.into()
-            } else {
-                fluxplay_core::DEFAULT_ENV_FILTER.into()
-            }
-        }))
-        .try_init();
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        if fluxplay_core::full_logs_enabled() {
+            fluxplay_core::FULL_ENV_FILTER.into()
+        } else {
+            fluxplay_core::DEFAULT_ENV_FILTER.into()
+        }
+    });
+    // Windows GUI subsystem has no console: log to `%LOCALAPPDATA%luxplayluxplay.log`
+    // (truncated each launch) so problems stay diagnosable.
+    #[cfg(windows)]
+    if let Some(file) = windows_log_file() {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_ansi(false)
+            .with_writer(std::sync::Mutex::new(file))
+            .try_init();
+        fluxplay_player::log_native_verbosity_banner();
+        return;
+    }
+    let _ = tracing_subscriber::fmt().with_env_filter(filter).try_init();
     fluxplay_player::log_native_verbosity_banner();
+}
+
+#[cfg(windows)]
+fn windows_log_file() -> Option<std::fs::File> {
+    let dir = dirs::data_local_dir()?.join("fluxplay");
+    std::fs::create_dir_all(&dir).ok()?;
+    std::fs::File::create(dir.join("fluxplay.log")).ok()
 }
 
 #[cfg(target_os = "android")]

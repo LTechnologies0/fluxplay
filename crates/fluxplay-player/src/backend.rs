@@ -123,6 +123,21 @@ impl BackendCaps {
     }
 }
 
+/// Soft RGBA into iced needs CPU-readable frames: map each zero-copy API to its
+/// `*-copy` twin. Already-`*-copy` / `no` names pass through.
+fn soft_hwdec_name(preferred: &str) -> &str {
+    match preferred {
+        "vaapi" => "vaapi-copy",
+        "cuda" | "nvdec" => "cuda-copy",
+        "d3d11va" => "d3d11va-copy",
+        "dxva2" => "dxva2-copy",
+        "videotoolbox" => "videotoolbox-copy",
+        "vulkan" => "vulkan-copy",
+        "auto" | "auto-safe" => "auto-copy",
+        other => other,
+    }
+}
+
 fn preferred_hwdec() -> &'static str {
     #[cfg(target_os = "android")]
     {
@@ -154,13 +169,23 @@ fn preferred_hwdec() -> &'static str {
             if matches!(
                 lower.as_str(),
                 "no" | "none" | "software" | "auto" | "auto-safe" | "auto-copy"
-                    | "vaapi" | "vaapi-copy" | "cuda" | "nvdec" | "vulkan" | "d3d11va"
-                    | "dxva2" | "videotoolbox"
+                    | "vaapi" | "vaapi-copy" | "cuda" | "cuda-copy" | "nvdec" | "nvdec-copy"
+                    | "vulkan" | "vulkan-copy" | "d3d11va" | "d3d11va-copy" | "dxva2"
+                    | "dxva2-copy" | "videotoolbox" | "videotoolbox-copy"
             ) {
                 return Box::leak(lower.into_boxed_str());
             }
         }
-        "auto"
+        // Soft present maps these to `*-copy` so iced gets CPU-readable frames.
+        // `auto` works everywhere; a platform default still helps when mpv's probe
+        // order prefers a zero-copy API that soft VO cannot use.
+        if cfg!(target_os = "windows") {
+            "d3d11va"
+        } else if cfg!(target_os = "macos") {
+            "videotoolbox"
+        } else {
+            "auto"
+        }
     }
 }
 
@@ -342,11 +367,14 @@ pub fn detect_backends() -> Vec<BackendInfo> {
 
     #[cfg(all(feature = "native-mpv", fluxplay_has_libmpv))]
     {
+        let loaded = crate::mpv_ffi::libmpv_available();
         out.push(BackendInfo {
             id: BackendId::Mpv,
-            available: true,
+            available: loaded,
             path: Some("libmpv".into()),
-            detail: if cfg!(feature = "static-link") {
+            detail: if !loaded {
+                "libmpv-2.dll absente — placez-la à côté de fluxplay.exe".into()
+            } else if cfg!(feature = "static-link") {
                 "libmpv lié statiquement — HLS/DASH/RTSP/HW".into()
             } else {
                 "libmpv natif (FFI) — HLS/DASH/RTSP/RTMP/SRT, HW accel".into()
@@ -581,6 +609,17 @@ fn resolve_relative_url(base: &str, loc: &str) -> String {
 }
 
 fn which(bin: &str) -> Option<String> {
+    // Windows: scan PATH in-process — spawning `where` from a GUI-subsystem exe
+    // flashes a console window on every backend probe.
+    #[cfg(windows)]
+    {
+        let path = std::env::var_os("PATH")?;
+        return std::env::split_paths(&path)
+            .flat_map(|dir| [dir.join(format!("{bin}.exe")), dir.join(bin)])
+            .find(|p| p.is_file())
+            .map(|p| p.display().to_string());
+    }
+    #[allow(unreachable_code)]
     let from_cmd = Command::new("which")
         .arg(bin)
         .output()
@@ -2460,6 +2499,13 @@ fn snapshot_scaled(w: u32, h: u32, pixels: &[u8]) -> (u32, u32, Arc<[u8]>) {
             soft_set(&mpv, "demuxer-max-bytes", "64MiB");
             soft_set(&mpv, "demuxer-max-back-bytes", "16MiB");
         }
+        #[cfg(not(target_os = "android"))]
+        {
+            // mpv defaults (150 + 50 MiB) let a long live session hoard ~200 MiB.
+            // 96 MiB still holds the 12 s VOD readahead of a ~60 Mb/s 4K stream.
+            soft_set(&mpv, "demuxer-max-bytes", "96MiB");
+            soft_set(&mpv, "demuxer-max-back-bytes", "24MiB");
+        }
         soft_set(
             &mpv,
             "volume",
@@ -2514,13 +2560,7 @@ fn snapshot_scaled(w: u32, h: u32, pixels: &[u8]) -> (u32, u32, Arc<[u8]>) {
                 // Soft RGBA and hybrid GPUs need *-copy. Native GPU VO uses zero-copy auto
                 // (Jellyfin hardwareDecoding=enabled → hwdec=auto).
                 let preferred = if present.uses_soft_rgba() || self.opts.hwdec_force_copy {
-                    match preferred_hwdec() {
-                        "vaapi" => "vaapi-copy",
-                        "cuda" | "nvdec" => "cuda-copy",
-                        "vulkan" => "vulkan-copy",
-                        "auto" | "auto-safe" => "auto-copy",
-                        other => other,
-                    }
+                    soft_hwdec_name(preferred_hwdec())
                 } else {
                     preferred_hwdec()
                 };
@@ -2547,11 +2587,29 @@ fn snapshot_scaled(w: u32, h: u32, pixels: &[u8]) -> (u32, u32, Arc<[u8]>) {
             soft_set(&mpv, "correct-downscaling", "no");
             soft_set(&mpv, "sigmoid-upscaling", "no");
             soft_set(&mpv, "interpolation", "no");
+            // Platform AO: soft present is CPU-bound; a predictable audio clock
+            // (wasapi / coreaudio / pipewire) keeps A/V sync without display-resample.
+            #[cfg(target_os = "windows")]
+            if mpv.set_option("ao", "wasapi").is_err() {
+                soft_set(&mpv, "ao", "wasapi");
+            }
+            #[cfg(target_os = "macos")]
+            if mpv.set_option("ao", "coreaudio").is_err() {
+                soft_set(&mpv, "ao", "coreaudio");
+            }
             if mpv.set_option("video-sync", "audio").is_err() {
                 soft_set(&mpv, "video-sync", "audio");
             }
             if mpv.set_option("framedrop", "vo").is_err() {
                 soft_set(&mpv, "framedrop", "vo");
+            }
+            // SoftPump / iced tick at the monitor rate — tell mpv so it does not
+            // produce frames faster than the UI can upload (same on every OS).
+            if self.present_hz >= 24 {
+                let fps = format!("{}", self.present_hz);
+                if mpv.set_option("display-fps-override", &fps).is_err() {
+                    soft_set(&mpv, "display-fps-override", &fps);
+                }
             }
         } else {
             // Native VO HQ — matches dexeonify/mpv-config + Jellyfin display sync.
@@ -2641,34 +2699,16 @@ fn snapshot_scaled(w: u32, h: u32, pixels: &[u8]) -> (u32, u32, Arc<[u8]>) {
             "volume",
             &format!("{}", (self.opts.volume * 100.0).clamp(0.0, 100.0) as u32),
         );
-        // Desktop only: brief settle so hwdec-current is meaningful. Never sleep on
-        // Android UI thread (ANR / frozen NativeActivity).
-        #[cfg(not(target_os = "android"))]
+        // Never force hwdec=no right after loadfile on any OS: IPTV/VOD streams
+        // have not opened their decoder yet (Windows/macOS always looked idle at
+        // 200 ms → CPU decode / stutter; Linux VA-API can attach just as late on
+        // a cold cache). `*-copy` / `auto-copy` fall back to software themselves
+        // when the GPU path fails; MediaCodec on Android attaches after packets.
         {
-            std::thread::sleep(std::time::Duration::from_millis(200));
             let hw = mpv
                 .get_property_string("hwdec-current")
                 .unwrap_or_else(|| "none".into());
-            // Soft VO only: if preferred never engaged, force software (avoid black soft stage).
-            // Native GPU VO may still be attaching NVDEC/VAAPI — do not yank it to SW.
-            if present.uses_soft_rgba()
-                && self.opts.hwdec
-                && (hw.is_empty()
-                    || hw.eq_ignore_ascii_case("no")
-                    || hw.eq_ignore_ascii_case("none"))
-            {
-                let _ = mpv.set_property("hwdec", "no");
-                warn!(%endpoint, "hwdec-current idle — forced software decode");
-            }
-        }
-        #[cfg(target_os = "android")]
-        {
-            // Do NOT force hwdec=no here — MediaCodec often attaches after the first
-            // packets. Premature SW fallback was decoding 4K on CPU (~10 fps).
-            let hw = mpv
-                .get_property_string("hwdec-current")
-                .unwrap_or_else(|| "none".into());
-            info!(%endpoint, %hw, "android hwdec after loadfile (may still be attaching)");
+            info!(%endpoint, %hw, "hwdec after loadfile (may still be attaching)");
         }
         let hw = mpv
             .get_property_string("hwdec-current")
@@ -3303,4 +3343,30 @@ fn mpv_cmd(ipc: &Path, parts: &[&str]) -> Result<()> {
         "mpv IPC: {}",
         last.unwrap_or("unavailable")
     )))
+}
+
+#[cfg(test)]
+mod soft_hwdec_tests {
+    use super::soft_hwdec_name;
+
+    #[test]
+    fn soft_present_maps_every_desktop_api_to_copy() {
+        assert_eq!(soft_hwdec_name("vaapi"), "vaapi-copy");
+        assert_eq!(soft_hwdec_name("cuda"), "cuda-copy");
+        assert_eq!(soft_hwdec_name("nvdec"), "cuda-copy");
+        assert_eq!(soft_hwdec_name("d3d11va"), "d3d11va-copy");
+        assert_eq!(soft_hwdec_name("dxva2"), "dxva2-copy");
+        assert_eq!(soft_hwdec_name("videotoolbox"), "videotoolbox-copy");
+        assert_eq!(soft_hwdec_name("vulkan"), "vulkan-copy");
+        assert_eq!(soft_hwdec_name("auto"), "auto-copy");
+        assert_eq!(soft_hwdec_name("auto-safe"), "auto-copy");
+    }
+
+    #[test]
+    fn already_copy_or_disabled_names_pass_through() {
+        assert_eq!(soft_hwdec_name("d3d11va-copy"), "d3d11va-copy");
+        assert_eq!(soft_hwdec_name("videotoolbox-copy"), "videotoolbox-copy");
+        assert_eq!(soft_hwdec_name("no"), "no");
+        assert_eq!(soft_hwdec_name("mediacodec-copy"), "mediacodec-copy");
+    }
 }

@@ -2,13 +2,16 @@
 //!
 //! Soft present at 1080p+ is otherwise blocked by UI-thread render + iced texture upload
 //! (~100–200 ms/frame). The pump renders into a slot; `pull_video_frame` only swaps.
+//!
+//! Waiting uses [`FrameWake`] (condvar), not `thread::sleep`: on Windows a 2 ms sleep
+//! is rounded up to ~15.6 ms and the picture hitchs every frame.
 
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use crate::mpv_ffi::LibMpv;
+use crate::mpv_ffi::{FrameWake, LibMpv};
 
 pub struct SoftFrame {
     pub w: u32,
@@ -29,21 +32,23 @@ pub struct SoftPump {
     /// Generation of frame UI has already consumed (for needs_redraw).
     consumed_gen: Arc<AtomicU32>,
     produced_gen: Arc<AtomicU32>,
+    /// Wake SoftPump when the UI frees the pending slot.
+    slot_free: Arc<(Mutex<()>, Condvar)>,
     join: Option<JoinHandle<()>>,
 }
 
 impl SoftPump {
     pub fn start(mpv: Arc<Mutex<LibMpv>>) -> Self {
-        let frame_dirty = mpv
+        let wake = mpv
             .lock()
             .map(|g| g.frame_dirty_handle())
-            .unwrap_or_else(|_| Arc::new(AtomicBool::new(true)));
-        Self::start_with_dirty(mpv, frame_dirty)
+            .unwrap_or_else(|_| Arc::new(FrameWake::new(true)));
+        Self::start_with_wake(mpv, wake)
     }
 
-    /// Start with a pre-shared dirty flag — the pump loop never takes the mpv
-    /// lock just to check dirtiness (lock-free fast path).
-    pub fn start_with_dirty(mpv: Arc<Mutex<LibMpv>>, frame_dirty: Arc<AtomicBool>) -> Self {
+    /// Start with a pre-shared wake — the pump loop never takes the mpv
+    /// lock just to check dirtiness (lock-free fast path + condvar).
+    pub fn start_with_wake(mpv: Arc<Mutex<LibMpv>>, frame_wake: Arc<FrameWake>) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let want_w = Arc::new(AtomicU32::new(1280));
         let want_h = Arc::new(AtomicU32::new(720));
@@ -51,6 +56,7 @@ impl SoftPump {
         let recycle = Arc::new(Mutex::new(None));
         let consumed_gen = Arc::new(AtomicU32::new(0));
         let produced_gen = Arc::new(AtomicU32::new(0));
+        let slot_free = Arc::new((Mutex::new(()), Condvar::new()));
 
         let stop_t = Arc::clone(&stop);
         let want_w_t = Arc::clone(&want_w);
@@ -58,7 +64,9 @@ impl SoftPump {
         let latest_t = Arc::clone(&latest);
         let recycle_t = Arc::clone(&recycle);
         let produced_t = Arc::clone(&produced_gen);
+        let slot_free_t = Arc::clone(&slot_free);
         let mpv_t = Arc::clone(&mpv);
+        let wake_t = Arc::clone(&frame_wake);
 
         let join = thread::Builder::new()
             .name("fp-soft-pump".into())
@@ -69,22 +77,19 @@ impl SoftPump {
                     let w = (want_w_t.load(Ordering::Relaxed).clamp(2, 3840) & !1).max(2);
                     let h = (want_h_t.load(Ordering::Relaxed).clamp(2, 2160) & !1).max(2);
 
-                    // Check pending / dirty without holding mpv lock.
+                    // One frame in hand until the UI takes it. Overwriting the slot
+                    // dropped pictures and made soft mpv surge then hitch.
                     let pending = latest_t
                         .lock()
                         .map(|g| g.is_some())
                         .unwrap_or(true);
-                    // Lock-free dirty read (shared atomic) — the old path locked the
-                    // mpv Mutex here 250-500×/s and stalled UI property reads.
-                    let needs = frame_dirty.load(Ordering::Acquire);
-                    // One frame in hand until the UI takes it. Overwriting the slot
-                    // dropped pictures and made soft mpv surge then hitch.
                     if pending {
-                        thread::sleep(Duration::from_millis(2));
+                        wait_slot(&slot_free_t, &stop_t, Duration::from_millis(16));
                         continue;
                     }
-                    if !needs {
-                        thread::sleep(Duration::from_millis(2));
+                    if !wake_t.is_dirty() {
+                        // Park until mpv's render callback (or 16 ms so stop/size changes apply).
+                        wake_t.wait_while_clean(&stop_t, Duration::from_millis(16));
                         continue;
                     }
 
@@ -118,11 +123,11 @@ impl SoftPump {
                                     gen: local_gen,
                                 });
                             }
-                            // Brief yield so UI can take the frame / lock mpv props.
-                            thread::sleep(Duration::from_millis(1));
+                            // Yield the mpv lock to the UI for property reads; park, don't sleep.
+                            wake_t.wait_while_clean(&stop_t, Duration::from_millis(1));
                         }
                         None => {
-                            thread::sleep(Duration::from_millis(4));
+                            wake_t.wait_while_clean(&stop_t, Duration::from_millis(4));
                         }
                     }
                 }
@@ -137,6 +142,7 @@ impl SoftPump {
             recycle,
             consumed_gen,
             produced_gen,
+            slot_free,
             join,
         }
     }
@@ -178,6 +184,8 @@ impl SoftPump {
         let frame = slot.take()?;
         self.consumed_gen
             .store((frame.gen & 0xffff_ffff) as u32, Ordering::Release);
+        drop(slot);
+        self.slot_free.1.notify_one();
         Some((frame.w, frame.h, frame.pixels))
     }
 
@@ -191,19 +199,32 @@ impl SoftPump {
                 *slot = Some(buf);
             }
         }
+        self.slot_free.1.notify_one();
     }
 
     pub fn stop(mut self) {
         self.stop.store(true, Ordering::Release);
+        self.slot_free.1.notify_all();
         if let Some(h) = self.join.take() {
             let _ = h.join();
         }
     }
 }
 
+fn wait_slot(slot_free: &(Mutex<()>, Condvar), stop: &AtomicBool, timeout: Duration) {
+    if stop.load(Ordering::Relaxed) {
+        return;
+    }
+    let Ok(guard) = slot_free.0.lock() else {
+        return;
+    };
+    let _ = slot_free.1.wait_timeout_while(guard, timeout, |_| !stop.load(Ordering::Relaxed));
+}
+
 impl Drop for SoftPump {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
+        self.slot_free.1.notify_all();
         if let Some(h) = self.join.take() {
             let _ = h.join();
         }

@@ -78,9 +78,11 @@ pub fn player_window(p: PlayerChrome<'_>) -> Element<'_, Message> {
         } else {
             soft_chip(p.ui, "VOD")
         };
-        let mut title_ink = p.ui.inverse_on_surface();
+        // Over video the header is always a dark scrim with light ink, whatever the
+        // app theme (the inverse surface was a light-grey slab in dark mode).
+        let mut title_ink = Color::WHITE;
         title_ink.a *= alpha;
-        let mut meta_ink = p.ui.inverse_on_surface();
+        let mut meta_ink = Color::WHITE;
         meta_ink.a *= alpha * 0.72;
         let title_block = column![
             text(truncate(p.title, 64))
@@ -117,13 +119,8 @@ pub fn player_window(p: PlayerChrome<'_>) -> Element<'_, Message> {
         )
         .width(Fill)
         .style(move |_t: &Theme| container::Style {
-            background: Some(Background::Color({
-                let mut c = p.ui.inverse_surface();
-                // Soft dim over video; keep readable inverse ink.
-                c.a = 0.82 * alpha;
-                c
-            })),
-            text_color: Some(p.ui.inverse_on_surface()),
+            background: Some(Background::Color(Color::from_rgba(0.0, 0.0, 0.0, 0.62 * alpha))),
+            text_color: Some(Color::WHITE),
             ..Default::default()
         });
 
