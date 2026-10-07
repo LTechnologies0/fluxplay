@@ -6,7 +6,8 @@ use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int, c_void};
 use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::Duration;
 
 use tracing::{debug, error, info, warn};
 
@@ -169,21 +170,69 @@ fn mpv_err(code: c_int) -> Result<()> {
     Err(PlayerError::Backend(format!("libmpv: {msg}")))
 }
 
+/// Dirty flag + waitable wake-up for soft present.
+///
+/// SoftPump must not `thread::sleep(2 ms)`: on Windows the default timer is
+/// ~15.6 ms, so those waits became frame-long hitches. The render update
+/// callback marks this and notifies; SoftPump parks on the condvar instead.
+pub struct FrameWake {
+    dirty: AtomicBool,
+    lock: Mutex<()>,
+    cvar: Condvar,
+}
+
+impl FrameWake {
+    pub fn new(dirty: bool) -> Self {
+        Self {
+            dirty: AtomicBool::new(dirty),
+            lock: Mutex::new(()),
+            cvar: Condvar::new(),
+        }
+    }
+
+    pub fn mark(&self) {
+        self.dirty.store(true, Ordering::Release);
+        self.cvar.notify_one();
+    }
+
+    pub fn is_dirty(&self) -> bool {
+        self.dirty.load(Ordering::Acquire)
+    }
+
+    pub fn swap_clean(&self) -> bool {
+        self.dirty.swap(false, Ordering::AcqRel)
+    }
+
+    /// Park until [`Self::mark`] or `timeout`. Returns immediately when already dirty
+    /// or `stop` is set — same on Linux, Windows, and macOS (no coarse sleep).
+    pub fn wait_while_clean(&self, stop: &AtomicBool, timeout: Duration) {
+        if self.is_dirty() || stop.load(Ordering::Relaxed) {
+            return;
+        }
+        let Ok(guard) = self.lock.lock() else {
+            return;
+        };
+        let _ = self.cvar.wait_timeout_while(guard, timeout, |_| {
+            !self.is_dirty() && !stop.load(Ordering::Relaxed)
+        });
+    }
+}
+
 unsafe extern "C" fn render_update_cb(ctx: *mut c_void) {
     if ctx.is_null() {
         return;
     }
-    let flag = &*(ctx as *const AtomicBool);
-    flag.store(true, Ordering::Release);
+    // SAFETY: `ctx` is `Arc::into_raw` of the same `FrameWake` held by LibMpv.
+    (*(ctx as *const FrameWake)).mark();
 }
 
 /// In-process libmpv player with optional software render target (no OS video window).
 pub struct LibMpv {
     ctx: *mut mpv_handle,
     render: *mut mpv_render_context,
-    frame_dirty: Arc<AtomicBool>,
+    frame_dirty: Arc<FrameWake>,
     /// Extra Arc ownership for the C update callback (`into_raw` / `from_raw`).
-    frame_dirty_cb_raw: *const AtomicBool,
+    frame_dirty_cb_raw: *const FrameWake,
     /// Reused tightly-packed RGBA scratch (render target).
     sw_rgba: Vec<u8>,
     /// Previous present buffer recycled to avoid alloc+memcpy every frame.
@@ -246,7 +295,7 @@ impl LibMpv {
         Ok(Self {
             ctx,
             render: ptr::null_mut(),
-            frame_dirty: Arc::new(AtomicBool::new(false)),
+            frame_dirty: Arc::new(FrameWake::new(false)),
             frame_dirty_cb_raw: ptr::null(),
             sw_rgba: Vec::new(),
             sw_recycle: Vec::new(),
@@ -356,7 +405,7 @@ impl LibMpv {
                 cb_raw as *mut c_void,
             );
         }
-        self.frame_dirty.store(true, Ordering::Release);
+        self.frame_dirty.mark();
         self.force_render = true;
         info!("LibMpv software render context ready");
         Ok(())
@@ -466,12 +515,12 @@ impl LibMpv {
     }
 
     pub fn frame_needs_redraw(&self) -> bool {
-        self.force_render || self.frame_dirty.load(Ordering::Acquire)
+        self.force_render || self.frame_dirty.is_dirty()
     }
 
-    /// Shared dirty flag for the soft pump — avoids locking the mpv Mutex 250×/s
+    /// Shared wake for the soft pump — avoids locking the mpv Mutex 250×/s
     /// just to read an atomic (lock ping-pong stalls UI property reads mid-render).
-    pub fn frame_dirty_handle(&self) -> Arc<AtomicBool> {
+    pub fn frame_dirty_handle(&self) -> Arc<FrameWake> {
         Arc::clone(&self.frame_dirty)
     }
 
@@ -486,9 +535,7 @@ impl LibMpv {
         let h = (h.min(2160) & !1).max(2);
 
         let flags = unsafe { mpv_render_context_update(self.render) };
-        let dirty = self
-            .frame_dirty
-            .swap(false, Ordering::AcqRel)
+        let dirty = self.frame_dirty.swap_clean()
             || self.force_render
             || (flags & MPV_RENDER_UPDATE_FRAME) != 0
             || self.sw_w != w
@@ -557,7 +604,7 @@ impl LibMpv {
             }
             let mut st = pad_stride;
             if try_render(fmt_rgb0, &mut self.sw_rgb0, &mut st) < 0 {
-                self.frame_dirty.store(true, Ordering::Release);
+                self.frame_dirty.mark();
                 return None;
             }
             for y in 0..h as usize {
