@@ -139,6 +139,11 @@ pub async fn rank(source: &MediaSource) -> Ranking {
         "servers ranked"
     );
     if let Ok(mut c) = cache().lock() {
+        // Pathological: many throwaway profiles. Cap so rankings cannot grow forever.
+        const CACHE_CAP: usize = 64;
+        if c.len() >= CACHE_CAP && !c.contains_key(&source.id) {
+            c.clear();
+        }
         c.insert(
             source.id,
             Cached {

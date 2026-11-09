@@ -14,14 +14,11 @@ default-members = ["crates/fluxplay"]
 version = "0.3.3"
 edition = "2021"
 license = "MIT"
-authors = ["FluxPlay"]
-repository = "https://github.com/fluxplay/fluxplay"
 
 [workspace.dependencies]
 fluxplay-core = { path = "crates/fluxplay-core" }
 fluxplay-providers = { path = "crates/fluxplay-providers" }
 fluxplay-player = { path = "crates/fluxplay-player", default-features = false }
-fluxplay-ffi = { path = "crates/fluxplay-ffi" }
 
 anyhow = "1"
 thiserror = "2"
@@ -46,6 +43,7 @@ open = "5"
 rusqlite = { version = "0.32", features = ["bundled"] }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp"] }
 zip = "2"
+proptest = "1"
 
 [patch.crates-io]
 iced = { path = "vendor/iced" }

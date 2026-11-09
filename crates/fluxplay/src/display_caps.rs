@@ -15,7 +15,6 @@
 //! Env overrides still win: `FLUXPLAY_MONITOR_HZ`, `FLUXPLAY_GUI_FPS`,
 //! `FLUXPLAY_VIDEO_FPS`, `FLUXPLAY_META_PARALLEL`, `FLUXPLAY_IMAGE_INFLIGHT`.
 // Linux probes (xrandr / DRM sysfs / lspci) stay compiled for their tests; Windows uses user32.
-#![cfg_attr(windows, allow(dead_code))]
 
 #[cfg(not(target_os = "android"))]
 use std::process::Command;
@@ -41,7 +40,7 @@ pub enum DisplaySession {
     Wayland,
     #[cfg(any(test, not(target_os = "android")))]
     X11,
-    #[cfg_attr(not(target_os = "android"), allow(dead_code))]
+    #[cfg(target_os = "android")]
     Android,
     #[cfg(any(test, not(target_os = "android")))]
     Unknown,
@@ -54,6 +53,7 @@ impl DisplaySession {
             Self::Wayland => "Wayland",
             #[cfg(any(test, not(target_os = "android")))]
             Self::X11 => "X11",
+            #[cfg(target_os = "android")]
             Self::Android => "Android",
             #[cfg(any(test, not(target_os = "android")))]
             Self::Unknown => "?",
@@ -117,10 +117,6 @@ pub struct DisplayCaps {
 impl DisplayCaps {
     pub fn gui_period_ms(&self) -> u64 {
         period_ms(self.gui_hz)
-    }
-
-    pub fn video_period_ms(&self) -> u64 {
-        period_ms(self.video_hz)
     }
 
     pub fn summary_line(&self) -> String {
@@ -224,24 +220,31 @@ pub fn resolve_caps(
         let capped = (cfps.ceil() as u32).saturating_add(4).max(MIN_HZ);
         video_auto = video_auto.min(capped);
     }
-    #[allow(unused_mut)] // mutated only inside the Android cfg block below
-    let mut video_hz = resolve_pref(video_pref, env_u32("FLUXPLAY_VIDEO_FPS"), video_auto);
-    #[cfg(target_os = "android")]
-    {
-        if let Some(caps) = crate::android_bridge::poll_android_device_caps() {
-            if caps.select_present_mode().uses_surface()
-                && crate::android_bridge::is_video_surface_ready()
-            {
-                video_hz = video_hz.min(caps.refresh_hz.max(24));
+    let video_hz = {
+        let base = resolve_pref(video_pref, env_u32("FLUXPLAY_VIDEO_FPS"), video_auto);
+        #[cfg(target_os = "android")]
+        {
+            let mut video_hz = base;
+            if let Some(caps) = crate::android_bridge::poll_android_device_caps() {
+                if caps.select_present_mode().uses_surface()
+                    && crate::android_bridge::is_video_surface_ready()
+                {
+                    video_hz = video_hz.min(caps.refresh_hz.max(24));
+                } else {
+                    video_hz = video_hz.min(caps.soft_budget().video_hz);
+                }
             } else {
-                video_hz = video_hz.min(caps.soft_budget().video_hz);
+                let cores = probe.cpu_logical.max(1);
+                let soft_cap = if cores >= 8 { 30 } else { 24 };
+                video_hz = video_hz.min(soft_cap);
             }
-        } else {
-            let cores = probe.cpu_logical.max(1);
-            let soft_cap = if cores >= 8 { 30 } else { 24 };
-            video_hz = video_hz.min(soft_cap);
+            video_hz
         }
-    }
+        #[cfg(not(target_os = "android"))]
+        {
+            base
+        }
+    };
 
     let probe = DisplayProbe {
         monitor_hz,
@@ -312,12 +315,11 @@ fn derive_tuning(probe: &DisplayProbe, gui_hz: u32) -> RuntimeTuning {
     }
 
     // Posters render at ~200–300 px tall: decoding bigger only burns RAM/VRAM.
-    let decode_edge_px = if probe.monitor_w >= 2560 {
-        420
-    } else if probe.monitor_w > 0 && probe.monitor_w <= 1366 {
-        300
+    // Hard cap 300 for the ~100 Mo RSS budget (mosaic still looks fine).
+    let decode_edge_px = if probe.monitor_w > 0 && probe.monitor_w <= 1366 {
+        260
     } else {
-        360
+        300
     };
 
     RuntimeTuning {
@@ -838,12 +840,6 @@ fn probe_gpu_topology() -> GpuTopology {
     }
 }
 
-#[allow(dead_code)]
-fn probe_gpu() -> (String, GpuTier) {
-    let t = probe_gpu_topology();
-    (t.display.name.clone(), t.display_tier())
-}
-
 /// All VGA/3D controllers from lspci (multi-GPU).
 #[cfg(any(test, not(target_os = "android")))]
 pub fn parse_lspci_gpus(out: &str) -> Vec<GpuDevice> {
@@ -1065,6 +1061,50 @@ eDP-1 "BOE 0x0A1C"
         assert_eq!(period_ms(60), 17);
         assert_eq!(period_ms(120), 8);
         assert_eq!(period_ms(30), 33);
+    }
+
+    #[test]
+    fn soft_video_budget_clamps_above_720p_on_igpu() {
+        // Soft RGBA path: >720p on iGPU must not claim 120 Hz (jank / thermal).
+        let hz_720 = soft_video_budget(GpuTier::Integrated, Some((1280, 720)), false);
+        let hz_1080 = soft_video_budget(GpuTier::Integrated, Some((1920, 1080)), false);
+        let hz_uhd = soft_video_budget(GpuTier::Integrated, Some((3840, 2160)), false);
+        assert!(hz_720 <= 60);
+        assert!(hz_1080 <= 60);
+        assert!(hz_uhd <= 30);
+        assert!(SOFT_PRESENT_MAX <= 240);
+    }
+
+    #[test]
+    fn decode_edge_stays_at_or_under_300_for_rss_plan() {
+        let probe = DisplayProbe {
+            monitor_name: "t".into(),
+            monitor_hz: 60,
+            monitor_w: 1920,
+            monitor_h: 1080,
+            gpu_name: "g".into(),
+            gpu_tier: GpuTier::Integrated,
+            gpu_topology: GpuTopology::single("g", GpuTier::Integrated),
+            cpu_logical: 8,
+            cpu_arch: "x86_64",
+            session: DisplaySession::Wayland,
+            os_label: "Test".into(),
+            on_battery: false,
+            source: "test",
+        };
+        let t = derive_tuning(&probe, 60);
+        assert!(
+            t.decode_edge_px <= 300,
+            "decode_edge_px={} — plan caps posters at 300px",
+            t.decode_edge_px
+        );
+    }
+
+    #[test]
+    fn soft_video_budget_discrete_keeps_headroom_at_1080p() {
+        let hz = soft_video_budget(GpuTier::Discrete, Some((1920, 1080)), false);
+        assert!(hz >= 60, "discrete 1080p soft present too low: {hz}");
+        assert!(hz <= SOFT_PRESENT_MAX);
     }
 
     #[test]

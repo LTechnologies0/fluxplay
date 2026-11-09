@@ -256,6 +256,7 @@ fn parse_host_port_loose(raw: &str) -> (Option<String>, Option<u16>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     #[test]
     fn parses_hls() {
@@ -277,5 +278,36 @@ mod tests {
         let u = StreamUrl::parse("srt://192.168.1.100:4200?mode=listener").unwrap();
         assert_eq!(u.scheme, StreamScheme::Srt);
         assert_eq!(u.port, Some(4200));
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(256))]
+
+        #[test]
+        fn stream_scheme_parse_total(raw in "\\PC{0,64}") {
+            let _ = StreamScheme::parse(&raw);
+        }
+
+        #[test]
+        fn stream_url_parse_never_panics(raw in "\\PC{0,200}") {
+            let _ = StreamUrl::parse(&raw);
+        }
+
+        #[test]
+        fn known_schemes_round_trip_kind(
+            scheme in prop::sample::select(vec![
+                "http", "https", "rtsp", "rtsps", "rtmp", "rtmps",
+                "udp", "rtp", "srt",
+            ]),
+            // DNS-ish labels only — `url::Url` rejects hosts like `.0`.
+            host in "[a-z][a-z0-9-]{0,20}[a-z0-9]",
+            port in 1u16..65535u16,
+        ) {
+            let raw = format!("{scheme}://{host}:{port}/path");
+            let u = StreamUrl::parse(&raw);
+            prop_assert!(u.is_ok(), "parse failed for {raw}: {u:?}");
+            let u = u.unwrap();
+            prop_assert_eq!(u.scheme, StreamScheme::parse(&raw));
+        }
     }
 }

@@ -33,16 +33,6 @@ pub struct SafInbox {
     pub status: String,
     pub name: String,
     pub path: String,
-    // Written by the Java SAF callback for parity with the meta schema; Rust does not read it yet.
-    #[allow(dead_code)]
-    pub mime: String,
-}
-
-// Legacy pip.json schema — PiP state now comes from the live JNI poll (`poll_pip_mode`).
-#[allow(dead_code)]
-#[derive(Debug, Clone, Deserialize)]
-struct PipFlag {
-    in_pip: bool,
 }
 
 fn vm_activity() -> Option<(JavaVM, jni::sys::jobject)> {
@@ -199,16 +189,6 @@ fn saf_meta_candidates() -> Vec<PathBuf> {
     out
 }
 
-// Legacy pip.json path — kept next to the other flag paths; no reader since the JNI poll.
-#[allow(dead_code)]
-fn pip_flag_path() -> Option<PathBuf> {
-    files_dir().map(|b| b.join("saf_inbox").join("pip.json"))
-}
-
-fn audio_focus_flag_path() -> Option<PathBuf> {
-    files_dir().map(|b| b.join("saf_inbox").join("audio_focus.json"))
-}
-
 fn device_caps_path() -> Option<PathBuf> {
     files_dir().map(|b| b.join("saf_inbox").join("device_caps.json"))
 }
@@ -286,6 +266,9 @@ struct SurfaceStateJson {
 
 /// Full device caps for quality matrix (Phases B–C).
 pub fn poll_android_device_caps() -> Option<fluxplay_player::AndroidDeviceCaps> {
+    if let Some(caps) = crate::android_platform::poll_device_caps() {
+        return Some(caps);
+    }
     let path = device_caps_path()?;
     let text = std::fs::read_to_string(&path).ok()?;
     let caps: DeviceCapsJson = serde_json::from_str(&text).ok()?;
@@ -595,32 +578,8 @@ pub fn set_force_landscape(force: bool) {
     call_static_void_bool("setForceLandscape", force);
 }
 
-/// Android window color mode: `default` | `wide` | `hdr`.
 pub fn set_display_color_mode(mode: &str) {
-    let Some((vm, activity)) = vm_activity() else {
-        return;
-    };
-    let Ok(mut env) = vm.attach_current_thread() else {
-        return;
-    };
-    let Some(cls) = fp_class_obj(&mut env, activity) else {
-        return;
-    };
-    let Ok(jmode) = env.new_string(mode) else {
-        clear_ex(&mut env);
-        return;
-    };
-    if env
-        .call_static_method(
-            cls,
-            "setDisplayColorMode",
-            "(Ljava/lang/String;)V",
-            &[JValue::Object(&jmode)],
-        )
-        .is_err()
-    {
-        clear_ex(&mut env);
-    }
+    crate::android_platform::set_display_color_mode(mode);
 }
 
 /// Prepare SurfaceView present (mpv-android style): show view, return wid if ready.
@@ -690,44 +649,9 @@ pub fn set_video_surface_z_on_top(on_top: bool) {
     call_static_void_bool("setVideoSurfaceZOrderOnTop", on_top);
 }
 
-/// Select present mode from device caps + Surface readiness (Phase C).
-// Phase-C helper retained for the upcoming present-mode wiring; no caller yet.
-#[allow(dead_code)]
-pub fn select_android_present_mode() -> fluxplay_player::AndroidPresentMode {
-    let mut caps = poll_android_device_caps().unwrap_or_default();
-    // Refresh surface_ready from live probe.
-    caps.surface_ready = is_video_surface_ready() || caps.surface_ready;
-    caps.select_present_mode()
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct AudioFocusFlag {
-    held: bool,
-}
-
-/// True when Java reports we still hold audio focus (false after LOSS*).
-/// Cached ~250 ms: this was a file read + JSON parse up to 3× per UI tick.
+/// True when Rust reports audio focus state (no JSON file poll).
 pub fn poll_audio_focus_held() -> Option<bool> {
-    use std::sync::OnceLock;
-    use std::time::{Duration, Instant};
-    // None until first successful poll — Instant::now is not const.
-    static CACHE: OnceLock<std::sync::Mutex<(Instant, Option<bool>)>> = OnceLock::new();
-    let cache = CACHE.get_or_init(|| std::sync::Mutex::new((Instant::now(), None)));
-    {
-        let c = cache.lock().ok()?;
-        if c.0.elapsed() < Duration::from_millis(250) && c.1.is_some() {
-            return c.1;
-        }
-    }
-    let path = audio_focus_flag_path()?;
-    let text = std::fs::read_to_string(&path).ok()?;
-    let v = serde_json::from_str::<AudioFocusFlag>(&text)
-        .ok()
-        .map(|f| f.held);
-    if let Ok(mut c) = cache.lock() {
-        *c = (Instant::now(), v);
-    }
-    v
+    crate::android_platform::poll_held()
 }
 
 /// Launch SAF OPEN_DOCUMENT / CREATE_DOCUMENT via FluxPlayNativeActivity.
@@ -804,12 +728,6 @@ fn call_start_saf(mode: &str, mime: &str, source: &str) {
     }
 }
 
-// Public probe kept for diagnostics; `poll_saf_inbox` short-circuits on the same flag.
-#[allow(dead_code)]
-pub fn saf_is_pending() -> bool {
-    SAF_PENDING.load(Ordering::SeqCst)
-}
-
 /// Poll inbox written by Java `onActivityResult`. Consumes the meta file.
 pub fn poll_saf_inbox() -> Option<SafInbox> {
     if !SAF_PENDING.load(Ordering::SeqCst) {
@@ -837,11 +755,11 @@ pub fn poll_saf_inbox() -> Option<SafInbox> {
 
 /// Sync `pip_mode` from live Java `isInPip` (ignore stale pip.json).
 pub fn poll_pip_mode() -> bool {
-    call_static_bool("isInPip")
+    crate::android_platform::in_pip_mode()
 }
 
 pub fn is_night_mode() -> bool {
-    call_static_bool("isNightMode")
+    crate::android_platform::is_night_mode()
 }
 
 pub fn is_television() -> bool {
@@ -849,20 +767,19 @@ pub fn is_television() -> bool {
 }
 
 pub fn request_audio_focus() {
-    call_static_void("requestAudioFocus");
+    crate::android_platform::request();
 }
 
 pub fn abandon_audio_focus() {
-    call_static_void("abandonAudioFocus");
+    crate::android_platform::abandon();
 }
 
 pub fn set_immersive_mode(enable: bool) {
-    call_static_void_bool("setImmersiveMode", enable);
+    crate::android_platform::set_immersive_mode(enable);
 }
 
-/// Ask the Activity to refresh WindowInsets into the JNI cache (UI thread).
 pub fn refresh_system_insets() {
-    call_static_void("refreshSystemInsets");
+    crate::android_platform::refresh_insets();
 }
 
 pub fn finish_activity() {
@@ -871,63 +788,10 @@ pub fn finish_activity() {
 
 /// System bar insets in logical dp: (left, top, right, bottom).
 pub fn system_insets_dp() -> (f32, f32, f32, f32) {
-    let fallback = if is_television() {
-        (0.0, 0.0, 0.0, 0.0)
-    } else {
-        (0.0, 0.0, 0.0, 24.0)
-    };
-    let Some((vm, activity)) = vm_activity() else {
-        return fallback;
-    };
-    let Ok(mut env) = vm.attach_current_thread() else {
-        return fallback;
-    };
-    let Some(cls) = fp_class_obj(&mut env, activity) else {
-        return content_rect_insets_dp();
-    };
-    // Nested attach on android_main never pops locals — frame the JNI call.
-    let read = env.with_local_frame(16, |env| -> Result<[i32; 5], jni::errors::Error> {
-        let arr = env.call_static_method(cls, "systemInsetsPx", "()[I", &[])?;
-        let obj = arr.l()?;
-        let jint_arr: jni::objects::JIntArray =
-            unsafe { jni::objects::JIntArray::from_raw(obj.into_raw()) };
-        let len = env.get_array_length(&jint_arr)?;
-        if len < 5 {
-            return Err(jni::errors::Error::JavaException);
-        }
-        let mut buf = [0i32; 5];
-        env.get_int_array_region(&jint_arr, 0, &mut buf)?;
-        Ok(buf)
-    });
-    match read {
-        Ok(buf) => {
-            let dpi = buf[4].max(120) as f32;
-            let scale = dpi / 160.0;
-            let (l, t, r, b) = (
-                buf[0] as f32 / scale,
-                buf[1] as f32 / scale,
-                buf[2] as f32 / scale,
-                buf[3] as f32 / scale,
-            );
-            // All-zero before first insets dispatch — keep non-TV bottom fallback.
-            if l == 0.0 && t == 0.0 && r == 0.0 && b == 0.0 {
-                return fallback;
-            }
-            (l, t, r, b)
-        }
-        Err(_) => {
-            clear_ex(&mut env);
-            content_rect_insets_dp()
-        }
-    }
-}
-
-fn content_rect_insets_dp() -> (f32, f32, f32, f32) {
     if is_television() {
-        (0.0, 0.0, 0.0, 0.0)
-    } else {
-        (0.0, 0.0, 0.0, 48.0)
+        return (0.0, 0.0, 0.0, 0.0);
     }
+    crate::android_platform::insets_dp()
 }
 
 pub fn enter_pip(width: i32, height: i32) {
@@ -967,25 +831,7 @@ pub fn set_keep_screen_on(enable: bool) {
     if LAST.swap(bits, Ordering::Relaxed) == bits {
         return;
     }
-    if let Some((vm, activity)) = vm_activity() {
-        if let Ok(mut env) = vm.attach_current_thread() {
-            if let Some(cls) = fp_class_obj(&mut env, activity) {
-                if env
-                    .call_static_method(
-                        cls,
-                        "setKeepScreenOn",
-                        "(Z)V",
-                        &[JValue::Bool(u8::from(enable))],
-                    )
-                    .is_ok()
-                {
-                    return;
-                }
-                clear_ex(&mut env);
-            }
-        }
-    }
-    crate::android_intent::set_keep_screen_on(enable);
+    crate::android_platform::set_keep_screen_on(enable);
 }
 
 /// Resolve Activity filesDir path for last SAF import when meta path empty.

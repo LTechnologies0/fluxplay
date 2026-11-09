@@ -8,6 +8,11 @@ pub mod profiler;
 pub mod protocol;
 pub mod xmltv;
 
+#[cfg(test)]
+mod prop_xmltv;
+#[cfg(test)]
+mod prop_models;
+
 pub use error::{Error, Result};
 pub use log::{Stopwatch, DEFAULT_ENV_FILTER, FULL_ENV_FILTER, full_logs_enabled};
 pub use models::*;

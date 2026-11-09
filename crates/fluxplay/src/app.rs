@@ -2300,16 +2300,16 @@ impl FluxPlay {
             self.video_frame_wh = (0, 0);
             self.clear_stage_picture();
             // Soft RGBA used the shared GPU image cache — bump poster handles (new iced
-            // ids) then warm-fetch anything missing; art_warm alone skips RAM hits.
+            // ids) then reload only on-screen art (no off-screen warm).
             self.refresh_browse_poster_gpu_textures();
             self.art_warm_cursor = 0;
-            self.art_warm_active = !self.browse_index.is_empty();
+            self.art_warm_active = false;
         } else if !self.browse_index.is_empty() {
             // Playback ended or zapped without clearing the stage — mosaic can still
             // sample stale atlas regions from soft RGBA uploads.
             self.refresh_browse_poster_gpu_textures();
             self.art_warm_cursor = 0;
-            self.art_warm_active = true;
+            self.art_warm_active = false;
         }
         #[cfg(target_os = "android")]
         {
@@ -3257,8 +3257,8 @@ impl FluxPlay {
                 let page = self.browse_page();
                 let base = self.list_limit.max(page);
                 self.list_limit = base.saturating_add(page).min(10_000);
-                self.art_warm_active = true;
-                return Task::batch([self.refresh_browse_art(), self.queue_visible_ages()]);
+                self.art_warm_active = false;
+                return Task::batch([self.prefetch_visible_art(), self.queue_visible_ages()]);
             }
             Message::BrowseScrolled(y, view_h) => {
                 let view_h = view_h.max(1.0);
@@ -8686,9 +8686,9 @@ impl FluxPlay {
 
 
     fn finish_browse_index_rebuild(&mut self) {
-        self.art_warm_active = !self.browse_index.is_empty()
-            && self.vod_detail.is_none()
-            && !(matches!(self.tab, Tab::Series) && self.series_detail.is_some());
+        // Visible-only posters — « Voir plus » unlocks more tiles without warm.
+        self.art_warm_active = false;
+        self.art_warm_cursor = 0;
         self.browse_slice =
             self.content_virtual_slice(self.browse_scroll_y, self.browse_view_h);
     }
@@ -9501,32 +9501,32 @@ impl FluxPlay {
     }
 
     /// Prefetch posters for the current browse selection at profile load/reload.
-    /// Walks `browse_index` in order (what the user will scroll) — not catalog tip.
+    /// Visible unlocked page only — no off-screen warm (RAM ceiling).
     fn prefetch_catalog_art(&mut self) -> Task<Message> {
         if self.browse_parked {
             return Task::none();
         }
         self.art_warm_cursor = 0;
-        self.art_warm_active = !self.browse_index.is_empty();
+        self.art_warm_active = false;
         self.refresh_browse_art()
     }
 
-    /// Visible window + background warm of the current filter.
+    /// Visible window only (off-screen warm disabled — mosaïque paginée).
     fn refresh_browse_art(&mut self) -> Task<Message> {
-        Task::batch([self.prefetch_visible_art(), self.pump_art_warm()])
+        self.art_warm_active = false;
+        self.prefetch_visible_art()
     }
 
     fn continue_art_warm(&mut self) -> Task<Message> {
-        if self.browse_parked || !self.art_warm_active || self.browse_flinging() {
-            return Task::none();
-        }
-        self.pump_art_warm()
+        let _ = self;
+        Task::none()
     }
 
-    /// How many browse_index entries to warm after load (~8–12 mosaic screens).
+    /// Soft-stage GPU refresh / legacy warm bound — unlocked list page only.
     fn art_warm_target(&self) -> usize {
-        let cols = self.layout_metrics().cols.max(1);
-        (cols.saturating_mul(56)).clamp(160, 560).min(self.browse_index.len())
+        self.list_limit
+            .min(crate::images::MAX_RAM_HANDLES.saturating_sub(16))
+            .min(self.browse_index.len())
     }
 
     fn art_url_for_browse_pos(&self, pos: usize) -> Option<String> {
@@ -9669,80 +9669,6 @@ impl FluxPlay {
         for (url, sid) in urls {
             self.images.refresh_gpu_texture(&url, sid);
         }
-    }
-
-    /// Fill inflight slots from browse_index[art_warm_cursor..] until warm target.
-    fn pump_art_warm(&mut self) -> Task<Message> {
-        if !self.art_warm_active {
-            return Task::none();
-        }
-        // Films and series: stay on the rows in front of the user. Warming the
-        // catalog from the top filled every slot, so scrolled posters never started.
-        let posters = matches!(self.tab, Tab::Vod | Tab::Series)
-            && self.vod_detail.is_none()
-            && self.series_detail.is_none();
-        let target = if posters {
-            let (cols, tile_w) = self.poster_grid();
-            let screen = self.onscreen_browse_range(cols, tile_w);
-            let ahead = screen
-                .end
-                .saturating_add(cols)
-                .min(self.mounted_limit())
-                .min(self.browse_index.len());
-            if self.art_warm_cursor + cols < screen.start || self.art_warm_cursor > ahead {
-                self.art_warm_cursor = screen.start;
-            }
-            ahead
-        } else {
-            self.art_warm_target().min(self.mounted_limit())
-        };
-        if self.art_warm_cursor >= target {
-            if !posters || target >= self.browse_index.len() {
-                self.art_warm_active = false;
-            }
-            return Task::none();
-        }
-        let mut tasks = Vec::new();
-        let room = self.images.max_inflight
-            .saturating_sub(self.images.inflight_len())
-            .min(18);
-        if room == 0 {
-            return Task::none();
-        }
-        while self.art_warm_cursor < target && tasks.len() < room {
-            if self.images.inflight_len() + tasks.len() >= self.images.max_inflight {
-                break;
-            }
-            let Some(url) = self.art_url_for_browse_pos(self.art_warm_cursor) else {
-                self.art_warm_cursor += 1;
-                continue;
-            };
-            let sid = self.art_url_source_at(self.art_warm_cursor);
-            match self.images.request(&url, sid) {
-                crate::images::RequestOutcome::Fetch { url: u, source_id } => {
-                    self.art_warm_cursor += 1;
-                    tasks.push(Task::perform(
-                        crate::images::fetch_image_prepared_edged(u, source_id, self.images.decode_edge_px),
-                        Message::ImageLoaded,
-                    ));
-                }
-                crate::images::RequestOutcome::Ready
-                | crate::images::RequestOutcome::Pending
-                | crate::images::RequestOutcome::Skip => {
-                    self.art_warm_cursor += 1;
-                }
-            }
-        }
-        if self.art_warm_cursor >= target && (!posters || target >= self.browse_index.len()) {
-            self.art_warm_active = false;
-        }
-        if tasks.is_empty() {
-            return Task::none();
-        }
-        let n = tasks.len() as u64;
-        let (d, t) = self.jobs.images.snapshot();
-        self.jobs.images.set_total(t.saturating_add(n).max(d + n));
-        Task::batch(tasks)
     }
 
     fn prefetch_visible_art(&mut self) -> Task<Message> {

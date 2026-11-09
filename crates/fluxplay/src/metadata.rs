@@ -147,12 +147,6 @@ pub fn parse_title_query(raw: &str) -> TitleQuery {
     TitleQuery { title, year }
 }
 
-/// Back-compat: title only.
-#[allow(dead_code)]
-pub fn clean_title(raw: &str) -> String {
-    parse_title_query(raw).title
-}
-
 fn extract_year(s: &str) -> Option<String> {
     // Prefer (YYYY) then [YYYY]
     for (open, close) in [('(', ')'), ('[', ']')] {
