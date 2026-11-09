@@ -227,16 +227,21 @@ where
         shell: &mut Shell<'_, Message>,
         viewport: &Rectangle,
     ) {
-        self.content.as_widget_mut().update(
-            &mut tree.children[0],
-            event,
-            layout,
-            cursor,
-            renderer,
-            clipboard,
-            shell,
-            viewport,
-        );
+        // A child shifted outside this area (virtual mosaic `pin`) must not
+        // take the click that landed on a sibling, such as the search field.
+        let pointer = matches!(event, Event::Mouse(_) | Event::Touch(_));
+        if !pointer || cursor.is_over(layout.bounds()) {
+            self.content.as_widget_mut().update(
+                &mut tree.children[0],
+                event,
+                layout,
+                cursor,
+                renderer,
+                clipboard,
+                shell,
+                viewport,
+            );
+        }
 
         if shell.is_event_captured() {
             return;

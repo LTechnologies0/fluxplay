@@ -272,7 +272,7 @@ fn derive_tuning(probe: &DisplayProbe, gui_hz: u32) -> RuntimeTuning {
         .clamp(1, 6);
 
     let mut image_inflight: usize = match (probe.gpu_topology.display_tier(), cores) {
-        (GpuTier::Discrete, c) if c >= 8 => 28,
+        (GpuTier::Discrete, c) if c >= 8 => 36,
         (GpuTier::Discrete, _) => 22,
         (GpuTier::Integrated, c) if c >= 8 => 16,
         (GpuTier::Integrated, _) => 12,
@@ -291,7 +291,7 @@ fn derive_tuning(probe: &DisplayProbe, gui_hz: u32) -> RuntimeTuning {
     let image_inflight = env_u32("FLUXPLAY_IMAGE_INFLIGHT")
         .map(|v| v as usize)
         .unwrap_or(image_inflight)
-        .clamp(4, 32);
+        .clamp(4, 48);
 
     let image_prefetch = ((gui_hz / 8).max(6) as usize)
         .min(24)

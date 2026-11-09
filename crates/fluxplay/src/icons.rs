@@ -17,6 +17,8 @@ pub enum Icon {
     Movie,
     Series,
     Favorite,
+    /// Filled heart, used once a title is in the favorites.
+    FavoriteFilled,
     Epg,
     Sources,
     Settings,
@@ -29,6 +31,8 @@ pub enum Icon {
     VolumeUp,
     VolumeOff,
     Fullscreen,
+    /// Corners inward — leave fullscreen.
+    FullscreenExit,
     Close,
     More,
     Search,
@@ -37,11 +41,17 @@ pub enum Icon {
     Check,
     Replay10,
     Forward10,
+    #[allow(dead_code)]
     Stop,
     #[allow(dead_code)]
     Playlist,
     SkipPrevious,
     SkipNext,
+    ChevronLeft,
+    ChevronRight,
+    ExpandMore,
+    /// Episode alert on a series that is already out.
+    Bell,
 }
 
 impl Icon {
@@ -52,6 +62,7 @@ impl Icon {
             Self::Movie => include_bytes!("../assets/icons/movie.svg"),
             Self::Series => include_bytes!("../assets/icons/video_library.svg"),
             Self::Favorite => include_bytes!("../assets/icons/favorite.svg"),
+            Self::FavoriteFilled => include_bytes!("../assets/icons/favorite_filled.svg"),
             Self::Epg => include_bytes!("../assets/icons/calendar_month.svg"),
             Self::Sources => include_bytes!("../assets/icons/dns.svg"),
             Self::Settings => include_bytes!("../assets/icons/settings.svg"),
@@ -64,6 +75,7 @@ impl Icon {
             Self::VolumeUp => include_bytes!("../assets/icons/volume_up.svg"),
             Self::VolumeOff => include_bytes!("../assets/icons/volume_off.svg"),
             Self::Fullscreen => include_bytes!("../assets/icons/fullscreen.svg"),
+            Self::FullscreenExit => include_bytes!("../assets/icons/fullscreen_exit.svg"),
             Self::Close => include_bytes!("../assets/icons/close.svg"),
             Self::More => include_bytes!("../assets/icons/more_horiz.svg"),
             Self::Search => include_bytes!("../assets/icons/search.svg"),
@@ -76,6 +88,10 @@ impl Icon {
             Self::Playlist => include_bytes!("../assets/icons/playlist_play.svg"),
             Self::SkipPrevious => include_bytes!("../assets/icons/skip_previous.svg"),
             Self::SkipNext => include_bytes!("../assets/icons/skip_next.svg"),
+            Self::ChevronLeft => include_bytes!("../assets/icons/chevron_left.svg"),
+            Self::ChevronRight => include_bytes!("../assets/icons/chevron_right.svg"),
+            Self::ExpandMore => include_bytes!("../assets/icons/expand_more.svg"),
+            Self::Bell => include_bytes!("../assets/icons/notifications.svg"),
         }
     }
 
@@ -91,7 +107,9 @@ impl Icon {
             Self::LiveTv => include_bytes!("../assets/icons/png/live_tv.png"),
             Self::Movie => include_bytes!("../assets/icons/png/movie.png"),
             Self::Series => include_bytes!("../assets/icons/png/video_library.png"),
-            Self::Favorite => include_bytes!("../assets/icons/png/favorite.png"),
+            Self::Favorite | Self::FavoriteFilled => {
+                include_bytes!("../assets/icons/png/favorite.png")
+            }
             Self::Epg => include_bytes!("../assets/icons/png/calendar_month.png"),
             Self::Sources => include_bytes!("../assets/icons/png/dns.png"),
             Self::Settings => include_bytes!("../assets/icons/png/settings.png"),
@@ -103,7 +121,9 @@ impl Icon {
             Self::Pause => include_bytes!("../assets/icons/png/pause.png"),
             Self::VolumeUp => include_bytes!("../assets/icons/png/volume_up.png"),
             Self::VolumeOff => include_bytes!("../assets/icons/png/volume_off.png"),
-            Self::Fullscreen => include_bytes!("../assets/icons/png/fullscreen.png"),
+            Self::Fullscreen | Self::FullscreenExit => {
+                include_bytes!("../assets/icons/png/fullscreen.png")
+            }
             Self::Close => include_bytes!("../assets/icons/png/close.png"),
             Self::More => include_bytes!("../assets/icons/png/more_horiz.png"),
             Self::Search => include_bytes!("../assets/icons/png/search.png"),
@@ -116,6 +136,9 @@ impl Icon {
             Self::Playlist => include_bytes!("../assets/icons/png/playlist_play.png"),
             Self::SkipPrevious => include_bytes!("../assets/icons/png/skip_previous.png"),
             Self::SkipNext => include_bytes!("../assets/icons/png/skip_next.png"),
+            Self::ChevronLeft | Self::ChevronRight | Self::ExpandMore | Self::Bell => {
+                return None
+            }
         })
     }
 
@@ -127,6 +150,7 @@ impl Icon {
             Self::Movie => "VID",
             Self::Series => "SER",
             Self::Favorite => "*",
+            Self::FavoriteFilled => "*",
             Self::Epg => "EPG",
             Self::Sources => "SRC",
             Self::Settings => "SET",
@@ -139,6 +163,7 @@ impl Icon {
             Self::VolumeUp => "VOL",
             Self::VolumeOff => "MUT",
             Self::Fullscreen => "FS",
+            Self::FullscreenExit => "FS",
             Self::Close => "X",
             Self::More => "...",
             Self::Search => "?",
@@ -151,6 +176,10 @@ impl Icon {
             Self::Playlist => "PL",
             Self::SkipPrevious => "<<",
             Self::SkipNext => ">>",
+            Self::ChevronLeft => "<",
+            Self::ChevronRight => ">",
+            Self::ExpandMore => "v",
+            Self::Bell => "!",
         }
     }
 }
