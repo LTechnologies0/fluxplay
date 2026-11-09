@@ -1,6 +1,6 @@
 //! Minimal libmpv client + software render bindings (embedded video in iced).
 
-#![allow(non_camel_case_types, dead_code)]
+#![allow(non_camel_case_types)]
 
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int, c_void};
@@ -329,6 +329,7 @@ impl LibMpv {
     }
 
     /// Set a pre-init option as int64 (Android `wid` = Surface jobject pointer).
+    #[cfg(target_os = "android")]
     pub fn set_option_i64(&self, name: &str, value: i64) -> Result<()> {
         #[cfg_attr(windows, link(name = "libmpv-2", kind = "raw-dylib"))]
         extern "C" {
@@ -471,10 +472,6 @@ impl LibMpv {
             .into_owned();
         unsafe { mpv_free(p as *mut c_void) };
         Some(s)
-    }
-
-    pub fn get_property_f64(&self, name: &str) -> Option<f64> {
-        self.get_property_string(name)?.parse().ok()
     }
 
     /// Fast typed read — no mpv heap-string round-trip (hot path: per-tick polls).

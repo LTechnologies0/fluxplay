@@ -3,8 +3,6 @@
 //!
 //! Public helpers include sync-fallback / tooling APIs not always on the hot path.
 
-#![allow(dead_code)]
-
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -18,6 +16,7 @@ use tracing::{debug, info, trace, warn};
 use uuid::Uuid;
 
 use crate::async_jobs::{JobProgress, DEFAULT_CHUNK};
+use crate::browse_tiles::BrowseTile;
 
 /// Skip portal re-sync when last full sync is younger than this.
 pub const SYNC_FRESH_SECS: u64 = 12 * 3600;
@@ -26,9 +25,16 @@ pub const SYNC_FRESH_SECS: u64 = 12 * 3600;
 #[derive(Debug)]
 pub struct BundleApplyResult {
     pub kind: BundleApplyKind,
-    pub checksum: String,
-    /// Merged catalog slice for this source (enrichment preserved). `None` if unchanged.
-    pub merged: Option<PlaylistBundle>,
+}
+
+/// Boot spine: categories + EPG + counts. No VOD/series/channel payloads in RAM.
+#[derive(Debug, Clone, Default)]
+pub struct CatalogSpine {
+    pub categories: Vec<Category>,
+    pub epg: Vec<EpgProgramme>,
+    pub channel_count: usize,
+    pub vod_count: usize,
+    pub series_count: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -88,8 +94,9 @@ impl CatalogDb {
         }
         let _ = std::fs::create_dir_all(crate::storage::profile_images_dir(source_id));
         let conn = Connection::open(&path)?;
-        // Small page cache, no mmap of the whole file. Rows are read by query, not mapped in.
-        let _ = conn.pragma_update(None, "cache_size", -2048i64);
+        // ~8 MiB page cache (was 2) — mosaic OFFSET pages stay warm while scrolling.
+        // Still no mmap of the whole catalog file into RSS.
+        let _ = conn.pragma_update(None, "cache_size", -8192i64);
         let _ = conn.pragma_update(None, "mmap_size", 0i64);
         migrate_schema(&conn)?;
         self.conns.insert(source_id, conn);
@@ -103,10 +110,6 @@ impl CatalogDb {
 
     fn conn(&self, source_id: Uuid) -> rusqlite::Result<&Connection> {
         self.conns.get(&source_id).ok_or(rusqlite::Error::InvalidQuery)
-    }
-
-    fn any_conn(&self) -> Option<&Connection> {
-        self.conns.values().next()
     }
 
     fn meta_get_conn(conn: &Connection, key: &str) -> Option<String> {
@@ -148,12 +151,6 @@ impl CatalogDb {
         let _ = conn.execute_batch("PRAGMA optimize;");
     }
 
-    pub fn mark_all_full_sync_now(&self) {
-        for id in self.source_ids() {
-            self.mark_full_sync_now(id);
-        }
-    }
-
     /// True when every open profile is warm enough to skip portal re-sync.
     pub fn is_sync_fresh(&self) -> bool {
         if self.conns.is_empty() {
@@ -188,16 +185,7 @@ impl CatalogDb {
         Ok(())
     }
 
-    /// Apply a portal dump: skip when checksum matches; otherwise upsert + keep OMDb/meta.
-    pub fn apply_source_bundle(
-        &mut self,
-        source_id: Uuid,
-        part: PlaylistBundle,
-    ) -> rusqlite::Result<BundleApplyResult> {
-        self.apply_source_bundle_progressive(source_id, part, None)
-    }
-
-    /// Same as [`apply_source_bundle`] with optional atomic progress (chunked upserts).
+    /// Same as a full portal apply with optional atomic progress (chunked upserts).
     pub fn apply_source_bundle_progressive(
         &mut self,
         source_id: Uuid,
@@ -218,8 +206,6 @@ impl CatalogDb {
             );
             return Ok(BundleApplyResult {
                 kind: BundleApplyKind::Unchanged,
-                checksum,
-                merged: None,
             });
         }
 
@@ -292,14 +278,21 @@ impl CatalogDb {
         {
             let mut keep = tx.prepare("INSERT OR IGNORE INTO _keep_ch(id) VALUES(?1)")?;
             let mut stmt = tx.prepare(
-                "INSERT INTO channels (source_id, id, payload, name) VALUES (?1,?2,?3,?4)
-                 ON CONFLICT(source_id, id) DO UPDATE SET payload=excluded.payload, name=excluded.name",
+                "INSERT INTO channels (source_id, id, payload, name, logo)
+                 VALUES (?1,?2,?3,?4,?5)
+                 ON CONFLICT(source_id, id) DO UPDATE SET
+                   payload=excluded.payload, name=excluded.name, logo=excluded.logo",
             )?;
             for chunk in merged.channels.chunks(DEFAULT_CHUNK) {
                 for ch in chunk {
                     let payload = serde_json::to_string(ch).unwrap_or_default();
+                    let logo = ch
+                        .logo
+                        .as_deref()
+                        .or(ch.tvg_logo.as_deref())
+                        .map(str::to_string);
                     keep.execute(params![ch.id])?;
-                    stmt.execute(params![sid, ch.id, payload, ch.name])?;
+                    stmt.execute(params![sid, ch.id, payload, ch.name, logo])?;
                 }
                 if let Some(p) = progress {
                     p.add_done(chunk.len() as u64);
@@ -309,15 +302,17 @@ impl CatalogDb {
         {
             let mut keep = tx.prepare("INSERT OR IGNORE INTO _keep_vod(id) VALUES(?1)")?;
             let mut stmt = tx.prepare(
-                "INSERT INTO vod (source_id, id, payload, name, year, genre, category_id, meta_ok)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8)
+                "INSERT INTO vod (source_id, id, payload, name, year, genre, category_id, meta_ok, poster, rating)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)
                  ON CONFLICT(source_id, id) DO UPDATE SET
                    payload=excluded.payload,
                    name=excluded.name,
                    year=excluded.year,
                    genre=excluded.genre,
                    category_id=excluded.category_id,
-                   meta_ok=excluded.meta_ok",
+                   meta_ok=excluded.meta_ok,
+                   poster=excluded.poster,
+                   rating=excluded.rating",
             )?;
             for chunk in merged.vod.chunks(DEFAULT_CHUNK) {
                 for v in chunk {
@@ -332,7 +327,9 @@ impl CatalogDb {
                         v.year,
                         v.genre,
                         v.category_id,
-                        meta_ok
+                        meta_ok,
+                        v.poster,
+                        v.rating,
                     ])?;
                 }
                 if let Some(p) = progress {
@@ -343,20 +340,23 @@ impl CatalogDb {
         {
             let mut keep = tx.prepare("INSERT OR IGNORE INTO _keep_ser(id) VALUES(?1)")?;
             let mut stmt = tx.prepare(
-                "INSERT INTO series (source_id, id, payload, name, year, genre, category_id, meta_ok)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8)
+                "INSERT INTO series (source_id, id, payload, name, year, genre, category_id, meta_ok, cover, rating)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)
                  ON CONFLICT(source_id, id) DO UPDATE SET
                    payload=excluded.payload,
                    name=excluded.name,
                    year=excluded.year,
                    genre=excluded.genre,
                    category_id=excluded.category_id,
-                   meta_ok=excluded.meta_ok",
+                   meta_ok=excluded.meta_ok,
+                   cover=excluded.cover,
+                   rating=excluded.rating",
             )?;
             for chunk in merged.series.chunks(DEFAULT_CHUNK) {
                 for s in chunk {
                     let payload = serde_json::to_string(s).unwrap_or_default();
                     let meta_ok = if series_meta_ok(s) { 1i64 } else { 0 };
+                    let cover = s.cover.clone().or_else(|| s.banner.clone());
                     keep.execute(params![s.id])?;
                     stmt.execute(params![
                         sid,
@@ -366,7 +366,9 @@ impl CatalogDb {
                         s.year,
                         s.genre,
                         s.category_id,
-                        meta_ok
+                        meta_ok,
+                        cover,
+                        s.rating,
                     ])?;
                 }
                 if let Some(p) = progress {
@@ -426,19 +428,7 @@ impl CatalogDb {
 
         Ok(BundleApplyResult {
             kind: BundleApplyKind::Updated { preserved_meta },
-            checksum,
-            merged: Some(merged),
         })
-    }
-
-    /// Legacy full replace — prefers [`apply_source_bundle`].
-    pub fn replace_source_bundle(
-        &mut self,
-        source_id: Uuid,
-        part: &PlaylistBundle,
-    ) -> rusqlite::Result<()> {
-        let _ = self.apply_source_bundle(source_id, part.clone())?;
-        Ok(())
     }
 
     fn load_enriched_vod_map(
@@ -588,130 +578,6 @@ impl CatalogDb {
             }
         }
         None
-    }
-
-    /// A window of payloads. `offset` is the row to start at, `limit` the page size.
-    pub fn page_payloads(&self, table: &str, offset: usize, limit: usize) -> Vec<String> {
-        let table = match table {
-            "vod" | "series" | "channels" | "epg" => table,
-            _ => return Vec::new(),
-        };
-        let sql = format!("SELECT payload FROM {table} LIMIT ?1 OFFSET ?2");
-        let mut out = Vec::new();
-        for conn in self.conns.values() {
-            if out.len() >= limit {
-                break;
-            }
-            let Ok(mut stmt) = conn.prepare(&sql) else {
-                continue;
-            };
-            let Ok(rows) = stmt.query_map(
-                rusqlite::params![limit as i64, offset as i64],
-                |row| row.get::<_, String>(0),
-            ) else {
-                continue;
-            };
-            for raw in rows.flatten() {
-                out.push(raw);
-                if out.len() >= limit {
-                    break;
-                }
-            }
-        }
-        out
-    }
-
-    pub fn load_bundle(&self) -> rusqlite::Result<PlaylistBundle> {
-        self.load_bundle_of(&self.source_ids())
-    }
-
-    /// Catalog of these profiles only: every folder under `profiles/` is opened, including
-    /// removed, disabled or demo profiles whose rows must not reach the UI.
-    pub fn load_bundle_of(&self, ids: &[Uuid]) -> rusqlite::Result<PlaylistBundle> {
-        let _prof = fluxplay_core::Stopwatch::start("catalog_load_bundle");
-        let mut bundle = PlaylistBundle::default();
-        for &id in ids {
-            let Ok(conn) = self.conn(id) else {
-                continue;
-            };
-            Self::load_bundle_from_conn(conn, &mut bundle)?;
-        }
-        info!(
-            categories = bundle.categories.len(),
-            channels = bundle.channels.len(),
-            vod = bundle.vod.len(),
-            series = bundle.series.len(),
-            epg = bundle.epg.len(),
-            "catalog load_bundle"
-        );
-        Ok(bundle)
-    }
-
-    fn load_bundle_from_conn(conn: &Connection, bundle: &mut PlaylistBundle) -> rusqlite::Result<()> {
-        {
-            let mut stmt = conn.prepare("SELECT id, name, content FROM categories")?;
-            let rows = stmt.query_map([], |row| {
-                let content: String = row.get(2)?;
-                Ok(Category {
-                    id: row.get(0)?,
-                    name: row.get(1)?,
-                    content: match content.as_str() {
-                        "vod" => ContentKind::Vod,
-                        "series" => ContentKind::Series,
-                        _ => ContentKind::Live,
-                    },
-                })
-            })?;
-            for r in rows.flatten() {
-                bundle.categories.push(r);
-            }
-        }
-        {
-            let mut stmt = conn.prepare("SELECT payload FROM channels")?;
-            let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
-            for raw in rows.flatten() {
-                if let Ok(ch) = serde_json::from_str::<Channel>(&raw) {
-                    bundle.channels.push(ch);
-                }
-            }
-        }
-        {
-            let mut stmt = conn.prepare("SELECT payload FROM vod")?;
-            let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
-            for raw in rows.flatten() {
-                if let Ok(v) = serde_json::from_str::<VodItem>(&raw) {
-                    bundle.vod.push(v);
-                }
-            }
-        }
-        {
-            let mut stmt = conn.prepare("SELECT payload FROM series")?;
-            let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
-            for raw in rows.flatten() {
-                if let Ok(mut s) = serde_json::from_str::<SeriesItem>(&raw) {
-                    // Episode trees stay in the row. Opening a series reads that one payload.
-                    s.seasons.clear();
-                    bundle.series.push(s);
-                }
-            }
-        }
-        {
-            // What is on now and next, not the far future: `DESC LIMIT` kept the last
-            // 8000 programmes of the guide and dropped today's.
-            let now = chrono::Utc::now();
-            let from = (now - chrono::Duration::hours(6)).to_rfc3339();
-            let to = (now + chrono::Duration::hours(48)).to_rfc3339();
-            let mut stmt = conn.prepare(
-                "SELECT payload FROM epg WHERE start_ts >= ?1 AND start_ts <= ?2 ORDER BY start_ts LIMIT 8000",
-            )?;
-            let rows = stmt.query_map(params![from, to], |row| row.get::<_, String>(0))?;
-            for raw in rows.flatten() {
-                if let Ok(p) = serde_json::from_str::<EpgProgramme>(&raw) {
-                    bundle.epg.push(p);
-                }
-            }
-        }
-        Ok(())
     }
 
     /// Ids only: the browse index maps them to rows already in RAM, so full
@@ -884,75 +750,6 @@ impl CatalogDb {
         out
     }
 
-    // Column-per-arg mirrors the DB schema; a params struct would duplicate the row type.
-    #[allow(clippy::too_many_arguments)]
-    pub fn update_vod_meta(
-        &self,
-        source_id: Uuid,
-        id: &str,
-        year: Option<&str>,
-        genre: Option<&str>,
-        plot: Option<&str>,
-        poster: Option<&str>,
-        rating: Option<&str>,
-        imdb_id: Option<&str>,
-    ) -> rusqlite::Result<()> {
-        let sid = source_id.to_string();
-        let Ok(conn) = self.conn(source_id) else {
-            return Ok(());
-        };
-        let raw: Option<String> = conn
-            .query_row(
-                "SELECT payload FROM vod WHERE source_id = ?1 AND id = ?2",
-                params![sid, id],
-                |row| row.get(0),
-            )
-            .optional()?;
-        let Some(raw) = raw else {
-            return Ok(());
-        };
-        let mut item: VodItem = serde_json::from_str(&raw).unwrap_or_else(|_| VodItem {
-            id: id.to_string(),
-            name: String::new(),
-            stream_url: String::new(),
-            poster: None,
-            plot: None,
-            year: None,
-            rating: None,
-            genre: None,
-            imdb_id: None,
-            actors: None,
-            director: None,
-            writer: None,
-            runtime: None,
-            rated: None,
-            awards: None,
-            language: None,
-            country: None,
-            category_id: None,
-            source_id: Some(source_id),
-        });
-        if year.is_some() {
-            item.year = year.map(str::to_string);
-        }
-        if genre.is_some() {
-            item.genre = genre.map(str::to_string);
-        }
-        if plot.is_some() {
-            item.plot = plot.map(str::to_string);
-        }
-        if poster.is_some() {
-            item.poster = poster.map(str::to_string);
-        }
-        if rating.is_some() {
-            item.rating = rating.map(str::to_string);
-        }
-        if imdb_id.is_some() {
-            item.imdb_id = imdb_id.map(str::to_string);
-        }
-        self.persist_vod(&item)
-    }
-
     /// Write full VOD JSON payload (credits, ratings, IMDb id, …).
     pub fn persist_vod(&self, item: &VodItem) -> rusqlite::Result<()> {
         let Some(source_id) = item.source_id else {
@@ -964,81 +761,20 @@ impl CatalogDb {
             return Ok(());
         };
         conn.execute(
-            "UPDATE vod SET payload = ?1, year = ?2, genre = ?3, meta_ok = 1
-             WHERE source_id = ?4 AND id = ?5",
-            params![payload, item.year, item.genre, sid, item.id],
+            "UPDATE vod SET payload = ?1, year = ?2, genre = ?3, meta_ok = 1,
+             poster = ?4, rating = ?5
+             WHERE source_id = ?6 AND id = ?7",
+            params![
+                payload,
+                item.year,
+                item.genre,
+                item.poster,
+                item.rating,
+                sid,
+                item.id
+            ],
         )?;
         Ok(())
-    }
-
-    // Column-per-arg mirrors the DB schema; a params struct would duplicate the row type.
-    #[allow(clippy::too_many_arguments)]
-    pub fn update_series_meta(
-        &self,
-        source_id: Uuid,
-        id: &str,
-        year: Option<&str>,
-        genre: Option<&str>,
-        plot: Option<&str>,
-        cover: Option<&str>,
-        rating: Option<&str>,
-        imdb_id: Option<&str>,
-    ) -> rusqlite::Result<()> {
-        let sid = source_id.to_string();
-        let Ok(conn) = self.conn(source_id) else {
-            return Ok(());
-        };
-        let raw: Option<String> = conn
-            .query_row(
-                "SELECT payload FROM series WHERE source_id = ?1 AND id = ?2",
-                params![sid, id],
-                |row| row.get(0),
-            )
-            .optional()?;
-        let Some(raw) = raw else {
-            return Ok(());
-        };
-        let mut item: SeriesItem = serde_json::from_str(&raw).unwrap_or_else(|_| SeriesItem {
-            id: id.to_string(),
-            name: String::new(),
-            cover: None,
-            banner: None,
-            plot: None,
-            year: None,
-            rating: None,
-            genre: None,
-            imdb_id: None,
-            actors: None,
-            director: None,
-            writer: None,
-            runtime: None,
-            rated: None,
-            awards: None,
-            language: None,
-            country: None,
-            seasons: Vec::new(),
-            source_id: Some(source_id),
-            category_id: None,
-        });
-        if year.is_some() {
-            item.year = year.map(str::to_string);
-        }
-        if genre.is_some() {
-            item.genre = genre.map(str::to_string);
-        }
-        if plot.is_some() {
-            item.plot = plot.map(str::to_string);
-        }
-        if cover.is_some() {
-            item.cover = cover.map(str::to_string);
-        }
-        if rating.is_some() {
-            item.rating = rating.map(str::to_string);
-        }
-        if imdb_id.is_some() {
-            item.imdb_id = imdb_id.map(str::to_string);
-        }
-        self.persist_series(&item)
     }
 
     /// Write full series JSON payload (credits, seasons, IMDb id, …).
@@ -1051,10 +787,20 @@ impl CatalogDb {
         let Ok(conn) = self.conn(source_id) else {
             return Ok(());
         };
+        let cover = item.cover.clone().or_else(|| item.banner.clone());
         conn.execute(
-            "UPDATE series SET payload = ?1, year = ?2, genre = ?3, meta_ok = 1
-             WHERE source_id = ?4 AND id = ?5",
-            params![payload, item.year, item.genre, sid, item.id],
+            "UPDATE series SET payload = ?1, year = ?2, genre = ?3, meta_ok = 1,
+             cover = ?4, rating = ?5
+             WHERE source_id = ?6 AND id = ?7",
+            params![
+                payload,
+                item.year,
+                item.genre,
+                cover,
+                item.rating,
+                sid,
+                item.id
+            ],
         )?;
         Ok(())
     }
@@ -1166,10 +912,17 @@ impl CatalogDb {
     }
 
     pub fn counts(&self) -> (usize, usize, usize) {
+        self.counts_of(&self.source_ids())
+    }
+
+    pub fn counts_of(&self, ids: &[Uuid]) -> (usize, usize, usize) {
         let mut ch = 0usize;
         let mut vod = 0usize;
         let mut series = 0usize;
-        for conn in self.conns.values() {
+        for &id in ids {
+            let Ok(conn) = self.conn(id) else {
+                continue;
+            };
             ch += conn
                 .query_row("SELECT COUNT(*) FROM channels", [], |r| r.get::<_, i64>(0))
                 .unwrap_or(0) as usize;
@@ -1181,6 +934,752 @@ impl CatalogDb {
                 .unwrap_or(0) as usize;
         }
         (ch, vod, series)
+    }
+
+    /// Categories + EPG + counts — never deserializes VOD/series/channel payloads.
+    pub fn load_spine_of(&self, ids: &[Uuid]) -> rusqlite::Result<CatalogSpine> {
+        let mut spine = CatalogSpine::default();
+        for &id in ids {
+            let Ok(conn) = self.conn(id) else {
+                continue;
+            };
+            Self::load_spine_from_conn(conn, &mut spine)?;
+        }
+        let (ch, vod, series) = self.counts_of(ids);
+        spine.channel_count = ch;
+        spine.vod_count = vod;
+        spine.series_count = series;
+        info!(
+            categories = spine.categories.len(),
+            channels = spine.channel_count,
+            vod = spine.vod_count,
+            series = spine.series_count,
+            "catalog load_spine"
+        );
+        Ok(spine)
+    }
+
+    fn load_spine_from_conn(conn: &Connection, spine: &mut CatalogSpine) -> rusqlite::Result<()> {
+        {
+            let mut stmt = conn.prepare("SELECT id, name, content FROM categories")?;
+            let rows = stmt.query_map([], |row| {
+                let content: String = row.get(2)?;
+                Ok(Category {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    content: match content.as_str() {
+                        "vod" => ContentKind::Vod,
+                        "series" => ContentKind::Series,
+                        _ => ContentKind::Live,
+                    },
+                })
+            })?;
+            for r in rows.flatten() {
+                spine.categories.push(r);
+            }
+        }
+        {
+            let now = chrono::Utc::now();
+            let from = (now - chrono::Duration::hours(6)).to_rfc3339();
+            let to = (now + chrono::Duration::hours(48)).to_rfc3339();
+            let mut stmt = conn.prepare(
+                "SELECT payload FROM epg WHERE start_ts >= ?1 AND start_ts <= ?2 ORDER BY start_ts LIMIT 8000",
+            )?;
+            let rows = stmt.query_map(params![from, to], |row| row.get::<_, String>(0))?;
+            for raw in rows.flatten() {
+                if let Ok(p) = serde_json::from_str::<EpgProgramme>(&raw) {
+                    spine.epg.push(p);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Mosaic VOD rows (`ORDER BY rowid` = catalog / identity browse order).
+    pub fn browse_tiles_vod(
+        &self,
+        ids: &[Uuid],
+        offset: usize,
+        limit: usize,
+        category_id: Option<&str>,
+    ) -> Vec<BrowseTile> {
+        self.query_browse_tiles(ids, "vod", offset, limit, category_id)
+    }
+
+    pub fn browse_tiles_series(
+        &self,
+        ids: &[Uuid],
+        offset: usize,
+        limit: usize,
+        category_id: Option<&str>,
+    ) -> Vec<BrowseTile> {
+        self.query_browse_tiles(ids, "series", offset, limit, category_id)
+    }
+
+    pub fn browse_tiles_channels(
+        &self,
+        ids: &[Uuid],
+        offset: usize,
+        limit: usize,
+        group: Option<&str>,
+    ) -> Vec<BrowseTile> {
+        let mut out = Vec::with_capacity(limit.min(512));
+        let mut skip = offset;
+        let mut need = limit;
+        let group_f = group.filter(|g| !g.is_empty() && *g != "Tous" && *g != "*");
+        for &source_id in ids {
+            if need == 0 {
+                break;
+            }
+            let Ok(conn) = self.conn(source_id) else {
+                continue;
+            };
+            let n = if let Some(g) = group_f {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM channels WHERE json_extract(payload, '$.group') = ?1",
+                    params![g],
+                    |r| r.get::<_, i64>(0),
+                )
+                .unwrap_or(0) as usize
+            } else {
+                conn.query_row("SELECT COUNT(*) FROM channels", [], |r| r.get::<_, i64>(0))
+                    .unwrap_or(0) as usize
+            };
+            if skip >= n {
+                skip -= n;
+                continue;
+            }
+            let sql = if group_f.is_some() {
+                "SELECT id, name, logo,
+                        json_extract(payload, '$.group'),
+                        json_extract(payload, '$.tvg_logo')
+                 FROM channels
+                 WHERE json_extract(payload, '$.group') = ?1
+                 ORDER BY rowid LIMIT ?2 OFFSET ?3"
+            } else {
+                "SELECT id, name, logo,
+                        json_extract(payload, '$.group'),
+                        json_extract(payload, '$.tvg_logo')
+                 FROM channels
+                 ORDER BY rowid LIMIT ?1 OFFSET ?2"
+            };
+            let Ok(mut stmt) = conn.prepare(sql) else {
+                continue;
+            };
+            let map = |row: &rusqlite::Row<'_>| -> rusqlite::Result<BrowseTile> {
+                let logo: Option<String> = row.get(2)?;
+                let group_v: Option<String> = row.get(3)?;
+                let tvg: Option<String> = row.get(4)?;
+                Ok(BrowseTile {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    art_url: logo.or(tvg),
+                    category_id: group_v.clone(),
+                    source_id: Some(source_id),
+                    year: None,
+                    genre: None,
+                    rating: None,
+                    group: group_v,
+                })
+            };
+            let rows = if let Some(g) = group_f {
+                stmt.query_map(params![g, need as i64, skip as i64], map)
+            } else {
+                stmt.query_map(params![need as i64, skip as i64], map)
+            };
+            if let Ok(rows) = rows {
+                for tile in rows.flatten() {
+                    out.push(tile);
+                    need -= 1;
+                    if need == 0 {
+                        break;
+                    }
+                }
+            }
+            skip = 0;
+        }
+        out
+    }
+
+    fn query_browse_tiles(
+        &self,
+        ids: &[Uuid],
+        table: &str,
+        offset: usize,
+        limit: usize,
+        category_id: Option<&str>,
+    ) -> Vec<BrowseTile> {
+        let art_col = if table == "series" { "cover" } else { "poster" };
+        let mut out = Vec::with_capacity(limit.min(512));
+        let mut skip = offset;
+        let mut need = limit;
+        let cat = category_id.filter(|c| !c.is_empty() && *c != "*");
+        // One profile: skip COUNT(*) (OFFSET is enough). Multi-source still needs it.
+        let single = ids.len() == 1;
+        for &source_id in ids {
+            if need == 0 {
+                break;
+            }
+            let Ok(conn) = self.conn(source_id) else {
+                continue;
+            };
+            if !single {
+                let n = if let Some(c) = cat {
+                    conn.query_row(
+                        &format!("SELECT COUNT(*) FROM {table} WHERE category_id = ?1"),
+                        params![c],
+                        |r| r.get::<_, i64>(0),
+                    )
+                    .unwrap_or(0) as usize
+                } else {
+                    conn.query_row(
+                        &format!("SELECT COUNT(*) FROM {table}"),
+                        [],
+                        |r| r.get::<_, i64>(0),
+                    )
+                    .unwrap_or(0) as usize
+                };
+                if skip >= n {
+                    skip -= n;
+                    continue;
+                }
+            }
+            let sql = if cat.is_some() {
+                format!(
+                    "SELECT id, name, {art_col}, year, genre, rating, category_id
+                     FROM {table} WHERE category_id = ?1 ORDER BY rowid LIMIT ?2 OFFSET ?3"
+                )
+            } else {
+                format!(
+                    "SELECT id, name, {art_col}, year, genre, rating, category_id
+                     FROM {table} ORDER BY rowid LIMIT ?1 OFFSET ?2"
+                )
+            };
+            let Ok(mut stmt) = conn.prepare(&sql) else {
+                continue;
+            };
+            let map_row = |row: &rusqlite::Row<'_>| -> rusqlite::Result<BrowseTile> {
+                Ok(BrowseTile {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    art_url: row.get(2)?,
+                    year: row.get(3)?,
+                    genre: row.get(4)?,
+                    rating: row.get(5)?,
+                    category_id: row.get(6)?,
+                    source_id: Some(source_id),
+                    group: None,
+                })
+            };
+            let rows = if let Some(c) = cat {
+                stmt.query_map(params![c, need as i64, skip as i64], map_row)
+            } else {
+                stmt.query_map(params![need as i64, skip as i64], map_row)
+            };
+            if let Ok(rows) = rows {
+                for tile in rows.flatten() {
+                    out.push(tile);
+                    need = need.saturating_sub(1);
+                    if need == 0 {
+                        break;
+                    }
+                }
+            }
+            skip = 0;
+            if single {
+                break;
+            }
+        }
+        out
+    }
+
+    /// Count rows matching an optional category (`*` / empty = all).
+    pub fn count_vod(&self, ids: &[Uuid], category_id: Option<&str>) -> usize {
+        self.count_table(ids, "vod", category_id)
+    }
+
+    pub fn count_series(&self, ids: &[Uuid], category_id: Option<&str>) -> usize {
+        self.count_table(ids, "series", category_id)
+    }
+
+    pub fn count_channels(&self, ids: &[Uuid], group: Option<&str>) -> usize {
+        let group_f = group.filter(|g| !g.is_empty() && *g != "Tous" && *g != "*");
+        let mut n = 0usize;
+        for &id in ids {
+            let Ok(conn) = self.conn(id) else {
+                continue;
+            };
+            n += if let Some(g) = group_f {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM channels WHERE json_extract(payload, '$.group') = ?1",
+                    params![g],
+                    |r| r.get::<_, i64>(0),
+                )
+                .unwrap_or(0) as usize
+            } else {
+                conn.query_row("SELECT COUNT(*) FROM channels", [], |r| r.get::<_, i64>(0))
+                    .unwrap_or(0) as usize
+            };
+        }
+        n
+    }
+
+    pub fn search_channel_ids(
+        &self,
+        query: &str,
+        group: Option<&str>,
+        limit: usize,
+    ) -> Vec<String> {
+        let group_f = group.filter(|g| !g.is_empty() && *g != "Tous" && *g != "*");
+        let ids = self.search_fts_or_like("channels", query, None, limit);
+        if group_f.is_none() {
+            return ids;
+        }
+        let want = group_f.unwrap();
+        let mut out = Vec::with_capacity(ids.len());
+        for id in ids {
+            if out.len() >= limit {
+                break;
+            }
+            if let Some(ch) = self.channel_by_id(&id) {
+                if ch.group.as_deref() == Some(want) {
+                    out.push(id);
+                }
+            }
+        }
+        out
+    }
+
+    fn count_table(&self, ids: &[Uuid], table: &str, category_id: Option<&str>) -> usize {
+        let cat = category_id.filter(|c| !c.is_empty() && *c != "*");
+        let mut n = 0usize;
+        for &id in ids {
+            let Ok(conn) = self.conn(id) else {
+                continue;
+            };
+            n += if let Some(c) = cat {
+                conn.query_row(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE category_id = ?1"),
+                    params![c],
+                    |r| r.get::<_, i64>(0),
+                )
+                .unwrap_or(0) as usize
+            } else {
+                conn.query_row(
+                    &format!("SELECT COUNT(*) FROM {table}"),
+                    [],
+                    |r| r.get::<_, i64>(0),
+                )
+                .unwrap_or(0) as usize
+            };
+        }
+        n
+    }
+
+    /// Slim tiles for an ordered id list (search results), keyed later by browse pos.
+    pub fn slim_vod_by_ids(&self, ids: &[Uuid], item_ids: &[String]) -> Vec<BrowseTile> {
+        self.slim_by_ids(ids, "vod", "poster", item_ids)
+    }
+
+    pub fn slim_series_by_ids(&self, ids: &[Uuid], item_ids: &[String]) -> Vec<BrowseTile> {
+        self.slim_by_ids(ids, "series", "cover", item_ids)
+    }
+
+    pub fn slim_channels_by_ids(&self, ids: &[Uuid], item_ids: &[String]) -> Vec<BrowseTile> {
+        let mut out = Vec::with_capacity(item_ids.len());
+        for item_id in item_ids {
+            for &source_id in ids {
+                let Ok(conn) = self.conn(source_id) else {
+                    continue;
+                };
+                let row = conn.query_row(
+                    "SELECT id, name, logo,
+                            json_extract(payload, '$.group'),
+                            json_extract(payload, '$.tvg_logo')
+                     FROM channels WHERE id = ?1 LIMIT 1",
+                    params![item_id],
+                    |row| {
+                        let logo: Option<String> = row.get(2)?;
+                        let group_v: Option<String> = row.get(3)?;
+                        let tvg: Option<String> = row.get(4)?;
+                        Ok(BrowseTile {
+                            id: row.get(0)?,
+                            name: row.get(1)?,
+                            art_url: logo.or(tvg),
+                            category_id: group_v.clone(),
+                            source_id: Some(source_id),
+                            year: None,
+                            genre: None,
+                            rating: None,
+                            group: group_v,
+                        })
+                    },
+                );
+                if let Ok(tile) = row {
+                    out.push(tile);
+                    break;
+                }
+            }
+        }
+        out
+    }
+
+    /// `(global_offset, id, name, category_id)` for browse-index builds off SQLite.
+    pub fn collect_vod_browse_rows(
+        &self,
+        source_ids: &[Uuid],
+        category_id: Option<&str>,
+    ) -> Vec<(usize, String, String, Option<String>)> {
+        self.collect_table_browse_rows(source_ids, "vod", category_id)
+    }
+
+    pub fn collect_series_browse_rows(
+        &self,
+        source_ids: &[Uuid],
+        category_id: Option<&str>,
+    ) -> Vec<(usize, String, String, Option<String>)> {
+        self.collect_table_browse_rows(source_ids, "series", category_id)
+    }
+
+    /// `(global_offset, name, group)` for live browse filters.
+    pub fn collect_live_browse_rows(
+        &self,
+        source_ids: &[Uuid],
+        group: Option<&str>,
+    ) -> Vec<(usize, String, Option<String>)> {
+        let group_f = group.filter(|g| !g.is_empty() && *g != "Tous" && *g != "*");
+        let mut out = Vec::new();
+        let mut global_base = 0usize;
+        for &source_id in source_ids {
+            let Ok(conn) = self.conn(source_id) else {
+                continue;
+            };
+            let sql = if group_f.is_some() {
+                "SELECT name, json_extract(payload, '$.group') FROM channels
+                 WHERE json_extract(payload, '$.group') = ?1 ORDER BY rowid"
+            } else {
+                "SELECT name, json_extract(payload, '$.group') FROM channels ORDER BY rowid"
+            };
+            let Ok(mut stmt) = conn.prepare(sql) else {
+                continue;
+            };
+            let mut local = 0usize;
+            if let Some(g) = group_f {
+                if let Ok(rows) = stmt.query_map(params![g], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+                }) {
+                    for row in rows.flatten() {
+                        out.push((global_base + local, row.0, row.1));
+                        local += 1;
+                    }
+                }
+            } else if let Ok(rows) = stmt.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+            }) {
+                for row in rows.flatten() {
+                    out.push((global_base + local, row.0, row.1));
+                    local += 1;
+                }
+            }
+            global_base += local;
+        }
+        out
+    }
+
+    fn collect_table_browse_rows(
+        &self,
+        source_ids: &[Uuid],
+        table: &str,
+        category_id: Option<&str>,
+    ) -> Vec<(usize, String, String, Option<String>)> {
+        let cat = category_id.filter(|c| !c.is_empty() && *c != "*");
+        let mut out = Vec::new();
+        let mut global_base = 0usize;
+        for &source_id in source_ids {
+            let Ok(conn) = self.conn(source_id) else {
+                continue;
+            };
+            let sql = if cat.is_some() {
+                format!(
+                    "SELECT id, name, category_id FROM {table} WHERE category_id = ?1 ORDER BY rowid"
+                )
+            } else {
+                format!("SELECT id, name, category_id FROM {table} ORDER BY rowid")
+            };
+            let Ok(mut stmt) = conn.prepare(&sql) else {
+                continue;
+            };
+            let mut local = 0usize;
+            if let Some(c) = cat {
+                if let Ok(rows) = stmt.query_map(params![c], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                }) {
+                    for row in rows.flatten() {
+                        out.push((global_base + local, row.0, row.1, row.2));
+                        local += 1;
+                    }
+                }
+            } else if let Ok(rows) = stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            }) {
+                for row in rows.flatten() {
+                    out.push((global_base + local, row.0, row.1, row.2));
+                    local += 1;
+                }
+            }
+            global_base += local;
+        }
+        out
+    }
+
+    fn slim_by_ids(
+        &self,
+        source_ids: &[Uuid],
+        table: &str,
+        art_col: &str,
+        item_ids: &[String],
+    ) -> Vec<BrowseTile> {
+        let mut out = Vec::with_capacity(item_ids.len());
+        for item_id in item_ids {
+            for &source_id in source_ids {
+                let Ok(conn) = self.conn(source_id) else {
+                    continue;
+                };
+                let sql = format!(
+                    "SELECT id, name, {art_col}, year, genre, rating, category_id
+                     FROM {table} WHERE id = ?1 LIMIT 1"
+                );
+                let row = conn.query_row(&sql, params![item_id], |row| {
+                    Ok(BrowseTile {
+                        id: row.get(0)?,
+                        name: row.get(1)?,
+                        art_url: row.get(2)?,
+                        year: row.get(3)?,
+                        genre: row.get(4)?,
+                        rating: row.get(5)?,
+                        category_id: row.get(6)?,
+                        source_id: Some(source_id),
+                        group: None,
+                    })
+                });
+                if let Ok(tile) = row {
+                    out.push(tile);
+                    break;
+                }
+            }
+        }
+        out
+    }
+
+    pub fn vod_item_by_id(&self, id: &str) -> Option<VodItem> {
+        let raw = self.payload_by_id("vod", id)?;
+        serde_json::from_str(&raw).ok()
+    }
+
+    pub fn series_item_by_id(&self, id: &str) -> Option<SeriesItem> {
+        let raw = self.payload_by_id("series", id)?;
+        serde_json::from_str(&raw).ok()
+    }
+
+    pub fn channel_by_id(&self, id: &str) -> Option<Channel> {
+        let raw = self.payload_by_id("channels", id)?;
+        serde_json::from_str(&raw).ok()
+    }
+
+    fn live_group_filter(group: Option<&str>) -> Option<&str> {
+        group.filter(|g| !g.is_empty() && *g != "Tous" && *g != "*")
+    }
+
+    /// Live channels in catalog order (SQLite SSOT — `bundle.channels` stays empty on spine boot).
+    pub fn channels_in_group(
+        &self,
+        ids: &[Uuid],
+        group: Option<&str>,
+        search: Option<&str>,
+        limit: usize,
+    ) -> Vec<Channel> {
+        let group_f = Self::live_group_filter(group);
+        let q = search
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_lowercase());
+        let mut out = Vec::with_capacity(limit.min(64));
+        'profiles: for &source_id in ids {
+            let Ok(conn) = self.conn(source_id) else {
+                continue;
+            };
+            if let Some(g) = group_f {
+                let Ok(mut stmt) = conn.prepare(
+                    "SELECT payload FROM channels WHERE json_extract(payload, '$.group') = ?1 ORDER BY rowid",
+                ) else {
+                    continue;
+                };
+                let Ok(rows) = stmt.query_map(params![g], |r| r.get::<_, String>(0)) else {
+                    continue;
+                };
+                for raw in rows.flatten() {
+                    let Ok(mut ch) = serde_json::from_str::<Channel>(&raw) else {
+                        continue;
+                    };
+                    if ch.source_id.is_none() {
+                        ch.source_id = Some(source_id);
+                    }
+                    if let Some(ref needle) = q {
+                        let name = ch.name.to_lowercase();
+                        let disp = crate::names::display_channel(&ch.name).to_lowercase();
+                        if !name.contains(needle) && !disp.contains(needle) {
+                            continue;
+                        }
+                    }
+                    out.push(ch);
+                    if out.len() >= limit {
+                        break 'profiles;
+                    }
+                }
+            } else {
+                let Ok(mut stmt) =
+                    conn.prepare("SELECT payload FROM channels ORDER BY rowid")
+                else {
+                    continue;
+                };
+                let Ok(rows) = stmt.query_map([], |r| r.get::<_, String>(0)) else {
+                    continue;
+                };
+                for raw in rows.flatten() {
+                    let Ok(mut ch) = serde_json::from_str::<Channel>(&raw) else {
+                        continue;
+                    };
+                    if ch.source_id.is_none() {
+                        ch.source_id = Some(source_id);
+                    }
+                    if let Some(ref needle) = q {
+                        let name = ch.name.to_lowercase();
+                        let disp = crate::names::display_channel(&ch.name).to_lowercase();
+                        if !name.contains(needle) && !disp.contains(needle) {
+                            continue;
+                        }
+                    }
+                    out.push(ch);
+                    if out.len() >= limit {
+                        break 'profiles;
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Previous / next live channel within a group (same order as mosaic / zap).
+    pub fn live_channel_neighbor(
+        &self,
+        ids: &[Uuid],
+        group: Option<&str>,
+        current_id: &str,
+        current_source: Option<Uuid>,
+        delta: i32,
+    ) -> Option<Channel> {
+        let group_f = Self::live_group_filter(group);
+        let mut order: Vec<(Uuid, String)> = Vec::new();
+        for &source_id in ids {
+            let Ok(conn) = self.conn(source_id) else {
+                continue;
+            };
+            if let Some(g) = group_f {
+                let Ok(mut stmt) = conn.prepare(
+                    "SELECT id FROM channels WHERE json_extract(payload, '$.group') = ?1 ORDER BY rowid",
+                ) else {
+                    continue;
+                };
+                let Ok(rows) = stmt.query_map(params![g], |r| r.get::<_, String>(0)) else {
+                    continue;
+                };
+                for id in rows.flatten() {
+                    order.push((source_id, id));
+                }
+            } else {
+                let Ok(mut stmt) = conn.prepare("SELECT id FROM channels ORDER BY rowid") else {
+                    continue;
+                };
+                let Ok(rows) = stmt.query_map([], |r| r.get::<_, String>(0)) else {
+                    continue;
+                };
+                for id in rows.flatten() {
+                    order.push((source_id, id));
+                }
+            }
+        }
+        if order.is_empty() {
+            return None;
+        }
+        let idx = order.iter().position(|(sid, id)| {
+            id == current_id && (current_source.is_none() || Some(*sid) == current_source)
+        })?;
+        let len = order.len() as i32;
+        if len == 0 {
+            return None;
+        }
+        let next_i = (idx as i32 + delta).rem_euclid(len) as usize;
+        let (sid, id) = &order[next_i];
+        let mut ch = self.channel_by_id(id)?;
+        if ch.source_id.is_none() {
+            ch.source_id = Some(*sid);
+        }
+        Some(ch)
+    }
+
+    /// Ids needing metadata enrich (not the full row set).
+    pub fn vod_ids_needing_enrich(&self, ids: &[Uuid], limit: usize) -> Vec<(Uuid, String)> {
+        self.ids_needing_enrich(ids, "vod", limit)
+    }
+
+    pub fn series_ids_needing_enrich(&self, ids: &[Uuid], limit: usize) -> Vec<(Uuid, String)> {
+        self.ids_needing_enrich(ids, "series", limit)
+    }
+
+    fn ids_needing_enrich(
+        &self,
+        ids: &[Uuid],
+        table: &str,
+        limit: usize,
+    ) -> Vec<(Uuid, String)> {
+        let mut out = Vec::new();
+        for &source_id in ids {
+            if out.len() >= limit {
+                break;
+            }
+            let Ok(conn) = self.conn(source_id) else {
+                continue;
+            };
+            let sql = format!(
+                "SELECT id FROM {table} WHERE meta_ok = 0 ORDER BY rowid LIMIT ?1"
+            );
+            let Ok(mut stmt) = conn.prepare(&sql) else {
+                continue;
+            };
+            let remain = (limit - out.len()) as i64;
+            let ids: Vec<String> = stmt
+                .query_map(params![remain], |r| r.get::<_, String>(0))
+                .ok()
+                .into_iter()
+                .flatten()
+                .flatten()
+                .collect();
+            for id in ids {
+                out.push((source_id, id));
+                if out.len() >= limit {
+                    break;
+                }
+            }
+        }
+        out
     }
 
     /// Flush WAL into the main DB file before zip/export (avoids incomplete copies).
@@ -1289,6 +1788,37 @@ fn migrate_schema(conn: &Connection) -> rusqlite::Result<()> {
         .execute("ALTER TABLE vod ADD COLUMN meta_ok INTEGER NOT NULL DEFAULT 0", []);
     let _ = conn
         .execute("ALTER TABLE series ADD COLUMN meta_ok INTEGER NOT NULL DEFAULT 0", []);
+    // Slim mosaic columns — full plot/cast stay in payload JSON only.
+    let _ = conn.execute("ALTER TABLE vod ADD COLUMN poster TEXT", []);
+    let _ = conn.execute("ALTER TABLE vod ADD COLUMN rating TEXT", []);
+    let _ = conn.execute("ALTER TABLE series ADD COLUMN cover TEXT", []);
+    let _ = conn.execute("ALTER TABLE series ADD COLUMN rating TEXT", []);
+    let _ = conn.execute("ALTER TABLE channels ADD COLUMN logo TEXT", []);
+    // One-shot JSON→column backfill. Re-running on every open scanned 200k+ rows
+    // (~300–500 ms) and made mosaic scroll unusable when tile fills re-opened the DB.
+    if CatalogDb::meta_get_conn(conn, "slim_cols_v1").as_deref() != Some("1") {
+        let _ = conn.execute_batch(
+            r#"
+            UPDATE vod SET poster = json_extract(payload, '$.poster')
+              WHERE poster IS NULL AND json_extract(payload, '$.poster') IS NOT NULL;
+            UPDATE vod SET rating = json_extract(payload, '$.rating')
+              WHERE rating IS NULL AND json_extract(payload, '$.rating') IS NOT NULL;
+            UPDATE series SET cover = COALESCE(
+                json_extract(payload, '$.cover'),
+                json_extract(payload, '$.banner')
+              )
+              WHERE cover IS NULL;
+            UPDATE series SET rating = json_extract(payload, '$.rating')
+              WHERE rating IS NULL AND json_extract(payload, '$.rating') IS NOT NULL;
+            UPDATE channels SET logo = COALESCE(
+                json_extract(payload, '$.logo'),
+                json_extract(payload, '$.tvg_logo')
+              )
+              WHERE logo IS NULL;
+            "#,
+        );
+        let _ = CatalogDb::meta_set_conn(conn, "slim_cols_v1", "1");
+    }
     conn.execute_batch(
         r#"
         CREATE INDEX IF NOT EXISTS idx_vod_cat ON vod(category_id);
@@ -1688,10 +2218,10 @@ pub fn ingest_one_blocking(
     Ok(res.kind)
 }
 
-/// Load merged bundle off the UI thread (read path; WAL-friendly).
-pub fn load_bundle_blocking(source_ids: &[Uuid]) -> Result<PlaylistBundle, String> {
+/// Load categories + EPG + counts only (no VOD/series/channel payloads).
+pub fn load_spine_blocking(source_ids: &[Uuid]) -> Result<CatalogSpine, String> {
     let db = CatalogDb::open(source_ids).ok_or_else(|| "catalog db open failed".to_string())?;
-    db.load_bundle_of(source_ids).map_err(|e| e.to_string())
+    db.load_spine_of(source_ids).map_err(|e| e.to_string())
 }
 
 pub fn portal_checksum(part: &PlaylistBundle) -> String {
@@ -1873,4 +2403,166 @@ fn series_meta_ok(s: &SeriesItem) -> bool {
     s.imdb_id.is_some()
         || (s.plot.as_ref().map(|p| p.len() >= 40).unwrap_or(false) && s.actors.is_some())
         || (s.genre.is_some() && s.year.is_some() && s.plot.is_some())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn memory_db(source_id: Uuid) -> CatalogDb {
+        let conn = Connection::open_in_memory().expect("memory sqlite");
+        migrate_schema(&conn).expect("migrate");
+        let mut conns = HashMap::new();
+        conns.insert(source_id, conn);
+        CatalogDb { conns }
+    }
+
+    fn sample_vod(id: &str, name: &str, cat: &str) -> VodItem {
+        VodItem {
+            id: id.into(),
+            name: name.into(),
+            stream_url: format!("https://example.test/{id}"),
+            poster: Some(format!("https://img.test/{id}.jpg")),
+            plot: None,
+            year: Some("2020".into()),
+            rating: Some("7.5".into()),
+            genre: Some("Action".into()),
+            imdb_id: None,
+            actors: None,
+            director: None,
+            writer: None,
+            runtime: None,
+            rated: None,
+            awards: None,
+            language: None,
+            country: None,
+            category_id: Some(cat.into()),
+            source_id: None,
+        }
+    }
+
+    #[test]
+    fn browse_tiles_vod_reads_poster_columns_not_full_payload() {
+        let sid = Uuid::nil();
+        let mut db = memory_db(sid);
+        let mut part = PlaylistBundle::default();
+        part.vod = vec![
+            sample_vod("1", "Alpha", "movies"),
+            sample_vod("2", "Beta", "movies"),
+            sample_vod("3", "Gamma", "docs"),
+        ];
+        db.apply_source_bundle_progressive(sid, part, None)
+            .expect("ingest");
+
+        let page = db.browse_tiles_vod(&[sid], 0, 2, None);
+        assert_eq!(page.len(), 2);
+        assert_eq!(page[0].id, "1");
+        assert_eq!(page[0].art_url.as_deref(), Some("https://img.test/1.jpg"));
+        assert_eq!(page[0].year.as_deref(), Some("2020"));
+        assert_eq!(page[1].id, "2");
+
+        let cat = db.browse_tiles_vod(&[sid], 0, 10, Some("docs"));
+        assert_eq!(cat.len(), 1);
+        assert_eq!(cat[0].id, "3");
+        assert_eq!(db.count_vod(&[sid], Some("movies")), 2);
+        assert_eq!(db.count_vod(&[sid], None), 3);
+
+        let spine = db.load_spine_of(&[sid]).expect("spine");
+        assert_eq!(spine.vod_count, 3);
+        assert_eq!(spine.channel_count, 0);
+        assert_eq!(spine.series_count, 0);
+    }
+
+    #[test]
+    fn browse_tiles_offset_across_pages() {
+        let sid = Uuid::nil();
+        let mut db = memory_db(sid);
+        let mut part = PlaylistBundle::default();
+        part.vod = (0..5)
+            .map(|i| sample_vod(&format!("{i}"), &format!("V{i}"), "c"))
+            .collect();
+        db.apply_source_bundle_progressive(sid, part, None)
+            .expect("ingest");
+        let page = db.browse_tiles_vod(&[sid], 2, 2, None);
+        assert_eq!(page.len(), 2);
+        assert_eq!(page[0].id, "2");
+        assert_eq!(page[1].id, "3");
+    }
+
+    fn rss_kib() -> u64 {
+        std::fs::read_to_string("/proc/self/status")
+            .ok()
+            .and_then(|s| {
+                s.lines().find_map(|l| {
+                    let rest = l.strip_prefix("VmRSS:")?;
+                    rest.split_whitespace().next()?.parse().ok()
+                })
+            })
+            .unwrap_or(0)
+    }
+
+    /// Optional probe: `FLUXPLAY_RSS_PROBE=1 cargo test -p fluxplay --lib spine_rss -- --nocapture`
+    ///
+    /// Simulates browse idle: spine + warmed [`BrowseTileCache`] (plan ≤100 Mo navigation).
+    #[test]
+    fn spine_rss_far_below_full_bundle() {
+        if std::env::var_os("FLUXPLAY_RSS_PROBE").is_none() {
+            return;
+        }
+        use crate::browse_tiles::{BrowseTileCache, BROWSE_TILE_CACHE_CAP, BROWSE_TILE_FETCH_LIMIT};
+
+        let ids: Vec<Uuid> = crate::storage::profiles_dir()
+            .read_dir()
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|e| Uuid::parse_str(e.file_name().to_str()?).ok())
+            .collect();
+        assert!(!ids.is_empty(), "no profiles under data_dir");
+        let before = rss_kib();
+        let spine = load_spine_blocking(&ids).expect("spine");
+        let after_spine = rss_kib();
+        let db = CatalogDb::open(&ids).expect("db");
+        let mut cache = BrowseTileCache::default();
+        let mut offset = 0usize;
+        let mut filled = 0usize;
+        while filled < BROWSE_TILE_CACHE_CAP {
+            let page = db.browse_tiles_vod(&ids, offset, BROWSE_TILE_FETCH_LIMIT, None);
+            if page.is_empty() {
+                break;
+            }
+            let n = page.len();
+            cache.store_contiguous(offset, page);
+            filled = filled.saturating_add(n);
+            offset = offset.saturating_add(n);
+            if n < BROWSE_TILE_FETCH_LIMIT {
+                break;
+            }
+        }
+        let after_cache = rss_kib();
+        let delta_mib = after_cache.saturating_sub(before) as f64 / 1024.0;
+        eprintln!(
+            "RSS probe (browse idle): before={before} KiB spine={after_spine} KiB (+{}) \
+             tile_cache={after_cache} KiB (+{} / {delta_mib:.1} MiB) \
+             counts ch={} vod={} series={} tiles_filled≈{}",
+            after_spine.saturating_sub(before),
+            after_cache.saturating_sub(after_spine),
+            spine.channel_count,
+            spine.vod_count,
+            spine.series_count,
+            filled.min(BROWSE_TILE_CACHE_CAP),
+        );
+        // Spine + warm tile LRU must stay << full PlaylistBundle (~200–450 MiB).
+        assert!(
+            after_cache.saturating_sub(before) < 80_000,
+            "spine+tile_cache grew {} KiB — expected << full bundle",
+            after_cache.saturating_sub(before)
+        );
+        // Navigation budget from the plan: ~40–60 Mo typical; hard fail only if absurd.
+        assert!(
+            delta_mib < 100.0,
+            "browse idle RSS grew {delta_mib:.1} MiB — plan target ≤100 Mo navigation"
+        );
+        assert!(spine.vod_count + spine.series_count + spine.channel_count > 0);
+    }
 }

@@ -46,7 +46,7 @@ pub struct PlayerChrome<'a> {
     pub sleep_mins: Option<u32>,
     pub pip: bool,
     // Read only by the desktop soft-present toolbar height; Android chrome is overlay-only.
-    #[cfg_attr(target_os = "android", allow(dead_code))]
+    #[cfg(not(target_os = "android"))]
     pub chrome_h: f32,
     /// When false, chrome is fading out / hidden (see `chrome_alpha`).
     pub chrome_visible: bool,
@@ -1333,46 +1333,6 @@ fn toolbar_svg(
                 Padding::from([10, 12])
             }
         })
-        .style(move |_t: &Theme| container::Style {
-            background: Some(Background::Color(bg)),
-            border: Border {
-                color: Color::TRANSPARENT,
-                width: 0.0,
-                radius,
-            },
-            ..Default::default()
-        });
-    if enabled {
-        mouse_area(body).on_press(msg).into()
-    } else {
-        body.into()
-    }
-}
-
-/// Icon button on vibrant floating toolbar (`onPrimaryContainer`) — text fallback.
-#[allow(dead_code)]
-fn toolbar_icon(
-    ui: UiTheme,
-    label: &str,
-    msg: Message,
-    enabled: bool,
-    active: bool,
-) -> Element<'static, Message> {
-    let label = label.to_string();
-    let ink = ui.on_primary_container();
-    // Expressive morph: unselected full pill → selected squircle.
-    let radius = if active {
-        RADIUS_LG.into()
-    } else {
-        RADIUS_FULL.into()
-    };
-    let bg = if active {
-        Color::from_rgba(ink.r, ink.g, ink.b, 0.22)
-    } else {
-        Color::TRANSPARENT
-    };
-    let body = container(text(label).size(TYPE_LABEL_L).color(ink))
-        .padding(Padding::from([10, 12]))
         .style(move |_t: &Theme| container::Style {
             background: Some(Background::Color(bg)),
             border: Border {

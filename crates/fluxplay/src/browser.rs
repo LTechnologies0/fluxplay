@@ -23,7 +23,6 @@ use crate::theme::{
 };
 use crate::app::{Message, PasteTarget};
 
-pub const LIST_PAGE: usize = 48;
 /// Sidebar categories (Live / VOD / Series) — show the full catalog list.
 pub const CAT_PAGE: usize = 2000;
 /// Iced breaks on multi‑million‑px scroll content. Cap the *layout* height and
@@ -31,13 +30,13 @@ pub const CAT_PAGE: usize = 2000;
 /// Higher = less sensitive scrollbar on huge catalogs, but iced hates
 /// multi‑million‑px layouts — keep a hard ceiling.
 pub const MAX_VIRTUAL_CONTENT_PX: f32 = 480_000.0;
-/// Target scroll travel per virtual row (px) before hitting the cap.
-/// With the height ceiling this stays smooth up to ~1M mosaic rows.
-const VIRTUAL_ROW_TRAVEL_PX: f32 = 8.0;
-/// Rows rendered above/below the viewport (fast flings need deeper lead-in).
-pub const VIRTUAL_OVERSCAN: usize = 14;
+/// Rows rendered above/below the viewport (tile geometry only — art stays
+/// on-screen; deep overscan used to prefetch hundreds of posters into RAM).
+pub const VIRTUAL_OVERSCAN: usize = 4;
+/// Initial mosaic unlock (≈1–2 screens). More posters load via « Afficher plus ».
+pub const MOSAIC_PAGE_ITEMS: usize = 24;
 
-/// Indices into `bundle.channels` / `vod` / `series` for the active browse filter.
+/// Positions in the SQLite-backed browse order (`BrowseIndex` / `BrowseTileCache`).
 ///
 /// `Identity` avoids allocating a million-entry `Vec` for « All » + empty search —
 /// browse position `i` maps straight to catalog index `i`.
@@ -98,20 +97,7 @@ impl BrowseIndex {
         }
     }
 
-    /// Catalog indices covering `[start, end)` browse positions (viewport-sized).
-    pub fn window(&self, start: usize, end: usize) -> Vec<usize> {
-        let end = end.min(self.len());
-        let start = start.min(end);
-        match self {
-            Self::Empty => Vec::new(),
-            Self::Identity { .. } => (start..end).collect(),
-            Self::Mapped(v) => v[start..end].to_vec(),
-        }
-    }
 }
-/// Episodes listed via the same virtual window (cap reserved for non-virtual fallbacks).
-#[allow(dead_code)]
-pub const EPISODE_PAGE: usize = 10_000;
 
 pub fn shell_background(ui: UiTheme) -> Color {
     // Body canvas = surfaceDim; navigation panes use surfaceContainer separately.
@@ -247,12 +233,8 @@ pub fn virtual_slice(
         };
     }
 
-    // Compressed mode: keep layout height == content_h always
-    // (spacers must absorb the difference vs real item_h — otherwise scroll
-    // offset desyncs and fast flings show blank / jumpy mosaics).
-    let content_h = (total as f32 * VIRTUAL_ROW_TRAVEL_PX)
-        .clamp(view_h * 4.0, MAX_VIRTUAL_CONTENT_PX)
-        .max(view_h + item_h);
+    // Compressed mode: same height contract as [`virtual_content_height`].
+    let content_h = virtual_content_height(total, view_h, item_h);
     let max_scroll = (content_h - view_h).max(1.0);
     let scroll_y = scroll_y.clamp(0.0, max_scroll);
     let t = (scroll_y / max_scroll).clamp(0.0, 1.0);
@@ -308,9 +290,7 @@ mod virtual_scroll_tests {
             let s = virtual_slice(y, view_h, item_h, total, 10);
             let mid = (s.end - s.start) as f32 * item_h;
             let layout = s.top_spacer + mid + s.bottom_spacer;
-            let content_h = (total as f32 * VIRTUAL_ROW_TRAVEL_PX)
-                .clamp(view_h * 4.0, MAX_VIRTUAL_CONTENT_PX)
-                .max(view_h + item_h);
+            let content_h = virtual_content_height(total, view_h, item_h);
             assert!(
                 (layout - content_h).abs() < 1.0,
                 "y={y} layout={layout} content_h={content_h} slice={s:?}"
@@ -327,9 +307,7 @@ mod virtual_scroll_tests {
         let total = 8_766usize;
         let item_h = 250.0;
         let view_h = 900.0;
-        let content_h = (total as f32 * VIRTUAL_ROW_TRAVEL_PX)
-            .clamp(view_h * 4.0, MAX_VIRTUAL_CONTENT_PX)
-            .max(view_h + item_h);
+        let content_h = virtual_content_height(total, view_h, item_h);
         let max_scroll = (content_h - view_h).max(1.0);
         for overscan in [6usize, 14, 28] {
             for i in 0..200 {
@@ -374,24 +352,32 @@ mod virtual_scroll_tests {
         assert_eq!(idx.get(0), Some(0));
         assert_eq!(idx.get(999_999), Some(999_999));
         assert_eq!(idx.get(1_000_000), None);
-        let win = idx.window(100, 108);
-        assert_eq!(win, (100..108).collect::<Vec<_>>());
+        // Identity maps browse pos → catalog pos without allocating a Vec.
+        for p in 100..108 {
+            assert_eq!(idx.get(p), Some(p));
+        }
     }
 }
 
 /// Mosaic row stride (poster + title + meta + gap) for virtualization.
-pub fn mosaic_row_height(tile_w: f32) -> f32 {
+pub fn mosaic_row_height_for(tile_w: f32, touch_target: f32) -> f32 {
     let w = tile_w.max(96.0);
     let poster_h = (w * 1.5).round();
     // iced line-height is taller than the font size; short rows overlap the next poster.
-    poster_h + SPACE_SM + TYPE_LABEL_L * 1.35 + SPACE_SM + TYPE_LABEL_M * 1.35 + MOSAIC_GAP + 8.0
+    // TV touch targets bump the title block so focus chrome never clips.
+    let text_block = (touch_target * 0.55).max(TYPE_LABEL_L * 1.35 + TYPE_LABEL_M * 1.35);
+    poster_h + SPACE_SM + text_block + MOSAIC_GAP + 8.0
 }
 
 /// Compact live / episode / category row stride (includes inter-row gap).
 pub fn list_row_height(thumb: f32) -> f32 {
+    list_row_height_for(thumb, crate::theme::TOUCH_TARGET)
+}
+
+pub fn list_row_height_for(thumb: f32, touch_target: f32) -> f32 {
     let th = if thumb > 1.0 { thumb } else { 44.0 };
-    // Single-line row: thumb + vertical padding (touch-friendly ≥48).
-    th.max(crate::theme::TOUCH_TARGET) + 16.0
+    // Single-line row: thumb + vertical padding (surface touch target).
+    th.max(touch_target) + 16.0
 }
 
 /// Category sidebar row stride.
@@ -432,6 +418,10 @@ pub fn push_spacer_chunks<'a>(
 }
 
 /// Layout height for a virtualized list / mosaic (natural or compressed).
+///
+/// Monotonic in `total`: once the soft ceiling is hit, height stays at
+/// [`MAX_VIRTUAL_CONTENT_PX`] (never collapses back to `total × 8px`, which
+/// used to yank the scrollbar when catalogs crossed the limit).
 pub fn virtual_content_height(total: usize, view_h: f32, item_h: f32) -> f32 {
     let view_h = view_h.max(1.0);
     if total == 0 || item_h <= 1.0 {
@@ -441,9 +431,7 @@ pub fn virtual_content_height(total: usize, view_h: f32, item_h: f32) -> f32 {
     if natural <= MAX_VIRTUAL_CONTENT_PX {
         natural
     } else {
-        (total as f32 * VIRTUAL_ROW_TRAVEL_PX)
-            .clamp(view_h * 4.0, MAX_VIRTUAL_CONTENT_PX)
-            .max(view_h + item_h)
+        MAX_VIRTUAL_CONTENT_PX.max(view_h + item_h)
     }
 }
 
@@ -1200,7 +1188,6 @@ pub fn content_header<'a>(
 }
 
 /// [`content_header`] with a contextual search placeholder ("Rechercher une série…").
-#[allow(clippy::too_many_arguments)]
 pub fn content_header_with<'a>(
     ui: UiTheme,
     title: String,
@@ -1303,7 +1290,6 @@ pub fn content_header_with<'a>(
 }
 
 // UI row builder: each arg maps to a distinct visual slot; a builder struct adds noise.
-#[allow(clippy::too_many_arguments)]
 pub fn media_row<'a>(
     title: String,
     subtitle: String,
@@ -1724,36 +1710,57 @@ pub fn empty_hint(ui: UiTheme, msg: impl Into<String>) -> Element<'static, Messa
     .into()
 }
 
-/// Pagination control kept for TV / non-virtual fallbacks (`Message::LoadMore`).
-#[allow(dead_code)]
-pub fn load_more_btn(ui: UiTheme, remaining: Option<usize>) -> Element<'static, Message> {
-    // Outlined / tonal L pill — mouse_area (styled `button` drops glyphs on GLES).
-    let label = match remaining {
-        Some(n) if n > 0 => format!("Afficher plus (+{n})"),
-        _ => "Afficher plus".into(),
+/// Footer under a capped mosaic — unlock the next page of posters (RAM-safe).
+pub fn mosaic_show_more(
+    ui: UiTheme,
+    shown: usize,
+    total: usize,
+    page: usize,
+) -> Element<'static, Message> {
+    let remaining = total.saturating_sub(shown);
+    let next = remaining.min(page);
+    let label = if remaining == 0 {
+        format!("Tout affiché · {total}")
+    } else {
+        format!("Afficher plus · +{next} (reste {remaining})")
     };
-    mouse_area(
-        container(text(label).size(TYPE_LABEL_L).color(ui.primary()))
-            .padding(Padding::from([16, 24]))
-            .width(Fill)
-            .align_x(Alignment::Center)
-            .style(move |_t: &Theme| container::Style {
-                background: Some(Background::Color(Color::TRANSPARENT)),
-                border: Border {
-                    radius: RADIUS_FULL.into(),
-                    color: ui.outline(),
-                    width: 1.0,
-                },
-                ..Default::default()
-            }),
+    let enabled = remaining > 0;
+    let body = container(
+        text(label)
+            .size(TYPE_LABEL_L)
+            .color(if enabled { ui.on_primary() } else { ui.ink_muted() }),
     )
-    .on_press(Message::LoadMore)
-    .into()
+    .padding(Padding::from([SPACE_SM as u16, SPACE_MD as u16]))
+    .style(move |_t: &Theme| container::Style {
+        background: Some(Background::Color(if enabled {
+            ui.accent()
+        } else {
+            ui.surface_container_high()
+        })),
+        border: Border {
+            radius: RADIUS_FULL.into(),
+            width: 0.0,
+            color: Color::TRANSPARENT,
+        },
+        ..Default::default()
+    });
+    let row = container(
+        column![body]
+            .align_x(Alignment::Center)
+            .width(Fill),
+    )
+    .padding(Padding::from([SPACE_MD as u16, SPACE_SM as u16]))
+    .width(Fill)
+    .center_x(Fill);
+    if enabled {
+        mouse_area(row).on_press(Message::MosaicShowMore).into()
+    } else {
+        row.into()
+    }
 }
 
 /// MYTV-style poster tile: vertical art + title + "year, genre".
 // UI tile builder: each arg maps to a distinct visual slot; a builder struct adds noise.
-#[allow(clippy::too_many_arguments)]
 pub fn mosaic_tile<'a>(
     title: String,
     meta_line: String,
@@ -1763,11 +1770,13 @@ pub fn mosaic_tile<'a>(
     tile_w: f32,
     thumb: Option<&'a Handle>,
     pressed: bool,
+    focused: bool,
 ) -> Element<'a, Message> {
     let w = tile_w.max(96.0);
     // Classic poster aspect ~2:3
     let h = (w * 1.5).round();
     let press_alpha = if pressed { 0.85_f32 } else { 1.0 };
+    let focus_border = if focused { 3.0_f32 } else { 0.0 };
 
     let poster: Element<'a, Message> = {
         // Android: show poster art by default; skip only if FLUXPLAY_ANDROID_ART=0/off.
@@ -1801,8 +1810,12 @@ pub fn mosaic_tile<'a>(
                 background: Some(Background::Color(ui.surface_container_high())),
                 border: Border {
                     radius: radius_poster(),
-                    width: 0.0,
-                    color: Color::TRANSPARENT,
+                    width: focus_border,
+                    color: if focused {
+                        ui.primary()
+                    } else {
+                        Color::TRANSPARENT
+                    },
                 },
                 ..Default::default()
             })
@@ -1813,7 +1826,7 @@ pub fn mosaic_tile<'a>(
                 .find(|c| c.is_ascii_alphanumeric())
                 .map(|c| c.to_ascii_uppercase())
                 .unwrap_or('#');
-            mosaic_empty_poster(ui, w, h, letter)
+            mosaic_empty_poster(ui, w, h, letter, focused)
         }
     };
 
@@ -1850,6 +1863,11 @@ pub fn mosaic_tile<'a>(
         } else {
             None
         },
+        shadow: if focused {
+            crate::theme::elevation_shadow(3, ui.day)
+        } else {
+            iced::Shadow::default()
+        },
         ..Default::default()
     });
 
@@ -1859,7 +1877,13 @@ pub fn mosaic_tile<'a>(
         .into()
 }
 
-fn mosaic_empty_poster<'a>(ui: UiTheme, w: f32, h: f32, letter: char) -> Element<'a, Message> {
+fn mosaic_empty_poster<'a>(
+    ui: UiTheme,
+    w: f32,
+    h: f32,
+    letter: char,
+    focused: bool,
+) -> Element<'a, Message> {
     // Single ASCII letter — emoji/multi-glyph often vanish on Android GLES.
     container(
         text(letter.to_string())
@@ -1873,8 +1897,12 @@ fn mosaic_empty_poster<'a>(ui: UiTheme, w: f32, h: f32, letter: char) -> Element
     .style(move |_t: &Theme| container::Style {
         background: Some(Background::Color(ui.surface_container_high())),
         border: Border {
-            color: ui.outline_variant(),
-            width: 1.0,
+            color: if focused {
+                ui.primary()
+            } else {
+                ui.outline_variant()
+            },
+            width: if focused { 3.0 } else { 1.0 },
             radius: radius_poster(),
         },
         ..Default::default()
@@ -2068,7 +2096,6 @@ pub fn download_pill<'a>(
 
 /// Film / series detail: poster, synopsis, cast, primary play, optional episodes.
 // Detail-page renderer: args are independent view slots; grouping would just move the noise.
-#[allow(clippy::too_many_arguments)]
 pub fn media_detail_page<'a>(
     ui: UiTheme,
     title: &str,

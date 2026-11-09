@@ -82,8 +82,7 @@ impl GpuTopology {
     }
 
     /// True when decode≠display → force `vaapi-copy` / `mediacodec-copy` / soft.
-    /// Hybrid multi-GPU is a desktop probe; Android is always single-SoC.
-    #[cfg(any(test, not(target_os = "android")))]
+    #[cfg(test)]
     pub fn requires_copy_path(&self) -> bool {
         // Two identical cards still sit on different render nodes: either difference
         // means frames cross devices.

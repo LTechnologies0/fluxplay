@@ -430,9 +430,6 @@ impl LibFfmpeg {
         Some((gw as u32, gh as u32, out))
     }
 
-    pub fn shutdown(self) {
-        // Drop closes.
-    }
 }
 
 impl Drop for LibFfmpeg {

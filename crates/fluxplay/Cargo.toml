@@ -23,6 +23,8 @@ native-player = [
     "fluxplay-player/bundle-rpath",
 ]
 static-mpv = ["fluxplay-player/static-link", "fluxplay-player/bundle-rpath"]
+# Expose parsers / tile cache for cargo-fuzz targets (see /fuzz).
+fuzzing = []
 
 [dependencies]
 fluxplay-core.workspace = true
@@ -76,3 +78,6 @@ log = "0.4"
 tracing-log = "0.2"
 jni = "0.21"
 ndk-context = "0.1"
+
+[dev-dependencies]
+proptest = { workspace = true }

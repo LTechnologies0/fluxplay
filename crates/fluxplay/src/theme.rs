@@ -1,9 +1,7 @@
 //! Material 3 Expressive tokens — accent presets + day/night surfaces.
 //! Inspired by M3 Expressive and IPTV clients (TiviMate / MYTV / Smarters).
 //!
-//! Design-system surface: many roles / spacing tokens are reserved for upcoming chrome.
-
-#![allow(dead_code)]
+//! Design-system surface: spacing / type tokens are referenced from browser + app views.
 
 use fluxplay_core::models::AccentPreset;
 use iced::font::{Family, Weight};
@@ -96,16 +94,6 @@ impl UiTheme {
         Color::from_rgb8(r, g, b)
     }
 
-    pub fn on_secondary(self) -> Color {
-        if self.day {
-            let (r, g, b) = accent_tokens(self.accent).on_secondary;
-            Color::from_rgb8(r, g, b)
-        } else {
-            // Night secondary is a light pastel → dark ink.
-            Color::from_rgb8(0x1A, 0x1C, 0x22)
-        }
-    }
-
     pub fn secondary_container(self) -> Color {
         let t = accent_tokens(self.accent);
         let (r, g, b) = if self.day {
@@ -124,49 +112,12 @@ impl UiTheme {
         }
     }
 
-    // --- Tertiary (favorites / soft badges) ---
-    pub fn tertiary(self) -> Color {
-        self.favorite()
-    }
-
-    pub fn on_tertiary(self) -> Color {
-        if self.day {
-            Color::from_rgb8(0x3A, 0x2A, 0x00)
-        } else {
-            Color::from_rgb8(0x2A, 0x1E, 0x00)
-        }
-    }
-
-    pub fn tertiary_container(self) -> Color {
-        // Opaque blend of favorite gold into surface (no alpha wash).
-        let t = self.favorite();
-        let s = self.surface();
-        let w = if self.day { 0.28 } else { 0.34 };
-        Color::from_rgb(
-            t.r * w + s.r * (1.0 - w),
-            t.g * w + s.g * (1.0 - w),
-            t.b * w + s.b * (1.0 - w),
-        )
-    }
-
-    pub fn on_tertiary_container(self) -> Color {
-        self.on_tertiary()
-    }
-
     // --- Error (distinct from LIVE) ---
     pub fn error(self) -> Color {
         if self.day {
             Color::from_rgb8(0xBA, 0x1A, 0x1A)
         } else {
             Color::from_rgb8(0xF2, 0xB8, 0xB5)
-        }
-    }
-
-    pub fn on_error(self) -> Color {
-        if self.day {
-            Color::from_rgb8(0xFF, 0xFF, 0xFF)
-        } else {
-            Color::from_rgb8(0x60, 0x14, 0x10)
         }
     }
 
@@ -187,16 +138,11 @@ impl UiTheme {
         }
     }
 
-    /// LIVE badge / recording indicator (kept separate from `error`).
-    pub fn live(self) -> Color {
-        if self.day {
-            Color::from_rgb8(0xBA, 0x1A, 0x1A)
-        } else {
-            Color::from_rgb8(0xFF, 0xB4, 0xAB)
-        }
+    /// Favorite star (`tertiary`).
+    pub fn tertiary(self) -> Color {
+        self.favorite()
     }
 
-    /// Favorite star (`tertiary`).
     pub fn favorite(self) -> Color {
         if self.day {
             Color::from_rgb8(0xC9, 0x8A, 0x00)
@@ -227,14 +173,6 @@ impl UiTheme {
         }
     }
 
-    pub fn surface_bright(self) -> Color {
-        if self.day {
-            Color::from_rgb8(0xFF, 0xFF, 0xFF)
-        } else {
-            Color::from_rgb8(0x1C, 0x25, 0x34)
-        }
-    }
-
     pub fn on_surface(self) -> Color {
         self.ink()
     }
@@ -256,15 +194,6 @@ impl UiTheme {
             Color::from_rgba8(0x0F, 0x17, 0x22, 0.58)
         } else {
             Color::from_rgba8(0xE8, 0xEF, 0xF6, 0.55)
-        }
-    }
-
-    pub fn surface_container_lowest(self) -> Color {
-        if self.day {
-            // Slightly off-white (not pure #FFF).
-            Color::from_rgb8(0xFA, 0xFB, 0xFD)
-        } else {
-            Color::from_rgb8(0x08, 0x0B, 0x12)
         }
     }
 
@@ -310,11 +239,6 @@ impl UiTheme {
         self.surface_container_high()
     }
 
-    /// Nav / top bar chrome — always `surfaceContainer` (stable across breakpoints).
-    pub fn chrome_surface(self) -> Color {
-        self.surface_container()
-    }
-
     /// Selected row fill (`primaryContainer` soft).
     pub fn selection_fill(self) -> Color {
         let c = self.primary_container();
@@ -322,6 +246,7 @@ impl UiTheme {
     }
 
     /// Android tonal elevation step; desktop collapses ≥1 to `surface_elevated`.
+    #[cfg(target_os = "android")]
     pub fn elevated_fill(self, level: u8) -> Color {
         #[cfg(target_os = "android")]
         {
@@ -384,19 +309,6 @@ impl UiTheme {
         }
     }
 
-    pub fn divider(self) -> Color {
-        self.outline_variant()
-    }
-
-    // --- Inverse (snackbars) ---
-    pub fn inverse_surface(self) -> Color {
-        if self.day {
-            Color::from_rgb8(0x2F, 0x30, 0x33)
-        } else {
-            Color::from_rgb8(0xE3, 0xE2, 0xE6)
-        }
-    }
-
     pub fn inverse_on_surface(self) -> Color {
         if self.day {
             Color::from_rgb8(0xF0, 0xF0, 0xF4)
@@ -405,27 +317,9 @@ impl UiTheme {
         }
     }
 
-    pub fn inverse_primary(self) -> Color {
-        // True inverse: night primary when day, day primary when night.
-        if self.day {
-            self.accent.primary_night()
-        } else {
-            self.accent.primary_day()
-        }
-    }
-
     /// Modal / sheet scrim @ 32%.
     pub fn scrim(self) -> Color {
         Color::from_rgba(0.0, 0.0, 0.0, 0.32)
-    }
-
-    /// Player overlay scrim @ 45%.
-    pub fn scrim_heavy(self) -> Color {
-        Color::from_rgba(0.0, 0.0, 0.0, 0.45)
-    }
-
-    pub fn on_accent(self) -> Color {
-        self.on_primary()
     }
 }
 
@@ -493,7 +387,6 @@ struct AccentTokens {
     secondary_night: (u8, u8, u8),
     secondary_container_day: (u8, u8, u8),
     secondary_container_night: (u8, u8, u8),
-    on_secondary: (u8, u8, u8),
 }
 
 /// Complementary secondary family keyed by accent group (opaque containers).
@@ -553,7 +446,7 @@ fn accent_tokens(preset: AccentPreset) -> AccentTokens {
         Gold | Amber | Peach | Lime | Neon => (0x3A, 0x2A, 0x00),
         _ => (0xFF, 0xFF, 0xFF),
     };
-    let (sd, sn, scd, scn, os) = secondary_tokens(preset);
+    let (sd, sn, scd, scn, _os) = secondary_tokens(preset);
     let t = |day, night, cd, cn, od, opn| AccentTokens {
         day,
         night,
@@ -566,7 +459,6 @@ fn accent_tokens(preset: AccentPreset) -> AccentTokens {
         secondary_night: sn,
         secondary_container_day: scd,
         secondary_container_night: scn,
-        on_secondary: os,
     };
     match preset {
         Teal => t((0x00,0x6A,0x62),(0x4F,0xDB,0xC8),(0x9A,0xF2,0xE6),(0x00,0x4F,0x49),(0x00,0x2A,0x27),(0x00,0x33,0x2F)),
@@ -616,11 +508,8 @@ pub const SPACE_SM: f32 = 8.0; // space100
 pub const SPACE_MD: f32 = 12.0; // space150
 pub const SPACE_LG: f32 = 16.0; // space200
 pub const SPACE_XL: f32 = 24.0; // space300
-pub const SPACE_XXL: f32 = 32.0; // space400
-pub const SPACE_XXXL: f32 = 48.0; // space600
 
 /// M3 shape corner-radius scale (10 steps).
-pub const RADIUS_NONE: f32 = 0.0;
 pub const RADIUS_EXTRA_SMALL: f32 = 4.0;
 pub const RADIUS_SMALL: f32 = 8.0;
 pub const RADIUS_MEDIUM: f32 = 12.0;
@@ -632,13 +521,11 @@ pub const RADIUS_EXTRA_EXTRA_LARGE: f32 = 48.0;
 pub const RADIUS_FULL: f32 = 999.0;
 
 // Legacy aliases used across browser / player / app.
-pub const RADIUS_XS: f32 = RADIUS_EXTRA_SMALL;
 pub const RADIUS_SM: f32 = RADIUS_SMALL;
 pub const RADIUS_MD: f32 = RADIUS_LARGE;
 pub const RADIUS_LG: f32 = RADIUS_LARGE_INCREASED;
 pub const RADIUS_XL: f32 = RADIUS_EXTRA_LARGE;
 pub const RADIUS_XXL: f32 = RADIUS_EXTRA_LARGE_INCREASED;
-pub const RADIUS_XXXL: f32 = RADIUS_EXTRA_EXTRA_LARGE;
 
 /// Poster tile: softer top, tighter bottom (Expressive image crop).
 pub fn radius_poster() -> iced::border::Radius {
@@ -657,16 +544,6 @@ pub fn radius_floating_toolbar() -> iced::border::Radius {
         top_right: RADIUS_EXTRA_EXTRA_LARGE,
         bottom_right: RADIUS_EXTRA_EXTRA_LARGE,
         bottom_left: RADIUS_EXTRA_EXTRA_LARGE,
-    }
-}
-
-/// Docked / floating toolbar — only top corners soft (sheets / docked).
-pub fn radius_dock() -> iced::border::Radius {
-    iced::border::Radius {
-        top_left: RADIUS_EXTRA_LARGE,
-        top_right: RADIUS_EXTRA_LARGE,
-        bottom_right: 0.0,
-        bottom_left: 0.0,
     }
 }
 
@@ -705,10 +582,7 @@ pub fn radius_list_item(selected: bool) -> iced::border::Radius {
 }
 
 // --- Typography (baseline sizes; emphasized = weight bump in callers) ---
-pub const TYPE_DISPLAY_L: f32 = 57.0;
-pub const TYPE_DISPLAY_M: f32 = 45.0;
 pub const TYPE_DISPLAY_S: f32 = 36.0;
-pub const TYPE_HEADLINE_L: f32 = 32.0;
 pub const TYPE_HEADLINE_M: f32 = 28.0;
 pub const TYPE_HEADLINE_S: f32 = 24.0;
 pub const TYPE_TITLE_L: f32 = 22.0;
@@ -716,7 +590,6 @@ pub const TYPE_TITLE_M: f32 = 16.0;
 pub const TYPE_TITLE_S: f32 = 14.0;
 pub const TYPE_BODY_L: f32 = 16.0;
 pub const TYPE_BODY_M: f32 = 14.0;
-pub const TYPE_BODY_S: f32 = 12.0;
 pub const TYPE_LABEL_L: f32 = 14.0;
 pub const TYPE_LABEL_M: f32 = 12.0;
 pub const TYPE_LABEL_S: f32 = 11.0;
@@ -724,35 +597,21 @@ pub const TYPE_LABEL_S: f32 = 11.0;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TypeRole {
     DisplayS,
-    HeadlineL,
-    HeadlineM,
     HeadlineS,
     TitleL,
     TitleM,
     TitleS,
-    BodyL,
-    BodyM,
-    BodyS,
-    LabelL,
     LabelM,
-    LabelS,
 }
 
 pub fn type_size(role: TypeRole) -> f32 {
     match role {
         TypeRole::DisplayS => TYPE_DISPLAY_S,
-        TypeRole::HeadlineL => TYPE_HEADLINE_L,
-        TypeRole::HeadlineM => TYPE_HEADLINE_M,
         TypeRole::HeadlineS => TYPE_HEADLINE_S,
         TypeRole::TitleL => TYPE_TITLE_L,
         TypeRole::TitleM => TYPE_TITLE_M,
         TypeRole::TitleS => TYPE_TITLE_S,
-        TypeRole::BodyL => TYPE_BODY_L,
-        TypeRole::BodyM => TYPE_BODY_M,
-        TypeRole::BodyS => TYPE_BODY_S,
-        TypeRole::LabelL => TYPE_LABEL_L,
         TypeRole::LabelM => TYPE_LABEL_M,
-        TypeRole::LabelS => TYPE_LABEL_S,
     }
 }
 
@@ -798,16 +657,12 @@ pub const SLIDER_S_TRACK: f32 = 6.0;
 pub const SLIDER_S_HEIGHT: f32 = 28.0;
 pub const SLIDER_HANDLE_W: u16 = 4;
 pub const FAB_MEDIUM: f32 = 48.0;
-pub const SEARCH_BAR_H: f32 = 56.0;
 pub const LOADING_SIZE: f32 = 48.0;
 pub const TOUCH_TARGET: f32 = 48.0;
 pub const CARD_RADIUS: f32 = RADIUS_LARGE;
-pub const CARD_PAD: f32 = SPACE_LG;
-pub const CARD_GAP: f32 = SPACE_SM;
 
 /// Motion stubs (duration / coast).
 pub const MOTION_SHORT_MS: u64 = 120;
-pub const MOTION_MED_MS: u64 = 200;
 pub const MOTION_COAST_FRICTION: f32 = 0.88;
 
 /// Elevation levels 0–5 → soft desktop shadow (Android: use `Shadow::default()`).
@@ -834,8 +689,6 @@ pub fn elevation_shadow(level: u8, day: bool) -> iced::Shadow {
         }
     }
 }
-
-pub const PLAYER_PAD: f32 = SPACE_LG;
 
 /// Minimum mosaic tile width (logical px) before dropping a column.
 pub const MOSAIC_TILE_MIN: f32 = 120.0;
@@ -874,9 +727,9 @@ impl Breakpoint {
 /// One-shot layout budget for a paint pass.
 #[derive(Debug, Clone, Copy)]
 pub struct LayoutMetrics {
+    /// Product surface (phone / tablet / desktop / television).
+    pub surface: crate::ui_surface::UiSurface,
     pub bp: Breakpoint,
-    pub width: f32,
-    pub height: f32,
     /// Side rail width; 0 → use horizontal top tabs.
     pub rail_w: f32,
     /// Category sidebar width; 0 → chips above content.
@@ -894,38 +747,51 @@ pub struct LayoutMetrics {
     pub player_chrome_h: f32,
     pub stack_header: bool,
     pub top_nav: bool,
-    pub short: bool,
     /// Phone landscape: single-row tab strip instead of 2-col grid.
     pub nav_strip: bool,
+    /// Interactive target size for the active surface (48 phone / 64 TV).
+    pub touch_target: f32,
+    /// Show D-pad focus chrome on mosaic cells.
+    pub focus_chrome: bool,
 }
 
 impl LayoutMetrics {
     pub fn compute(width: f32, height: f32) -> Self {
+        let surface = crate::ui_surface::UiSurface::detect(width, height);
+        Self::compute_for(surface, width, height)
+    }
+
+    /// Layout for an explicit [`crate::ui_surface::UiSurface`] (TV leanback, tests).
+    pub fn compute_for(
+        surface: crate::ui_surface::UiSurface,
+        width: f32,
+        height: f32,
+    ) -> Self {
         let w = width.max(280.0);
         let h = height.max(200.0);
         // Phone landscape is often ≥600 wide but ~360 tall — width-only breakpoints
         // wrongly switch to rail + category sidebar and crush the UI.
         let short = h < 520.0;
         let landscape = w > h * 1.05;
-        let compact = w.min(h) < 520.0 || h < 480.0 || (landscape && h < 560.0);
-        let bp = if compact {
-            Breakpoint::Phone
-        } else {
-            Breakpoint::from_width(w)
-        };
+        let bp = surface.layout_breakpoint(w, h);
+        let compact = matches!(bp, Breakpoint::Phone);
+        let overscan = surface.overscan_pad();
+        let type_scale = surface.type_scale();
 
         #[cfg(target_os = "android")]
-        let pad = if short { 6.0_f32 } else { 8.0_f32 };
+        let mut pad = if short { 6.0_f32 } else { 8.0_f32 };
         #[cfg(not(target_os = "android"))]
-        let pad = match bp {
+        let mut pad = match bp {
             Breakpoint::Phone => SPACE_SM,
             Breakpoint::Tablet => SPACE_MD,
             Breakpoint::Laptop => SPACE_LG,
             Breakpoint::Desktop | Breakpoint::Tv => SPACE_XL,
         };
+        pad += overscan;
         let gap = match bp {
             Breakpoint::Phone => if short { SPACE_XS } else { SPACE_SM },
             Breakpoint::Tablet => SPACE_SM,
+            Breakpoint::Tv => SPACE_LG,
             _ => SPACE_MD,
         };
 
@@ -957,17 +823,19 @@ impl LayoutMetrics {
             Breakpoint::Tablet => 4,
             Breakpoint::Laptop => 6,
             Breakpoint::Desktop => 8,
-            Breakpoint::Tv => 8,
+            // Fewer, larger posters for 10-foot remote navigation.
+            Breakpoint::Tv => 6,
         };
         let cols = mosaic_cols(content_w).min(max_cols).max(1);
         let tile_w = mosaic_tile_width(content_w, cols);
         let search_w = match bp {
             Breakpoint::Phone => content_w.max(100.0),
+            Breakpoint::Tv => (content_w * 0.42).clamp(280.0, 520.0),
             _ => (content_w * 0.34).clamp(100.0, 380.0),
         };
 
         // Type ladder: Phone / Tablet / Desktop / Tv (Laptop shares Desktop).
-        let (title_size, body_size, rail_size, thumb, player_chrome_h) = match bp {
+        let (mut title_size, mut body_size, mut rail_size, thumb, player_chrome_h) = match bp {
             Breakpoint::Phone => (
                 TYPE_TITLE_L,
                 TYPE_BODY_M,
@@ -979,13 +847,15 @@ impl LayoutMetrics {
             Breakpoint::Laptop | Breakpoint::Desktop => {
                 (TYPE_HEADLINE_M, TYPE_BODY_L, TYPE_TITLE_M, if matches!(bp, Breakpoint::Desktop) { 52.0 } else { 48.0 }, 116.0)
             }
-            Breakpoint::Tv => (TYPE_DISPLAY_S, TYPE_BODY_L, TYPE_LABEL_L, 64.0, 128.0),
+            Breakpoint::Tv => (TYPE_DISPLAY_S, TYPE_BODY_L, TYPE_LABEL_L, 72.0, 144.0),
         };
+        title_size *= type_scale;
+        body_size *= type_scale;
+        rail_size *= type_scale;
 
         Self {
+            surface,
             bp,
-            width: w,
-            height: h,
             rail_w,
             cat_w,
             content_w,
@@ -1005,8 +875,9 @@ impl LayoutMetrics {
                 || search_w >= content_w * 0.85
                 || search_w < 240.0,
             top_nav,
-            short,
             nav_strip: top_nav && short && landscape,
+            touch_target: surface.touch_target(),
+            focus_chrome: surface.wants_focus_chrome() || surface.is_touch(),
         }
     }
 }

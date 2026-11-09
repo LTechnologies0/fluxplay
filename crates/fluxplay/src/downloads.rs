@@ -729,7 +729,6 @@ struct Session {
 /// One HTTP request, appending to the `.part` from its current length. A
 /// large file served with byte ranges switches to [`parallel::run`], this
 /// response becoming its first connection.
-#[allow(clippy::too_many_arguments)]
 async fn attempt(
     client: &reqwest::Client,
     plan: &Plan,
@@ -1191,6 +1190,10 @@ pub fn sanitize_file_name(name: &str) -> String {
         .join(" ");
     let trimmed = collapsed.trim_start_matches('.').trim_end_matches(['.', ' ']);
     let mut out: String = trimmed.chars().take(150).collect();
+    // Cap UTF-8 bytes so emoji-heavy titles stay filesystem-friendly.
+    while out.len() > 240 {
+        out.pop();
+    }
     if out.is_empty() {
         out = "FluxPlay".into();
     }

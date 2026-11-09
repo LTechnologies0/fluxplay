@@ -155,14 +155,6 @@ pub async fn start_tunnel_from_file(path: &Path, bootstrap_dns: &str) -> Result<
     result
 }
 
-#[allow(dead_code)]
-pub async fn start_tunnel_from_str(conf: &str, bootstrap_dns: &str) -> Result<String, String> {
-    stop_tunnel();
-    let bootstrap = bootstrap_from_conf_or_settings(conf, bootstrap_dns);
-    let conf = prepare_conf_with_bootstrap(conf, &bootstrap).await?;
-    start_tunnel_from_prepared(&conf).await
-}
-
 async fn start_tunnel_from_prepared(conf: &str) -> Result<String, String> {
     let profile = parse_profile(conf).map_err(|e| format!("profil WireGuard : {e}"))?;
     let proxy = WgProxy::start(&profile)

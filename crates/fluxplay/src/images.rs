@@ -19,22 +19,31 @@ use tracing::{debug, error, trace, warn};
 use url::Url;
 use uuid::Uuid;
 
-/// Cap RAM handles — keep several mosaic viewports warm during fast flings.
-/// Handles hold the compressed (downscaled) file, ~15–40 KB each.
-const MAX_RAM_HANDLES: usize = 768;
+/// Cap RAM handles — keep a couple mosaic viewports warm during flings.
+/// Handles hold the compressed (downscaled) file, ~8–40 KB each.
+// Visible mosaic only (+ tiny overscan). "Afficher plus" unlocks more tiles;
+// iced atlas must not retain hundreds of off-screen posters.
+pub(crate) const MAX_RAM_HANDLES: usize = 72;
 const MAX_IMAGE_BYTES: usize = 2_500_000;
+/// Soft ceiling for a single UI-prepared poster (JPEG after downscale).
+const MAX_UI_HANDLE_BYTES: usize = 96_000;
 /// Default soft cap when host caps are not applied yet.
 pub const MAX_INFLIGHT_IMAGES: usize = 24;
 /// Longest edge for GPU/RAM handles (overridden by host decode_edge_px).
-const MAX_UI_EDGE_PX: u32 = 480;
+/// Must stay ≤ plan hard cap (300) — see `display_caps` / `invariants`.
+pub(crate) const MAX_UI_EDGE_PX: u32 = 300;
+/// Cap host-circuit map — clear-on-full (hosts rotate forever on IPTV CDNs).
+const HOST_CIRCUIT_CAP: usize = 512;
 
 const URL_SOFT_FAIL: Duration = Duration::from_secs(12 * 60);
 /// Cap permanent-fail set — over cap, clear wholesale (worst case: one retry).
-const FAILED_CAP: usize = 4096;
+const FAILED_CAP: usize = 768;
 /// Sweep expired soft-fail entries once the map passes this size.
-const SOFT_FAIL_SWEEP_AT: usize = 1024;
+const SOFT_FAIL_SWEEP_AT: usize = 256;
 /// Cap for the `normalize_image_url` memo map — clear-on-full.
-const NORMALIZE_CACHE_CAP: usize = 2048;
+const NORMALIZE_CACHE_CAP: usize = 512;
+/// Cap for per-host warn throttle map.
+const WARN_HOST_CAP: usize = 256;
 const HOST_COOLDOWN: Duration = Duration::from_secs(25 * 60);
 const HOST_FAIL_TRIP: u32 = 5;
 const HOST_WARN_INTERVAL: Duration = Duration::from_secs(90);
@@ -94,6 +103,33 @@ impl ImageCache {
 
     pub fn inflight_len(&self) -> usize {
         self.inflight.len()
+    }
+
+    pub fn handle_count(&self) -> usize {
+        self.handles.len()
+    }
+
+    /// Drop every decoded handle + in-flight bookkeeping (category / tab switch).
+    /// Keeps soft-fail / circuit state so we don't retry-storm dead CDNs.
+    pub fn clear_handles(&mut self) {
+        self.handles.clear();
+        self.touch_gen.clear();
+        self.inflight.clear();
+        self.inflight_source.clear();
+        self.clock = self.clock.wrapping_add(1);
+    }
+
+    /// Keep only URLs still needed for the current mosaic (visible + warm band).
+    pub fn retain_urls<I, S>(&mut self, keep: I)
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let set: HashSet<String> = keep.into_iter().map(|s| s.as_ref().to_string()).collect();
+        self.handles.retain(|u, _| set.contains(u));
+        self.touch_gen.retain(|u, _| set.contains(u));
+        self.inflight.retain(|u| set.contains(u));
+        self.inflight_source.retain(|u, _| set.contains(u));
     }
 
     /// O(1) MRU bump — safe to call for every visible mosaic tile each frame.
@@ -171,24 +207,6 @@ impl ImageCache {
         }
     }
 
-    #[allow(dead_code)]
-    pub fn take_inflight_source(&mut self, url: &str) -> Option<Uuid> {
-        self.inflight_source.remove(url).flatten()
-    }
-
-    #[allow(dead_code)]
-    pub fn insert_bytes(&mut self, url: String, bytes: Vec<u8>) {
-        self.inflight.remove(&url);
-        self.inflight_source.remove(&url);
-        self.soft_fail.remove(&url);
-        if bytes.len() < 64 || looks_like_html(&bytes) {
-            self.insert_failed(url);
-            return;
-        }
-        let bytes = downscale_for_ui(bytes, self.decode_edge_px);
-        self.insert_ui_bytes(url, bytes);
-    }
-
     /// Insert bytes already prepared for UI (decoded/downscaled off-thread).
     /// New `Handle` so iced/wgpu re-uploads after the shared UI atlas was reused (e.g. soft video).
     pub fn refresh_gpu_texture(&mut self, url: &str, _source_id: Option<Uuid>) {
@@ -212,8 +230,13 @@ impl ImageCache {
             // Success resets the circuit so a flaky host can recover.
             self.host_circuit.remove(&host);
         }
-        if bytes.len() < 64 || looks_like_html(&bytes) {
-            warn!(target: "fluxplay::images", %url, len = bytes.len(), "reject non-image bytes");
+        if bytes.len() < 64 || bytes.len() > MAX_UI_HANDLE_BYTES || looks_like_html(&bytes) {
+            warn!(
+                target: "fluxplay::images",
+                %url,
+                len = bytes.len(),
+                "reject non-image / oversized UI bytes"
+            );
             self.insert_failed(url);
             return;
         }
@@ -256,6 +279,11 @@ impl ImageCache {
         let until = now + URL_SOFT_FAIL;
         self.soft_fail.insert(url.clone(), until);
         if let Some(host) = host_key(&url) {
+            if self.host_circuit.len() >= HOST_CIRCUIT_CAP
+                && !self.host_circuit.contains_key(&host)
+            {
+                self.host_circuit.clear();
+            }
             let entry = self.host_circuit.entry(host.clone()).or_insert(HostCircuit {
                 fails: 0,
                 cool_until: None,
@@ -274,13 +302,6 @@ impl ImageCache {
                 );
             }
         }
-    }
-
-    /// Drop inflight without blacklisting — allows retry after transient network errors.
-    #[allow(dead_code)]
-    pub fn clear_inflight(&mut self, url: &str) {
-        self.inflight.remove(url);
-        self.inflight_source.remove(url);
     }
 }
 
@@ -336,20 +357,42 @@ fn clearnet_image_http() -> reqwest::Client {
         .clone()
 }
 
-fn warn_host_once(host: &str, msg: &str, detail: &str) {
+fn warn_host_cache() -> &'static Mutex<HashMap<String, Instant>> {
     static LAST: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::new();
-    let map = LAST.get_or_init(|| Mutex::new(HashMap::new()));
+    LAST.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn normalize_cache() -> &'static Mutex<HashMap<String, String>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn warn_host_once(host: &str, msg: &str, detail: &str) {
     let now = Instant::now();
-    if let Ok(mut g) = map.lock() {
+    if let Ok(mut g) = warn_host_cache().lock() {
         if let Some(prev) = g.get(host) {
             if now.duration_since(*prev) < HOST_WARN_INTERVAL {
                 debug!(%host, %detail, "{msg}");
                 return;
             }
         }
+        if g.len() >= WARN_HOST_CAP && !g.contains_key(host) {
+            g.clear();
+        }
         g.insert(host.to_string(), now);
     }
     warn!(%host, %detail, "{msg}");
+}
+
+/// Drop process-global image aux maps (normalize memo + warn throttle).
+/// Called on tab / category switches so IPTV CDN churn cannot pin MBs of String keys.
+pub fn trim_global_aux_caches() {
+    if let Ok(mut g) = normalize_cache().lock() {
+        g.clear();
+    }
+    if let Ok(mut g) = warn_host_cache().lock() {
+        g.clear();
+    }
 }
 
 /// Collapse `//`, percent-encode unicode path/query (fixes Wikimedia HTTP 400).
@@ -380,9 +423,7 @@ fn normalize_image_url(url: &str) -> String {
 /// Memoized `normalize_image_url` — pure function called per tile per frame.
 /// Global `Mutex` map (same pattern as `warn_host_once`); clear-on-full cap.
 fn normalized_cached(url: &str) -> String {
-    static CACHE: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
-    let map = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Ok(mut g) = map.lock() {
+    if let Ok(mut g) = normalize_cache().lock() {
         if let Some(hit) = g.get(url) {
             return hit.clone();
         }
@@ -577,15 +618,6 @@ pub async fn fetch_image_bytes(
     Err((url, last_err))
 }
 
-/// Fetch then downscale on the blocking pool (iced `update` stays light).
-#[allow(dead_code)]
-pub async fn fetch_image_prepared(
-    url: String,
-    source_id: Option<Uuid>,
-) -> Result<(String, Option<Uuid>, Vec<u8>), (String, String)> {
-    fetch_image_prepared_edged(url, source_id, MAX_UI_EDGE_PX).await
-}
-
 pub async fn fetch_image_prepared_edged(
     url: String,
     source_id: Option<Uuid>,
@@ -603,12 +635,14 @@ fn looks_like_html(bytes: &[u8]) -> bool {
 }
 
 pub(crate) fn downscale_for_ui(bytes: Vec<u8>, edge_px: u32) -> Vec<u8> {
-    let edge = edge_px.max(160);
+    let edge = edge_px.clamp(160, MAX_UI_EDGE_PX.max(edge_px));
     let Ok(img) = image::load_from_memory(&bytes) else {
-        return bytes;
+        // Never park a multi-MB undecodable blob in the UI handle map.
+        return Vec::new();
     };
     let (w, h) = img.dimensions();
-    if w <= edge && h <= edge {
+    // Already tiny on disk and within the edge — keep original.
+    if w <= edge && h <= edge && bytes.len() <= MAX_UI_HANDLE_BYTES {
         return bytes;
     }
     let resized = img.thumbnail(edge, edge);
@@ -617,6 +651,7 @@ pub(crate) fn downscale_for_ui(bytes: Vec<u8>, edge_px: u32) -> Vec<u8> {
         .write_to(&mut Cursor::new(&mut out), image::ImageFormat::Jpeg)
         .is_ok()
         && out.len() >= 64
+        && out.len() <= MAX_UI_HANDLE_BYTES
     {
         return out;
     }
@@ -625,10 +660,12 @@ pub(crate) fn downscale_for_ui(bytes: Vec<u8>, edge_px: u32) -> Vec<u8> {
         .write_to(&mut Cursor::new(&mut out), image::ImageFormat::Png)
         .is_ok()
         && out.len() >= 64
+        && out.len() <= MAX_UI_HANDLE_BYTES
     {
         return out;
     }
-    bytes
+    // Prefer empty (rejected on insert) over retaining a huge original.
+    Vec::new()
 }
 
 fn legacy_disk_root() -> PathBuf {
@@ -706,5 +743,38 @@ mod tests {
         }
         assert!(c.host_blocked(&url));
         assert!(matches!(c.request(&url, None), RequestOutcome::Skip));
+    }
+
+    #[test]
+    fn mosaic_ram_handle_budget_matches_100mb_plan() {
+        // Plan: keep handles tight so category switches cannot pin hundreds of atlas slots.
+        assert_eq!(MAX_RAM_HANDLES, 72);
+        assert!(
+            MAX_UI_EDGE_PX <= 300,
+            "MAX_UI_EDGE_PX={MAX_UI_EDGE_PX} — decoded posters too large for soft path"
+        );
+    }
+
+    #[test]
+    fn clear_handles_drops_ram_but_keeps_circuits() {
+        let mut c = ImageCache::default();
+        c.insert_ui_bytes(
+            "https://cdn.example/a.jpg".into(),
+            vec![0xFFu8; 128], // rejected as non-image → failed set
+        );
+        // Force a soft-fail circuit entry, then clear handles.
+        c.mark_soft_failed("http://dead.example/x.png".into());
+        c.clear_handles();
+        assert_eq!(c.handle_count(), 0);
+        assert_eq!(c.inflight_len(), 0);
+        assert_eq!(c.soft_fail.len(), 1);
+        assert!(c.host_circuit.contains_key("dead.example"));
+    }
+
+    #[test]
+    fn downscale_rejects_undecodable_blob() {
+        let junk = vec![0u8; 500_000];
+        let out = downscale_for_ui(junk, 300);
+        assert!(out.is_empty());
     }
 }

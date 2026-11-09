@@ -25,7 +25,7 @@ use iced::{
 };
 use uuid::Uuid;
 
-use crate::browser::{BrowseIndex, CAT_PAGE, LIST_PAGE};
+use crate::browser::{BrowseIndex, CAT_PAGE};
 use crate::player_ui::PlayerPanel;
 use crate::theme::{
     type_style, LayoutMetrics, TypeRole, UiTheme, MOTION_COAST_FRICTION, MOTION_SHORT_MS,
@@ -199,9 +199,6 @@ struct FluxPlay {
     network_probe: String,
     system_dark: bool,
     cat_filter: String,
-    /// Legacy page cap (pre–virtual-scroll). Kept for [`Message::LoadMore`] reserve path.
-    #[allow(dead_code)]
-    list_limit: usize,
     images: crate::images::ImageCache,
     catalog_db: Option<crate::catalog_db::CatalogDb>,
     autoplay_done: bool,
@@ -228,8 +225,6 @@ struct FluxPlay {
     /// Depth matches the 5 worker video atlases (on-screen + present queue + upload).
     video_allocation_hold: Option<ImageAllocation>,
     video_allocation_hold2: Option<ImageAllocation>,
-    video_allocation_hold3: Option<ImageAllocation>,
-    video_allocation_hold4: Option<ImageAllocation>,
     video_frame_wh: (u32, u32),
     /// One in-flight `image::allocate` — drop intermediate soft frames.
     video_upload_busy: bool,
@@ -305,9 +300,14 @@ struct FluxPlay {
     display_probe_at: std::time::Instant,
     /// Resolved GUI / video FPS ceilings from prefs + probe + stage.
     display_caps: DisplayCaps,
-    /// Indices into `bundle.channels` / `vod` / `series` for the current browse filter.
-    /// `BrowseIndex::Identity` for « All » avoids a million-entry Vec.
+    /// Browse positions for the active tab/filter (`Identity` = SQLite catalog order).
     browse_index: BrowseIndex,
+    /// Slim mosaic rows (LRU); full payloads stay in SQLite.
+    tile_cache: crate::browse_tiles::BrowseTileCache,
+    /// Catalog sizes after spine load (bundle vod/series/channels vecs stay empty).
+    channel_count: usize,
+    vod_count: usize,
+    series_count: usize,
     /// Flat series-detail rows (headers + episodes) for virtual scroll.
     episode_flat: Vec<EpisodeFlat>,
     /// Scroll offset / viewport height for the active virtualized list.
@@ -322,8 +322,11 @@ struct FluxPlay {
     /// Cached sidebar rows — rebuilt on tab / filter / catalog, not on content scroll.
     cat_entries: Vec<(String, String, bool, usize)>,
     /// Coalesce ImageLoaded → one iced view refresh per burst (fast scroll).
+    /// Hard-capped — unbounded growth during fling was a multi-hundred-MB leak.
     pending_images: Vec<(String, Option<Uuid>, Vec<u8>)>,
     image_flush_armed: bool,
+    /// Bumped on browse rebuild / category switch — stale ImageLoaded are dropped.
+    art_fetch_gen: u64,
     /// Scroll velocity (px/s) for art lookahead / fling LOD.
     browse_scroll_vy: f32,
     browse_scroll_at: Option<std::time::Instant>,
@@ -336,9 +339,11 @@ struct FluxPlay {
     browse_drag_accum: f32,
     /// True once finger moved past slop — suppress tile/row open on release.
     browse_drag_moved: bool,
-    /// Background warm of `browse_index` art after profile load (not scroll-gated).
+    /// Background warm of `browse_index` art — kept off; visible-only loads posters.
     art_warm_cursor: usize,
     art_warm_active: bool,
+    /// How many mosaic items are unlocked (page growth via « Afficher plus »).
+    mosaic_shown: usize,
     /// Debounce search → index rebuild (generation discards stale timers).
     search_debounce_gen: u64,
     /// Atomic job meters (ingest / index / images) + browse generation.
@@ -483,11 +488,9 @@ pub(crate) enum Message {
     /// Android system Back while browsing (close detail → ignore Activity finish).
     #[cfg(target_os = "android")]
     NavBack,
-    /// TV / D-pad browse focus step (when player not open).
-    #[cfg(target_os = "android")]
-    BrowseFocusDelta(i32),
-    /// TV / D-pad activate focused browse row.
-    #[cfg(target_os = "android")]
+    /// Remote / keyboard mosaic focus step (`dcol` / `drow` in grid cells).
+    BrowseFocusStep { dcol: i32, drow: i32 },
+    /// Activate the focused mosaic / live row (Enter / DPAD_CENTER).
     BrowseActivate,
     /// Poll SAF inbox (document picker / create).
     #[cfg(target_os = "android")]
@@ -562,8 +565,8 @@ pub(crate) enum Message {
         result: Result<Arc<PlaylistBundle>, String>,
     },
     SourcesBatchLoaded(Vec<(Uuid, Result<Arc<PlaylistBundle>, String>)>),
-    /// Full catalog reload finished off the UI thread (avoids ANR on huge SQLite).
-    BundleCacheReady(Result<PlaylistBundle, String>),
+    /// Spine reload finished off the UI thread (categories + EPG + counts only).
+    BundleCacheReady(Result<crate::catalog_db::CatalogSpine, String>),
     OpenExternal,
     SetExternalPlayer(String),
     PickPlaylistFile,
@@ -607,6 +610,11 @@ pub(crate) enum Message {
         sources: Vec<Uuid>,
         result: Result<Vec<SeriesItem>, String>,
     },
+    /// Category rows written off-UI; rebuild spine only if `category_id` still selected.
+    CategoryPersistDone {
+        category_id: String,
+        is_series: bool,
+    },
     OpenSeries(String),
     SeriesDetailLoaded(Result<SeriesItem, String>),
     SeriesEpisodesEnriched(SeriesItem),
@@ -623,9 +631,6 @@ pub(crate) enum Message {
     },
     CatFilterChanged(String),
     SelectBrowseCategory(String),
-    /// Reserved: pagination UI before virtual scroll (`browser::load_more_btn`).
-    #[allow(dead_code)]
-    LoadMore,
     /// Virtualized browse scroll: absolute Y + viewport height.
     BrowseScrolled(f32, f32),
     /// Deferred check after scrolling: wheel/trackpad sends no "stopped" event.
@@ -639,9 +644,11 @@ pub(crate) enum Message {
     BrowseCoastTick,
     /// Mosaic tile press feedback (id = vod/series id).
     MosaicPress(String),
+    /// Unlock the next mosaic page (posters + tiles) — RAM-safe pagination.
+    MosaicShowMore,
     /// Category sidebar scroll (virtualized).
     CatScrolled(f32, f32),
-    ImageLoaded(ImageLoadResult),
+    ImageLoaded(u64, ImageLoadResult),
     /// Apply coalesced poster bytes to the RAM cache (one view rebuild).
     FlushPendingImages,
     /// SQLite ingest finished off the UI thread.
@@ -655,6 +662,8 @@ pub(crate) enum Message {
         gen: u64,
         index: BrowseIndex,
         episode_flat: Vec<EpisodeFlat>,
+        /// Pre-filled tiles for SQL search (browse pos = vec index).
+        search_tiles: Vec<crate::browse_tiles::BrowseTile>,
     },
     MetaEnriched {
         series: Vec<(String, Option<uuid::Uuid>, crate::metadata::MetaPatch)>,
@@ -859,7 +868,6 @@ impl FluxPlay {
             network_probe: String::new(),
             system_dark,
             cat_filter: String::new(),
-            list_limit: LIST_PAGE,
             images: crate::images::ImageCache::default(),
             catalog_db,
             autoplay_done: false,
@@ -879,8 +887,6 @@ impl FluxPlay {
             video_allocation: None,
             video_allocation_hold: None,
             video_allocation_hold2: None,
-            video_allocation_hold3: None,
-            video_allocation_hold4: None,
             video_frame_wh: (0, 0),
             video_upload_busy: false,
             video_upload_gen: 0,
@@ -936,6 +942,10 @@ impl FluxPlay {
                 None,
             ),
             browse_index: BrowseIndex::Empty,
+            tile_cache: crate::browse_tiles::BrowseTileCache::default(),
+            channel_count: 0,
+            vod_count: 0,
+            series_count: 0,
             episode_flat: Vec::new(),
             browse_scroll_y: 0.0,
             browse_view_h: 720.0,
@@ -945,6 +955,7 @@ impl FluxPlay {
             cat_slice: (0, 0),
             cat_entries: Vec::new(),
             pending_images: Vec::new(),
+            art_fetch_gen: 0,
             image_flush_armed: false,
             browse_scroll_vy: 0.0,
             browse_scroll_at: None,
@@ -955,6 +966,7 @@ impl FluxPlay {
             browse_drag_moved: false,
             art_warm_cursor: 0,
             art_warm_active: false,
+            mosaic_shown: browser::MOSAIC_PAGE_ITEMS,
             search_debounce_gen: 0,
             jobs: crate::async_jobs::JobMeters::new(),
             #[cfg(target_os = "android")]
@@ -1097,9 +1109,9 @@ impl FluxPlay {
         let task = Task::batch(boot);
         tracing::info!(
             sources = app.sources.len(),
-            channels = app.bundle.channels.len(),
-            vod = app.bundle.vod.len(),
-            series = app.bundle.series.len(),
+            channels = app.channel_count,
+            vod = app.vod_count,
+            series = app.series_count,
             sync_fresh,
             has_real,
             "FluxPlay::new ready"
@@ -1504,14 +1516,7 @@ impl FluxPlay {
             if player_open {
                 event::listen_with(map_player_hotkeys)
             } else {
-                #[cfg(target_os = "android")]
-                {
-                    event::listen_with(map_android_back)
-                }
-                #[cfg(not(target_os = "android"))]
-                {
-                    Subscription::none()
-                }
+                event::listen_with(map_browse_keys)
             }
         };
         #[cfg(target_os = "android")]
@@ -1702,12 +1707,14 @@ impl FluxPlay {
         };
         #[cfg(not(target_os = "android"))]
         let (max_w, max_h) = {
+            // Auto soft present capped at 720p for the ~100 Mo RSS budget.
+            // FLUXPLAY_SOFT_UHD lifts Auto to 1080p; explicit quality prefs still apply.
             let uhd = std::env::var_os("FLUXPLAY_SOFT_UHD").is_some();
-            let (qw, qh) = self
-                .settings
-                .video_quality
-                .max_wh()
-                .unwrap_or(if uhd { (3840, 2160) } else { (1920, 1080) });
+            let (qw, qh) = self.settings.video_quality.max_wh().unwrap_or(if uhd {
+                (1920, 1080)
+            } else {
+                (1280, 720)
+            });
             let mw = self.display_probe.monitor_w;
             let mh = self.display_probe.monitor_h;
             if mw >= 320 && mh >= 240 {
@@ -1749,6 +1756,15 @@ impl FluxPlay {
                 }
             }
         }
+        debug_assert!(
+            {
+                let uhd = std::env::var_os("FLUXPLAY_SOFT_UHD").is_some()
+                    || self.settings.video_quality.max_wh().is_some();
+                crate::invariants::soft_present_within_budget(rw, rh, uhd)
+                    || rw <= 1920 && rh <= 1080
+            },
+            "soft present {rw}x{rh} outside budget"
+        );
         (rw, rh)
     }
 
@@ -1770,21 +1786,19 @@ impl FluxPlay {
             self.video_allocation = None;
             self.video_allocation_hold = None;
             self.video_allocation_hold2 = None;
-            self.video_allocation_hold3 = None;
-            self.video_allocation_hold4 = None;
             self.video_frame_wh = (0, 0);
             self.clear_stage_picture();
             // Soft RGBA used the shared GPU image cache — bump poster handles (new iced
-            // ids) then warm-fetch anything missing; art_warm alone skips RAM hits.
+            // ids) then reload only on-screen art (no off-screen warm).
             self.refresh_browse_poster_gpu_textures();
             self.art_warm_cursor = 0;
-            self.art_warm_active = !self.browse_index.is_empty();
+            self.art_warm_active = false;
         } else if !self.browse_index.is_empty() {
             // Playback ended or zapped without clearing the stage — mosaic can still
             // sample stale atlas regions from soft RGBA uploads.
             self.refresh_browse_poster_gpu_textures();
             self.art_warm_cursor = 0;
-            self.art_warm_active = true;
+            self.art_warm_active = false;
         }
         #[cfg(target_os = "android")]
         {
@@ -1857,8 +1871,6 @@ impl FluxPlay {
             self.video_allocation = None;
             self.video_allocation_hold = None;
             self.video_allocation_hold2 = None;
-            self.video_allocation_hold3 = None;
-            self.video_allocation_hold4 = None;
         }
     }
 
@@ -2003,8 +2015,10 @@ impl FluxPlay {
                     self.chrome_alpha = 1.0;
                     self.player_pointer_at = Some(std::time::Instant::now());
                     crate::android_bridge::set_immersive_mode(true);
-                    // Force landscape UX while playing (portrait mode dropped).
-                    crate::android_bridge::set_force_landscape(true);
+                    // Phones: lock landscape while playing. TV is already landscape.
+                    if !self.layout_metrics().surface.is_television() {
+                        crate::android_bridge::set_force_landscape(true);
+                    }
                     // Do NOT show SurfaceView here — Z-order on-top blacks the browse UI.
                     // Bind warms it only at play start.
                 }
@@ -2108,8 +2122,6 @@ impl FluxPlay {
                     self.video_allocation = None;
                     self.video_allocation_hold = None;
                     self.video_allocation_hold2 = None;
-                    self.video_allocation_hold3 = None;
-                    self.video_allocation_hold4 = None;
                     self.video_frame_wh = (0, 0);
                     self.invalidate_soft_stage(true);
                     self.player_fullscreen = false;
@@ -2173,10 +2185,12 @@ impl FluxPlay {
                 // in Séries silently filtered Films / TV too.
                 self.search.clear();
                 self.search_debounce_gen = self.search_debounce_gen.wrapping_add(1);
-                self.list_limit = LIST_PAGE;
                 self.series_detail = None;
                 self.vod_detail = None;
+                self.episode_flat.clear();
+                self.series_queue.clear();
                 self.detail_meta_loading = false;
+                self.trim_ui_session_caches();
                 if tab == Tab::Settings && self.backends_cache.is_none() {
                     self.backends_cache = Some(detect_backends());
                     self.external_players = fluxplay_player::detect_external_players();
@@ -2218,17 +2232,11 @@ impl FluxPlay {
                 if gen != self.search_debounce_gen {
                     return Task::none();
                 }
-                self.list_limit = LIST_PAGE;
                 return Task::batch([self.rebuild_browse_index(), self.refresh_browse_art()]);
             }
             Message::CatFilterChanged(s) => {
                 self.cat_filter = s;
                 self.rebuild_cat_entries();
-            }
-            Message::LoadMore => {
-                tracing::debug!(list_limit = self.list_limit, "load more");
-                self.list_limit = (self.list_limit.saturating_add(LIST_PAGE)).min(10_000);
-                return self.refresh_browse_art();
             }
             Message::BrowseScrolled(y, view_h) => {
                 let view_h = view_h.max(1.0);
@@ -2257,20 +2265,23 @@ impl FluxPlay {
                 let slice = self.content_virtual_slice(y, view_h);
                 if slice == self.browse_slice {
                     if flinging {
+                        // Titles stay sync-cheap; only art waits for settle.
+                        let _ = self.fill_visible_browse_tiles();
                         return Self::browse_settle_task();
                     }
                     if settled {
                         return Task::batch([
                             self.flush_pending_images(),
+                            self.fill_visible_browse_tiles(),
                             self.refresh_browse_art(),
                         ]);
                     }
-                    return Task::none();
+                    // Slow drag: keep tile holes filled without art thrash.
+                    return self.fill_visible_browse_tiles();
                 }
                 self.browse_slice = slice;
-                // During fling: remount window (state already updated) but skip art storm.
-                // Velocity only decays on new scroll events, so schedule a settle check:
-                // without it the last fast wheel turn left art loading off for good.
+                // Tile metadata sync (~ms); skip image storm while flinging.
+                let _ = self.fill_visible_browse_tiles();
                 if flinging {
                     return Self::browse_settle_task();
                 }
@@ -2296,7 +2307,11 @@ impl FluxPlay {
                 self.browse_was_flinging = false;
                 self.browse_slice =
                     self.content_virtual_slice(self.browse_scroll_y, self.browse_view_h);
-                return Task::batch([self.flush_pending_images(), self.refresh_browse_art()]);
+                return Task::batch([
+                    self.flush_pending_images(),
+                    self.fill_visible_browse_tiles(),
+                    self.refresh_browse_art(),
+                ]);
             }
             Message::BrowseScrollBy(dy) => {
                 if dy.abs() < 0.01 {
@@ -2310,8 +2325,8 @@ impl FluxPlay {
                     (self.browse_scroll_y + dy).clamp(0.0, max_scroll);
                 self.browse_slice =
                     self.content_virtual_slice(self.browse_scroll_y, self.browse_view_h);
-                // The follow-up BrowseScrolled sees this slice as unchanged and loads
-                // nothing: art for the new rows is fetched once the wheel rests.
+                // Titles immediately; art once the wheel rests (BrowseSettle).
+                let _ = self.fill_visible_browse_tiles();
                 self.browse_scroll_at = Some(std::time::Instant::now());
                 return Task::batch([
                     iced::widget::operation::scroll_by(
@@ -2385,6 +2400,21 @@ impl FluxPlay {
             Message::MosaicPress(id) => {
                 self.pressed_mosaic = Some(id);
             }
+            Message::MosaicShowMore => {
+                let total = self.browse_index.len();
+                if !matches!(self.tab, Tab::Vod | Tab::Series)
+                    || self.vod_detail.is_some()
+                    || self.series_detail.is_some()
+                    || self.mosaic_shown >= total
+                {
+                    return Task::none();
+                }
+                self.mosaic_shown = (self.mosaic_shown + browser::MOSAIC_PAGE_ITEMS).min(total);
+                return Task::batch([
+                    self.fill_visible_browse_tiles(),
+                    self.prefetch_visible_art(),
+                ]);
+            }
             Message::CatScrolled(y, view_h) => {
                 let view_h = view_h.max(1.0);
                 let slice = browser::virtual_slice(
@@ -2403,7 +2433,6 @@ impl FluxPlay {
                 self.cat_slice = key;
             }
             Message::SelectBrowseCategory(id) => {
-                self.list_limit = LIST_PAGE;
                 let task = match self.tab {
                     Tab::Live => {
                         self.selected_group = if id == "*" {
@@ -2423,10 +2452,12 @@ impl FluxPlay {
                         let idx = self.rebuild_browse_index();
                         let follow = if id == "*"
                             || self
-                                .bundle
-                                .vod
-                                .iter()
-                                .any(|v| v.category_id.as_deref() == Some(id.as_str()))
+                                .catalog_db
+                                .as_ref()
+                                .map(|db| {
+                                    db.count_vod(&self.enabled_source_ids(), Some(id.as_str())) > 0
+                                })
+                                .unwrap_or(false)
                         {
                             self.refresh_browse_art()
                         } else {
@@ -2441,10 +2472,13 @@ impl FluxPlay {
                         let idx = self.rebuild_browse_index();
                         let follow = if id == "*"
                             || self
-                                .bundle
-                                .series
-                                .iter()
-                                .any(|s| s.category_id.as_deref() == Some(id.as_str()))
+                                .catalog_db
+                                .as_ref()
+                                .map(|db| {
+                                    db.count_series(&self.enabled_source_ids(), Some(id.as_str()))
+                                        > 0
+                                })
+                                .unwrap_or(false)
                         {
                             self.refresh_browse_art()
                         } else {
@@ -2464,18 +2498,18 @@ impl FluxPlay {
                 if self.consume_browse_drag_suppress() {
                     return Task::none();
                 }
-                let found = self
-                    .bundle
-                    .channels
-                    .iter()
-                    .find(|c| c.id == id && c.source_id == source_id)
-                    .or_else(|| self.bundle.channels.iter().find(|c| c.id == id))
-                    .cloned();
-                let Some(ch) = found else {
-                    self.status = "Chaîne introuvable".into();
-                    return Task::none();
-                };
-                return Task::done(Message::PlayChannel(ch));
+                let mut ch = self
+                    .catalog_db
+                    .as_ref()
+                    .and_then(|db| db.channel_by_id(&id));
+                if let Some(ch) = ch.as_mut() {
+                    if ch.source_id.is_none() {
+                        ch.source_id = source_id;
+                    }
+                    return Task::done(Message::PlayChannel(ch.clone()));
+                }
+                self.status = "Chaîne introuvable".into();
+                return Task::none();
             }
             Message::DownloadMedia { name, url } => return self.request_download(name, url),
             Message::DownloadSeason(season) => {
@@ -2606,6 +2640,7 @@ impl FluxPlay {
                         crate::downloads::forget_partial(&mut self.download_partials, &url);
                         self.download_library.insert(&url, path.clone());
                         self.downloads.insert(url, DownloadState::Done { path });
+                        self.trim_download_session_map();
                         return self.pump_download_queue();
                     }
                     DownloadEvent::Finished(Err(error)) => {
@@ -2613,6 +2648,7 @@ impl FluxPlay {
                         self.download_partials =
                             crate::downloads::scan_partials(&self.downloads_dir());
                         self.downloads.insert(url, DownloadState::Failed);
+                        self.trim_download_session_map();
                         return self.pump_download_queue();
                     }
                 }
@@ -2979,6 +3015,34 @@ impl FluxPlay {
             }
             #[cfg(target_os = "android")]
             Message::SafPoll => {
+                crate::android_platform::ensure_post_notifications_permission();
+                crate::android_platform::register_default_callback();
+                if let Some(action) = crate::android_platform::take_pending() {
+                    let id = self.player_id.or(self.main_id).unwrap_or(window::Id::unique());
+                    let hk = match action {
+                        crate::android_platform::MediaAction::TogglePause => {
+                            PlayerHotkey::TogglePause
+                        }
+                        crate::android_platform::MediaAction::Play => PlayerHotkey::TogglePause,
+                        crate::android_platform::MediaAction::Pause => PlayerHotkey::TogglePause,
+                        crate::android_platform::MediaAction::Stop => PlayerHotkey::Stop,
+                    };
+                    return Task::done(Message::PlayerHotkeyIn(id, hk));
+                }
+                if crate::android_platform::take_reconnect_pulse() {
+                    if let Some(ch) = self.session.channel.clone() {
+                        if matches!(
+                            self.session.state,
+                            PlaybackState::Playing
+                                | PlaybackState::Buffering
+                                | PlaybackState::Paused
+                                | PlaybackState::Error
+                        ) {
+                            self.status = "Réseau OK — reconnexion…".into();
+                            return Task::done(Message::PlayChannel(ch));
+                        }
+                    }
+                }
                 self.refresh_system_dark();
                 crate::android_bridge::refresh_system_insets();
                 let prev_insets = self.system_insets;
@@ -3087,39 +3151,48 @@ impl FluxPlay {
                 crate::android_bridge::finish_activity();
                 return Task::none();
             }
-            #[cfg(target_os = "android")]
-            Message::BrowseFocusDelta(delta) => {
-                let len = self.browse_index.len();
-                if len == 0 {
+            Message::BrowseFocusStep { dcol, drow } => {
+                let len = self.mosaic_display_len();
+                if len == 0 || (dcol == 0 && drow == 0) {
                     return Task::none();
                 }
-                let next = if delta < 0 {
-                    self.browse_focus.saturating_sub((-delta) as usize)
-                } else {
-                    (self.browse_focus + delta as usize).min(len.saturating_sub(1))
-                };
+                let m = self.layout_metrics();
+                let cols = m.cols.max(1) as i32;
+                let cur = self.browse_focus as i32;
+                let row = cur / cols;
+                let col = cur % cols;
+                let nrow = (row + drow).max(0);
+                let ncol = (col + dcol).clamp(0, cols - 1);
+                let next = (nrow * cols + ncol).clamp(0, len.saturating_sub(1) as i32) as usize;
                 self.browse_focus = next;
+                // Keep the focused cell near mid-viewport on 10-foot surfaces.
+                if m.surface.is_television() {
+                    let row_h = browser::mosaic_row_height_for(m.tile_w, m.touch_target);
+                    let target_y = (next as f32 / cols as f32) * row_h
+                        - (self.browse_view_h * 0.35).max(0.0);
+                    self.browse_scroll_y = target_y.max(0.0);
+                }
                 if matches!(self.tab, Tab::Live | Tab::Favorites) {
-                    if let Some(bi) = self.browse_index.get(next) {
-                        if let Some(ch) = self.bundle.channels.get(bi) {
-                            self.selected_channel = Some(ch.id.clone());
-                        }
+                    if let Some(tile) = self.tile_cache.peek(next) {
+                        self.selected_channel = Some(tile.id.clone());
                     }
                 }
+                let _ = self.fill_visible_browse_tiles();
                 return Task::none();
             }
-            #[cfg(target_os = "android")]
             Message::BrowseActivate => {
-                if !matches!(self.tab, Tab::Live | Tab::Favorites) {
-                    return Task::none();
-                }
-                let Some(bi) = self.browse_index.get(self.browse_focus) else {
+                let Some(tile) = self.tile_cache.peek(self.browse_focus) else {
                     return Task::none();
                 };
-                let Some(ch) = self.bundle.channels.get(bi) else {
-                    return Task::none();
+                return match self.tab {
+                    Tab::Live | Tab::Favorites => Task::done(Message::PlayChannelId(
+                        tile.id.clone(),
+                        tile.source_id,
+                    )),
+                    Tab::Vod => Task::done(Message::OpenVodDetail(tile.id.clone())),
+                    Tab::Series => Task::done(Message::OpenSeries(tile.id.clone())),
+                    _ => Task::none(),
                 };
-                return Task::done(Message::PlayChannelId(ch.id.clone(), ch.source_id));
             }
             #[cfg(target_os = "android")]
             Message::CatalogBootReady {
@@ -3150,6 +3223,7 @@ impl FluxPlay {
                     self.android_want_surface_upgrade = false;
                     crate::android_bridge::release_video_surface_wid();
                     crate::android_bridge::set_hdr_color_mode(false);
+                    crate::android_platform::hide_playback_notification();
                 }
                 self.status = "Arrêté".into();
                 // Defer window close so libmpv teardown finishes cleanly.
@@ -3404,7 +3478,7 @@ impl FluxPlay {
                     }
                     if let Some(held) = crate::android_bridge::poll_audio_focus_held() {
                         // Only react to LOSS after we actually held focus. A stale
-                        // audio_focus.json with held=false must NOT pause a fresh play
+                        // Stale audio_focus.json must NOT pause a fresh play
                         // (that killed OpenSL within milliseconds — silent video).
                         if !held
                             && self.audio_focus_held
@@ -3494,8 +3568,6 @@ impl FluxPlay {
                         self.video_allocation = None;
                         self.video_allocation_hold = None;
                         self.video_allocation_hold2 = None;
-                        self.video_allocation_hold3 = None;
-                        self.video_allocation_hold4 = None;
                         self.video_frame_wh = (0, 0);
                         crate::android_bridge::stabilize_android_session();
                         self.maintain_android_surface_session(true);
@@ -3552,6 +3624,26 @@ impl FluxPlay {
                     self.playback_clock_poll = Some(std::time::Instant::now());
                     self.session.refresh_times();
                     self.session.refresh_buffering_state();
+                    #[cfg(target_os = "android")]
+                    {
+                        let playing = matches!(
+                            self.session.state,
+                            PlaybackState::Playing | PlaybackState::Buffering
+                        );
+                        let title = self
+                            .session
+                            .channel
+                            .as_ref()
+                            .map(|c| c.name.as_str())
+                            .unwrap_or("FluxPlay");
+                        let pos_ms =
+                            (self.session.position_secs.max(0.0) * 1000.0).round() as i64;
+                        if !matches!(self.session.backend, Some(BackendId::External)) {
+                            crate::android_platform::sync_playback_notification(
+                                playing, title, pos_ms,
+                            );
+                        }
+                    }
                 }
                 // External / Intent: no owned process — never treat as EOF.
                 let owned_playback = !matches!(self.session.backend, Some(BackendId::External));
@@ -3661,8 +3753,7 @@ impl FluxPlay {
                         self.video_frame = Some(allocation.handle().clone());
                         // Keep prior GPU textures so a slow draw cannot sample a
                         // worker atlas that was already reset for a newer frame.
-                        self.video_allocation_hold4 = self.video_allocation_hold3.take();
-                        self.video_allocation_hold3 = self.video_allocation_hold2.take();
+                        // Keep 3 GPU soft frames (current + 2 holds) for the RSS budget.
                         self.video_allocation_hold2 = self.video_allocation_hold.take();
                         self.video_allocation_hold = self.video_allocation.take();
                         self.video_allocation = Some(allocation);
@@ -4205,7 +4296,6 @@ impl FluxPlay {
                     PasteTarget::FormWgPaste => self.form_wg_paste = cleaned,
                     PasteTarget::Search => {
                         self.search = cleaned;
-                        self.list_limit = LIST_PAGE;
                         self.search_debounce_gen = self.search_debounce_gen.wrapping_add(1);
                         let gen = self.search_debounce_gen;
                         self.status = "Texte collé".into();
@@ -4290,8 +4380,11 @@ impl FluxPlay {
                         self.translations.insert(src, dst);
                     }
                 }
-                if self.translations.len() > 4000 {
+                // Synopses across many detail pages grow without bound — keep a small LRU-ish set.
+                const TRANSLATIONS_CAP: usize = 384;
+                if self.translations.len() > TRANSLATIONS_CAP {
                     self.translations.clear();
+                    self.translating.clear();
                     return self.translate_open_detail_task();
                 }
             }
@@ -4634,6 +4727,9 @@ impl FluxPlay {
                 };
                 crate::storage::write_profile_source_json(&src);
                 self.status = "Export profil…".into();
+                if let Some(db) = &self.catalog_db {
+                    db.wal_checkpoint_all();
+                }
                 #[cfg(not(target_os = "android"))]
                 {
                     return Task::perform(
@@ -4662,9 +4758,6 @@ impl FluxPlay {
                 }
                 #[cfg(target_os = "android")]
                 {
-                    if let Some(db) = &self.catalog_db {
-                        db.wal_checkpoint_all();
-                    }
                     let dest = crate::storage::data_dir()
                         .join("exports")
                         .join(crate::profile_io::suggested_export_name(&src));
@@ -4744,7 +4837,9 @@ impl FluxPlay {
                 if let Ok(raw) = std::fs::read_to_string(&fav_path) {
                     if let Ok(favs) = serde_json::from_str::<Vec<String>>(&raw) {
                         for f in favs {
-                            if !self.settings.favorites.iter().any(|x| x == &f) {
+                            if self.settings.favorites.len() < 2_000
+                                && !self.settings.favorites.iter().any(|x| x == &f)
+                            {
                                 self.settings.favorites.push(f);
                             }
                         }
@@ -4769,8 +4864,8 @@ impl FluxPlay {
             Message::BundleCacheReady(result) => {
                 self.loading = false;
                 match result {
-                    Ok(bundle) => {
-                        self.apply_bundle_cache(bundle);
+                    Ok(spine) => {
+                        self.apply_spine_cache(spine);
                         if self.selected_group.is_none() {
                             self.selected_group = pick_default_live_group(&self.bundle);
                         }
@@ -4788,19 +4883,19 @@ impl FluxPlay {
                         self.status = if sync_fresh {
                             format!(
                                 "Offline-ready · {} live · {} VOD · {} séries (cache chaud)",
-                                self.bundle.channels.len(),
-                                self.bundle.vod.len(),
-                                self.bundle.series.len(),
+                                self.channel_count,
+                                self.vod_count,
+                                self.series_count,
                             )
                         } else {
                             format!(
                                 "DB locale · {} live · {} VOD · {} séries",
-                                self.bundle.channels.len(),
-                                self.bundle.vod.len(),
-                                self.bundle.series.len(),
+                                self.channel_count,
+                                self.vod_count,
+                                self.series_count,
                             )
                         };
-                        let mut tasks = vec![self.rebuild_browse_index()];
+                        let mut tasks = vec![self.rebuild_browse_index(), self.fill_visible_browse_tiles()];
                         if sync_fresh && std::env::var_os("FLUXPLAY_AUTO_URL").is_none() {
                             tasks.push(self.after_catalog_ready_tasks());
                         } else {
@@ -4931,78 +5026,93 @@ impl FluxPlay {
                 gen,
                 index,
                 episode_flat,
+                search_tiles,
             } => {
                 if gen != self.jobs.browse_gen() {
                     return Task::none();
                 }
                 self.browse_index = index;
                 self.episode_flat = episode_flat;
+                if !search_tiles.is_empty() {
+                    self.tile_cache.clear();
+                    let pairs: Vec<_> = search_tiles
+                        .into_iter()
+                        .enumerate()
+                        .map(|(i, t)| (i, t))
+                        .collect();
+                    self.tile_cache.store_at(pairs);
+                }
                 if self.browse_focus >= self.browse_index.len() {
                     self.browse_focus = self.browse_index.len().saturating_sub(1);
                 }
                 self.finish_browse_index_rebuild();
                 return Task::batch([
                     self.snap_browse_scroll_task(),
+                    self.fill_visible_browse_tiles(),
                     self.refresh_browse_art(),
                 ]);
             }
             Message::MetaEnriched { series, vod } => {
                 for (id, source_id, patch) in series {
-                    if let Some(item) = self.bundle.series.iter_mut().find(|s| s.id == id) {
-                        patch.apply_series(item);
-                        if let (Some(db), Some(sid)) = (&self.catalog_db, source_id.or(item.source_id))
-                        {
-                            let mut saved = item.clone();
-                            saved.source_id = Some(sid);
-                            let _ = db.persist_series(&saved);
+                    if let Some(db) = &self.catalog_db {
+                        if let Some(mut item) = db.series_item_by_id(&id) {
+                            patch.apply_series(&mut item);
+                            if let Some(sid) = source_id.or(item.source_id) {
+                                item.source_id = Some(sid);
+                                let _ = db.persist_series(&item);
+                            }
                         }
                     }
                 }
                 for (id, source_id, patch) in vod {
-                    if let Some(item) = self.bundle.vod.iter_mut().find(|v| v.id == id) {
-                        patch.apply_vod(item);
-                        if let (Some(db), Some(sid)) = (&self.catalog_db, source_id.or(item.source_id))
-                        {
-                            let mut saved = item.clone();
-                            saved.source_id = Some(sid);
-                            let _ = db.persist_vod(&saved);
+                    if let Some(db) = &self.catalog_db {
+                        if let Some(mut item) = db.vod_item_by_id(&id) {
+                            patch.apply_vod(&mut item);
+                            if let Some(sid) = source_id.or(item.source_id) {
+                                item.source_id = Some(sid);
+                                let _ = db.persist_vod(&item);
+                            }
                         }
                     }
                 }
-                // Refresh open series detail if it was enriched.
-                if let Some(detail) = &self.series_detail {
-                    if let Some(updated) = self.bundle.series.iter().find(|s| s.id == detail.id) {
-                        let mut d = updated.clone();
-                        if d.seasons.is_empty() {
-                            d.seasons = detail.seasons.clone();
+                if let Some(detail) = &mut self.series_detail {
+                    if let Some(db) = &self.catalog_db {
+                        if let Some(updated) = db.series_item_by_id(&detail.id) {
+                            let seasons = detail.seasons.clone();
+                            *detail = updated;
+                            if detail.seasons.is_empty() {
+                                detail.seasons = seasons;
+                            }
                         }
-                        self.series_detail = Some(d);
                     }
                 }
-                if let Some(detail) = &self.vod_detail {
-                    if let Some(updated) = self.bundle.vod.iter().find(|v| v.id == detail.id) {
-                        self.vod_detail = Some(updated.clone());
+                if let Some(detail) = &mut self.vod_detail {
+                    if let Some(db) = &self.catalog_db {
+                        if let Some(updated) = db.vod_item_by_id(&detail.id) {
+                            *detail = updated;
+                        }
                     }
                 }
-                return self.prefetch_catalog_art();
+                // Visible band only — full catalog warm after meta was a RAM ratchet.
+                return self.light_art_refresh_if_browsing();
             }
             Message::VodInfoBatch(items) => {
                 for item in items {
-                    if let Some(existing) = self.bundle.vod.iter_mut().find(|v| v.id == item.id) {
-                        merge_xtream_vod_fields(existing, &item);
-                        if let (Some(db), Some(sid)) = (&self.catalog_db, existing.source_id) {
-                            let mut saved = existing.clone();
-                            saved.source_id = Some(sid);
-                            let _ = db.persist_vod(&saved);
+                    if let Some(db) = &self.catalog_db {
+                        if let Some(mut saved) = db.vod_item_by_id(&item.id) {
+                            merge_xtream_vod_fields(&mut saved, &item);
+                            if saved.source_id.is_some() {
+                                let _ = db.persist_vod(&saved);
+                            }
                         }
                     }
                     if self.vod_detail.as_ref().map(|d| d.id.as_str()) == Some(item.id.as_str()) {
-                        if let Some(updated) = self.bundle.vod.iter().find(|v| v.id == item.id) {
-                            self.vod_detail = Some(updated.clone());
+                        if let Some(detail) = self.vod_detail.as_mut() {
+                            merge_xtream_vod_fields(detail, &item);
                         }
                     }
                 }
-                return self.prefetch_catalog_art();
+                return self.light_art_refresh_if_browsing();
             }
             Message::OpenImdb(id_or_query) => {
                 let url = crate::metadata::imdb_title_url(&id_or_query);
@@ -5347,7 +5457,10 @@ impl FluxPlay {
             Message::EpgFetched(source_id, programmes) => {
                 if !programmes.is_empty() {
                     let n = programmes.len();
-                    fluxplay_providers::merge_epg(&mut self.bundle.epg, programmes.clone());
+                    // SQLite always; RAM only while Live/EPG/Favorites need now/next.
+                    if matches!(self.tab, Tab::Live | Tab::Epg | Tab::Favorites) {
+                        fluxplay_providers::merge_epg(&mut self.bundle.epg, programmes.clone());
+                    }
                     if let Some(db) = &self.catalog_db {
                         if let Err(e) = db.merge_epg(source_id, &programmes) {
                             tracing::warn!(error = %e, "persist epg failed");
@@ -5363,24 +5476,40 @@ impl FluxPlay {
                 sources,
                 result,
             } => {
-                // The user may have moved on: merge the items, but only report on
-                // (and redraw) the category still on screen.
+                // Persist always (SQLite is the source of truth). Rebuild + art warm
+                // only when this category is still selected — stale loads used to
+                // chain spine reloads and re-warm mosaics for every previous click.
                 let current = self.selected_vod_category.as_deref() == Some(category_id.as_str());
                 match result {
                     Ok(items) => {
-                        self.bundle.vod.retain(|v| {
-                            v.category_id.as_deref() != Some(&category_id)
-                                || !v.source_id.is_some_and(|s| sources.contains(&s))
-                        });
                         let n = items.len();
-                        self.bundle.vod.extend(items);
+                        let sid0 = sources.first().copied();
+                        let source_ids = self.enabled_source_ids();
+                        let cid = category_id.clone();
                         if current {
-                            self.status = format!("VOD catégorie · {n} films");
-                            return Task::batch([
-                                self.rebuild_browse_index(),
-                                self.refresh_browse_art(),
-                            ]);
+                            self.status = format!("VOD catégorie · {n} films — écriture SQLite…");
                         }
+                        return Task::perform(
+                            async move {
+                                let _ = crate::async_jobs::run_blocking(move || {
+                                    if let Some(db) = crate::catalog_db::CatalogDb::open(&source_ids)
+                                    {
+                                        for mut item in items {
+                                            if item.source_id.is_none() {
+                                                item.source_id = sid0;
+                                            }
+                                            let _ = db.persist_vod(&item);
+                                        }
+                                    }
+                                })
+                                .await;
+                                cid
+                            },
+                            |category_id| Message::CategoryPersistDone {
+                                category_id,
+                                is_series: false,
+                            },
+                        );
                     }
                     Err(e) if current => self.status = format!("VOD: {e}"),
                     Err(_) => {}
@@ -5395,23 +5524,53 @@ impl FluxPlay {
                     self.selected_series_category.as_deref() == Some(category_id.as_str());
                 match result {
                     Ok(items) => {
-                        self.bundle.series.retain(|s| {
-                            s.category_id.as_deref() != Some(&category_id)
-                                || !s.source_id.is_some_and(|id| sources.contains(&id))
-                        });
                         let n = items.len();
-                        self.bundle.series.extend(items);
+                        let sid0 = sources.first().copied();
+                        let source_ids = self.enabled_source_ids();
+                        let cid = category_id.clone();
                         if current {
-                            self.status = format!("Séries catégorie · {n} titres");
-                            return Task::batch([
-                                self.rebuild_browse_index(),
-                                self.refresh_browse_art(),
-                            ]);
+                            self.status = format!("Séries catégorie · {n} titres — écriture SQLite…");
                         }
+                        return Task::perform(
+                            async move {
+                                let _ = crate::async_jobs::run_blocking(move || {
+                                    if let Some(db) = crate::catalog_db::CatalogDb::open(&source_ids)
+                                    {
+                                        for mut item in items {
+                                            if item.source_id.is_none() {
+                                                item.source_id = sid0;
+                                            }
+                                            let _ = db.persist_series(&item);
+                                        }
+                                    }
+                                })
+                                .await;
+                                cid
+                            },
+                            |category_id| Message::CategoryPersistDone {
+                                category_id,
+                                is_series: true,
+                            },
+                        );
                     }
                     Err(e) if current => self.status = format!("Séries: {e}"),
                     Err(_) => {}
                 }
+            }
+            Message::CategoryPersistDone {
+                category_id,
+                is_series,
+            } => {
+                let current = if is_series {
+                    self.selected_series_category.as_deref() == Some(category_id.as_str())
+                } else {
+                    self.selected_vod_category.as_deref() == Some(category_id.as_str())
+                };
+                if !current {
+                    return Task::none();
+                }
+                self.status = "Catégorie prête — relecture SQLite…".into();
+                return self.rebuild_bundle_from_cache_task();
             }
             Message::OpenSeries(id) => {
                 self.pressed_mosaic = None;
@@ -5422,8 +5581,11 @@ impl FluxPlay {
                 self.detail_meta_loading = false;
                 self.browse_scroll_y = 0.0;
                 self.browse_view_h = 0.0;
-                if let Some(existing) = self.bundle.series.iter().find(|s| s.id == id) {
-                    let mut detail = existing.clone();
+                if let Some(mut detail) = self
+                    .catalog_db
+                    .as_ref()
+                    .and_then(|db| db.series_item_by_id(&id))
+                {
                     if detail.seasons.is_empty() {
                         if let Some(raw) = self
                             .catalog_db
@@ -5444,10 +5606,8 @@ impl FluxPlay {
                 self.status = "Chargement épisodes…".into();
                 let translate = self.translate_open_detail_task();
                 let wanted = self
-                    .bundle
-                    .series
-                    .iter()
-                    .find(|s| s.id == id)
+                    .series_detail
+                    .as_ref()
                     .and_then(|s| s.source_id);
                 let src = self
                     .sources
@@ -5492,17 +5652,16 @@ impl FluxPlay {
                         crate::names::display_title(&item.name),
                         item.seasons.len()
                     );
-                    let in_catalog =
-                        match self.bundle.series.iter_mut().find(|s| s.id == item.id) {
-                            Some(existing) => {
-                                merge_xtream_series_fields(existing, &item);
-                                true
+                    if let Some(db) = &self.catalog_db {
+                        if let Some(mut saved) = db.series_item_by_id(&item.id) {
+                            merge_xtream_series_fields(&mut saved, &item);
+                            if saved.source_id.is_some() {
+                                let _ = db.persist_series(&saved);
                             }
-                            None => false,
-                        };
-                    // Late answer for a page the viewer already left (or closed): catalog only.
+                        }
+                    }
                     let open = self.series_detail.as_ref().map(|d| d.id.as_str());
-                    if open.map(|id| id != item.id).unwrap_or(in_catalog) {
+                    if open.map(|id| id != item.id).unwrap_or(false) {
                         return Task::none();
                     }
                     match self.series_detail.as_mut() {
@@ -5521,9 +5680,6 @@ impl FluxPlay {
                 Err(e) => self.status = format!("Série: {e}"),
             },
             Message::SeriesEpisodesEnriched(item) => {
-                if let Some(existing) = self.bundle.series.iter_mut().find(|s| s.id == item.id) {
-                    existing.seasons = item.seasons.clone();
-                }
                 let open = self.series_detail.as_ref().map(|d| d.id.as_str()) == Some(item.id.as_str());
                 if open {
                     if let Some(detail) = &mut self.series_detail {
@@ -5558,7 +5714,11 @@ impl FluxPlay {
                 self.series_detail = None;
                 self.browse_scroll_y = 0.0;
                 self.browse_view_h = 0.0;
-                let Some(item) = self.bundle.vod.iter().find(|v| v.id == id).cloned() else {
+                let Some(item) = self
+                    .catalog_db
+                    .as_ref()
+                    .and_then(|db| db.vod_item_by_id(&id))
+                else {
                     self.status = "Film introuvable".into();
                     return Task::none();
                 };
@@ -5600,12 +5760,12 @@ impl FluxPlay {
             }
             Message::VodDetailLoaded(result) => match result {
                 Ok(item) => {
-                    if let Some(existing) = self.bundle.vod.iter_mut().find(|v| v.id == item.id) {
-                        merge_xtream_vod_fields(existing, &item);
-                        if let (Some(db), Some(sid)) = (&self.catalog_db, existing.source_id) {
-                            let mut saved = existing.clone();
-                            saved.source_id = Some(sid);
-                            let _ = db.persist_vod(&saved);
+                    if let Some(db) = &self.catalog_db {
+                        if let Some(mut saved) = db.vod_item_by_id(&item.id) {
+                            merge_xtream_vod_fields(&mut saved, &item);
+                            if saved.source_id.is_some() {
+                                let _ = db.persist_vod(&saved);
+                            }
                         }
                     }
                     // Merge into the open page: the panel answer lacks fields the catalog /
@@ -5646,7 +5806,15 @@ impl FluxPlay {
                 id,
                 patch,
             } => {
-                self.detail_meta_loading = false;
+                let still_open = if is_series {
+                    self.series_detail.as_ref().is_some_and(|d| d.id == id)
+                } else {
+                    self.vod_detail.as_ref().is_some_and(|d| d.id == id)
+                };
+                // Late response for a previous fiche must not clear the spinner of the new one.
+                if still_open {
+                    self.detail_meta_loading = false;
+                }
                 let Some(patch) = patch else {
                     // Negative-cache the miss so we don't hammer OMDb on every open.
                     if let Some(db) = &self.catalog_db {
@@ -5693,12 +5861,10 @@ impl FluxPlay {
                     }
                 }
                 if is_series {
-                    if let Some(item) = self.bundle.series.iter_mut().find(|s| s.id == id) {
-                        patch.apply_series(item);
-                        if let (Some(db), Some(sid)) = (&self.catalog_db, item.source_id) {
-                            let mut saved = item.clone();
-                            saved.source_id = Some(sid);
-                            let _ = db.persist_series(&saved);
+                    if let Some(db) = &self.catalog_db {
+                        if let Some(mut item) = db.series_item_by_id(&id) {
+                            patch.apply_series(&mut item);
+                            let _ = db.persist_series(&item);
                         }
                     }
                     if let Some(detail) = &mut self.series_detail {
@@ -5713,12 +5879,10 @@ impl FluxPlay {
                         }
                     }
                 } else {
-                    if let Some(item) = self.bundle.vod.iter_mut().find(|v| v.id == id) {
-                        patch.apply_vod(item);
-                        if let (Some(db), Some(sid)) = (&self.catalog_db, item.source_id) {
-                            let mut saved = item.clone();
-                            saved.source_id = Some(sid);
-                            let _ = db.persist_vod(&saved);
+                    if let Some(db) = &self.catalog_db {
+                        if let Some(mut item) = db.vod_item_by_id(&id) {
+                            patch.apply_vod(&mut item);
+                            let _ = db.persist_vod(&item);
                         }
                     }
                     if let Some(detail) = &mut self.vod_detail {
@@ -5731,8 +5895,17 @@ impl FluxPlay {
                 }
                 return Task::batch([self.refresh_browse_art(), self.translate_open_detail_task()]);
             }
-            Message::ImageLoaded(Ok((url, source_id, bytes))) => {
+            Message::ImageLoaded(gen, Ok((url, source_id, bytes))) => {
                 self.jobs.images.tick();
+                if gen != self.art_fetch_gen {
+                    // Category / tab moved on — drop stale decode (was a major RSS leak).
+                    return Task::none();
+                }
+                const PENDING_CAP: usize = 24;
+                if self.pending_images.len() >= PENDING_CAP {
+                    // Prefer flushing what we have over unbounded decode buffers mid-fling.
+                    let _ = self.flush_pending_images();
+                }
                 self.pending_images.push((url, source_id, bytes));
                 // During fling: buffer only — no iced view rebuild (LOD / culling).
                 if self.browse_flinging() {
@@ -5742,7 +5915,6 @@ impl FluxPlay {
                     return Task::batch([
                         self.flush_pending_images(),
                         self.prefetch_visible_art(),
-                        self.continue_art_warm(),
                     ]);
                 }
                 if !self.image_flush_armed {
@@ -5755,8 +5927,11 @@ impl FluxPlay {
                     );
                 }
             }
-            Message::ImageLoaded(Err((url, err))) => {
+            Message::ImageLoaded(gen, Err((url, err))) => {
                 self.jobs.images.tick();
+                if gen != self.art_fetch_gen {
+                    return Task::none();
+                }
                 tracing::debug!(%url, %err, "image fetch failed");
                 // Permanent: HTTP 4xx (except 408/429 already retried), garbage body, too large.
                 let permanent = (err.starts_with("HTTP 4")
@@ -5771,18 +5946,20 @@ impl FluxPlay {
                     // Soft-fail + host circuit — stops retry storms on dead CDNs / SOCKS.
                     self.images.mark_soft_failed(url);
                 }
-                return self.continue_art_warm();
+                return self.prefetch_visible_art();
             }
             Message::FlushPendingImages => {
                 self.image_flush_armed = false;
                 if self.browse_flinging() {
-                    // Keep buffering; settle path will flush.
+                    // Cap buffers even mid-fling — settle path will promote visibles.
+                    if self.pending_images.len() >= 24 {
+                        let _ = self.flush_pending_images();
+                    }
                     return Task::none();
                 }
                 return Task::batch([
                     self.flush_pending_images(),
                     self.prefetch_visible_art(),
-                    self.continue_art_warm(),
                 ]);
             }
         }
@@ -6017,47 +6194,46 @@ impl FluxPlay {
     }
 
     fn enrich_metadata_task(&self) -> Task<Message> {
+        let source_ids = self.enabled_source_ids();
         let mut series_cached = Vec::new();
         let mut series_fetch = Vec::new();
-        for s in self
-            .bundle
-            .series
-            .iter()
-            .filter(|s| crate::metadata::needs_series_enrich(s))
-            .take(12)
-        {
-            let q = crate::metadata::parse_title_query(&s.name);
-            let key = q.cache_key("series");
-            if let Some(db) = &self.catalog_db {
-                if let Some((miss, patch)) = db.meta_cache_get(&key) {
-                    if !miss {
-                        series_cached.push((s.id.clone(), s.source_id, patch));
-                    }
-                    continue;
-                }
-            }
-            series_fetch.push((s.id.clone(), s.source_id, s.name.clone()));
-        }
         let mut vod_cached = Vec::new();
         let mut vod_fetch = Vec::new();
-        for v in self
-            .bundle
-            .vod
-            .iter()
-            .filter(|v| crate::metadata::needs_vod_enrich(v))
-            .take(24)
-        {
-            let q = crate::metadata::parse_title_query(&v.name);
-            let key = q.cache_key("movie");
-            if let Some(db) = &self.catalog_db {
+        if let Some(db) = &self.catalog_db {
+            for (sid, id) in db.series_ids_needing_enrich(&source_ids, 12) {
+                let Some(s) = db.series_item_by_id(&id) else {
+                    continue;
+                };
+                if !crate::metadata::needs_series_enrich(&s) {
+                    continue;
+                }
+                let q = crate::metadata::parse_title_query(&s.name);
+                let key = q.cache_key("series");
                 if let Some((miss, patch)) = db.meta_cache_get(&key) {
                     if !miss {
-                        vod_cached.push((v.id.clone(), v.source_id, patch));
+                        series_cached.push((s.id.clone(), Some(sid).or(s.source_id), patch));
                     }
                     continue;
                 }
+                series_fetch.push((s.id.clone(), Some(sid).or(s.source_id), s.name.clone()));
             }
-            vod_fetch.push((v.id.clone(), v.source_id, v.name.clone()));
+            for (sid, id) in db.vod_ids_needing_enrich(&source_ids, 24) {
+                let Some(v) = db.vod_item_by_id(&id) else {
+                    continue;
+                };
+                if !crate::metadata::needs_vod_enrich(&v) {
+                    continue;
+                }
+                let q = crate::metadata::parse_title_query(&v.name);
+                let key = q.cache_key("movie");
+                if let Some((miss, patch)) = db.meta_cache_get(&key) {
+                    if !miss {
+                        vod_cached.push((v.id.clone(), Some(sid).or(v.source_id), patch));
+                    }
+                    continue;
+                }
+                vod_fetch.push((v.id.clone(), Some(sid).or(v.source_id), v.name.clone()));
+            }
         }
 
         if series_fetch.is_empty() && vod_fetch.is_empty() {
@@ -6131,27 +6307,27 @@ impl FluxPlay {
     /// Kept small + low concurrency — portals ban aggressive parallel scrapes.
     fn enrich_xtream_vod_batch_task(&self) -> Task<Message> {
         let mut jobs: Vec<(MediaSource, String)> = Vec::new();
-        for v in self
-            .bundle
-            .vod
-            .iter()
-            .filter(|v| crate::metadata::needs_vod_enrich(v))
-            .take(12)
-        {
-            let src = v
-                .source_id
-                .and_then(|id| {
-                    self.sources.iter().find(|s| {
-                        s.id == id && s.enabled && s.kind == SourceKind::Xtream
-                    })
-                })
-                .or_else(|| {
-                    self.sources
-                        .iter()
-                        .find(|s| s.enabled && s.kind == SourceKind::Xtream)
-                });
-            if let Some(src) = src {
-                jobs.push((src.clone(), v.id.clone()));
+        let source_ids = self.enabled_source_ids();
+        if let Some(db) = &self.catalog_db {
+            for (sid, id) in db.vod_ids_needing_enrich(&source_ids, 12) {
+                let Some(v) = db.vod_item_by_id(&id) else {
+                    continue;
+                };
+                if !crate::metadata::needs_vod_enrich(&v) {
+                    continue;
+                }
+                let src = self
+                    .sources
+                    .iter()
+                    .find(|s| s.id == sid && s.enabled && s.kind == SourceKind::Xtream)
+                    .or_else(|| {
+                        self.sources
+                            .iter()
+                            .find(|s| s.enabled && s.kind == SourceKind::Xtream)
+                    });
+                if let Some(src) = src {
+                    jobs.push((src.clone(), v.id));
+                }
             }
         }
         if jobs.is_empty() {
@@ -6185,53 +6361,94 @@ impl FluxPlay {
         )
     }
 
-    fn mosaic_meta_line(
-        year: Option<&str>,
-        genre: Option<&str>,
-        rating: Option<&str>,
-        fallback: &str,
-    ) -> String {
-        let mut out = String::with_capacity(48);
-        let mut first = true;
-        let mut push = |s: &str| {
-            if s.is_empty() {
-                return;
-            }
-            if !first {
-                out.push_str(" · ");
-            }
-            out.push_str(s);
-            first = false;
+    /// Fill mosaic cells for the visible browse window (+ overscan).
+    ///
+    /// Sync on the already-open catalog — a page is a few ms. Holes paint as "…"
+    /// until filled; [`BrowseTileCache::viewport_health`] detects that in tests.
+    fn fill_visible_browse_tiles(&mut self) -> Task<Message> {
+        use crate::browse_tiles::BROWSE_TILE_FETCH_LIMIT;
+
+        if self.browse_index.is_empty() {
+            return Task::none();
+        }
+        if self.vod_detail.is_some() {
+            return Task::none();
+        }
+        if matches!(self.tab, Tab::Series) && self.series_detail.is_some() {
+            return Task::none();
+        }
+        let kind = match self.tab {
+            Tab::Vod => ContentKind::Vod,
+            Tab::Series => ContentKind::Series,
+            Tab::Live | Tab::Favorites => ContentKind::Live,
+            _ => return Task::none(),
         };
-        if let Some(y) = crate::metadata::fmt_year(year) {
-            push(&y);
+        self.tile_cache.set_kind(kind);
+        let m = self.layout_metrics();
+        let win = self.visible_browse_window(m.cols, m.tile_w);
+        if win.start >= win.end {
+            return Task::none();
         }
-        if let Some(g) = genre.filter(|s| !s.is_empty()) {
-            let g0 = g.split([',', '/', '|', ';']).next().unwrap_or(g).trim();
-            push(g0);
-        }
-        let rating = crate::metadata::fmt_rating(rating);
-        if let Some(r) = rating.as_deref() {
-            if !first {
-                out.push_str(" · ");
+
+        // Already coherent: just refresh LRU order for the on-screen band.
+        if self.tile_cache.viewport_health(win.start, win.end).is_coherent() {
+            for pos in win.start..win.end {
+                self.tile_cache.touch(pos);
             }
-            #[cfg(target_os = "android")]
+            return Task::none();
+        }
+
+        let Some(db) = self.catalog_db.as_ref() else {
+            return Task::none();
+        };
+        let source_ids = self.enabled_source_ids();
+        // Own filter strings so SQLite pages don't borrow `self` across cache mutates.
+        let cat_vod = self.vod_cat_sql().map(str::to_owned);
+        let cat_series = self.series_cat_sql().map(str::to_owned);
+        let group_live = self.live_group_sql().map(str::to_owned);
+
+        // At most two contiguous SQLite pages per frame — keeps scroll under budget.
+        for _ in 0..2 {
+            let Some((browse_start, browse_end)) =
+                self.tile_cache.first_unfilled_run(win.start, win.end)
+            else {
+                break;
+            };
+            let catalog_start = self
+                .browse_index
+                .get(browse_start)
+                .unwrap_or(browse_start);
+            let span = (browse_end - browse_start).min(BROWSE_TILE_FETCH_LIMIT);
+            let tiles = match kind {
+                ContentKind::Vod => {
+                    db.browse_tiles_vod(&source_ids, catalog_start, span, cat_vod.as_deref())
+                }
+                ContentKind::Series => {
+                    db.browse_tiles_series(&source_ids, catalog_start, span, cat_series.as_deref())
+                }
+                ContentKind::Live => {
+                    db.browse_tiles_channels(&source_ids, catalog_start, span, group_live.as_deref())
+                }
+            };
+            if tiles.is_empty() {
+                break;
+            }
+            self.tile_cache.store_contiguous(browse_start, tiles);
+        }
+
+        debug_assert!(
+            self.tile_cache.len() <= crate::browse_tiles::BROWSE_TILE_CACHE_CAP,
+            "BrowseTileCache exceeded soft RAM cap"
+        );
+        debug_assert!(
             {
-                out.push('*');
-            }
-            #[cfg(not(target_os = "android"))]
-            {
-                out.push('★');
-            }
-            out.push(' ');
-            out.push_str(r);
-            first = false;
-        }
-        if first {
-            fallback.to_string()
-        } else {
-            out
-        }
+                let h = self.tile_cache.viewport_health(win.start, win.end);
+                // Incomplete only when SQLite returned fewer rows than the hole (EOF).
+                h.holes == 0 || h.coverage() > 0.0
+            },
+            "browse fill left an empty viewport — mosaic would show blank rows"
+        );
+        Task::none()
     }
 
     /// Rebuild the browse index for the current tab / category / search.
@@ -6245,6 +6462,18 @@ impl FluxPlay {
         self.browse_slice = (0, 0);
         // Keep previous `browse_index` until BrowseIndexReady — avoids empty mosaic flash.
         self.art_warm_cursor = 0;
+        self.art_warm_active = false;
+        self.mosaic_shown = browser::MOSAIC_PAGE_ITEMS;
+        // Category switch: drop previous mosaic posters + pending decodes so RSS
+        // cannot ratchet 200→600 Mo across clicks (iced atlas retains Handles).
+        self.art_fetch_gen = self.art_fetch_gen.wrapping_add(1);
+        self.pending_images.clear();
+        self.image_flush_armed = false;
+        self.images.clear_handles();
+        // Reset image job meter — otherwise totals ratchet forever across categories.
+        self.jobs.images.reset(0);
+        self.tile_cache.clear();
+        self.trim_ui_session_caches();
         self.rebuild_cat_entries();
 
         if matches!(self.tab, Tab::Series) && self.series_detail.is_some() {
@@ -6254,17 +6483,27 @@ impl FluxPlay {
             return self.snap_browse_scroll_task();
         }
         if matches!(self.tab, Tab::Favorites) {
-            self.browse_index = BrowseIndex::mapped(
-                self.bundle
-                    .channels
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, c)| self.settings.is_favorite(&c.id))
-                    .map(|(i, _)| i)
-                    .collect(),
-            );
+            let fav_ids: Vec<String> = self
+                .settings
+                .favorites
+                .iter()
+                .filter(|id| !id.is_empty())
+                .cloned()
+                .collect();
+            let n = fav_ids.len();
+            self.browse_index = BrowseIndex::identity(n);
+            if let Some(db) = &self.catalog_db {
+                let source_ids = self.enabled_source_ids();
+                let tiles = db.slim_channels_by_ids(&source_ids, &fav_ids);
+                let pairs: Vec<_> = tiles.into_iter().enumerate().map(|(i, t)| (i, t)).collect();
+                self.tile_cache.set_kind(ContentKind::Live);
+                self.tile_cache.store_at(pairs);
+            }
             self.finish_browse_index_rebuild();
-            return self.snap_browse_scroll_task();
+            return Task::batch([
+                self.snap_browse_scroll_task(),
+                self.fill_visible_browse_tiles(),
+            ]);
         }
         if !matches!(self.tab, Tab::Live | Tab::Vod | Tab::Series) {
             self.browse_index.clear();
@@ -6279,53 +6518,49 @@ impl FluxPlay {
 
         let q = self.search.trim();
         let lang = self.lang_ctx();
-        // Identity: full catalog order — no allocation, instant ready for 1M titles.
+        let source_ids = self.enabled_source_ids();
+        // Identity: SQLite catalog order — no million-entry Vec.
         if q.is_empty() && lang.is_none() {
             match self.tab {
-                Tab::Vod
-                    if matches!(self.selected_vod_category.as_deref(), None | Some("*")) =>
-                {
-                    self.browse_index = BrowseIndex::identity(self.bundle.vod.len());
+                Tab::Vod => {
+                    let len = self
+                        .catalog_db
+                        .as_ref()
+                        .map(|db| db.count_vod(&source_ids, self.vod_cat_sql()))
+                        .unwrap_or(self.vod_count);
+                    self.browse_index = BrowseIndex::identity(len);
                     self.finish_browse_index_rebuild();
                     return Task::batch([
                         self.snap_browse_scroll_task(),
+                        self.fill_visible_browse_tiles(),
                         self.refresh_browse_art(),
                     ]);
                 }
-                Tab::Series
-                    if matches!(self.selected_series_category.as_deref(), None | Some("*")) =>
-                {
-                    self.browse_index = BrowseIndex::identity(self.bundle.series.len());
+                Tab::Series => {
+                    let len = self
+                        .catalog_db
+                        .as_ref()
+                        .map(|db| db.count_series(&source_ids, self.series_cat_sql()))
+                        .unwrap_or(self.series_count);
+                    self.browse_index = BrowseIndex::identity(len);
                     self.finish_browse_index_rebuild();
                     return Task::batch([
                         self.snap_browse_scroll_task(),
+                        self.fill_visible_browse_tiles(),
                         self.refresh_browse_art(),
                     ]);
                 }
-                Tab::Live if matches!(self.selected_group.as_deref(), None | Some("Tous") | Some("*")) =>
-                {
-                    // Live-only contiguous catalog → identity; mixed → cheap index of Live kinds.
-                    let all_live = self
-                        .bundle
-                        .channels
-                        .iter()
-                        .all(|c| c.kind == ContentKind::Live);
-                    self.browse_index = if all_live {
-                        BrowseIndex::identity(self.bundle.channels.len())
-                    } else {
-                        BrowseIndex::mapped(
-                            self.bundle
-                                .channels
-                                .iter()
-                                .enumerate()
-                                .filter(|(_, c)| c.kind == ContentKind::Live)
-                                .map(|(i, _)| i)
-                                .collect(),
-                        )
-                    };
+                Tab::Live => {
+                    let len = self
+                        .catalog_db
+                        .as_ref()
+                        .map(|db| db.count_channels(&source_ids, self.live_group_sql()))
+                        .unwrap_or(self.channel_count);
+                    self.browse_index = BrowseIndex::identity(len);
                     self.finish_browse_index_rebuild();
                     return Task::batch([
                         self.snap_browse_scroll_task(),
+                        self.fill_visible_browse_tiles(),
                         self.refresh_browse_art(),
                     ]);
                 }
@@ -6340,60 +6575,6 @@ impl FluxPlay {
         let group = self.selected_group.clone();
         let vod_cat = self.selected_vod_category.clone();
         let series_cat = self.selected_series_category.clone();
-        let source_ids: Vec<Uuid> = self.sources.iter().map(|s| s.id).collect();
-
-        // Slim rows: avoid cloning titles when we only need category / id match.
-        let live_rows: Vec<(usize, String, Option<String>)> = if matches!(tab, Tab::Live) {
-            self.bundle
-                .channels
-                .iter()
-                .enumerate()
-                .filter(|(_, c)| c.kind == ContentKind::Live)
-                .map(|(i, c)| (i, c.name.clone(), c.group.clone()))
-                .collect()
-        } else {
-            Vec::new()
-        };
-        let vod_rows: Vec<(usize, String, String, Option<String>)> = if matches!(tab, Tab::Vod) {
-            if q.is_empty() && lang.is_none() {
-                // Category filter only — skip name clone.
-                self.bundle
-                    .vod
-                    .iter()
-                    .enumerate()
-                    .map(|(i, v)| (i, String::new(), String::new(), v.category_id.clone()))
-                    .collect()
-            } else {
-                self.bundle
-                    .vod
-                    .iter()
-                    .enumerate()
-                    .map(|(i, v)| (i, v.id.clone(), v.name.clone(), v.category_id.clone()))
-                    .collect()
-            }
-        } else {
-            Vec::new()
-        };
-        let series_rows: Vec<(usize, String, String, Option<String>)> =
-            if matches!(tab, Tab::Series) {
-                if q.is_empty() && lang.is_none() {
-                    self.bundle
-                        .series
-                        .iter()
-                        .enumerate()
-                        .map(|(i, s)| (i, String::new(), String::new(), s.category_id.clone()))
-                        .collect()
-                } else {
-                    self.bundle
-                        .series
-                        .iter()
-                        .enumerate()
-                        .map(|(i, s)| (i, s.id.clone(), s.name.clone(), s.category_id.clone()))
-                        .collect()
-                }
-            } else {
-                Vec::new()
-            };
 
         progress.reset(1);
         Task::perform(
@@ -6406,9 +6587,6 @@ impl FluxPlay {
                         vod_cat,
                         series_cat,
                         source_ids,
-                        live_rows,
-                        vod_rows,
-                        series_rows,
                         lang,
                         progress,
                     )
@@ -6416,20 +6594,36 @@ impl FluxPlay {
                 .await
                 .unwrap_or_default()
             },
-            move |(index, episode_flat)| Message::BrowseIndexReady {
+            move |(index, episode_flat, search_tiles)| Message::BrowseIndexReady {
                 gen,
                 index,
                 episode_flat,
+                search_tiles,
             },
         )
     }
 
 
     fn finish_browse_index_rebuild(&mut self) {
-        self.art_warm_active = !self.browse_index.is_empty()
-            && self.vod_detail.is_none()
-            && !(matches!(self.tab, Tab::Series) && self.series_detail.is_some());
+        // Visible-only posters — never re-arm off-screen warm after index rebuild.
+        self.art_warm_active = false;
+        self.art_warm_cursor = 0;
         self.browse_slice = self.content_virtual_slice(0.0, self.browse_view_h);
+    }
+
+    /// How many VOD/Series mosaic items are unlocked (page growth via « Afficher plus »).
+    fn mosaic_display_len(&self) -> usize {
+        let mosaic = matches!(
+            (self.tab, self.vod_detail.is_some(), self.series_detail.is_some()),
+            (Tab::Vod, false, _) | (Tab::Series, _, false)
+        );
+        if mosaic {
+            self.browse_index
+                .len()
+                .min(self.mosaic_shown.max(browser::MOSAIC_PAGE_ITEMS))
+        } else {
+            self.browse_index.len()
+        }
     }
 
     fn rebuild_episode_flat(&mut self) {
@@ -6476,7 +6670,11 @@ impl FluxPlay {
                 let all_count = if self.lang_filter_on() {
                     0
                 } else {
-                    self.bundle.channels.len()
+                    let ids = self.enabled_source_ids();
+                    self.catalog_db
+                        .as_ref()
+                        .map(|db| db.count_channels(&ids, None))
+                        .unwrap_or(self.channel_count)
                 };
                 self.cat_entries
                     .push(("*".into(), "Toutes".into(), all_active, all_count));
@@ -6497,7 +6695,11 @@ impl FluxPlay {
                 let all_count = if self.lang_filter_on() {
                     0
                 } else {
-                    self.bundle.vod.len()
+                    let ids = self.enabled_source_ids();
+                    self.catalog_db
+                        .as_ref()
+                        .map(|db| db.count_vod(&ids, None))
+                        .unwrap_or(self.vod_count)
                 };
                 self.cat_entries
                     .push(("*".into(), "Toutes".into(), all_active, all_count));
@@ -6518,7 +6720,11 @@ impl FluxPlay {
                 let all_count = if self.lang_filter_on() {
                     0
                 } else {
-                    self.bundle.series.len()
+                    let ids = self.enabled_source_ids();
+                    self.catalog_db
+                        .as_ref()
+                        .map(|db| db.count_series(&ids, None))
+                        .unwrap_or(self.series_count)
                 };
                 self.cat_entries
                     .push(("*".into(), "Toutes".into(), all_active, all_count));
@@ -6568,11 +6774,11 @@ impl FluxPlay {
         match self.tab {
             Tab::Vod if self.vod_detail.is_none() => {
                 let cols = m.cols.max(1);
-                let rows = self.browse_index.len().div_ceil(cols);
+                let rows = self.mosaic_display_len().div_ceil(cols);
                 let s = browser::virtual_slice(
                     scroll_y,
                     view_h,
-                    browser::mosaic_row_height(m.tile_w),
+                    browser::mosaic_row_height_for(m.tile_w, m.touch_target),
                     rows,
                     overscan,
                 );
@@ -6580,11 +6786,11 @@ impl FluxPlay {
             }
             Tab::Series if self.series_detail.is_none() => {
                 let cols = m.cols.max(1);
-                let rows = self.browse_index.len().div_ceil(cols);
+                let rows = self.mosaic_display_len().div_ceil(cols);
                 let s = browser::virtual_slice(
                     scroll_y,
                     view_h,
-                    browser::mosaic_row_height(m.tile_w),
+                    browser::mosaic_row_height_for(m.tile_w, m.touch_target),
                     rows,
                     overscan,
                 );
@@ -6617,10 +6823,11 @@ impl FluxPlay {
     /// Browse positions actually inside the viewport (no overscan / lookahead).
     fn onscreen_browse_range(&self, cols: usize, tile_w: f32) -> std::ops::Range<usize> {
         let cols = cols.max(1);
-        let len = self.browse_index.len();
+        let len = self.mosaic_display_len();
+        let touch = self.layout_metrics().touch_target;
         let (row_h, per_row) = match self.tab {
-            Tab::Vod | Tab::Series => (browser::mosaic_row_height(tile_w), cols),
-            _ => (browser::list_row_height(0.0), 1),
+            Tab::Vod | Tab::Series => (browser::mosaic_row_height_for(tile_w, touch), cols),
+            _ => (browser::list_row_height_for(0.0, touch), 1),
         };
         let rows = len.div_ceil(per_row);
         let slice = browser::virtual_slice(
@@ -6640,11 +6847,12 @@ impl FluxPlay {
     /// Visible mosaic/list indices plus velocity-based lookahead for fast flings.
     fn art_prefetch_window(&self, cols: usize, tile_w: f32) -> std::ops::Range<usize> {
         let cols = cols.max(1);
+        let touch = self.layout_metrics().touch_target;
         let row_h = match self.tab {
             Tab::Vod | Tab::Series if self.series_detail.is_none() && self.vod_detail.is_none() => {
-                browser::mosaic_row_height(tile_w)
+                browser::mosaic_row_height_for(tile_w, touch)
             }
-            _ => browser::list_row_height(0.0),
+            _ => browser::list_row_height_for(0.0, touch),
         };
         // Lead by ~0.35s of fling distance, clamped to 2–16 rows.
         let lead_rows = ((self.browse_scroll_vy.abs() * 0.35) / row_h.max(1.0))
@@ -6655,7 +6863,8 @@ impl FluxPlay {
 
         match self.tab {
             Tab::Vod | Tab::Series if self.series_detail.is_none() && self.vod_detail.is_none() => {
-                let rows = self.browse_index.len().div_ceil(cols);
+                let len = self.mosaic_display_len();
+                let rows = len.div_ceil(cols);
                 let slice = browser::virtual_slice(
                     self.browse_scroll_y,
                     self.browse_view_h,
@@ -6674,7 +6883,7 @@ impl FluxPlay {
                     start = start.saturating_sub(lead_rows / 2);
                 }
                 let start_i = start.saturating_mul(cols);
-                let end_i = (end.saturating_mul(cols)).min(self.browse_index.len());
+                let end_i = (end.saturating_mul(cols)).min(len);
                 start_i..end_i
             }
             Tab::Live | Tab::Favorites => {
@@ -6698,6 +6907,44 @@ impl FluxPlay {
         }
     }
 
+    /// Drop session UI maps that ratchet across browsing (translations, failed downloads…).
+    fn trim_ui_session_caches(&mut self) {
+        const TRANSLATIONS_SOFT: usize = 256;
+        if self.translations.len() > TRANSLATIONS_SOFT {
+            self.translations.clear();
+            self.translating.clear();
+        }
+        self.trim_download_session_map();
+        // Favorites / recent are user data — hard-cap pathological imports only.
+        const FAVORITES_CAP: usize = 2_000;
+        if self.settings.favorites.len() > FAVORITES_CAP {
+            self.settings.favorites.truncate(FAVORITES_CAP);
+        }
+        crate::images::trim_global_aux_caches();
+    }
+
+    /// Keep only active / queued download rows — Done/Failed UI rows pile up forever otherwise.
+    fn trim_download_session_map(&mut self) {
+        const SESSION_CAP: usize = 48;
+        if self.downloads.len() <= SESSION_CAP {
+            return;
+        }
+        let drop_keys: Vec<String> = self
+            .downloads
+            .iter()
+            .filter_map(|(k, st)| match st {
+                crate::downloads::DownloadState::Done { .. }
+                | crate::downloads::DownloadState::Failed => Some(k.clone()),
+                _ => None,
+            })
+            .collect();
+        // Leave enough finished rows for the panel; drop the oldest surplus.
+        let surplus = self.downloads.len().saturating_sub(SESSION_CAP);
+        for key in drop_keys.into_iter().take(surplus) {
+            self.downloads.remove(&key);
+        }
+    }
+
     fn flush_pending_images(&mut self) -> Task<Message> {
         if self.pending_images.is_empty() {
             return Task::none();
@@ -6707,7 +6954,11 @@ impl FluxPlay {
         // first so LRU eviction drops off-screen posters, not the ones being shown
         // (they were never re-requested and stayed as letter placeholders).
         self.promote_visible_art();
+        let wanted = self.wanted_art_urls();
         for (url, source_id, bytes) in batch {
+            if !wanted.is_empty() && !wanted.contains(&url) {
+                continue;
+            }
             let n = bytes.len();
             self.images.insert_ui_bytes(url.clone(), bytes);
             if let (Some(db), Some(sid), Some(path)) = (
@@ -6718,11 +6969,36 @@ impl FluxPlay {
                 db.touch_image(sid, &url, &path, n);
             }
         }
+        // After inserting, drop handles that left the current band (category residue).
+        if !wanted.is_empty() {
+            self.images.retain_urls(wanted.iter().cloned());
+        }
+        debug_assert!(
+            self.images.handle_count() <= crate::images::MAX_RAM_HANDLES,
+            "ImageCache leaked past MAX_RAM_HANDLES after flush"
+        );
         if let Some(db) = &self.catalog_db {
             db.evict_old_images(4_000);
             db.evict_old_meta(30 * 24 * 60 * 60);
         }
         Task::none()
+    }
+
+    /// URLs for the painted window only — used to reject stale inserts.
+    fn wanted_art_urls(&self) -> std::collections::HashSet<String> {
+        let mut out = std::collections::HashSet::new();
+        if self.vod_detail.is_some() || self.series_detail.is_some() {
+            return out;
+        }
+        let m = self.layout_metrics();
+        let win = self.visible_browse_window(m.cols, m.tile_w);
+        let len = self.mosaic_display_len();
+        for pos in win.start..win.end.min(len) {
+            if let Some(url) = self.art_url_for_browse_pos(pos) {
+                out.insert(url);
+            }
+        }
+        out
     }
 
     fn promote_visible_art(&mut self) {
@@ -6769,9 +7045,11 @@ impl FluxPlay {
             if let crate::images::RequestOutcome::Fetch { url: u, source_id } =
                 self.images.request(&url, None)
             {
+                let gen = self.art_fetch_gen;
+                let edge = self.images.decode_edge_px;
                 tasks.push(Task::perform(
-                    crate::images::fetch_image_prepared_edged(u, source_id, self.images.decode_edge_px),
-                    Message::ImageLoaded,
+                    crate::images::fetch_image_prepared_edged(u, source_id, edge),
+                    move |r| Message::ImageLoaded(gen, r),
                 ));
             }
         }
@@ -6786,67 +7064,46 @@ impl FluxPlay {
     }
 
     /// Prefetch posters for the current browse selection at profile load/reload.
-    /// Walks `browse_index` in order (what the user will scroll) — not catalog tip.
+    /// Visible mosaic only — no off-screen warm (RAM ceiling).
     fn prefetch_catalog_art(&mut self) -> Task<Message> {
         self.art_warm_cursor = 0;
-        self.art_warm_active = !self.browse_index.is_empty();
+        self.art_warm_active = false;
         self.refresh_browse_art()
     }
 
-    /// Visible window + background warm of the current filter.
-    fn refresh_browse_art(&mut self) -> Task<Message> {
-        Task::batch([self.prefetch_visible_art(), self.pump_art_warm()])
-    }
-
-    fn continue_art_warm(&mut self) -> Task<Message> {
-        if !self.art_warm_active || self.browse_flinging() {
+    /// Visible mosaic only — used after background meta/xtream batches so they
+    /// cannot restart a full art warm (and re-inflate the iced atlas).
+    fn light_art_refresh_if_browsing(&mut self) -> Task<Message> {
+        if self.vod_detail.is_some() || self.series_detail.is_some() {
             return Task::none();
         }
-        self.pump_art_warm()
+        match self.tab {
+            Tab::Vod | Tab::Series | Tab::Live | Tab::Favorites => self.prefetch_visible_art(),
+            _ => Task::none(),
+        }
     }
 
-    /// How many browse_index entries to warm after load (~8–12 mosaic screens).
+    /// Visible window only (off-screen warm disabled — mosaïque paginée).
+    fn refresh_browse_art(&mut self) -> Task<Message> {
+        self.art_warm_active = false;
+        self.prefetch_visible_art()
+    }
+
+    /// Soft-stage GPU refresh window — unlocked mosaic page only.
     fn art_warm_target(&self) -> usize {
-        let cols = self.layout_metrics().cols.max(1);
-        (cols.saturating_mul(56)).clamp(160, 560).min(self.browse_index.len())
+        self.mosaic_display_len()
+            .min(crate::images::MAX_RAM_HANDLES.saturating_sub(16))
     }
 
     fn art_url_for_browse_pos(&self, pos: usize) -> Option<String> {
-        let i = self.browse_index.get(pos)?;
-        match self.tab {
-            Tab::Live | Tab::Favorites => {
-                let ch = self.bundle.channels.get(i)?;
-                crate::images::pick_art(
-                    ch.logo.as_deref().or(ch.tvg_logo.as_deref()),
-                    None,
-                    None,
-                    None,
-                )
-            }
-            Tab::Vod if self.vod_detail.is_none() => {
-                let v = self.bundle.vod.get(i)?;
-                crate::images::vod_poster_url(v)
-            }
-            Tab::Series if self.series_detail.is_none() => {
-                let s = self.bundle.series.get(i)?;
-                crate::images::series_cover_url(s)
-            }
-            _ => None,
+        if let Some(tile) = self.tile_cache.peek(pos) {
+            return tile.art_url.clone().filter(|u| !u.is_empty());
         }
+        None
     }
 
     fn art_url_source_at(&self, pos: usize) -> Option<Uuid> {
-        let i = self.browse_index.get(pos)?;
-        match self.tab {
-            Tab::Live | Tab::Favorites => self.bundle.channels.get(i).and_then(|c| c.source_id),
-            Tab::Vod if self.vod_detail.is_none() => {
-                self.bundle.vod.get(i).and_then(|v| v.source_id)
-            }
-            Tab::Series if self.series_detail.is_none() => {
-                self.bundle.series.get(i).and_then(|s| s.source_id)
-            }
-            _ => None,
-        }
+        self.tile_cache.peek(pos).and_then(|t| t.source_id)
     }
 
     /// After soft video, shared atlas UVs may point at stale pixels — new Handle ids force re-upload.
@@ -6865,59 +7122,6 @@ impl FluxPlay {
                 self.images.refresh_gpu_texture(&url, sid);
             }
         }
-    }
-
-    /// Fill inflight slots from browse_index[art_warm_cursor..] until warm target.
-    fn pump_art_warm(&mut self) -> Task<Message> {
-        if !self.art_warm_active {
-            return Task::none();
-        }
-        let target = self.art_warm_target();
-        if self.art_warm_cursor >= target {
-            self.art_warm_active = false;
-            return Task::none();
-        }
-        let mut tasks = Vec::new();
-        let room = self.images.max_inflight
-            .saturating_sub(self.images.inflight_len())
-            .min(18);
-        if room == 0 {
-            return Task::none();
-        }
-        while self.art_warm_cursor < target && tasks.len() < room {
-            if self.images.inflight_len() + tasks.len() >= self.images.max_inflight {
-                break;
-            }
-            let Some(url) = self.art_url_for_browse_pos(self.art_warm_cursor) else {
-                self.art_warm_cursor += 1;
-                continue;
-            };
-            let sid = self.art_url_source_at(self.art_warm_cursor);
-            match self.images.request(&url, sid) {
-                crate::images::RequestOutcome::Fetch { url: u, source_id } => {
-                    self.art_warm_cursor += 1;
-                    tasks.push(Task::perform(
-                        crate::images::fetch_image_prepared_edged(u, source_id, self.images.decode_edge_px),
-                        Message::ImageLoaded,
-                    ));
-                }
-                crate::images::RequestOutcome::Ready
-                | crate::images::RequestOutcome::Pending
-                | crate::images::RequestOutcome::Skip => {
-                    self.art_warm_cursor += 1;
-                }
-            }
-        }
-        if self.art_warm_cursor >= target {
-            self.art_warm_active = false;
-        }
-        if tasks.is_empty() {
-            return Task::none();
-        }
-        let n = tasks.len() as u64;
-        let (d, t) = self.jobs.images.snapshot();
-        self.jobs.images.set_total(t.saturating_add(n).max(d + n));
-        Task::batch(tasks)
     }
 
     fn prefetch_visible_art(&mut self) -> Task<Message> {
@@ -6953,51 +7157,18 @@ impl FluxPlay {
             return self.prefetch_urls_capped(urls, cap);
         }
         match self.tab {
-            Tab::Live | Tab::Favorites => {
-                for i in self.browse_index.window(win.start, win.end) {
-                    let Some(ch) = self.bundle.channels.get(i) else {
-                        continue;
-                    };
-                    if let Some(u) = crate::images::pick_art(
-                        ch.logo.as_deref().or(ch.tvg_logo.as_deref()),
-                        None,
-                        None,
-                        None,
-                    ) {
-                        urls.push(u);
-                    }
-                }
-            }
-            Tab::Vod => {
+            Tab::Live | Tab::Favorites | Tab::Vod | Tab::Series => {
                 if let Some(d) = &self.vod_detail {
-                    if let Some(u) = crate::images::pick_art(None, d.poster.as_deref(), None, None) {
+                    if let Some(u) = crate::images::vod_poster_url(d) {
+                        urls.push(u);
+                    }
+                } else if let Some(d) = &self.series_detail {
+                    if let Some(u) = crate::images::series_cover_url(d) {
                         urls.push(u);
                     }
                 } else {
-                    for i in self.browse_index.window(win.start, win.end) {
-                        let Some(v) = self.bundle.vod.get(i) else {
-                            continue;
-                        };
-                        if let Some(u) = crate::images::vod_poster_url(v) {
-                            self.images.promote(&u);
-                            urls.push(u);
-                        }
-                    }
-                }
-            }
-            Tab::Series => {
-                if let Some(d) = &self.series_detail {
-                    if let Some(u) =
-                        crate::images::pick_art(None, None, d.cover.as_deref(), d.banner.as_deref())
-                    {
-                        urls.push(u);
-                    }
-                } else {
-                    for i in self.browse_index.window(win.start, win.end) {
-                        let Some(s) = self.bundle.series.get(i) else {
-                            continue;
-                        };
-                        if let Some(u) = crate::images::series_cover_url(s) {
+                    for pos in win.start..win.end.min(self.browse_index.len()) {
+                        if let Some(u) = self.art_url_for_browse_pos(pos) {
                             self.images.promote(&u);
                             urls.push(u);
                         }
@@ -7011,7 +7182,6 @@ impl FluxPlay {
 
     fn resync_player_options(&mut self) {
         let prev = self.session.native.options_mut().clone();
-        #[allow(unused_mut)] // mutated under android cfg
         let mut next = play_options_from(&self.settings);
         // Never clobber a live Surface bind / present mode mid-play — that leaves
         // punch-through on with Soft flags (or vice versa) → black hole.
@@ -7024,10 +7194,6 @@ impl FluxPlay {
             if prev.android_present.uses_surface() {
                 next.android_soft_vf = prev.android_soft_vf.clone();
             }
-        }
-        #[cfg(not(target_os = "android"))]
-        {
-            let _ = &prev;
         }
         // Headers come from the playing profile, not from the settings being changed.
         if self.session.channel.is_some() {
@@ -7267,12 +7433,20 @@ impl FluxPlay {
 
     fn fetch_epg_for_visible_task(&self) -> Task<Message> {
         let chans: Vec<(String, Option<Uuid>)> = self
-            .bundle
-            .live_in_group(self.selected_group.as_deref())
-            .into_iter()
-            .take(12)
-            .map(|c| (c.id.clone(), c.source_id))
-            .collect();
+            .catalog_db
+            .as_ref()
+            .map(|db| {
+                db.channels_in_group(
+                    &self.enabled_source_ids(),
+                    self.selected_group.as_deref(),
+                    None,
+                    12,
+                )
+                .into_iter()
+                .map(|c| (c.id.clone(), c.source_id))
+                .collect()
+            })
+            .unwrap_or_default();
         self.fetch_epg_for(chans)
     }
 
@@ -7307,12 +7481,22 @@ impl FluxPlay {
     #[cfg(not(target_os = "android"))]
     fn pick_autoplay_channel(&self) -> Option<Channel> {
         let group = self.selected_group.as_deref();
-        self.bundle
-            .live_in_group(group)
-            .into_iter()
-            .find(|c| !is_adult_cat(c.group.as_deref().unwrap_or("")))
-            .cloned()
-            .or_else(|| self.bundle.channels.first().cloned())
+        let ids = self.enabled_source_ids();
+        let db = self.catalog_db.as_ref()?;
+        let group_sql = match group {
+            None | Some("Tous") | Some("*") => None,
+            Some(g) => Some(g),
+        };
+        for tile in db.browse_tiles_channels(&ids, 0, 64, group_sql) {
+            if !is_adult_cat(tile.group.as_deref().unwrap_or("")) {
+                if let Some(ch) = db.channel_by_id(&tile.id) {
+                    return Some(ch);
+                }
+            }
+        }
+        db.browse_tiles_channels(&ids, 0, 1, group_sql)
+            .first()
+            .and_then(|t| db.channel_by_id(&t.id))
     }
 
     /// Profile a stream URL belongs to: Xtream credentials in the path, then
@@ -7335,21 +7519,23 @@ impl FluxPlay {
         if let Some(s) = by_creds {
             return Some(s.clone());
         }
-        let catalog_id = self
-            .bundle
-            .vod
-            .iter()
-            .find(|v| v.stream_url == url)
+        if let Some(sid) = self
+            .vod_detail
+            .as_ref()
+            .filter(|v| v.stream_url == url)
             .and_then(|v| v.source_id)
             .or_else(|| {
-                self.bundle
-                    .channels
-                    .iter()
-                    .find(|c| c.stream_url == url)
+                self.session
+                    .channel
+                    .as_ref()
+                    .filter(|c| c.stream_url == url)
                     .and_then(|c| c.source_id)
-            });
-        if let Some(s) = catalog_id.and_then(|id| enabled().find(|s| s.id == id)) {
-            return Some(s.clone());
+            })
+            .or_else(|| self.tile_cache.peek(self.browse_focus).and_then(|t| t.source_id))
+        {
+            if let Some(s) = enabled().find(|s| s.id == sid) {
+                return Some(s.clone());
+            }
         }
         let host = url::Url::parse(url).ok()?.host_str()?.to_ascii_lowercase();
         enabled()
@@ -7440,23 +7626,15 @@ impl FluxPlay {
         )
     }
 
-    /// Force iced scrollables back to top — prevents empty mosaic when
-    /// `browse_scroll_y` was reset but the widget still sat in the spacer zone.
+    /// Stable iced scrollable ids — never encode category/group in the id.
+    /// Per-category ids remounted hundreds of scroll States / operation targets
+    /// across browsing and ratcheted UI RAM. Offset reset uses `scroll_to(0)`.
     fn browse_scroll_widget_id(&self) -> String {
         match self.tab {
-            Tab::Vod => format!(
-                "flux-vod-{}",
-                self.selected_vod_category.as_deref().unwrap_or("*")
-            ),
+            Tab::Vod => "flux-vod".into(),
             Tab::Series if self.series_detail.is_some() => "flux-episodes".into(),
-            Tab::Series => format!(
-                "flux-series-{}",
-                self.selected_series_category.as_deref().unwrap_or("*")
-            ),
-            Tab::Live => format!(
-                "flux-live-{}",
-                self.selected_group.as_deref().unwrap_or("*")
-            ),
+            Tab::Series => "flux-series".into(),
+            Tab::Live => "flux-live".into(),
             Tab::Favorites => "flux-browse-fav".into(),
             _ => "flux-browse".into(),
         }
@@ -7468,13 +7646,13 @@ impl FluxPlay {
         match self.tab {
             Tab::Vod if self.vod_detail.is_none() => {
                 let cols = m.cols.max(1);
-                let rows = self.browse_index.len().div_ceil(cols);
-                browser::virtual_content_height(rows, view_h, browser::mosaic_row_height(m.tile_w))
+                let rows = self.mosaic_display_len().div_ceil(cols);
+                browser::virtual_content_height(rows, view_h, browser::mosaic_row_height_for(m.tile_w, m.touch_target))
             }
             Tab::Series if self.series_detail.is_none() => {
                 let cols = m.cols.max(1);
-                let rows = self.browse_index.len().div_ceil(cols);
-                browser::virtual_content_height(rows, view_h, browser::mosaic_row_height(m.tile_w))
+                let rows = self.mosaic_display_len().div_ceil(cols);
+                browser::virtual_content_height(rows, view_h, browser::mosaic_row_height_for(m.tile_w, m.touch_target))
             }
             Tab::Series if self.series_detail.is_some() => browser::virtual_content_height(
                 self.episode_flat.len(),
@@ -7550,52 +7728,6 @@ impl FluxPlay {
         )
     }
 
-    /// Persist portal dump: checksum short-circuit + enrichment-preserving upsert.
-    /// Progressive batch ingest is the hot path; this remains the single-source sync fallback.
-    #[allow(dead_code)]
-    fn ingest_source_bundle(
-        &mut self,
-        source_id: Uuid,
-        part: PlaylistBundle,
-    ) -> crate::catalog_db::BundleApplyKind {
-        if let Some(db) = &mut self.catalog_db {
-            let epg = part.epg.clone();
-            match db.apply_source_bundle(source_id, part.clone()) {
-                Ok(res) => {
-                    if let Err(e) = db.merge_epg(source_id, &epg) {
-                        tracing::warn!(error = %e, "catalog epg merge failed");
-                    }
-                    db.mark_full_sync_now(source_id);
-                    match res.kind {
-                        crate::catalog_db::BundleApplyKind::Unchanged => {
-                            if !epg.is_empty() {
-                                fluxplay_providers::merge_epg(&mut self.bundle.epg, epg);
-                            }
-                            return res.kind;
-                        }
-                        crate::catalog_db::BundleApplyKind::Updated { .. } => {
-                            if let Some(merged) = res.merged {
-                                replace_source_bundle(&mut self.bundle, source_id, merged);
-                            }
-                            return res.kind;
-                        }
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "catalog apply_source_bundle failed");
-                    replace_source_bundle(&mut self.bundle, source_id, part);
-                    return crate::catalog_db::BundleApplyKind::Updated { preserved_meta: 0 };
-                }
-            }
-        }
-        // No DB: merge enrichment from RAM then replace.
-        let merged = merge_part_with_existing(&self.bundle, source_id, part);
-        replace_source_bundle(&mut self.bundle, source_id, merged);
-        crate::catalog_db::BundleApplyKind::Updated {
-            preserved_meta: 0,
-        }
-    }
-
     /// Probe the servers of a profile with mirrors (playback and downloads
     /// then prefer the fastest reachable one).
     fn rank_servers_task(&self, id: Uuid) -> Task<Message> {
@@ -7654,7 +7786,7 @@ impl FluxPlay {
         Task::perform(
             async move {
                 crate::async_jobs::run_blocking(move || {
-                    crate::catalog_db::load_bundle_blocking(&ids)
+                    crate::catalog_db::load_spine_blocking(&ids)
                 })
                 .await
                 .unwrap_or_else(Err)
@@ -7663,14 +7795,51 @@ impl FluxPlay {
         )
     }
 
-    fn apply_bundle_cache(&mut self, bundle: PlaylistBundle) {
-        self.bundle = bundle;
+    fn apply_spine_cache(&mut self, spine: crate::catalog_db::CatalogSpine) {
+        self.bundle.categories = spine.categories;
+        self.bundle.epg = spine.epg;
+        self.bundle.vod.clear();
+        self.bundle.series.clear();
+        self.bundle.channels.clear();
+        self.channel_count = spine.channel_count;
+        self.vod_count = spine.vod_count;
+        self.series_count = spine.series_count;
+        self.tile_cache.clear();
+        self.art_fetch_gen = self.art_fetch_gen.wrapping_add(1);
+        self.pending_images.clear();
+        self.images.clear_handles();
+        self.jobs.images.reset(0);
         tracing::info!(
-            channels = self.bundle.channels.len(),
-            vod = self.bundle.vod.len(),
-            series = self.bundle.series.len(),
-            "rebuilt bundle from catalog db"
+            channels = self.channel_count,
+            vod = self.vod_count,
+            series = self.series_count,
+            "rebuilt spine from catalog db"
         );
+    }
+
+    fn enabled_source_ids(&self) -> Vec<Uuid> {
+        self.sources.iter().filter(|s| s.enabled).map(|s| s.id).collect()
+    }
+
+    fn vod_cat_sql(&self) -> Option<&str> {
+        match self.selected_vod_category.as_deref() {
+            None | Some("*") => None,
+            Some(id) => Some(id),
+        }
+    }
+
+    fn series_cat_sql(&self) -> Option<&str> {
+        match self.selected_series_category.as_deref() {
+            None | Some("*") => None,
+            Some(id) => Some(id),
+        }
+    }
+
+    fn live_group_sql(&self) -> Option<&str> {
+        match self.selected_group.as_deref() {
+            None | Some("Tous") | Some("*") => None,
+            Some(g) => Some(g),
+        }
     }
 
     fn arm_series_queue_for_url(&mut self, current_url: &str) {
@@ -7980,6 +8149,7 @@ impl FluxPlay {
             goto_draft: &self.goto_draft,
             sleep_mins: self.sleep_mins,
             pip: self.pip_mode,
+            #[cfg(not(target_os = "android"))]
             chrome_h: self.layout_metrics().player_chrome_h,
             chrome_visible: self.player_chrome_visible,
             chrome_alpha: self.chrome_alpha,
@@ -8067,15 +8237,20 @@ impl FluxPlay {
             }
             ContentKind::Vod => None,
             ContentKind::Live => {
-                let same = |c: &&Channel| c.id == cur.id && c.source_id == cur.source_id;
-                let mut list = self.bundle.live_in_group(self.selected_group.as_deref());
-                if !list.iter().any(same) {
-                    // Started from favorites / recents / search: zap within its own group.
-                    list = self.bundle.live_in_group(cur.group.as_deref());
-                }
-                let idx = list.iter().position(same)? as i32;
-                let next = (idx + delta).rem_euclid(list.len() as i32) as usize;
-                Some(Message::PlayChannel(list[next].clone()))
+                let db = self.catalog_db.as_ref()?;
+                let ids = self.enabled_source_ids();
+                let ch = db
+                    .live_channel_neighbor(&ids, self.selected_group.as_deref(), &cur.id, cur.source_id, delta)
+                    .or_else(|| {
+                        db.live_channel_neighbor(
+                            &ids,
+                            cur.group.as_deref(),
+                            &cur.id,
+                            cur.source_id,
+                            delta,
+                        )
+                    })?;
+                Some(Message::PlayChannel(ch))
             }
         }
     }
@@ -8164,32 +8339,34 @@ impl FluxPlay {
                 "Aucune chaîne dans cette sélection.",
             ));
         } else {
-            // Never scan EPG on the browse paint path — it blocks scroll.
-            for bi in self.browse_index.window(slice.start, slice.end) {
-                let Some(ch) = self.bundle.channels.get(bi) else {
-                    continue;
-                };
-                let fav = self.settings.is_favorite(&ch.id);
-                let subtitle = ch
-                    .group
-                    .as_deref()
+            for pos in slice.start..slice.end.min(self.browse_index.len()) {
+                let tile = self.tile_cache.peek(pos);
+                let name = tile.map(|t| t.name.as_str()).unwrap_or("…");
+                let id = tile.map(|t| t.id.as_str()).unwrap_or("");
+                let sid = tile.and_then(|t| t.source_id);
+                let fav = !id.is_empty() && self.settings.is_favorite(id);
+                let subtitle = tile
+                    .and_then(|t| t.group.as_deref())
                     .map(crate::names::category_label)
                     .unwrap_or_else(|| "Live".into());
-                // Same key as the art prefetch (normalised URL, `tvg-logo` fallback).
-                let thumb = crate::images::pick_art(
-                    ch.logo.as_deref().or(ch.tvg_logo.as_deref()),
-                    None,
-                    None,
-                    None,
-                )
-                .and_then(|k| self.images.get(&k));
+                let thumb = tile
+                    .and_then(|t| t.art_url.as_deref())
+                    .and_then(|k| self.images.get(k));
                 rows.push(browser::media_row(
-                    crate::names::display_channel(&ch.name),
+                    if tile.is_some() {
+                        crate::names::display_channel(name)
+                    } else {
+                        "…".into()
+                    },
                     subtitle,
-                    Message::PlayChannelId(ch.id.clone(), ch.source_id),
-                    Some((fav, Message::ToggleFavorite(ch.id.clone()))),
+                    Message::PlayChannelId(id.to_string(), sid),
+                    if id.is_empty() {
+                        None
+                    } else {
+                        Some((fav, Message::ToggleFavorite(id.to_string())))
+                    },
                     ui,
-                    self.selected_channel.as_deref() == Some(ch.id.as_str()),
+                    self.selected_channel.as_deref() == Some(id),
                     thumb,
                     40.0,
                     list_w,
@@ -8227,10 +8404,7 @@ impl FluxPlay {
             m.stack_header,
         );
 
-        let scroll_id = format!(
-            "flux-live-{}",
-            self.selected_group.as_deref().unwrap_or("*")
-        );
+        let scroll_id = self.browse_scroll_widget_id();
         let content_h = browser::virtual_content_height(total, self.browse_view_h, row_h);
         let scroller = if total == 0 {
             browser::soft_scroll_on(
@@ -8282,8 +8456,9 @@ impl FluxPlay {
         let tile_w = m.tile_w;
 
         let total = self.browse_index.len();
-        let n_rows = total.div_ceil(cols);
-        let row_h = browser::mosaic_row_height(tile_w);
+        let shown = self.mosaic_display_len();
+        let n_rows = shown.div_ceil(cols);
+        let row_h = browser::mosaic_row_height_for(tile_w, m.touch_target);
         // Paint with no overscan: the mosaic is a viewport overlay, so extra
         // rows would sit at the top and show the wrong films.
         let slice = browser::virtual_slice(
@@ -8305,32 +8480,35 @@ impl FluxPlay {
                 let mut r = Row::new().spacing(crate::theme::MOSAIC_GAP).width(Fill);
                 for c in 0..cols {
                     let idx = row_i * cols + c;
-                    if idx >= total {
+                    if idx >= shown {
                         break;
                     }
-                    let Some(v) = self.browse_index.get(idx).and_then(|i| self.bundle.vod.get(i))
-                    else {
-                        continue;
-                    };
-                    // Always paint titles + cached art (blanking during fling looked broken).
-                    let ti = crate::names::parse_item_title(&v.name);
-                    let meta = Self::mosaic_meta_line(
-                        v.year.as_deref().filter(|y| !y.trim().is_empty()).or(ti.year.as_deref()),
-                        v.genre.as_deref(),
-                        v.rating.as_deref(),
-                        "Film",
-                    );
-                    let thumb = crate::images::vod_poster_url(v)
-                        .and_then(|u| self.images.get(&u));
+                    let tile = self.tile_cache.peek(idx);
+                    let name = tile.map(|t| t.name.as_str()).unwrap_or("…");
+                    let ti = crate::names::parse_item_title(name);
+                    let meta = tile
+                        .map(|t| {
+                            t.meta_line("Film")
+                        })
+                        .unwrap_or_else(|| "…".into());
+                    let id = tile.map(|t| t.id.as_str()).unwrap_or("");
+                    let thumb = tile
+                        .and_then(|t| t.art_url.as_deref())
+                        .and_then(|u| self.images.get(u));
                     r = r.push(browser::mosaic_tile(
-                        ti.title,
+                        if tile.is_some() {
+                            ti.title
+                        } else {
+                            "…".into()
+                        },
                         meta,
-                        v.id.clone(),
-                        Message::OpenVodDetail(v.id.clone()),
+                        id.to_string(),
+                        Message::OpenVodDetail(id.to_string()),
                         ui,
                         tile_w,
                         thumb,
-                        self.pressed_mosaic.as_deref() == Some(v.id.as_str()),
+                        self.pressed_mosaic.as_deref() == Some(id),
+                        m.focus_chrome && idx == self.browse_focus,
                     ));
                 }
                 r = r.push(Space::new().width(Fill));
@@ -8353,17 +8531,14 @@ impl FluxPlay {
         let header = browser::content_header_with(
             ui,
             cat_name,
-            format!("{total} films"),
+            format!("{shown}/{total} films"),
             &self.search,
             "Rechercher un film…",
             m.search_w,
             m.title_size,
             m.stack_header,
         );
-        let scroll_id = format!(
-            "flux-vod-{}",
-            self.selected_vod_category.as_deref().unwrap_or("*")
-        );
+        let scroll_id = self.browse_scroll_widget_id();
         let content_h =
             browser::virtual_content_height(n_rows, self.browse_view_h, row_h);
         let scroller = if total == 0 {
@@ -8377,14 +8552,16 @@ impl FluxPlay {
                 Message::BrowseScrolled,
             )
         };
-        let content = browser::pane(
-            ui,
-            Length::Fill,
-            column![header, scroller]
-                .spacing(m.gap)
-                .width(Fill)
-                .height(Fill),
-        );
+        let mut body = column![header, scroller].spacing(m.gap).width(Fill).height(Fill);
+        if total > 0 {
+            body = body.push(browser::mosaic_show_more(
+                ui,
+                shown,
+                total,
+                browser::MOSAIC_PAGE_ITEMS,
+            ));
+        }
+        let content = browser::pane(ui, Length::Fill, body);
         self.with_categories(ui, m, "Films / VOD", &self.cat_entries, content)
     }
 
@@ -8685,7 +8862,6 @@ impl FluxPlay {
 
     /// Detail-page fields normalized for display (portal noise removed) and, when
     /// enabled, synopsis / genre in the viewer language.
-    #[allow(clippy::too_many_arguments)]
     fn detail_text(
         &self,
         name: &str,
@@ -8738,8 +8914,7 @@ impl FluxPlay {
         m: crate::theme::LayoutMetrics,
         detail: &VodItem,
     ) -> Element<'_, Message> {
-        let poster = crate::images::pick_art(None, detail.poster.as_deref(), None, None)
-            .and_then(|u| self.images.get(&u));
+        let poster = crate::images::vod_poster_url(detail).and_then(|u| self.images.get(&u));
         let imdb_query = detail
             .imdb_id
             .clone()
@@ -8804,13 +8979,7 @@ impl FluxPlay {
         m: crate::theme::LayoutMetrics,
         detail: &SeriesItem,
     ) -> Element<'_, Message> {
-        let poster = crate::images::pick_art(
-            None,
-            None,
-            detail.cover.as_deref(),
-            detail.banner.as_deref(),
-        )
-        .and_then(|u| self.images.get(&u));
+        let poster = crate::images::series_cover_url(detail).and_then(|u| self.images.get(&u));
         // Season 0 holds specials (or unparsable keys): "Lire" starts at S01E01 when it exists.
         let episodes_of = |regular: bool| {
             detail
@@ -9013,8 +9182,9 @@ impl FluxPlay {
         }
 
         let total = self.browse_index.len();
-        let n_rows = total.div_ceil(cols);
-        let row_h = browser::mosaic_row_height(tile_w);
+        let shown = self.mosaic_display_len();
+        let n_rows = shown.div_ceil(cols);
+        let row_h = browser::mosaic_row_height_for(tile_w, m.touch_target);
         let slice = browser::virtual_slice(
             self.browse_scroll_y,
             self.browse_view_h,
@@ -9034,34 +9204,33 @@ impl FluxPlay {
                 let mut r = Row::new().spacing(crate::theme::MOSAIC_GAP).width(Fill);
                 for c in 0..cols {
                     let idx = row_i * cols + c;
-                    if idx >= total {
+                    if idx >= shown {
                         break;
                     }
-                    let Some(s) = self
-                        .browse_index
-                        .get(idx)
-                        .and_then(|i| self.bundle.series.get(i))
-                    else {
-                        continue;
-                    };
-                    let ti = crate::names::parse_item_title(&s.name);
-                    let meta = Self::mosaic_meta_line(
-                        s.year.as_deref().filter(|y| !y.trim().is_empty()).or(ti.year.as_deref()),
-                        s.genre.as_deref(),
-                        s.rating.as_deref(),
-                        "Série",
-                    );
-                    let thumb = crate::images::series_cover_url(s)
-                        .and_then(|u| self.images.get(&u));
+                    let tile = self.tile_cache.peek(idx);
+                    let name = tile.map(|t| t.name.as_str()).unwrap_or("…");
+                    let ti = crate::names::parse_item_title(name);
+                    let meta = tile
+                        .map(|t| t.meta_line("Série"))
+                        .unwrap_or_else(|| "…".into());
+                    let id = tile.map(|t| t.id.as_str()).unwrap_or("");
+                    let thumb = tile
+                        .and_then(|t| t.art_url.as_deref())
+                        .and_then(|u| self.images.get(u));
                     r = r.push(browser::mosaic_tile(
-                        ti.title,
+                        if tile.is_some() {
+                            ti.title
+                        } else {
+                            "…".into()
+                        },
                         meta,
-                        s.id.clone(),
-                        Message::OpenSeries(s.id.clone()),
+                        id.to_string(),
+                        Message::OpenSeries(id.to_string()),
                         ui,
                         tile_w,
                         thumb,
-                        self.pressed_mosaic.as_deref() == Some(s.id.as_str()),
+                        self.pressed_mosaic.as_deref() == Some(id),
+                        m.focus_chrome && idx == self.browse_focus,
                     ));
                 }
                 r = r.push(Space::new().width(Fill));
@@ -9083,17 +9252,14 @@ impl FluxPlay {
         let header = browser::content_header_with(
             ui,
             cat_name,
-            format!("{total} séries"),
+            format!("{shown}/{total} séries"),
             &self.search,
             "Rechercher une série…",
             m.search_w,
             m.title_size,
             m.stack_header,
         );
-        let scroll_id = format!(
-            "flux-series-{}",
-            self.selected_series_category.as_deref().unwrap_or("*")
-        );
+        let scroll_id = self.browse_scroll_widget_id();
         let content_h =
             browser::virtual_content_height(n_rows, self.browse_view_h, row_h);
         let scroller = if total == 0 {
@@ -9107,14 +9273,16 @@ impl FluxPlay {
                 Message::BrowseScrolled,
             )
         };
-        let content = browser::pane(
-            ui,
-            Length::Fill,
-            column![header, scroller]
-                .spacing(m.gap)
-                .width(Fill)
-                .height(Fill),
-        );
+        let mut body = column![header, scroller].spacing(m.gap).width(Fill).height(Fill);
+        if total > 0 {
+            body = body.push(browser::mosaic_show_more(
+                ui,
+                shown,
+                total,
+                browser::MOSAIC_PAGE_ITEMS,
+            ));
+        }
+        let content = browser::pane(ui, Length::Fill, body);
         self.with_categories(ui, m, "Séries", &self.cat_entries, content)
     }
 
@@ -9136,29 +9304,31 @@ impl FluxPlay {
                 "Aucun favori — appuyez sur ★ dans la liste TV.",
             ));
         } else {
-            for bi in self.browse_index.window(slice.start, slice.end) {
-                let Some(ch) = self.bundle.channels.get(bi) else {
-                    continue;
-                };
-                // Same key as the art prefetch (normalised URL, `tvg-logo` fallback).
-                let thumb = crate::images::pick_art(
-                    ch.logo.as_deref().or(ch.tvg_logo.as_deref()),
-                    None,
-                    None,
-                    None,
-                )
-                .and_then(|k| self.images.get(&k));
-                // Same cleaned labels as the Live list ("|FR| TF1 FHD" → "TF1 FHD").
+            for pos in slice.start..slice.end.min(self.browse_index.len()) {
+                let tile = self.tile_cache.peek(pos);
+                let name = tile.map(|t| t.name.as_str()).unwrap_or("…");
+                let id = tile.map(|t| t.id.as_str()).unwrap_or("");
+                let sid = tile.and_then(|t| t.source_id);
+                let thumb = tile
+                    .and_then(|t| t.art_url.as_deref())
+                    .and_then(|k| self.images.get(k));
                 rows.push(browser::media_row(
-                    crate::names::display_channel(&ch.name),
-                    ch.group
-                        .as_deref()
+                    if tile.is_some() {
+                        crate::names::display_channel(name)
+                    } else {
+                        "…".into()
+                    },
+                    tile.and_then(|t| t.group.as_deref())
                         .map(crate::names::category_label)
                         .unwrap_or_else(|| "Live".into()),
-                    Message::PlayChannelId(ch.id.clone(), ch.source_id),
-                    Some((true, Message::ToggleFavorite(ch.id.clone()))),
+                    Message::PlayChannelId(id.to_string(), sid),
+                    if id.is_empty() {
+                        None
+                    } else {
+                        Some((true, Message::ToggleFavorite(id.to_string())))
+                    },
                     ui,
-                    self.selected_channel.as_deref() == Some(ch.id.as_str()),
+                    self.selected_channel.as_deref() == Some(id),
                     thumb,
                     40.0,
                     m.content_w.max(120.0),
@@ -9902,25 +10072,25 @@ impl FluxPlay {
         let m = self.layout_metrics();
         let now = chrono::Utc::now();
         let mut items = Column::new().spacing(4).width(Fill);
-        let channels: Vec<&Channel> = if let Some(id) = &self.selected_channel {
-            self.bundle
-                .channels
-                .iter()
-                .filter(|c| &c.id == id)
+        let channels: Vec<Channel> = if let Some(id) = &self.selected_channel {
+            self.catalog_db
+                .as_ref()
+                .and_then(|db| db.channel_by_id(id))
+                .into_iter()
                 .collect()
         } else {
-            // The header search box filters the guide too (it used to be ignored).
-            let q = self.search.trim().to_lowercase();
-            self.bundle
-                .live_in_group(self.selected_group.as_deref())
-                .into_iter()
-                .filter(|c| {
-                    q.is_empty()
-                        || c.name.to_lowercase().contains(&q)
-                        || crate::names::display_channel(&c.name).to_lowercase().contains(&q)
+            let q = self.search.trim();
+            self.catalog_db
+                .as_ref()
+                .map(|db| {
+                    db.channels_in_group(
+                        &self.enabled_source_ids(),
+                        self.selected_group.as_deref(),
+                        if q.is_empty() { None } else { Some(q) },
+                        40,
+                    )
                 })
-                .take(40)
-                .collect()
+                .unwrap_or_default()
         };
 
         if channels.is_empty() || self.bundle.epg.is_empty() {
@@ -9930,7 +10100,7 @@ impl FluxPlay {
             ));
         }
 
-        for ch in channels {
+        for ch in &channels {
             let (cur, next) = self.bundle.now_next(ch, now);
             let cur_s = cur
                 .map(|p| {
@@ -10268,8 +10438,7 @@ fn sanitize_sources(sources: &mut [MediaSource]) {
     }
 }
 
-// Off-thread index build; each arg is an owned snapshot — a params struct adds indirection only.
-#[allow(clippy::too_many_arguments)]
+// Off-thread index build; row snapshots come from SQLite, not RAM bundle.
 fn build_browse_index_blocking(
     tab: Tab,
     q: String,
@@ -10277,41 +10446,54 @@ fn build_browse_index_blocking(
     vod_cat: Option<String>,
     series_cat: Option<String>,
     source_ids: Vec<Uuid>,
-    live_rows: Vec<(usize, String, Option<String>)>,
-    vod_rows: Vec<(usize, String, String, Option<String>)>,
-    series_rows: Vec<(usize, String, String, Option<String>)>,
     lang: Option<std::sync::Arc<LangCtx>>,
     progress: std::sync::Arc<crate::async_jobs::JobProgress>,
-) -> (BrowseIndex, Vec<EpisodeFlat>) {
+) -> (
+    BrowseIndex,
+    Vec<EpisodeFlat>,
+    Vec<crate::browse_tiles::BrowseTile>,
+) {
     use crate::async_jobs::DEFAULT_CHUNK;
     let q_lc = if q.is_empty() {
         None
     } else {
         Some(q.to_lowercase())
     };
+    let Some(db) = crate::catalog_db::CatalogDb::open(&source_ids) else {
+        return (BrowseIndex::Empty, Vec::new(), Vec::new());
+    };
+    let group_sql = match group.as_deref() {
+        None | Some("Tous") | Some("*") => None,
+        Some(g) => Some(g),
+    };
     let index = match tab {
         Tab::Live => {
+            if !q.is_empty() {
+                let found = db.search_channel_ids(&q, group_sql, 2_000);
+                let tiles = db.slim_channels_by_ids(&source_ids, &found);
+                progress.set_done(1);
+                return (
+                    BrowseIndex::identity(tiles.len()),
+                    Vec::new(),
+                    tiles,
+                );
+            }
+            let live_rows = db.collect_live_browse_rows(&source_ids, group_sql);
             progress.set_total(live_rows.len() as u64);
             let mut out = Vec::with_capacity(live_rows.len().min(65_536));
             let mut idle = Vec::new();
             for chunk in live_rows.chunks(DEFAULT_CHUNK) {
                 for (i, name, g) in chunk {
-                    let group_ok = match group.as_deref() {
-                        None | Some("Tous") | Some("*") => true,
-                        Some(want) => g.as_deref() == Some(want),
-                    };
                     let q_ok = q_lc
                         .as_deref()
                         .map(|ql| name.to_lowercase().contains(ql))
                         .unwrap_or(true);
-                    let lang_ok = group_ok
-                        && q_ok
+                    let lang_ok = q_ok
                         && lang
                             .as_deref()
                             .map(|l| l.keeps_channel(name, g.as_deref()))
                             .unwrap_or(true);
                     if lang_ok {
-                        // Empty PPV / event slots go after the real channels.
                         if crate::names::is_placeholder_channel(name) {
                             idle.push(*i);
                         } else {
@@ -10329,57 +10511,33 @@ fn build_browse_index_blocking(
                 None | Some("*") => None,
                 Some(id) => Some(id),
             };
-            if let Some(ql) = q_lc.as_deref().filter(|s| !s.is_empty()) {
-                let _ = ql;
-                if !q.is_empty() {
-                    if let Some(db) = crate::catalog_db::CatalogDb::open(&source_ids) {
-                        let found = db.search_vod_ids(&q, cat, 50_000);
-                        let want: std::collections::HashSet<&str> =
-                            found.iter().map(String::as_str).collect();
-                        progress.set_total(vod_rows.len() as u64);
-                        let mut out = Vec::with_capacity(found.len());
-                        for chunk in vod_rows.chunks(DEFAULT_CHUNK) {
-                            for (i, id, name, c) in chunk {
-                                let cat_ok = cat
-                                    .map(|cid| c.as_deref() == Some(cid))
-                                    .unwrap_or(true);
-                                if cat_ok
-                                    && want.contains(id.as_str())
-                                    && lang
-                                        .as_deref()
-                                        .map(|l| l.keeps_title(name, c.as_deref()))
-                                        .unwrap_or(true)
-                                {
-                                    out.push(*i);
-                                }
-                            }
-                            progress.add_done(chunk.len() as u64);
-                        }
-                        return (BrowseIndex::mapped(out), Vec::new());
-                    }
+            if !q.is_empty() {
+                let found = db.search_vod_ids(&q, cat, 2_000);
+                let mut tiles = db.slim_vod_by_ids(&source_ids, &found);
+                if let Some(l) = lang.as_deref() {
+                    tiles.retain(|t| l.keeps_title(&t.name, t.category_id.as_deref()));
                 }
+                progress.set_done(1);
+                return (
+                    BrowseIndex::identity(tiles.len()),
+                    Vec::new(),
+                    tiles,
+                );
             }
+            let vod_rows = db.collect_vod_browse_rows(&source_ids, cat);
             progress.set_total(vod_rows.len() as u64);
             let mut out = Vec::with_capacity(vod_rows.len().min(65_536));
             for chunk in vod_rows.chunks(DEFAULT_CHUNK) {
                 for (i, _id, name, c) in chunk {
-                    let cat_ok = cat.map(|cid| c.as_deref() == Some(cid)).unwrap_or(true);
                     let q_ok = q_lc
                         .as_deref()
-                        .map(|ql| {
-                            if name.is_empty() {
-                                true
-                            } else {
-                                name.to_lowercase().contains(ql)
-                            }
-                        })
+                        .map(|ql| name.to_lowercase().contains(ql))
                         .unwrap_or(true);
-                    let lang_ok = || {
-                        lang.as_deref()
-                            .map(|l| l.keeps_title(name, c.as_deref()))
-                            .unwrap_or(true)
-                    };
-                    if cat_ok && q_ok && lang_ok() {
+                    let lang_ok = lang
+                        .as_deref()
+                        .map(|l| l.keeps_title(name, c.as_deref()))
+                        .unwrap_or(true);
+                    if q_ok && lang_ok {
                         out.push(*i);
                     }
                 }
@@ -10393,53 +10551,32 @@ fn build_browse_index_blocking(
                 Some(id) => Some(id),
             };
             if !q.is_empty() {
-                if let Some(db) = crate::catalog_db::CatalogDb::open(&source_ids) {
-                    let found = db.search_series_ids(&q, cat, 50_000);
-                    let want: std::collections::HashSet<&str> =
-                        found.iter().map(String::as_str).collect();
-                    progress.set_total(series_rows.len() as u64);
-                    let mut out = Vec::with_capacity(found.len());
-                    for chunk in series_rows.chunks(DEFAULT_CHUNK) {
-                        for (i, id, name, c) in chunk {
-                            let cat_ok = cat
-                                .map(|cid| c.as_deref() == Some(cid))
-                                .unwrap_or(true);
-                            if cat_ok
-                                && want.contains(id.as_str())
-                                && lang
-                                    .as_deref()
-                                    .map(|l| l.keeps_title(name, c.as_deref()))
-                                    .unwrap_or(true)
-                            {
-                                out.push(*i);
-                            }
-                        }
-                        progress.add_done(chunk.len() as u64);
-                    }
-                    return (BrowseIndex::mapped(out), Vec::new());
+                let found = db.search_series_ids(&q, cat, 2_000);
+                let mut tiles = db.slim_series_by_ids(&source_ids, &found);
+                if let Some(l) = lang.as_deref() {
+                    tiles.retain(|t| l.keeps_title(&t.name, t.category_id.as_deref()));
                 }
+                progress.set_done(1);
+                return (
+                    BrowseIndex::identity(tiles.len()),
+                    Vec::new(),
+                    tiles,
+                );
             }
+            let series_rows = db.collect_series_browse_rows(&source_ids, cat);
             progress.set_total(series_rows.len() as u64);
             let mut out = Vec::with_capacity(series_rows.len().min(65_536));
             for chunk in series_rows.chunks(DEFAULT_CHUNK) {
                 for (i, _id, name, c) in chunk {
-                    let cat_ok = cat.map(|cid| c.as_deref() == Some(cid)).unwrap_or(true);
                     let q_ok = q_lc
                         .as_deref()
-                        .map(|ql| {
-                            if name.is_empty() {
-                                true
-                            } else {
-                                name.to_lowercase().contains(ql)
-                            }
-                        })
+                        .map(|ql| name.to_lowercase().contains(ql))
                         .unwrap_or(true);
-                    let lang_ok = || {
-                        lang.as_deref()
-                            .map(|l| l.keeps_title(name, c.as_deref()))
-                            .unwrap_or(true)
-                    };
-                    if cat_ok && q_ok && lang_ok() {
+                    let lang_ok = lang
+                        .as_deref()
+                        .map(|l| l.keeps_title(name, c.as_deref()))
+                        .unwrap_or(true);
+                    if q_ok && lang_ok {
                         out.push(*i);
                     }
                 }
@@ -10451,7 +10588,7 @@ fn build_browse_index_blocking(
     };
     let (d, t) = progress.snapshot();
     progress.set_done(t.max(d));
-    (index, Vec::new())
+    (index, Vec::new(), Vec::new())
 }
 
 fn pick_default_live_group(bundle: &PlaylistBundle) -> Option<String> {
@@ -10887,136 +11024,6 @@ fn merge_xtream_series_fields(existing: &mut SeriesItem, item: &SeriesItem) {
     take_text(&mut existing.country, &item.country);
 }
 
-/// Sync-fallback helpers for [`FluxPlay::ingest_source_bundle`] (batch path uses SQLite progressive ingest).
-#[allow(dead_code)]
-fn replace_source_bundle(into: &mut PlaylistBundle, source_id: Uuid, part: PlaylistBundle) {
-    into.channels.retain(|c| c.source_id != Some(source_id));
-    into.vod.retain(|v| v.source_id != Some(source_id));
-    into.series.retain(|s| s.source_id != Some(source_id));
-    // Replace overlapping category ids (per content kind) from this reload.
-    into.categories.retain(|c| {
-        !part
-            .categories
-            .iter()
-            .any(|p| p.content == c.content && p.id == c.id)
-    });
-    into.categories.extend(part.categories);
-    into.channels.extend(part.channels);
-    into.vod.extend(part.vod);
-    into.series.extend(part.series);
-    into.epg.extend(part.epg);
-    let mut ch_seen = std::collections::HashSet::new();
-    into.channels.retain(|c| ch_seen.insert(c.id.clone()));
-    let mut vod_seen = std::collections::HashSet::new();
-    into.vod.retain(|v| vod_seen.insert(v.id.clone()));
-    let mut ser_seen = std::collections::HashSet::new();
-    into.series.retain(|s| ser_seen.insert(s.id.clone()));
-}
-
-/// Keep OMDb/plot/actors from the previous in-memory items when portal fields are empty.
-#[allow(dead_code)]
-fn merge_part_with_existing(
-    existing: &PlaylistBundle,
-    source_id: Uuid,
-    mut part: PlaylistBundle,
-) -> PlaylistBundle {
-    use std::collections::HashMap;
-    let vod_old: HashMap<&str, &VodItem> = existing
-        .vod
-        .iter()
-        .filter(|v| v.source_id == Some(source_id))
-        .filter(|v| {
-            v.imdb_id.is_some()
-                || v.actors.is_some()
-                || v.plot.as_ref().map(|p| p.len() >= 40).unwrap_or(false)
-        })
-        .map(|v| (v.id.as_str(), v))
-        .collect();
-    let ser_old: HashMap<&str, &SeriesItem> = existing
-        .series
-        .iter()
-        .filter(|s| s.source_id == Some(source_id))
-        .filter(|s| {
-            s.imdb_id.is_some()
-                || s.actors.is_some()
-                || s.plot.as_ref().map(|p| p.len() >= 40).unwrap_or(false)
-        })
-        .map(|s| (s.id.as_str(), s))
-        .collect();
-    for v in &mut part.vod {
-        v.source_id = Some(source_id);
-        if let Some(old) = vod_old.get(v.id.as_str()) {
-            if v.plot.as_ref().map(|p| p.len()).unwrap_or(0)
-                < old.plot.as_ref().map(|p| p.len()).unwrap_or(0)
-            {
-                v.plot = old.plot.clone();
-            }
-            if v.actors.is_none() {
-                v.actors = old.actors.clone();
-            }
-            if v.director.is_none() {
-                v.director = old.director.clone();
-            }
-            if v.imdb_id.is_none() {
-                v.imdb_id = old.imdb_id.clone();
-            }
-            if v.rating.is_none() {
-                v.rating = old.rating.clone();
-            }
-            if v.poster.is_none() {
-                v.poster = old.poster.clone();
-            }
-            if v.genre.is_none() {
-                v.genre = old.genre.clone();
-            }
-            if v.year.is_none() {
-                v.year = old.year.clone();
-            }
-        }
-    }
-    for s in &mut part.series {
-        s.source_id = Some(source_id);
-        if let Some(old) = ser_old.get(s.id.as_str()) {
-            if s.plot.as_ref().map(|p| p.len()).unwrap_or(0)
-                < old.plot.as_ref().map(|p| p.len()).unwrap_or(0)
-            {
-                s.plot = old.plot.clone();
-            }
-            if s.actors.is_none() {
-                s.actors = old.actors.clone();
-            }
-            if s.director.is_none() {
-                s.director = old.director.clone();
-            }
-            if s.imdb_id.is_none() {
-                s.imdb_id = old.imdb_id.clone();
-            }
-            if s.rating.is_none() {
-                s.rating = old.rating.clone();
-            }
-            if s.cover.is_none() {
-                s.cover = old.cover.clone();
-            }
-            if s.banner.is_none() {
-                s.banner = old.banner.clone();
-            }
-            if s.genre.is_none() {
-                s.genre = old.genre.clone();
-            }
-            if s.year.is_none() {
-                s.year = old.year.clone();
-            }
-            if s.seasons.is_empty() && !old.seasons.is_empty() {
-                s.seasons = old.seasons.clone();
-            }
-        }
-    }
-    for ch in &mut part.channels {
-        ch.source_id = Some(source_id);
-    }
-    part
-}
-
 fn is_adult_cat(name: &str) -> bool {
     let n = name.to_ascii_uppercase();
     n.contains("XXX") || n.contains("ADULT") || n.contains("FOR ADULTS") || n.contains("+18")
@@ -11049,7 +11056,7 @@ fn profile_message_label(message: &Message) -> &'static str {
         Message::PlayerTick => "tick.player",
         Message::VideoFrameAllocated { .. } => "tick.video_frame",
         Message::PlayerChromeTick => "tick.chrome",
-        Message::ImageLoaded(_) => "async.image",
+        Message::ImageLoaded(..) => "async.image",
         Message::MetaEnriched { .. } => "async.meta",
         Message::VodInfoBatch(_) => "async.vod_info_batch",
         Message::PlayerLayout { .. } => "layout.player",
@@ -11062,6 +11069,7 @@ fn profile_message_label(message: &Message) -> &'static str {
         Message::VodDetailLoaded(_) => "async.vod_detail",
         Message::VodCategoryLoaded { .. } => "async.vod_category",
         Message::SeriesCategoryLoaded { .. } => "async.series_category",
+        Message::CategoryPersistDone { .. } => "async.category_persist",
         Message::SourceLoaded { .. } => "async.source",
         Message::SourcesBatchLoaded(_) => "async.sources_batch",
         Message::BundleCacheReady(_) => "async.bundle_cache",
@@ -11082,6 +11090,7 @@ fn profile_message_label(message: &Message) -> &'static str {
         }
         Message::BrowseCoastTick => "scroll.browse_coast",
         Message::MosaicPress(_) => "input.mosaic_press",
+        Message::MosaicShowMore => "nav.mosaic_more",
         Message::CatScrolled(_, _) => "scroll.cats",
         Message::FlushPendingImages => "async.image_flush",
         Message::SearchApply(_) => "nav.filtre_apply",
@@ -11093,7 +11102,7 @@ fn ui_action_label(message: &Message) -> Option<&'static str> {
     Some(match message {
         Message::PlayerTick
         | Message::VideoFrameAllocated { .. }
-        | Message::ImageLoaded(_)
+        | Message::ImageLoaded(..)
         | Message::FlushPendingImages
         | Message::BrowseScrolled(_, _)
         | Message::BrowseScrollBy(_)
@@ -11108,6 +11117,7 @@ fn ui_action_label(message: &Message) -> Option<&'static str> {
         | Message::MetaEnriched { .. } => {
             return None;
         }
+        Message::MosaicShowMore => "nav.mosaic_more",
         Message::PlayerLayout { .. } | Message::PlayerLayoutDirty(_) | Message::WindowResized { .. } => {
             return None;
         }
@@ -11117,9 +11127,7 @@ fn ui_action_label(message: &Message) -> Option<&'static str> {
         Message::CatFilterChanged(_) => "nav.filtre",
         #[cfg(target_os = "android")]
         Message::NavBack => "nav.retour",
-        #[cfg(target_os = "android")]
-        Message::BrowseFocusDelta(_) => "nav.browse_focus",
-        #[cfg(target_os = "android")]
+        Message::BrowseFocusStep { .. } => "nav.browse_focus",
         Message::BrowseActivate => "nav.browse_activate",
         Message::PlayChannel(_) | Message::PlayChannelId(..) => "lecteur.play_chaine",
         Message::PlayVod { .. } => "lecteur.play_vod",
@@ -11235,7 +11243,6 @@ fn ui_action_label(message: &Message) -> Option<&'static str> {
         Message::VodInfoBatch(_) => "vod.info_batch",
         Message::CloseVodDetail => "vod.close_detail",
         Message::DetailMetaLoaded { .. } => "meta.detail",
-        Message::LoadMore => "nav.load_more",
         Message::ClosePlayerWindow => "lecteur.fermer",
         Message::PlayerHotkey(_) | Message::PlayerHotkeyIn(..) => "lecteur.hotkey",
         Message::MainWindowOpened(_) => "fenetre.main_open",
@@ -11442,8 +11449,8 @@ fn map_player_hotkeys(
     Some(Message::PlayerHotkeyIn(id, hk))
 }
 
-#[cfg(target_os = "android")]
-fn map_android_back(
+/// D-pad / arrow browse when the player is closed (Android TV + desktop couch UI).
+fn map_browse_keys(
     event: Event,
     status: event::Status,
     _id: window::Id,
@@ -11455,13 +11462,14 @@ fn map_android_back(
         return None;
     };
     match key {
+        #[cfg(target_os = "android")]
         Key::Named(Named::GoBack) | Key::Named(Named::BrowserBack) | Key::Named(Named::Escape) => {
             Some(Message::NavBack)
         }
-        Key::Named(Named::ArrowUp) => Some(Message::BrowseFocusDelta(-1)),
-        Key::Named(Named::ArrowDown) => Some(Message::BrowseFocusDelta(1)),
-        Key::Named(Named::ArrowLeft) => Some(Message::BrowseFocusDelta(-1)),
-        Key::Named(Named::ArrowRight) => Some(Message::BrowseFocusDelta(1)),
+        Key::Named(Named::ArrowUp) => Some(Message::BrowseFocusStep { dcol: 0, drow: -1 }),
+        Key::Named(Named::ArrowDown) => Some(Message::BrowseFocusStep { dcol: 0, drow: 1 }),
+        Key::Named(Named::ArrowLeft) => Some(Message::BrowseFocusStep { dcol: -1, drow: 0 }),
+        Key::Named(Named::ArrowRight) => Some(Message::BrowseFocusStep { dcol: 1, drow: 0 }),
         Key::Named(Named::Enter) => Some(Message::BrowseActivate),
         _ => None,
     }

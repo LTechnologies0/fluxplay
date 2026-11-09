@@ -888,7 +888,6 @@ impl StreamSession {
     /// Apply persisted Settings defaults right after open (aspect / deint / scale / tone).
     /// Never injects a scale vf on Android Surface — that blacks MediaCodec embed.
     // Bundling these prefs into a struct would churn all call sites for no gain.
-    #[allow(clippy::too_many_arguments)]
     pub fn apply_saved_video_prefs(
         &mut self,
         aspect: AspectMode,
@@ -951,7 +950,6 @@ impl StreamSession {
 
     /// Re-apply soft vf chain after layout/rotate (keeps aspect-safe scale in sync).
     // Unit error mirrors the internal filter-apply chain; callers only check is_err().
-    #[allow(clippy::result_unit_err)]
     pub fn refresh_soft_filters(&mut self) -> Result<(), ()> {
         self.apply_video_filters()
     }

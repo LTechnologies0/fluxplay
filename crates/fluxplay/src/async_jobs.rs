@@ -127,31 +127,3 @@ pub async fn run_blocking<T: Send + 'static>(
         .map_err(|e| format!("spawn_blocking: {e}"))
 }
 
-/// Fold `items` in chunks of `chunk`, calling `on_chunk` for each slice.
-/// Updates `progress` after every chunk (`done` += chunk len).
-#[allow(dead_code)]
-pub fn for_each_chunk<T, F>(
-    items: &[T],
-    chunk: usize,
-    progress: Option<&JobProgress>,
-    mut on_chunk: F,
-) -> Result<(), String>
-where
-    F: FnMut(&[T]) -> Result<(), String>,
-{
-    let chunk = chunk.max(1);
-    if let Some(p) = progress {
-        p.set_total(items.len() as u64);
-        p.set_done(0);
-    }
-    let mut offset = 0usize;
-    while offset < items.len() {
-        let end = (offset + chunk).min(items.len());
-        on_chunk(&items[offset..end])?;
-        if let Some(p) = progress {
-            p.add_done((end - offset) as u64);
-        }
-        offset = end;
-    }
-    Ok(())
-}

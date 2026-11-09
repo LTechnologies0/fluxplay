@@ -544,70 +544,6 @@ fn tail_player_log() -> String {
         .unwrap_or_default()
 }
 
-#[allow(dead_code)]
-/// Legacy helper — prefer letting mpv/ffplay follow redirects (avoids burning CDN tokens).
-fn resolve_playback_url(url: &str, ua: &str) -> Option<String> {
-    if !(url.starts_with("http://") || url.starts_with("https://")) {
-        return None;
-    }
-    let heavy_ts = looks_like_mpeg_ts(url);
-    let client = reqwest::blocking::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .timeout(std::time::Duration::from_secs(if heavy_ts { 8 } else { 12 }))
-        .user_agent(ua)
-        .build()
-        .ok()?;
-
-    let mut current = url.to_string();
-    for _ in 0..10 {
-        let mut req = client.get(&current);
-        if heavy_ts || looks_like_mpeg_ts(&current) {
-            req = req.header(reqwest::header::RANGE, "bytes=0-0");
-        }
-        let resp = match req.send() {
-            Ok(r) => r,
-            Err(_) => return if current == url { None } else { Some(current) },
-        };
-        let status = resp.status();
-        if status.is_redirection() {
-            let loc = resp
-                .headers()
-                .get(reqwest::header::LOCATION)
-                .and_then(|v| v.to_str().ok())
-                .map(str::to_string);
-            drop(resp);
-            let Some(loc) = loc else {
-                break;
-            };
-            current = resolve_relative_url(&current, &loc);
-            continue;
-        }
-        if status.is_success() || status.as_u16() == 206 {
-            drop(resp);
-            return Some(current);
-        }
-        drop(resp);
-        break;
-    }
-    if current == url {
-        None
-    } else {
-        Some(current)
-    }
-}
-
-fn resolve_relative_url(base: &str, loc: &str) -> String {
-    if loc.starts_with("http://") || loc.starts_with("https://") {
-        return loc.to_string();
-    }
-    if let Ok(base_u) = url::Url::parse(base) {
-        if let Ok(joined) = base_u.join(loc) {
-            return joined.to_string();
-        }
-    }
-    loc.to_string()
-}
-
 fn which(bin: &str) -> Option<String> {
     // Windows: scan PATH in-process — spawning `where` from a GUI-subsystem exe
     // flashes a console window on every backend probe.
@@ -619,61 +555,63 @@ fn which(bin: &str) -> Option<String> {
             .find(|p| p.is_file())
             .map(|p| p.display().to_string());
     }
-    #[allow(unreachable_code)]
-    let from_cmd = Command::new("which")
-        .arg(bin)
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .and_then(|o| {
-            let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
-            if s.is_empty() {
-                None
-            } else {
-                Some(s)
-            }
-        })
-        .or_else(|| {
-            Command::new("where")
-                .arg(bin)
-                .output()
-                .ok()
-                .filter(|o| o.status.success())
-                .and_then(|o| {
-                    String::from_utf8_lossy(&o.stdout)
-                        .lines()
-                        .next()
-                        .map(|s| s.trim().to_string())
-                        .filter(|s| !s.is_empty())
-                })
-        });
-    if from_cmd.is_some() {
-        return from_cmd;
-    }
-    // GUI launches often miss Homebrew / ~/.local in PATH.
-    let mut candidates = Vec::new();
-    if let Ok(path) = std::env::var("PATH") {
-        for dir in std::env::split_paths(&path) {
-            candidates.push(dir.join(bin).display().to_string());
+    #[cfg(not(windows))]
+    {
+        let from_cmd = Command::new("which")
+            .arg(bin)
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .and_then(|o| {
+                let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                if s.is_empty() {
+                    None
+                } else {
+                    Some(s)
+                }
+            })
+            .or_else(|| {
+                Command::new("where")
+                    .arg(bin)
+                    .output()
+                    .ok()
+                    .filter(|o| o.status.success())
+                    .and_then(|o| {
+                        String::from_utf8_lossy(&o.stdout)
+                            .lines()
+                            .next()
+                            .map(|s| s.trim().to_string())
+                            .filter(|s| !s.is_empty())
+                    })
+            });
+        if from_cmd.is_some() {
+            return from_cmd;
         }
+        // GUI launches often miss Homebrew / ~/.local in PATH.
+        let mut candidates = Vec::new();
+        if let Ok(path) = std::env::var("PATH") {
+            for dir in std::env::split_paths(&path) {
+                candidates.push(dir.join(bin).display().to_string());
+            }
+        }
+        if bin == "mpv" {
+            candidates.extend([
+                "/home/linuxbrew/.linuxbrew/bin/mpv".into(),
+                "/usr/local/bin/mpv".into(),
+                "/usr/bin/mpv".into(),
+                "/opt/homebrew/bin/mpv".into(),
+            ]);
+        }
+        if bin == "ffplay" || bin == "ffmpeg" {
+            candidates.extend([
+                format!("/home/linuxbrew/.linuxbrew/bin/{bin}"),
+                format!("/usr/local/bin/{bin}"),
+                format!("/usr/bin/{bin}"),
+                format!("/opt/homebrew/bin/{bin}"),
+            ]);
+        }
+        candidates.into_iter().find(|p| Path::new(p).is_file())
     }
-    if bin == "mpv" {
-        candidates.extend([
-            "/home/linuxbrew/.linuxbrew/bin/mpv".into(),
-            "/usr/local/bin/mpv".into(),
-            "/usr/bin/mpv".into(),
-            "/opt/homebrew/bin/mpv".into(),
-        ]);
-    }
-    if bin == "ffplay" || bin == "ffmpeg" {
-        candidates.extend([
-            format!("/home/linuxbrew/.linuxbrew/bin/{bin}"),
-            format!("/usr/local/bin/{bin}"),
-            format!("/usr/bin/{bin}"),
-            format!("/opt/homebrew/bin/{bin}"),
-        ]);
-    }
-    candidates.into_iter().find(|p| Path::new(p).is_file())
 }
 
 fn pick_backend(pref: PlayerBackendPref) -> Result<BackendId> {
@@ -2501,10 +2439,10 @@ fn snapshot_scaled(w: u32, h: u32, pixels: &[u8]) -> (u32, u32, Arc<[u8]>) {
         }
         #[cfg(not(target_os = "android"))]
         {
-            // mpv defaults (150 + 50 MiB) let a long live session hoard ~200 MiB.
-            // 96 MiB still holds the 12 s VOD readahead of a ~60 Mb/s 4K stream.
-            soft_set(&mpv, "demuxer-max-bytes", "96MiB");
-            soft_set(&mpv, "demuxer-max-back-bytes", "24MiB");
+            // Soft-present 720p budget: 48+12 MiB demux (was 96+24).
+            // More rebuffer possible on bad IPTV; keeps RSS near ~100 Mo.
+            soft_set(&mpv, "demuxer-max-bytes", "48MiB");
+            soft_set(&mpv, "demuxer-max-back-bytes", "12MiB");
         }
         soft_set(
             &mpv,

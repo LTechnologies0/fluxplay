@@ -11,6 +11,9 @@ pub mod xtream;
 mod xtream_epg;
 pub mod xtream_url;
 
+#[cfg(test)]
+mod prop_xtream;
+
 use fluxplay_core::models::{MediaSource, PlaylistBundle, SourceKind};
 use fluxplay_core::xmltv;
 use fluxplay_core::Stopwatch;
@@ -370,6 +373,9 @@ pub async fn attach_epg(source: &MediaSource, mut bundle: PlaylistBundle) -> Res
     Ok(bundle)
 }
 
+/// Soft RAM ceiling for in-memory EPG (matches SQLite spine `LIMIT 8000`).
+const MAX_EPG_IN_RAM: usize = 8_000;
+
 /// Deduping merge of EPG programmes.
 pub fn merge_epg(
     into: &mut Vec<fluxplay_core::models::EpgProgramme>,
@@ -386,10 +392,16 @@ pub fn merge_epg(
             into.push(p);
         }
     }
+    if into.len() > MAX_EPG_IN_RAM {
+        // Drop oldest windows first — keep the guide tip the UI actually shows.
+        into.sort_by_key(|p| p.start);
+        let skip = into.len() - MAX_EPG_IN_RAM;
+        into.drain(0..skip);
+    }
     debug!(
         before,
         after = into.len(),
-        added = into.len() - before,
+        added = into.len().saturating_sub(before),
         "merge_epg"
     );
 }

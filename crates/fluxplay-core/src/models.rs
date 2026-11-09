@@ -1,6 +1,6 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use tracing::{debug, trace};
+use tracing::{debug, trace, warn};
 use uuid::Uuid;
 
 use crate::protocol::StreamScheme;
@@ -1208,9 +1208,11 @@ impl AppSettings {
         if let Some(i) = self.favorites.iter().position(|f| f == channel_id) {
             self.favorites.remove(i);
             debug!(%channel_id, favorite = false, "toggle_favorite");
-        } else {
+        } else if self.favorites.len() < 2_000 {
             self.favorites.push(channel_id.to_string());
             debug!(%channel_id, favorite = true, "toggle_favorite");
+        } else {
+            warn!(%channel_id, "favorites cap (2000) — not adding");
         }
     }
 
