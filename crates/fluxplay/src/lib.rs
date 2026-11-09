@@ -1,7 +1,11 @@
 //! FluxPlay desktop UI (iced) — also the Android / Android TV shell.
 
+// iced/wgpu Pipeline Sync bounds exceed rustc's default trait recursion depth (see #159228).
+#![recursion_limit = "256"]
+
 mod app;
 mod async_jobs;
+mod browse_tiles;
 mod browser;
 mod catalog_db;
 mod demo;
@@ -23,6 +27,37 @@ mod profile_io;
 mod rune_motion;
 mod storage;
 mod theme;
+mod ui_surface;
+mod invariants;
+#[cfg(test)]
+mod prop_names;
+#[cfg(test)]
+mod prop_surface;
+#[cfg(test)]
+mod prop_security;
+#[cfg(test)]
+mod prop_browser;
+#[cfg(test)]
+mod prop_metadata;
+
+/// Stable surface for libFuzzer / AFL harnesses (`--features fuzzing`).
+#[cfg(feature = "fuzzing")]
+pub mod fuzz_api {
+    pub use crate::browse_tiles::{
+        BrowseTile, BrowseTileCache, BrowseViewportHealth, BROWSE_TILE_CACHE_CAP,
+        BROWSE_TILE_FETCH_LIMIT,
+    };
+    pub use crate::invariants::{
+        assert_viewport_sane, soft_present_within_budget, DECODE_EDGE_HARD_CAP,
+        SOFT_PRESENT_MAX_H, SOFT_PRESENT_MAX_W,
+    };
+    pub use crate::downloads::sanitize_file_name;
+    pub use crate::names::{
+        category_label, display_channel, display_title, parse_category, parse_channel,
+        parse_item_title,
+    };
+    pub use crate::wg_proxy::parse_profile as parse_wg_profile;
+}
 #[cfg(not(target_os = "android"))]
 mod video_stage;
 
@@ -30,6 +65,8 @@ mod video_stage;
 mod android_intent;
 #[cfg(target_os = "android")]
 mod android_bridge;
+#[cfg(target_os = "android")]
+pub mod android_platform;
 
 use tracing_subscriber::EnvFilter;
 

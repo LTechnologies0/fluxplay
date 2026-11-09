@@ -3,17 +3,19 @@ package app.fluxplay.android;
 import android.app.Activity;
 import android.app.NativeActivity;
 import android.app.PictureInPictureParams;
-import android.content.Intent;
+import android.Manifest;
+import android.content.pm.PackageManager;
 import android.content.pm.ActivityInfo;
 import android.content.res.Configuration;
 import android.database.Cursor;
 import android.graphics.PixelFormat;
-import android.media.AudioAttributes;
-import android.media.AudioFocusRequest;
 import android.media.AudioManager;
 import android.media.MediaCodecInfo;
 import android.media.MediaCodecList;
+import android.net.ConnectivityManager;
+import android.net.Network;
 import android.net.Uri;
+import android.media.session.MediaSession;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Looper;
@@ -54,7 +56,6 @@ public class FluxPlayNativeActivity extends NativeActivity {
     private static final int REQ_CREATE = 4102;
 
     static {
-        // media-kit FFmpeg MediaCodec needs JNI/JavaVM registration via this helper.
         try {
             System.loadLibrary("mediakitandroidhelper");
             Log.i(TAG, "loaded mediakitandroidhelper");
@@ -63,6 +64,102 @@ public class FluxPlayNativeActivity extends NativeActivity {
         }
     }
 
+    private static native void nativeOnAudioFocusChange(int focusChange);
+
+    private static native void nativeAbandonAudioFocus();
+
+    private static native void nativeRequestAudioFocus();
+
+    private static native void nativeNetworkChanged(boolean online);
+
+    private static native void nativeMediaAction(int code);
+
+    private static ConnectivityManager.NetworkCallback sNetworkCallback;
+
+    /** Activity handle for Rust JNI (null before onCreate / after onDestroy). */
+    public static android.app.Activity activityForNative() {
+        return sInstance;
+    }
+
+    /** Shared listener — forwards focus events to Rust. */
+    public static AudioManager.OnAudioFocusChangeListener audioFocusListenerForNative() {
+        if (sNativeAudioFocusListener == null) {
+            sNativeAudioFocusListener = focusChange -> nativeOnAudioFocusChange(focusChange);
+        }
+        return sNativeAudioFocusListener;
+    }
+
+    public static void registerDefaultNetworkCallbackNative() {
+        FluxPlayNativeActivity a = sInstance;
+        if (a == null || sNetworkCallback != null) {
+            return;
+        }
+        try {
+            ConnectivityManager cm =
+                    (ConnectivityManager) a.getSystemService(CONNECTIVITY_SERVICE);
+            if (cm == null) {
+                return;
+            }
+            sNetworkCallback = new ConnectivityManager.NetworkCallback() {
+                @Override
+                public void onAvailable(Network network) {
+                    nativeNetworkChanged(true);
+                }
+
+                @Override
+                public void onLost(Network network) {
+                    nativeNetworkChanged(false);
+                }
+            };
+            cm.registerDefaultNetworkCallback(sNetworkCallback);
+            Log.i(TAG, "network callback registered (Rust)");
+        } catch (Exception e) {
+            Log.e(TAG, "registerDefaultNetworkCallbackNative", e);
+        }
+    }
+
+    public static void unregisterDefaultNetworkCallbackNative() {
+        FluxPlayNativeActivity a = sInstance;
+        if (a == null || sNetworkCallback == null) {
+            sNetworkCallback = null;
+            return;
+        }
+        try {
+            ConnectivityManager cm =
+                    (ConnectivityManager) a.getSystemService(CONNECTIVITY_SERVICE);
+            if (cm != null) {
+                cm.unregisterNetworkCallback(sNetworkCallback);
+            }
+        } catch (Exception e) {
+            Log.w(TAG, "unregisterDefaultNetworkCallbackNative", e);
+        }
+        sNetworkCallback = null;
+    }
+
+    /** MediaSession transport → Rust (lock screen / BT). */
+    public static void attachMediaSessionCallback(MediaSession session) {
+        if (session == null) {
+            return;
+        }
+        session.setCallback(new MediaSession.Callback() {
+            @Override
+            public void onPlay() {
+                nativeMediaAction(1);
+            }
+
+            @Override
+            public void onPause() {
+                nativeMediaAction(2);
+            }
+
+            @Override
+            public void onStop() {
+                nativeMediaAction(3);
+            }
+        });
+    }
+
+    private static AudioManager.OnAudioFocusChangeListener sNativeAudioFocusListener;
     private static FluxPlayNativeActivity sInstance;
     private static volatile boolean sInPip = false;
     /** Cached system insets [L,T,R,B,dpi] — updated on UI thread only. */
@@ -70,8 +167,6 @@ public class FluxPlayNativeActivity extends NativeActivity {
 
     private String pendingCreateSource;
     private String pendingMime = "*/*";
-    private AudioFocusRequest audioFocusRequest;
-    private AudioManager.OnAudioFocusChangeListener audioFocusListener;
 
     /** MediaCodec SurfaceView above iced GLES (mpv-android wid model). */
     private SurfaceView videoSurfaceView;
@@ -198,6 +293,7 @@ public class FluxPlayNativeActivity extends NativeActivity {
             // leaves a dead Surface (create→destroy within ~1s on Pixel).
             decor.post(() -> {
                 refreshInsetsFromDecor();
+                ensurePostNotificationsPermissionNative();
                 writeDeviceCaps();
                 // First CreateWindow can still see 0×0 before layout — poke once.
                 if (decor.getWidth() <= 0 || decor.getHeight() <= 0) {
@@ -299,8 +395,8 @@ public class FluxPlayNativeActivity extends NativeActivity {
         surfaceSessionWanted = false;
         removeVideoSurfaceView();
         if (sInstance == this) {
-            abandonAudioFocusInner();
-            writeAudioFocusFlag(false);
+            unregisterDefaultNetworkCallbackNative();
+            nativeAbandonAudioFocus();
             sInstance = null;
         }
         super.onDestroy();
@@ -697,109 +793,36 @@ public class FluxPlayNativeActivity extends NativeActivity {
         });
     }
 
-    public static void requestAudioFocus() {
+    private static volatile boolean sNotifPermPrompted;
+
+    /** API 33+: one-shot runtime grant for MediaStyle / lock-screen transport. */
+    public static void ensurePostNotificationsPermissionNative() {
+        if (Build.VERSION.SDK_INT < 33) {
+            return;
+        }
         FluxPlayNativeActivity a = sInstance;
         if (a == null) {
             return;
         }
-        // Sync when possible so Rust poll after request sees GRANTED before open_channel.
-        if (Looper.myLooper() == Looper.getMainLooper()) {
-            a.requestAudioFocusInner();
+        if (a.checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS)
+                == PackageManager.PERMISSION_GRANTED) {
             return;
         }
-        final java.util.concurrent.CountDownLatch done =
-                new java.util.concurrent.CountDownLatch(1);
-        a.runOnUiThread(() -> {
-            try {
-                a.requestAudioFocusInner();
-            } finally {
-                done.countDown();
-            }
-        });
-        try {
-            done.await(750, java.util.concurrent.TimeUnit.MILLISECONDS);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
+        if (sNotifPermPrompted) {
+            return;
         }
+        sNotifPermPrompted = true;
+        a.requestPermissions(new String[]{Manifest.permission.POST_NOTIFICATIONS}, 9001);
+        Log.i(TAG, "POST_NOTIFICATIONS runtime prompt");
+    }
+
+    /** Delegates to Rust AudioManager (single listener → nativeOnAudioFocusChange). */
+    public static void requestAudioFocus() {
+        nativeRequestAudioFocus();
     }
 
     public static void abandonAudioFocus() {
-        FluxPlayNativeActivity a = sInstance;
-        if (a == null) {
-            return;
-        }
-        a.runOnUiThread(a::abandonAudioFocusInner);
-    }
-
-    private void requestAudioFocusInner() {
-        try {
-            AudioManager am = (AudioManager) getSystemService(AUDIO_SERVICE);
-            if (am == null) {
-                return;
-            }
-            if (audioFocusListener == null) {
-                audioFocusListener = focusChange -> {
-                    if (focusChange == AudioManager.AUDIOFOCUS_LOSS
-                            || focusChange == AudioManager.AUDIOFOCUS_LOSS_TRANSIENT) {
-                        writeAudioFocusFlag(false);
-                        Log.i(TAG, "audio focus lost: " + focusChange);
-                    } else if (focusChange == AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK) {
-                        // Keep held=true — Rust should not hard-pause for duck.
-                        Log.i(TAG, "audio focus duck");
-                    } else if (focusChange == AudioManager.AUDIOFOCUS_GAIN) {
-                        writeAudioFocusFlag(true);
-                    }
-                };
-            }
-            int granted;
-            if (Build.VERSION.SDK_INT >= 26) {
-                if (audioFocusRequest == null) {
-                    AudioAttributes attrs = new AudioAttributes.Builder()
-                            .setUsage(AudioAttributes.USAGE_MEDIA)
-                            .setContentType(AudioAttributes.CONTENT_TYPE_MOVIE)
-                            .build();
-                    audioFocusRequest = new AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
-                            .setAudioAttributes(attrs)
-                            .setOnAudioFocusChangeListener(audioFocusListener)
-                            .setWillPauseWhenDucked(false)
-                            .setAcceptsDelayedFocusGain(true)
-                            .build();
-                }
-                granted = am.requestAudioFocus(audioFocusRequest);
-            } else {
-                granted = am.requestAudioFocus(
-                        audioFocusListener,
-                        AudioManager.STREAM_MUSIC,
-                        AudioManager.AUDIOFOCUS_GAIN);
-            }
-            if (granted == AudioManager.AUDIOFOCUS_REQUEST_GRANTED) {
-                writeAudioFocusFlag(true);
-            } else if (granted == AudioManager.AUDIOFOCUS_REQUEST_DELAYED) {
-                // Neither true (fake hold) nor false (kills OpenSL) — wait for GAIN.
-                Log.i(TAG, "audio focus DELAYED — waiting for GAIN");
-            } else {
-                writeAudioFocusFlag(false);
-            }
-        } catch (Exception e) {
-            Log.e(TAG, "requestAudioFocus failed", e);
-        }
-    }
-
-    private void abandonAudioFocusInner() {
-        try {
-            AudioManager am = (AudioManager) getSystemService(AUDIO_SERVICE);
-            if (am == null) {
-                return;
-            }
-            if (Build.VERSION.SDK_INT >= 26 && audioFocusRequest != null) {
-                am.abandonAudioFocusRequest(audioFocusRequest);
-            } else if (audioFocusListener != null) {
-                am.abandonAudioFocus(audioFocusListener);
-            }
-            writeAudioFocusFlag(false);
-        } catch (Exception e) {
-            Log.e(TAG, "abandonAudioFocus failed", e);
-        }
+        nativeAbandonAudioFocus();
     }
 
     private File safInboxDir() {
@@ -845,18 +868,6 @@ public class FluxPlayNativeActivity extends NativeActivity {
             }
         } catch (Exception e) {
             Log.e(TAG, "writePipFlag", e);
-        }
-    }
-
-    private void writeAudioFocusFlag(boolean held) {
-        try {
-            File meta = new File(safInboxDir(), "audio_focus.json");
-            String json = "{\"held\":" + (held ? "true" : "false") + "}";
-            try (FileOutputStream fos = new FileOutputStream(meta)) {
-                fos.write(json.getBytes("UTF-8"));
-            }
-        } catch (Exception e) {
-            Log.e(TAG, "writeAudioFocusFlag", e);
         }
     }
 

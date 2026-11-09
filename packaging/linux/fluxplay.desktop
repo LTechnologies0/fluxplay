@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=FluxPlay
+GenericName=IPTV Player
+Comment=Browse and play IPTV / Xtream catalogs
+Exec=fluxplay
+Icon=fluxplay
+Terminal=false
+Categories=AudioVideo;Video;Player;TV;
+Keywords=iptv;xtream;streaming;tv;
+StartupNotify=true
+StartupWMClass=fluxplay

@@ -3,6 +3,12 @@
 # [build]
 # rustflags = ["-C", "target-cpu=native"]
 
+# boringtun → curve25519-dalek 4.0.0-rc.3 still gates SIMD on nightly feature
+# `stdsimd`, removed in current rustc. Force the serial backend (same as
+# tokio-wireguard docs.rs) so `cargo run -p fluxplay` builds on nightly.
+[build]
+rustflags = ['--cfg', 'curve25519_dalek_backend="serial"']
+
 [alias]
 # Production binary (fat LTO + strip + panic=abort)
 rel = "build -p fluxplay --release"

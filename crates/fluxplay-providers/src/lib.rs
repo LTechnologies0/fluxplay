@@ -9,6 +9,8 @@ pub mod stalker;
 pub mod user_agents;
 pub mod xtream;
 mod xtream_epg;
+#[cfg(test)]
+mod prop_xtream;
 pub mod xtream_url;
 
 use fluxplay_core::models::{MediaSource, PlaylistBundle, SourceKind};

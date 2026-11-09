@@ -1,0 +1,76 @@
+[package]
+name = "fluxplay-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+# App targets need iced / WireGuard. cargo-fuzz overwrites [build].rustflags from
+# `.cargo/config.toml`, so scripts must pass:
+#   RUSTFLAGS='--cfg curve25519_dalek_backend="serial"'
+# or dalek 4.0.0-rc.3 dies on removed nightly `stdsimd`.
+[dependencies]
+libfuzzer-sys = "0.4"
+fluxplay-core = { path = "../crates/fluxplay-core" }
+fluxplay = { path = "../crates/fluxplay", default-features = false, features = ["fuzzing"] }
+
+[[bin]]
+name = "fuzz_m3u"
+path = "fuzz_targets/fuzz_m3u.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_stream_url"
+path = "fuzz_targets/fuzz_stream_url.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_xmltv"
+path = "fuzz_targets/fuzz_xmltv.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_titles"
+path = "fuzz_targets/fuzz_titles.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_browse_tiles"
+path = "fuzz_targets/fuzz_browse_tiles.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_wg_profile"
+path = "fuzz_targets/fuzz_wg_profile.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_sanitize"
+path = "fuzz_targets/fuzz_sanitize.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
+members = ["."]
+
+[patch.crates-io]
+iced = { path = "../vendor/iced" }
+iced_winit = { path = "../vendor/iced_winit" }
+iced_widget = { path = "../vendor/iced_widget" }
+iced_wgpu = { path = "../vendor/iced_wgpu" }
+tokio-wireguard = { path = "../vendor/tokio-wireguard" }

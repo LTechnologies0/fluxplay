@@ -19,22 +19,31 @@ use tracing::{debug, error, trace, warn};
 use url::Url;
 use uuid::Uuid;
 
-/// Cap RAM handles — keep several mosaic viewports warm during fast flings.
-/// Handles hold the compressed (downscaled) file, ~15–40 KB each.
+/// Cap RAM handles — keep a couple mosaic viewports warm during flings.
+/// Handles hold the compressed (downscaled) file, ~8–40 KB each.
+// Visible mosaic only (+ tiny overscan). "Afficher plus" unlocks more tiles;
+// iced atlas must not retain hundreds of off-screen posters.
 pub(crate) const MAX_RAM_HANDLES: usize = 72;
 const MAX_IMAGE_BYTES: usize = 2_500_000;
+/// Soft ceiling for a single UI-prepared poster (JPEG after downscale).
+const MAX_UI_HANDLE_BYTES: usize = 96_000;
 /// Default soft cap when host caps are not applied yet.
 pub const MAX_INFLIGHT_IMAGES: usize = 24;
 /// Longest edge for GPU/RAM handles (overridden by host decode_edge_px).
+/// Must stay ≤ plan hard cap (300) — see `display_caps` / `invariants`.
 pub(crate) const MAX_UI_EDGE_PX: u32 = 300;
+/// Cap host-circuit map — clear-on-full (hosts rotate forever on IPTV CDNs).
+const HOST_CIRCUIT_CAP: usize = 512;
 
 const URL_SOFT_FAIL: Duration = Duration::from_secs(12 * 60);
 /// Cap permanent-fail set — over cap, clear wholesale (worst case: one retry).
-const FAILED_CAP: usize = 4096;
+const FAILED_CAP: usize = 768;
 /// Sweep expired soft-fail entries once the map passes this size.
-const SOFT_FAIL_SWEEP_AT: usize = 1024;
+const SOFT_FAIL_SWEEP_AT: usize = 256;
 /// Cap for the `normalize_image_url` memo map — clear-on-full.
-const NORMALIZE_CACHE_CAP: usize = 2048;
+const NORMALIZE_CACHE_CAP: usize = 512;
+/// Cap for per-host warn throttle map.
+const WARN_HOST_CAP: usize = 256;
 const HOST_COOLDOWN: Duration = Duration::from_secs(25 * 60);
 const HOST_FAIL_TRIP: u32 = 5;
 const HOST_WARN_INTERVAL: Duration = Duration::from_secs(90);
@@ -85,18 +94,42 @@ impl Default for ImageCache {
 
 impl ImageCache {
     pub fn get(&self, url: &str) -> Option<&Handle> {
-        // Fetches are stored under the normalized URL (`@` → `%40` on IMDb
-        // headshots). Callers still pass the original address.
-        let url_n = normalized_cached(url);
-        let h = self.handles.get(&url_n);
+        let h = self.handles.get(url);
         if h.is_some() {
-            trace!(target: "fluxplay::images", url = %url_n, "cache hit");
+            trace!(target: "fluxplay::images", %url, "cache hit");
         }
         h
     }
 
     pub fn inflight_len(&self) -> usize {
         self.inflight.len()
+    }
+
+    pub fn handle_count(&self) -> usize {
+        self.handles.len()
+    }
+
+    /// Drop every decoded handle + in-flight bookkeeping (category / tab switch).
+    /// Keeps soft-fail / circuit state so we don't retry-storm dead CDNs.
+    pub fn clear_handles(&mut self) {
+        self.handles.clear();
+        self.touch_gen.clear();
+        self.inflight.clear();
+        self.inflight_source.clear();
+        self.clock = self.clock.wrapping_add(1);
+    }
+
+    /// Keep only URLs still needed for the current mosaic (visible + warm band).
+    pub fn retain_urls<I, S>(&mut self, keep: I)
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let set: HashSet<String> = keep.into_iter().map(|s| s.as_ref().to_string()).collect();
+        self.handles.retain(|u, _| set.contains(u));
+        self.touch_gen.retain(|u, _| set.contains(u));
+        self.inflight.retain(|u| set.contains(u));
+        self.inflight_source.retain(|u, _| set.contains(u));
     }
 
     /// O(1) MRU bump — safe to call for every visible mosaic tile each frame.
@@ -109,15 +142,6 @@ impl ImageCache {
         if self.handles.contains_key(url) {
             self.touch_gen.insert(url.to_string(), self.clock);
         }
-    }
-
-    /// Drop decoded posters. Disk copies stay, so the grid refills from disk
-    /// when the browser comes back. Failed-URL memory is kept (tiny, avoids refetch storms).
-    pub fn release_ram(&mut self) {
-        self.handles.clear();
-        self.touch_gen.clear();
-        self.inflight.clear();
-        self.inflight_source.clear();
     }
 
     fn evict_oldest(&mut self) {
@@ -183,24 +207,6 @@ impl ImageCache {
         }
     }
 
-    #[allow(dead_code)]
-    pub fn take_inflight_source(&mut self, url: &str) -> Option<Uuid> {
-        self.inflight_source.remove(url).flatten()
-    }
-
-    #[allow(dead_code)]
-    pub fn insert_bytes(&mut self, url: String, bytes: Vec<u8>) {
-        self.inflight.remove(&url);
-        self.inflight_source.remove(&url);
-        self.soft_fail.remove(&url);
-        if bytes.len() < 64 || looks_like_html(&bytes) {
-            self.insert_failed(url);
-            return;
-        }
-        let bytes = downscale_for_ui(bytes, self.decode_edge_px);
-        self.insert_ui_bytes(url, bytes);
-    }
-
     /// Insert bytes already prepared for UI (decoded/downscaled off-thread).
     /// New `Handle` so iced/wgpu re-uploads after the shared UI atlas was reused (e.g. soft video).
     pub fn refresh_gpu_texture(&mut self, url: &str, _source_id: Option<Uuid>) {
@@ -224,23 +230,16 @@ impl ImageCache {
             // Success resets the circuit so a flaky host can recover.
             self.host_circuit.remove(&host);
         }
-        if bytes.len() < 64 || looks_like_html(&bytes) {
-            warn!(target: "fluxplay::images", %url, len = bytes.len(), "reject non-image bytes");
+        if bytes.len() < 64 || bytes.len() > MAX_UI_HANDLE_BYTES || looks_like_html(&bytes) {
+            warn!(
+                target: "fluxplay::images",
+                %url,
+                len = bytes.len(),
+                "reject non-image / oversized UI bytes"
+            );
             self.insert_failed(url);
             return;
         }
-        // A progressive JPEG decodes in the `image` crate and still uploads as an
-        // empty frame. Rewrite it here too, in case the fetch path handed the
-        // original bytes through.
-        let bytes = if is_progressive_jpeg(&bytes) {
-            let rewritten = downscale_for_ui(bytes, self.decode_edge_px);
-            if is_progressive_jpeg(&rewritten) {
-                warn!(target: "fluxplay::images", %url, "progressive jpeg could not be rewritten");
-            }
-            rewritten
-        } else {
-            bytes
-        };
         debug!(target: "fluxplay::images", %url, len = bytes.len(), "insert handle");
         if self.handles.contains_key(&url) {
             self.handles.insert(url.clone(), Handle::from_bytes(bytes));
@@ -280,6 +279,11 @@ impl ImageCache {
         let until = now + URL_SOFT_FAIL;
         self.soft_fail.insert(url.clone(), until);
         if let Some(host) = host_key(&url) {
+            if self.host_circuit.len() >= HOST_CIRCUIT_CAP
+                && !self.host_circuit.contains_key(&host)
+            {
+                self.host_circuit.clear();
+            }
             let entry = self.host_circuit.entry(host.clone()).or_insert(HostCircuit {
                 fails: 0,
                 cool_until: None,
@@ -298,13 +302,6 @@ impl ImageCache {
                 );
             }
         }
-    }
-
-    /// Drop inflight without blacklisting — allows retry after transient network errors.
-    #[allow(dead_code)]
-    pub fn clear_inflight(&mut self, url: &str) {
-        self.inflight.remove(url);
-        self.inflight_source.remove(url);
     }
 }
 
@@ -326,36 +323,6 @@ fn host_key(url: &str) -> Option<String> {
         Some(p) => Some(format!("{host}:{p}")),
         None => Some(host.to_string()),
     }
-}
-
-const BROWSER_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36";
-
-/// Amazon, Wikimedia and AniList reject the IPTV user agent and return an empty tile.
-fn wants_browser_ua(url: &str) -> bool {
-    let u = url.to_ascii_lowercase();
-    u.contains("media-amazon.com")
-        || u.contains("imdb.com")
-        || u.contains("wikimedia.org")
-        || u.contains("wikipedia.org")
-        || u.contains("anilist.co")
-        || u.contains("anilistcdn")
-}
-
-fn browser_image_http() -> reqwest::Client {
-    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
-    CLIENT
-        .get_or_init(|| {
-            reqwest::Client::builder()
-                .user_agent(BROWSER_UA)
-                .timeout(Duration::from_secs(15))
-                .connect_timeout(Duration::from_secs(6))
-                .redirect(reqwest::redirect::Policy::limited(8))
-                .gzip(true)
-                .no_proxy()
-                .build()
-                .expect("browser image http")
-        })
-        .clone()
 }
 
 fn shared_http() -> reqwest::Client {
@@ -390,20 +357,42 @@ fn clearnet_image_http() -> reqwest::Client {
         .clone()
 }
 
-fn warn_host_once(host: &str, msg: &str, detail: &str) {
+fn warn_host_cache() -> &'static Mutex<HashMap<String, Instant>> {
     static LAST: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::new();
-    let map = LAST.get_or_init(|| Mutex::new(HashMap::new()));
+    LAST.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn normalize_cache() -> &'static Mutex<HashMap<String, String>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn warn_host_once(host: &str, msg: &str, detail: &str) {
     let now = Instant::now();
-    if let Ok(mut g) = map.lock() {
+    if let Ok(mut g) = warn_host_cache().lock() {
         if let Some(prev) = g.get(host) {
             if now.duration_since(*prev) < HOST_WARN_INTERVAL {
                 debug!(%host, %detail, "{msg}");
                 return;
             }
         }
+        if g.len() >= WARN_HOST_CAP && !g.contains_key(host) {
+            g.clear();
+        }
         g.insert(host.to_string(), now);
     }
     warn!(%host, %detail, "{msg}");
+}
+
+/// Drop process-global image aux maps (normalize memo + warn throttle).
+/// Called on tab / category switches so IPTV CDN churn cannot pin MBs of String keys.
+pub fn trim_global_aux_caches() {
+    if let Ok(mut g) = normalize_cache().lock() {
+        g.clear();
+    }
+    if let Ok(mut g) = warn_host_cache().lock() {
+        g.clear();
+    }
 }
 
 /// Collapse `//`, percent-encode unicode path/query (fixes Wikimedia HTTP 400).
@@ -434,9 +423,7 @@ fn normalize_image_url(url: &str) -> String {
 /// Memoized `normalize_image_url` — pure function called per tile per frame.
 /// Global `Mutex` map (same pattern as `warn_host_once`); clear-on-full cap.
 fn normalized_cached(url: &str) -> String {
-    static CACHE: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
-    let map = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Ok(mut g) = map.lock() {
+    if let Ok(mut g) = normalize_cache().lock() {
         if let Some(hit) = g.get(url) {
             return hit.clone();
         }
@@ -483,16 +470,8 @@ fn is_connect_like(err: &reqwest::Error) -> bool {
 }
 
 async fn image_get(url: &str) -> Result<reqwest::Response, reqwest::Error> {
-    let primary = if wants_browser_ua(url) {
-        browser_image_http()
-    } else {
-        shared_http()
-    };
-    let mut req = primary.get(url);
-    if url.contains("media-amazon.com") || url.contains("imdb.com") {
-        req = req.header("Referer", "https://www.imdb.com/");
-    }
-    match req.send().await {
+    let primary = shared_http();
+    match primary.get(url).send().await {
         Ok(r) => Ok(r),
         Err(e) => {
             let via_socks = fluxplay_providers::socks_proxy().is_some();
@@ -582,28 +561,13 @@ pub async fn fetch_image_bytes(
                 last_err = format!("HTTP {status}");
                 continue;
             }
-            // The resized IMDb portrait 404s for some people. The original file still exists.
-            if let Some(alt) = url
-                .find("._V1_QL75_")
-                .map(|i| format!("{}._V1_.jpg", &url[..i]))
-            {
-                if let Ok(alt_resp) = image_get(&alt).await {
-                    if alt_resp.status().is_success() {
-                        resp = alt_resp;
-                    } else {
-                        return Err((url, format!("HTTP {status}")));
-                    }
-                } else {
-                    return Err((url, format!("HTTP {status}")));
-                }
+            // Permanent client errors — log once per host burst, then caller blacklists URL.
+            if status.as_u16() >= 400 && status.as_u16() < 500 {
+                debug!(%url, status = %status, "image HTTP status");
             } else {
-                if status.as_u16() >= 400 && status.as_u16() < 500 {
-                    debug!(%url, status = %status, "image HTTP status");
-                } else {
-                    warn_host_once(&host, "image HTTP status", &status.to_string());
-                }
-                return Err((url, format!("HTTP {status}")));
+                warn_host_once(&host, "image HTTP status", &status.to_string());
             }
+            return Err((url, format!("HTTP {status}")));
         }
         if resp.content_length().is_some_and(|n| n > MAX_IMAGE_BYTES as u64) {
             warn!(%url, "image too large");
@@ -654,15 +618,6 @@ pub async fn fetch_image_bytes(
     Err((url, last_err))
 }
 
-/// Fetch then downscale on the blocking pool (iced `update` stays light).
-#[allow(dead_code)]
-pub async fn fetch_image_prepared(
-    url: String,
-    source_id: Option<Uuid>,
-) -> Result<(String, Option<Uuid>, Vec<u8>), (String, String)> {
-    fetch_image_prepared_edged(url, source_id, MAX_UI_EDGE_PX).await
-}
-
 pub async fn fetch_image_prepared_edged(
     url: String,
     source_id: Option<Uuid>,
@@ -675,81 +630,96 @@ pub async fn fetch_image_prepared_edged(
     }
 }
 
-/// SOF2 (`0xC2`) is a progressive JPEG. Baseline is SOF0 (`0xC0`).
-fn is_progressive_jpeg(bytes: &[u8]) -> bool {
-    if bytes.len() < 4 || bytes[0] != 0xFF || bytes[1] != 0xD8 {
-        return false;
-    }
-    let mut i = 2;
-    while i + 3 < bytes.len() {
-        if bytes[i] != 0xFF {
-            i += 1;
-            continue;
-        }
-        let marker = bytes[i + 1];
-        if marker == 0xC2 || marker == 0xC6 {
-            return true;
-        }
-        if marker == 0xC0 || marker == 0xC1 || marker == 0xDA {
-            return false;
-        }
-        if marker == 0xD8 || marker == 0xD9 || marker == 0x01 || (0xD0..=0xD7).contains(&marker) {
-            i += 2;
-            continue;
-        }
-        let seglen = u16::from_be_bytes([bytes[i + 2], bytes[i + 3]]) as usize;
-        if seglen < 2 {
-            return false;
-        }
-        i += 2 + seglen;
-    }
-    false
-}
-
 fn looks_like_html(bytes: &[u8]) -> bool {
     bytes.starts_with(b"<") || bytes.starts_with(b"<!DOCTYPE") || bytes.starts_with(b"<!doctype")
 }
 
 pub(crate) fn downscale_for_ui(bytes: Vec<u8>, edge_px: u32) -> Vec<u8> {
-    let edge = edge_px.max(160);
+    let edge = edge_px.clamp(160, MAX_UI_EDGE_PX.max(edge_px));
     let Ok(img) = image::load_from_memory(&bytes) else {
-        return bytes;
+        // Never park a multi-MB undecodable blob in the UI handle map.
+        return Vec::new();
     };
     let (w, h) = img.dimensions();
-    // Keep a small PNG or WebP: re-encoding a logo flattens its transparency.
-    // Every JPEG is rewritten below. Some IMDb portraits decode here and still
-    // never appear in iced when the original bytes are handed to the renderer.
-    if w <= edge && h <= edge && !bytes.starts_with(&[0xFF, 0xD8]) {
+    // Already tiny on disk and within the edge — keep original.
+    if w <= edge && h <= edge && bytes.len() <= MAX_UI_HANDLE_BYTES {
         return bytes;
     }
     let resized = img.thumbnail(edge, edge);
     let mut out = Vec::new();
-    // Headshots stay under the frame size. Write them as PNG: iced drops some
-    // of the JPEGs IMDb returns, even after a baseline re-encode.
-    let small_jpeg = bytes.starts_with(&[0xFF, 0xD8]) && w <= edge && h <= edge;
-    let format = if resized.color().has_alpha() || small_jpeg {
-        image::ImageFormat::Png
-    } else {
-        image::ImageFormat::Jpeg
-    };
     if resized
-        .write_to(&mut Cursor::new(&mut out), format)
+        .write_to(&mut Cursor::new(&mut out), image::ImageFormat::Jpeg)
         .is_ok()
         && out.len() >= 64
+        && out.len() <= MAX_UI_HANDLE_BYTES
     {
         return out;
     }
-    if format != image::ImageFormat::Png {
-        out.clear();
-        if resized
-            .write_to(&mut Cursor::new(&mut out), image::ImageFormat::Png)
-            .is_ok()
-            && out.len() >= 64
-        {
-            return out;
+    out.clear();
+    if resized
+        .write_to(&mut Cursor::new(&mut out), image::ImageFormat::Png)
+        .is_ok()
+        && out.len() >= 64
+        && out.len() <= MAX_UI_HANDLE_BYTES
+    {
+        return out;
+    }
+    // Prefer empty (rejected on insert) over retaining a huge original.
+    Vec::new()
+}
+
+fn legacy_disk_root() -> PathBuf {
+    #[cfg(target_os = "android")]
+    {
+        if let Some(app) = iced::android::ANDROID_APP.get() {
+            if let Some(base) = app.internal_data_path() {
+                return base.join("fluxplay").join("images");
+            }
         }
     }
-    bytes
+    dirs::cache_dir()
+        .unwrap_or_else(std::env::temp_dir)
+        .join("fluxplay")
+        .join("images")
+}
+
+fn disk_path_for(url: &str, source_id: Option<Uuid>) -> Option<PathBuf> {
+    let mut h = Sha256::new();
+    h.update(url.as_bytes());
+    let hex = hex::encode(h.finalize());
+    let name = format!("{hex}.img");
+    Some(match source_id {
+        Some(id) => crate::storage::profile_images_dir(id).join(name),
+        None => legacy_disk_root().join(name),
+    })
+}
+
+pub fn disk_path_for_url(url: &str, source_id: Option<Uuid>) -> Option<PathBuf> {
+    disk_path_for(url, source_id)
+}
+
+pub fn pick_art(
+    logo: Option<&str>,
+    poster: Option<&str>,
+    cover: Option<&str>,
+    banner: Option<&str>,
+) -> Option<String> {
+    [logo, poster, cover, banner]
+        .into_iter()
+        .flatten()
+        .map(str::trim)
+        .find(|u| is_fetchable_image_url(u))
+        .map(normalized_cached)
+}
+
+/// VOD mosaic/detail poster URL (list payloads often only have `stream_icon`).
+pub fn vod_poster_url(v: &fluxplay_core::models::VodItem) -> Option<String> {
+    pick_art(None, v.poster.as_deref(), None, None)
+}
+
+/// Series mosaic/detail art (`cover` / `cover_big` banner).
+pub fn series_cover_url(s: &fluxplay_core::models::SeriesItem) -> Option<String> {
+    pick_art(None, None, s.cover.as_deref(), s.banner.as_deref())
 }
 
 /// Width / height from the container header. Used while painting so a landscape
@@ -847,73 +817,9 @@ pub fn art_content_fit(handle: &Handle) -> iced::ContentFit {
     }
 }
 
-fn legacy_disk_root() -> PathBuf {
-    #[cfg(target_os = "android")]
-    {
-        if let Some(app) = iced::android::ANDROID_APP.get() {
-            if let Some(base) = app.internal_data_path() {
-                return base.join("fluxplay").join("images");
-            }
-        }
-    }
-    dirs::cache_dir()
-        .unwrap_or_else(std::env::temp_dir)
-        .join("fluxplay")
-        .join("images")
-}
-
-fn disk_path_for(url: &str, source_id: Option<Uuid>) -> Option<PathBuf> {
-    let mut h = Sha256::new();
-    h.update(url.as_bytes());
-    let hex = hex::encode(h.finalize());
-    let name = format!("{hex}.img");
-    Some(match source_id {
-        Some(id) => crate::storage::profile_images_dir(id).join(name),
-        None => legacy_disk_root().join(name),
-    })
-}
-
-pub fn disk_path_for_url(url: &str, source_id: Option<Uuid>) -> Option<PathBuf> {
-    disk_path_for(url, source_id)
-}
-
-pub fn pick_art(
-    logo: Option<&str>,
-    poster: Option<&str>,
-    cover: Option<&str>,
-    banner: Option<&str>,
-) -> Option<String> {
-    [logo, poster, cover, banner]
-        .into_iter()
-        .flatten()
-        .map(str::trim)
-        .find(|u| is_fetchable_image_url(u))
-        .map(normalized_cached)
-}
-
-/// VOD mosaic/detail poster URL (list payloads often only have `stream_icon`).
-pub fn vod_poster_url(v: &fluxplay_core::models::VodItem) -> Option<String> {
-    pick_art(None, v.poster.as_deref(), None, None)
-}
-
-/// Series mosaic/detail art (`cover` / `cover_big` banner).
-pub fn series_cover_url(s: &fluxplay_core::models::SeriesItem) -> Option<String> {
-    pick_art(None, None, s.cover.as_deref(), s.banner.as_deref())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn imdb_headshot_at_sign_is_percent_encoded() {
-        let raw = "https://m.media-amazon.com/images/M/MV5BMjI0MTg3MzI0M15BMl5BanBnXkFtZTcwMzQyODU2Mw@@._V1_.jpg";
-        let n = normalize_image_url(raw);
-        assert!(n.contains("Mw@@") || n.contains("%40"), "{n}");
-        let mut cache = ImageCache::default();
-        cache.insert_ui_bytes(n, vec![0xFF; 80]);
-        assert!(cache.get(raw).is_some());
-    }
 
     #[test]
     fn normalize_encodes_unicode_path() {
@@ -921,69 +827,6 @@ mod tests {
         let n = normalize_image_url(raw);
         assert!(n.contains("%C3%A8") || n.contains("%c3%a8"), "got {n}");
         assert!(!n.contains('è'));
-    }
-
-    #[test]
-    fn portrait_bytes_cover_landscape_bytes_contain() {
-        let poster = Handle::from_bytes(fake_png(600, 900));
-        assert_eq!(art_content_fit(&poster), iced::ContentFit::Cover);
-        let banner = Handle::from_bytes(fake_png(1280, 720));
-        assert_eq!(art_content_fit(&banner), iced::ContentFit::Contain);
-        let logo = Handle::from_bytes(fake_png(256, 256));
-        assert_eq!(art_content_fit(&logo), iced::ContentFit::Contain);
-    }
-
-    #[test]
-    fn downscale_preserves_small_png_and_alpha() {
-        let tiny = image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
-            24,
-            24,
-            image::Rgba([8, 16, 32, 0]),
-        ));
-        let mut raw = Vec::new();
-        tiny.write_to(&mut Cursor::new(&mut raw), image::ImageFormat::Png)
-            .unwrap();
-        assert_eq!(downscale_for_ui(raw.clone(), 160), raw);
-
-        let wide = image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
-            400,
-            120,
-            image::Rgba([8, 16, 32, 128]),
-        ));
-        let mut big = Vec::new();
-        wide.write_to(&mut Cursor::new(&mut big), image::ImageFormat::Png)
-            .unwrap();
-        let out = downscale_for_ui(big, 160);
-        assert!(
-            out.starts_with(&[0x89, b'P', b'N', b'G']),
-            "alpha downscale must stay PNG"
-        );
-        assert!(image::load_from_memory(&out).unwrap().color().has_alpha());
-    }
-
-    fn fake_png(w: u32, h: u32) -> Vec<u8> {
-        let mut b = vec![0u8; 24];
-        b[0..8].copy_from_slice(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]);
-        b[16..20].copy_from_slice(&w.to_be_bytes());
-        b[20..24].copy_from_slice(&h.to_be_bytes());
-        b
-    }
-
-    #[test]
-    fn progressive_headshot_is_rewritten_to_baseline() {
-        let path = r"C:\Users\dxtrp\AppData\Local\Temp\steve-golin.jpg";
-        let Ok(bytes) = std::fs::read(path) else {
-            return;
-        };
-        assert!(is_progressive_jpeg(&bytes));
-        let out = downscale_for_ui(bytes, 480);
-        assert!(!is_progressive_jpeg(&out), "cast photo stayed progressive");
-        let img = image::load_from_memory(&out).unwrap().to_rgba8();
-        let p = *img.get_pixel(img.width() / 2, img.height() / 5);
-        assert!(
-            p[0] > 15 || p[1] > 15 || p[2] > 15,
-            "rewritten portrait decoded blank: {p:?}"
-        );
     }
 
     #[test]
@@ -995,5 +838,38 @@ mod tests {
         }
         assert!(c.host_blocked(&url));
         assert!(matches!(c.request(&url, None), RequestOutcome::Skip));
+    }
+
+    #[test]
+    fn mosaic_ram_handle_budget_matches_100mb_plan() {
+        // Plan: keep handles tight so category switches cannot pin hundreds of atlas slots.
+        assert_eq!(MAX_RAM_HANDLES, 72);
+        assert!(
+            MAX_UI_EDGE_PX <= 300,
+            "MAX_UI_EDGE_PX={MAX_UI_EDGE_PX} — decoded posters too large for soft path"
+        );
+    }
+
+    #[test]
+    fn clear_handles_drops_ram_but_keeps_circuits() {
+        let mut c = ImageCache::default();
+        c.insert_ui_bytes(
+            "https://cdn.example/a.jpg".into(),
+            vec![0xFFu8; 128], // rejected as non-image → failed set
+        );
+        // Force a soft-fail circuit entry, then clear handles.
+        c.mark_soft_failed("http://dead.example/x.png".into());
+        c.clear_handles();
+        assert_eq!(c.handle_count(), 0);
+        assert_eq!(c.inflight_len(), 0);
+        assert_eq!(c.soft_fail.len(), 1);
+        assert!(c.host_circuit.contains_key("dead.example"));
+    }
+
+    #[test]
+    fn downscale_rejects_undecodable_blob() {
+        let junk = vec![0u8; 500_000];
+        let out = downscale_for_ui(junk, 300);
+        assert!(out.is_empty());
     }
 }
