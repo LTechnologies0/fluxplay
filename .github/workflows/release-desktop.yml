@@ -125,9 +125,12 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force -Path dist | Out-Null
-          Copy-Item "target/${{ matrix.target }}/release/${{ matrix.bin }}" "dist/${{ matrix.artifact }}.exe"
-          Compress-Archive -Path "dist/${{ matrix.artifact }}.exe" -DestinationPath "dist/${{ matrix.artifact }}.zip" -Force
+          # fluxplay.exe delay-loads libmpv-2.dll: ship it alongside for the embedded player.
+          $pkg = "dist/${{ matrix.artifact }}"
+          New-Item -ItemType Directory -Force -Path $pkg | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/${{ matrix.bin }}" "$pkg/fluxplay.exe"
+          ./scripts/fetch-libmpv-windows.ps1 -Dest $pkg
+          Compress-Archive -Path "$pkg/*" -DestinationPath "dist/${{ matrix.artifact }}.zip" -Force
           Get-FileHash "dist/${{ matrix.artifact }}.zip" -Algorithm SHA256 |
             ForEach-Object { "$($_.Hash.ToLower())  ${{ matrix.artifact }}.zip" } |
             Set-Content "dist/${{ matrix.artifact }}.zip.sha256"

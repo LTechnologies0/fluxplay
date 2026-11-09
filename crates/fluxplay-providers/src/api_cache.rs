@@ -166,6 +166,47 @@ pub fn put(key: &str, value: &Value) {
     }
 }
 
+/// After HTTP 429, keep the portal quiet so the next call does not extend the ban.
+static PORTAL_QUIET_UNTIL_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Remember that the portal refused a call. Background calls must not hit it yet.
+pub fn note_portal_backoff() {
+    let until = now_ms().saturating_add(30_000);
+    let _ = PORTAL_QUIET_UNTIL_MS.fetch_update(
+        std::sync::atomic::Ordering::Relaxed,
+        std::sync::atomic::Ordering::Relaxed,
+        |cur| Some(cur.max(until)),
+    );
+    warn!(quiet_secs = 30, "portal backoff");
+}
+
+pub fn portal_quiet_remaining() -> Duration {
+    let until = PORTAL_QUIET_UNTIL_MS.load(std::sync::atomic::Ordering::Relaxed);
+    let now = now_ms();
+    if until > now {
+        Duration::from_millis(until - now)
+    } else {
+        Duration::ZERO
+    }
+}
+
+/// Block until the quiet window opened by a 429 has elapsed.
+pub async fn wait_portal_quiet() {
+    let wait = portal_quiet_remaining();
+    if !wait.is_zero() {
+        debug!(wait_ms = wait.as_millis() as u64, "waiting out portal backoff");
+        tokio::time::sleep(wait).await;
+    }
+}
+
 /// Drop all cached Xtream API responses (manual reload).
 pub fn clear_all() {
     let _prof = Stopwatch::start("xtream_cache_clear");

@@ -59,6 +59,10 @@ impl XtreamClient {
         );
 
         for chunk in stream_ids.chunks(parallel) {
+            if !crate::api_cache::portal_quiet_remaining().is_zero() {
+                info!("short EPG batch stopped — portal quiet");
+                break;
+            }
             let mut handles = Vec::with_capacity(chunk.len());
             for sid in chunk {
                 let sid = sid.clone();

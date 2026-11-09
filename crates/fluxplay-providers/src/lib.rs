@@ -133,6 +133,38 @@ pub async fn load_xtream_vod_info(
     client.vod_info(vod_id).await
 }
 
+/// Film fiche for the title the viewer just opened. Waits out a portal 429.
+pub async fn load_xtream_vod_info_now(
+    source: &MediaSource,
+    vod_id: &str,
+) -> Result<fluxplay_core::models::VodItem> {
+    debug!(source_id = %source.id, %vod_id, "load_xtream_vod_info_now");
+    let mut client = xtream_client_for(source).ok_or_else(|| {
+        ProviderError::Message("source Xtream requise pour les détails VOD".into())
+    })?;
+    client.ensure_stream_base().await?;
+    client.vod_info_now(vod_id).await
+}
+
+/// Cast, director and runtime already stored with the series list. Empty when
+/// that list is not in the local API cache.
+pub fn cached_series_credits(
+    source: &MediaSource,
+) -> Vec<(String, Option<String>, Option<String>, Option<String>)> {
+    let Some(client) = xtream_client_for(source) else {
+        return Vec::new();
+    };
+    client
+        .cached_series_list()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|s| {
+            let actors = s.actors.filter(|a| !a.trim().is_empty())?;
+            Some((s.id, Some(actors), s.director, s.runtime))
+        })
+        .collect()
+}
+
 #[derive(Debug, Error)]
 pub enum ProviderError {
     #[error("http: {}", crate::redact_error(.0))]
@@ -439,14 +471,14 @@ pub async fn fetch_short_epg(
         return Vec::new();
     }
     // Cap batch size — UI may pass many visible channels.
-    let capped: Vec<String> = stream_ids.iter().take(12).cloned().collect();
+    let capped: Vec<String> = stream_ids.iter().take(16).cloned().collect();
     debug!(
         source_id = %source.id,
         requested = stream_ids.len(),
         capped = capped.len(),
         "fetch_short_epg"
     );
-    client.fetch_short_epg_batch(&capped, 4, 2).await
+    client.fetch_short_epg_batch(&capped, 4, 1).await
 }
 
 fn xtream_client_for(source: &MediaSource) -> Option<XtreamClient> {

@@ -50,8 +50,14 @@ hex.workspace = true
 image.workspace = true
 zip.workspace = true
 
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"
+
 [target.'cfg(not(target_os = "android"))'.dependencies]
-iced = { workspace = true, features = ["x11", "wayland", "linux-theme-detection", "tiny-skia"] }
+# advanced-shaping: with Basic shaping (iced's default for ASCII) a missing family /
+# weight is not substituted — on a Linux box with only DejaVu (no Medium weight) every
+# plain-ASCII title rendered empty. Advanced shaping falls back like Android does.
+iced = { workspace = true, features = ["x11", "wayland", "linux-theme-detection", "tiny-skia", "advanced-shaping"] }
 mimalloc = { version = "0.1", default-features = false }
 rfd.workspace = true
 dark-light = "2"

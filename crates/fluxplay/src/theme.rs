@@ -15,26 +15,47 @@ use iced::{Color, Font};
 pub struct UiTheme {
     pub day: bool,
     pub accent: AccentPreset,
+    /// Picked color. When set, it replaces the preset for every accent role.
+    pub custom: Option<[u8; 3]>,
+    /// Picked text color. When set, it replaces the default ink.
+    pub ink_rgb: Option<[u8; 3]>,
 }
+
+/// Side of the gradient square in the color settings.
+pub const ACCENT_PICK: f32 = 220.0;
 
 impl UiTheme {
     pub fn new(day: bool, accent: AccentPreset) -> Self {
-        Self { day, accent }
+        Self {
+            day,
+            accent,
+            custom: None,
+            ink_rgb: None,
+        }
+    }
+
+    pub fn with_custom(mut self, rgb: Option<[u8; 3]>) -> Self {
+        self.custom = rgb;
+        self
+    }
+
+    pub fn with_ink(mut self, rgb: Option<[u8; 3]>) -> Self {
+        self.ink_rgb = rgb;
+        self
+    }
+
+    pub fn accent_label(self) -> &'static str {
+        if self.custom.is_some() {
+            "Personnalisé"
+        } else {
+            self.accent.label()
+        }
     }
 
     pub fn iced_theme(self) -> Theme {
-        let (bg, text, primary) = match (self.day, self.accent) {
-            (true, a) => (
-                self.shell(),
-                Color::from_rgb8(0x0F, 0x17, 0x22),
-                a.primary_day(),
-            ),
-            (false, a) => (
-                self.shell(),
-                Color::from_rgb8(0xE8, 0xEF, 0xF6),
-                a.primary_night(),
-            ),
-        };
+        let text = self.ink();
+        let bg = self.shell();
+        let primary = self.primary();
         Theme::custom(
             if self.day { "FluxPlay Day" } else { "FluxPlay Night" },
             Palette {
@@ -54,6 +75,9 @@ impl UiTheme {
     }
 
     pub fn primary(self) -> Color {
+        if let Some(t) = self.custom_tokens() {
+            return self.rgb(t.day, t.night);
+        }
         if self.day {
             self.accent.primary_day()
         } else {
@@ -62,6 +86,9 @@ impl UiTheme {
     }
 
     pub fn on_primary(self) -> Color {
+        if let Some(t) = self.custom_tokens() {
+            return self.rgb(t.on_primary_day, t.on_primary_night);
+        }
         if self.day {
             self.accent.on_primary_day()
         } else {
@@ -70,6 +97,9 @@ impl UiTheme {
     }
 
     pub fn primary_container(self) -> Color {
+        if let Some(t) = self.custom_tokens() {
+            return self.rgb(t.container_day, t.container_night);
+        }
         if self.day {
             self.accent.container_day()
         } else {
@@ -78,6 +108,9 @@ impl UiTheme {
     }
 
     pub fn on_primary_container(self) -> Color {
+        if let Some(t) = self.custom_tokens() {
+            return self.rgb(t.on_day, t.on_primary_night);
+        }
         if self.day {
             self.accent.on_container_day()
         } else {
@@ -87,16 +120,23 @@ impl UiTheme {
 
     // --- Secondary (selection / nav / chips) — distinct hue family per accent ---
     pub fn secondary(self) -> Color {
+        if let Some(t) = self.custom_tokens() {
+            return self.rgb(t.secondary_day, t.secondary_night);
+        }
         let t = accent_tokens(self.accent);
         let (r, g, b) = if self.day {
             t.secondary_day
         } else {
-            t.secondary_night
+            let (r, g, b) = t.secondary_night;
+            (restful(r), restful(g), restful(b))
         };
         Color::from_rgb8(r, g, b)
     }
 
     pub fn on_secondary(self) -> Color {
+        if let Some(t) = self.custom_tokens() {
+            return self.rgb(t.on_secondary, t.on_secondary);
+        }
         if self.day {
             let (r, g, b) = accent_tokens(self.accent).on_secondary;
             Color::from_rgb8(r, g, b)
@@ -107,12 +147,24 @@ impl UiTheme {
     }
 
     pub fn secondary_container(self) -> Color {
+        if let Some(t) = self.custom_tokens() {
+            return self.rgb(t.secondary_container_day, t.secondary_container_night);
+        }
         let t = accent_tokens(self.accent);
         let (r, g, b) = if self.day {
             t.secondary_container_day
         } else {
             t.secondary_container_night
         };
+        Color::from_rgb8(r, g, b)
+    }
+
+    fn custom_tokens(self) -> Option<AccentTokens> {
+        self.custom.map(tokens_from_rgb)
+    }
+
+    fn rgb(self, day: (u8, u8, u8), night: (u8, u8, u8)) -> Color {
+        let (r, g, b) = if self.day { day } else { night };
         Color::from_rgb8(r, g, b)
     }
 
@@ -223,7 +275,7 @@ impl UiTheme {
         if self.day {
             Color::from_rgb8(0xF7, 0xF9, 0xFC)
         } else {
-            Color::from_rgb8(0x11, 0x16, 0x1F)
+            Color::from_rgb8(0x0C, 0x10, 0x16)
         }
     }
 
@@ -231,7 +283,7 @@ impl UiTheme {
         if self.day {
             Color::from_rgb8(0xFF, 0xFF, 0xFF)
         } else {
-            Color::from_rgb8(0x1C, 0x25, 0x34)
+            Color::from_rgb8(0x16, 0x1C, 0x26)
         }
     }
 
@@ -244,18 +296,24 @@ impl UiTheme {
     }
 
     pub fn ink(self) -> Color {
+        if let Some([r, g, b]) = self.ink_rgb {
+            return Color::from_rgb8(r, g, b);
+        }
         if self.day {
             Color::from_rgb8(0x0F, 0x17, 0x22)
         } else {
-            Color::from_rgb8(0xE8, 0xEF, 0xF6)
+            Color::from_rgb8(0xD0, 0xD7, 0xE0)
         }
     }
 
     pub fn ink_muted(self) -> Color {
+        if let Some([r, g, b]) = self.ink_rgb {
+            return Color::from_rgba8(r, g, b, 0.62);
+        }
         if self.day {
             Color::from_rgba8(0x0F, 0x17, 0x22, 0.58)
         } else {
-            Color::from_rgba8(0xE8, 0xEF, 0xF6, 0.55)
+            Color::from_rgba8(0xD0, 0xD7, 0xE0, 0.62)
         }
     }
 
@@ -281,7 +339,7 @@ impl UiTheme {
         if self.day {
             Color::from_rgb8(0xEA, 0xF0, 0xF6)
         } else {
-            Color::from_rgb8(0x14, 0x1A, 0x24)
+            Color::from_rgb8(0x10, 0x14, 0x1C)
         }
     }
 
@@ -289,7 +347,7 @@ impl UiTheme {
         if self.day {
             Color::from_rgb8(0xE6, 0xEC, 0xF3)
         } else {
-            Color::from_rgb8(0x1A, 0x22, 0x30)
+            Color::from_rgb8(0x14, 0x1A, 0x24)
         }
     }
 
@@ -297,7 +355,7 @@ impl UiTheme {
         if self.day {
             Color::from_rgb8(0xDE, 0xE5, 0xEE)
         } else {
-            Color::from_rgb8(0x22, 0x2B, 0x3A)
+            Color::from_rgb8(0x1A, 0x22, 0x2E)
         }
     }
 
@@ -448,7 +506,7 @@ impl AccentColors for AccentPreset {
 
     fn primary_night(self) -> Color {
         let (r, g, b) = accent_tokens(self).night;
-        Color::from_rgb8(r, g, b)
+        Color::from_rgb8(restful(r), restful(g), restful(b))
     }
 
     fn container_day(self) -> Color {
@@ -476,8 +534,112 @@ impl AccentColors for AccentPreset {
     }
 
     fn on_primary_night(self) -> Color {
-        let (r, g, b) = accent_tokens(self).on_primary_night;
-        Color::from_rgb8(r, g, b)
+        match self {
+            _ => Color::from_rgb8(0xF4, 0xF6, 0xF8),
+        }
+    }
+}
+
+/// Pull a bright pastel toward a dim mid-tone so night accents stay readable
+/// without glowing. Hue is kept; only the highlights come down.
+fn restful(c: u8) -> u8 {
+    let v = c as f32 / 255.0;
+    let v = 0.30 + v * 0.32;
+    v.clamp(0.0, 1.0).mul_add(255.0, 0.0).round() as u8
+}
+
+/// Hue 0..360, saturation and value 0..1.
+pub(crate) fn hsv_to_rgb(h: f32, s: f32, v: f32) -> (u8, u8, u8) {
+    let h = h.rem_euclid(360.0);
+    let c = v * s;
+    let x = c * (1.0 - ((h / 60.0) % 2.0 - 1.0).abs());
+    let m = v - c;
+    let (r, g, b) = if h < 60.0 {
+        (c, x, 0.0)
+    } else if h < 120.0 {
+        (x, c, 0.0)
+    } else if h < 180.0 {
+        (0.0, c, x)
+    } else if h < 240.0 {
+        (0.0, x, c)
+    } else if h < 300.0 {
+        (x, 0.0, c)
+    } else {
+        (c, 0.0, x)
+    };
+    let to = |n: f32| ((n + m) * 255.0).round().clamp(0.0, 255.0) as u8;
+    (to(r), to(g), to(b))
+}
+
+pub(crate) fn rgb_to_hsv(r: u8, g: u8, b: u8) -> (f32, f32, f32) {
+    let r = r as f32 / 255.0;
+    let g = g as f32 / 255.0;
+    let b = b as f32 / 255.0;
+    let max = r.max(g).max(b);
+    let min = r.min(g).min(b);
+    let d = max - min;
+    let h = if d == 0.0 {
+        0.0
+    } else if max == r {
+        60.0 * (((g - b) / d) % 6.0)
+    } else if max == g {
+        60.0 * (((b - r) / d) + 2.0)
+    } else {
+        60.0 * (((r - g) / d) + 4.0)
+    };
+    let s = if max == 0.0 { 0.0 } else { d / max };
+    (h.rem_euclid(360.0), s, max)
+}
+
+/// Same mapping as the gradient square: x is hue, y fades toward black.
+pub(crate) fn pick_color(nx: f32, ny: f32) -> [u8; 3] {
+    let hue = nx.clamp(0.0, 1.0) * 360.0;
+    let v = 1.0 - ny.clamp(0.0, 1.0) * 0.92;
+    let (r, g, b) = hsv_to_rgb(hue, 1.0, v);
+    [r, g, b]
+}
+
+pub(crate) fn cursor_for_rgb(rgb: [u8; 3]) -> (f32, f32) {
+    let (h, _s, v) = rgb_to_hsv(rgb[0], rgb[1], rgb[2]);
+    let ny = ((1.0 - v) / 0.92).clamp(0.0, 1.0);
+    ((h / 360.0).clamp(0.0, 1.0), ny)
+}
+
+fn tokens_from_rgb(rgb: [u8; 3]) -> AccentTokens {
+    let (r, g, b) = (rgb[0], rgb[1], rgb[2]);
+    let mix = |a: u8, toward: u8, t: f32| -> u8 {
+        (a as f32 * (1.0 - t) + toward as f32 * t).round() as u8
+    };
+    let lum = 0.2126 * r as f32 + 0.7152 * g as f32 + 0.0722 * b as f32;
+    let ink = if lum > 150.0 {
+        (0x1A, 0x14, 0x08)
+    } else {
+        (0xF4, 0xF6, 0xF8)
+    };
+    let (h, s, v) = rgb_to_hsv(r, g, b);
+    // Same hue as the pick, a little deeper — not the opposite color.
+    let (sr, sg, sb) = hsv_to_rgb(
+        h,
+        (s * 0.72).clamp(0.35, 0.9),
+        (v * 0.72).clamp(0.28, 0.7),
+    );
+    AccentTokens {
+        day: (r, g, b),
+        night: (r, g, b),
+        container_day: (mix(r, 255, 0.72), mix(g, 255, 0.72), mix(b, 255, 0.72)),
+        container_night: (mix(r, 0x12, 0.62), mix(g, 0x14, 0.62), mix(b, 0x1A, 0.62)),
+        on_day: ink,
+        on_primary_day: ink,
+        on_primary_night: ink,
+        secondary_day: (sr, sg, sb),
+        secondary_night: (sr, sg, sb),
+        secondary_container_day: (mix(sr, 255, 0.7), mix(sg, 255, 0.7), mix(sb, 255, 0.7)),
+        secondary_container_night: (
+            mix(sr, 0x12, 0.55),
+            mix(sg, 0x14, 0.55),
+            mix(sb, 0x1A, 0.55),
+        ),
+        on_secondary: ink,
     }
 }
 
@@ -839,7 +1001,7 @@ pub const PLAYER_PAD: f32 = SPACE_LG;
 
 /// Minimum mosaic tile width (logical px) before dropping a column.
 pub const MOSAIC_TILE_MIN: f32 = 120.0;
-pub const MOSAIC_GAP: f32 = 14.0;
+pub const MOSAIC_GAP: f32 = 10.0;
 
 /// Screen class from window width — M3 window size classes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -942,14 +1104,19 @@ impl LayoutMetrics {
             }
         };
 
-        let mut chrome = pad * 2.0;
-        if rail_w > 0.0 {
-            chrome += gap + pad * 2.0;
-        }
-        if cat_w > 0.0 {
-            chrome += gap + pad * 2.0;
-        }
-        let content_w = (w - rail_w - cat_w - chrome).max(120.0);
+        // Pane padding lives *inside* rail_w / cat_w / the content pane.
+        // Subtracting it again left a wide empty band beside the posters.
+        let gaps = match (rail_w > 0.0, cat_w > 0.0) {
+            (true, true) => gap * 2.0,
+            (true, false) | (false, true) => gap,
+            (false, false) => 0.0,
+        };
+        #[cfg(target_os = "android")]
+        let pane_pad = SPACE_SM;
+        #[cfg(not(target_os = "android"))]
+        let pane_pad = SPACE_MD;
+        let content_outer = (w - pad * 2.0 - rail_w - cat_w - gaps).max(160.0);
+        let content_w = (content_outer - pane_pad * 2.0 - 8.0).max(120.0);
 
         let max_cols = match bp {
             Breakpoint::Phone if short && landscape => 3,
@@ -999,7 +1166,11 @@ impl LayoutMetrics {
             rail_size,
             thumb,
             player_chrome_h,
-            stack_header: matches!(bp, Breakpoint::Phone) || search_w >= content_w * 0.85,
+            // Below ~240 px the search pill (icon + clear + paste) leaves no room to
+            // type: put it full-width under the title instead.
+            stack_header: matches!(bp, Breakpoint::Phone)
+                || search_w >= content_w * 0.85
+                || search_w < 240.0,
             top_nav,
             short,
             nav_strip: top_nav && short && landscape,

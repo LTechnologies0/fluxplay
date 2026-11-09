@@ -41,6 +41,8 @@ const MPV_EVENT_NONE: c_int = 0;
 
 const MPV_RENDER_PARAM_INVALID: c_int = 0;
 const MPV_RENDER_PARAM_API_TYPE: c_int = 1;
+/// Ask render() to return the frame for the audio clock without sleeping.
+const MPV_RENDER_PARAM_BLOCK_FOR_TARGET_TIME: c_int = 12;
 const MPV_RENDER_PARAM_SW_SIZE: c_int = 17;
 const MPV_RENDER_PARAM_SW_FORMAT: c_int = 18;
 const MPV_RENDER_PARAM_SW_STRIDE: c_int = 19;
@@ -49,6 +51,7 @@ const MPV_RENDER_PARAM_SW_POINTER: c_int = 20;
 /// MPV_RENDER_UPDATE_FRAME — new video frame available for render.
 const MPV_RENDER_UPDATE_FRAME: u64 = 1 << 0;
 
+#[cfg_attr(windows, link(name = "libmpv-2", kind = "raw-dylib"))]
 extern "C" {
     fn mpv_create() -> *mut mpv_handle;
     fn mpv_initialize(ctx: *mut mpv_handle) -> c_int;
@@ -84,6 +87,7 @@ extern "C" {
     fn mpv_render_context_render(ctx: *mut mpv_render_context, params: *mut MpvRenderParam)
         -> c_int;
     fn mpv_render_context_update(ctx: *mut mpv_render_context) -> u64;
+    fn mpv_render_context_report_swap(ctx: *mut mpv_render_context);
     fn mpv_render_context_set_update_callback(
         ctx: *mut mpv_render_context,
         callback: Option<unsafe extern "C" fn(*mut c_void)>,
@@ -121,6 +125,35 @@ pub fn register_android_java_vm(vm: *mut c_void) -> bool {
 #[cfg(not(target_os = "android"))]
 pub fn register_android_java_vm(_vm: *mut c_void) -> bool {
     false
+}
+
+/// Whether the libmpv shared library can be loaded at runtime.
+///
+/// Windows links `libmpv-2.dll` with `/DELAYLOAD`: the exe starts without it and
+/// the first `mpv_*` call would fault, so callers probe here first.
+#[cfg(windows)]
+pub fn libmpv_available() -> bool {
+    use std::sync::OnceLock;
+    static OK: OnceLock<bool> = OnceLock::new();
+    *OK.get_or_init(|| {
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn LoadLibraryW(name: *const u16) -> *mut c_void;
+        }
+        let name: Vec<u16> = "libmpv-2.dll\0".encode_utf16().collect();
+        let ok = !unsafe { LoadLibraryW(name.as_ptr()) }.is_null();
+        if ok {
+            info!("libmpv-2.dll loaded");
+        } else {
+            warn!("libmpv-2.dll not found next to fluxplay.exe — embedded player disabled");
+        }
+        ok
+    })
+}
+
+#[cfg(not(windows))]
+pub fn libmpv_available() -> bool {
+    true
 }
 
 fn mpv_err(code: c_int) -> Result<()> {
@@ -180,6 +213,11 @@ fn android_mpv_life() -> &'static std::sync::Mutex<()> {
 impl LibMpv {
     pub fn create() -> Result<Self> {
         debug!("LibMpv::create");
+        if !libmpv_available() {
+            return Err(PlayerError::Backend(
+                "libmpv-2.dll introuvable — placez-la à côté de fluxplay.exe".into(),
+            ));
+        }
         #[cfg(target_os = "android")]
         let _life = android_mpv_life()
             .lock()
@@ -246,6 +284,7 @@ impl LibMpv {
 
     /// Set a pre-init option as int64 (Android `wid` = Surface jobject pointer).
     pub fn set_option_i64(&self, name: &str, value: i64) -> Result<()> {
+        #[cfg_attr(windows, link(name = "libmpv-2", kind = "raw-dylib"))]
         extern "C" {
             fn mpv_set_option(
                 ctx: *mut mpv_handle,
@@ -334,6 +373,7 @@ impl LibMpv {
 
     /// Runtime int64 property (Android `wid` rebind after Surface recreate / rotate).
     pub fn set_property_i64(&self, name: &str, value: i64) -> Result<()> {
+        #[cfg_attr(windows, link(name = "libmpv-2", kind = "raw-dylib"))]
         extern "C" {
             fn mpv_set_property(
                 ctx: *mut mpv_handle,
@@ -482,6 +522,10 @@ impl LibMpv {
         let fmt_rgb0 = FMT_RGB0.get_or_init(|| CString::new("rgb0").expect("static fmt"));
 
         let mut try_render = |fmt: &CString, buf: &mut [u8], stride: &mut usize| -> c_int {
+            use std::sync::atomic::AtomicBool;
+            static SKIP_BLOCK: AtomicBool = AtomicBool::new(false);
+            let mut block_for_target: c_int = 0;
+            let skip = SKIP_BLOCK.load(Ordering::Relaxed);
             let mut params = [
                 MpvRenderParam {
                     type_: MPV_RENDER_PARAM_SW_SIZE,
@@ -500,11 +544,32 @@ impl LibMpv {
                     data: buf.as_mut_ptr() as *mut c_void,
                 },
                 MpvRenderParam {
+                    type_: if skip {
+                        MPV_RENDER_PARAM_INVALID
+                    } else {
+                        MPV_RENDER_PARAM_BLOCK_FOR_TARGET_TIME
+                    },
+                    data: if skip {
+                        ptr::null_mut()
+                    } else {
+                        (&mut block_for_target as *mut c_int) as *mut c_void
+                    },
+                },
+                MpvRenderParam {
                     type_: MPV_RENDER_PARAM_INVALID,
                     data: ptr::null_mut(),
                 },
             ];
-            unsafe { mpv_render_context_render(self.render, params.as_mut_ptr()) }
+            let code = unsafe { mpv_render_context_render(self.render, params.as_mut_ptr()) };
+            if code < 0 && !skip {
+                SKIP_BLOCK.store(true, Ordering::Relaxed);
+                params[4] = MpvRenderParam {
+                    type_: MPV_RENDER_PARAM_INVALID,
+                    data: ptr::null_mut(),
+                };
+                return unsafe { mpv_render_context_render(self.render, params.as_mut_ptr()) };
+            }
+            code
         };
 
         let code = try_render(fmt_rgba, &mut self.sw_rgba, &mut stride);
@@ -538,6 +603,11 @@ impl LibMpv {
         self.sw_w = w;
         self.sw_h = h;
         self.force_render = false;
+        // Without this, mpv thinks frames are never shown. After a few minutes
+        // it inserts a freeze every second until a seek resets the clock.
+        if !self.render.is_null() {
+            unsafe { mpv_render_context_report_swap(self.render) };
+        }
         // Hand the rendered buffer to the caller. Prepare the next render scratch
         // without zero-filling 8MB (mpv overwrites every pixel). Prefer recycling
         // capacity from `sw_recycle` when available.

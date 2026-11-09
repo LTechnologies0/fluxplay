@@ -20,6 +20,7 @@ use url::Url;
 use uuid::Uuid;
 
 /// Cap RAM handles — keep several mosaic viewports warm during fast flings.
+/// Handles hold the compressed (downscaled) file, ~15–40 KB each.
 const MAX_RAM_HANDLES: usize = 768;
 const MAX_IMAGE_BYTES: usize = 2_500_000;
 /// Default soft cap when host caps are not applied yet.
@@ -84,9 +85,12 @@ impl Default for ImageCache {
 
 impl ImageCache {
     pub fn get(&self, url: &str) -> Option<&Handle> {
-        let h = self.handles.get(url);
+        // Fetches are stored under the normalized URL (`@` → `%40` on IMDb
+        // headshots). Callers still pass the original address.
+        let url_n = normalized_cached(url);
+        let h = self.handles.get(&url_n);
         if h.is_some() {
-            trace!(target: "fluxplay::images", %url, "cache hit");
+            trace!(target: "fluxplay::images", url = %url_n, "cache hit");
         }
         h
     }
@@ -105,6 +109,15 @@ impl ImageCache {
         if self.handles.contains_key(url) {
             self.touch_gen.insert(url.to_string(), self.clock);
         }
+    }
+
+    /// Drop decoded posters. Disk copies stay, so the grid refills from disk
+    /// when the browser comes back. Failed-URL memory is kept (tiny, avoids refetch storms).
+    pub fn release_ram(&mut self) {
+        self.handles.clear();
+        self.touch_gen.clear();
+        self.inflight.clear();
+        self.inflight_source.clear();
     }
 
     fn evict_oldest(&mut self) {
@@ -216,6 +229,18 @@ impl ImageCache {
             self.insert_failed(url);
             return;
         }
+        // A progressive JPEG decodes in the `image` crate and still uploads as an
+        // empty frame. Rewrite it here too, in case the fetch path handed the
+        // original bytes through.
+        let bytes = if is_progressive_jpeg(&bytes) {
+            let rewritten = downscale_for_ui(bytes, self.decode_edge_px);
+            if is_progressive_jpeg(&rewritten) {
+                warn!(target: "fluxplay::images", %url, "progressive jpeg could not be rewritten");
+            }
+            rewritten
+        } else {
+            bytes
+        };
         debug!(target: "fluxplay::images", %url, len = bytes.len(), "insert handle");
         if self.handles.contains_key(&url) {
             self.handles.insert(url.clone(), Handle::from_bytes(bytes));
@@ -301,6 +326,36 @@ fn host_key(url: &str) -> Option<String> {
         Some(p) => Some(format!("{host}:{p}")),
         None => Some(host.to_string()),
     }
+}
+
+const BROWSER_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36";
+
+/// Amazon, Wikimedia and AniList reject the IPTV user agent and return an empty tile.
+fn wants_browser_ua(url: &str) -> bool {
+    let u = url.to_ascii_lowercase();
+    u.contains("media-amazon.com")
+        || u.contains("imdb.com")
+        || u.contains("wikimedia.org")
+        || u.contains("wikipedia.org")
+        || u.contains("anilist.co")
+        || u.contains("anilistcdn")
+}
+
+fn browser_image_http() -> reqwest::Client {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            reqwest::Client::builder()
+                .user_agent(BROWSER_UA)
+                .timeout(Duration::from_secs(15))
+                .connect_timeout(Duration::from_secs(6))
+                .redirect(reqwest::redirect::Policy::limited(8))
+                .gzip(true)
+                .no_proxy()
+                .build()
+                .expect("browser image http")
+        })
+        .clone()
 }
 
 fn shared_http() -> reqwest::Client {
@@ -428,8 +483,16 @@ fn is_connect_like(err: &reqwest::Error) -> bool {
 }
 
 async fn image_get(url: &str) -> Result<reqwest::Response, reqwest::Error> {
-    let primary = shared_http();
-    match primary.get(url).send().await {
+    let primary = if wants_browser_ua(url) {
+        browser_image_http()
+    } else {
+        shared_http()
+    };
+    let mut req = primary.get(url);
+    if url.contains("media-amazon.com") || url.contains("imdb.com") {
+        req = req.header("Referer", "https://www.imdb.com/");
+    }
+    match req.send().await {
         Ok(r) => Ok(r),
         Err(e) => {
             let via_socks = fluxplay_providers::socks_proxy().is_some();
@@ -519,13 +582,28 @@ pub async fn fetch_image_bytes(
                 last_err = format!("HTTP {status}");
                 continue;
             }
-            // Permanent client errors — log once per host burst, then caller blacklists URL.
-            if status.as_u16() >= 400 && status.as_u16() < 500 {
-                debug!(%url, status = %status, "image HTTP status");
+            // The resized IMDb portrait 404s for some people. The original file still exists.
+            if let Some(alt) = url
+                .find("._V1_QL75_")
+                .map(|i| format!("{}._V1_.jpg", &url[..i]))
+            {
+                if let Ok(alt_resp) = image_get(&alt).await {
+                    if alt_resp.status().is_success() {
+                        resp = alt_resp;
+                    } else {
+                        return Err((url, format!("HTTP {status}")));
+                    }
+                } else {
+                    return Err((url, format!("HTTP {status}")));
+                }
             } else {
-                warn_host_once(&host, "image HTTP status", &status.to_string());
+                if status.as_u16() >= 400 && status.as_u16() < 500 {
+                    debug!(%url, status = %status, "image HTTP status");
+                } else {
+                    warn_host_once(&host, "image HTTP status", &status.to_string());
+                }
+                return Err((url, format!("HTTP {status}")));
             }
-            return Err((url, format!("HTTP {status}")));
         }
         if resp.content_length().is_some_and(|n| n > MAX_IMAGE_BYTES as u64) {
             warn!(%url, "image too large");
@@ -597,6 +675,37 @@ pub async fn fetch_image_prepared_edged(
     }
 }
 
+/// SOF2 (`0xC2`) is a progressive JPEG. Baseline is SOF0 (`0xC0`).
+fn is_progressive_jpeg(bytes: &[u8]) -> bool {
+    if bytes.len() < 4 || bytes[0] != 0xFF || bytes[1] != 0xD8 {
+        return false;
+    }
+    let mut i = 2;
+    while i + 3 < bytes.len() {
+        if bytes[i] != 0xFF {
+            i += 1;
+            continue;
+        }
+        let marker = bytes[i + 1];
+        if marker == 0xC2 || marker == 0xC6 {
+            return true;
+        }
+        if marker == 0xC0 || marker == 0xC1 || marker == 0xDA {
+            return false;
+        }
+        if marker == 0xD8 || marker == 0xD9 || marker == 0x01 || (0xD0..=0xD7).contains(&marker) {
+            i += 2;
+            continue;
+        }
+        let seglen = u16::from_be_bytes([bytes[i + 2], bytes[i + 3]]) as usize;
+        if seglen < 2 {
+            return false;
+        }
+        i += 2 + seglen;
+    }
+    false
+}
+
 fn looks_like_html(bytes: &[u8]) -> bool {
     bytes.starts_with(b"<") || bytes.starts_with(b"<!DOCTYPE") || bytes.starts_with(b"<!doctype")
 }
@@ -607,27 +716,135 @@ pub(crate) fn downscale_for_ui(bytes: Vec<u8>, edge_px: u32) -> Vec<u8> {
         return bytes;
     };
     let (w, h) = img.dimensions();
-    if w <= edge && h <= edge {
+    // Keep a small PNG or WebP: re-encoding a logo flattens its transparency.
+    // Every JPEG is rewritten below. Some IMDb portraits decode here and still
+    // never appear in iced when the original bytes are handed to the renderer.
+    if w <= edge && h <= edge && !bytes.starts_with(&[0xFF, 0xD8]) {
         return bytes;
     }
     let resized = img.thumbnail(edge, edge);
     let mut out = Vec::new();
+    // Headshots stay under the frame size. Write them as PNG: iced drops some
+    // of the JPEGs IMDb returns, even after a baseline re-encode.
+    let small_jpeg = bytes.starts_with(&[0xFF, 0xD8]) && w <= edge && h <= edge;
+    let format = if resized.color().has_alpha() || small_jpeg {
+        image::ImageFormat::Png
+    } else {
+        image::ImageFormat::Jpeg
+    };
     if resized
-        .write_to(&mut Cursor::new(&mut out), image::ImageFormat::Jpeg)
+        .write_to(&mut Cursor::new(&mut out), format)
         .is_ok()
         && out.len() >= 64
     {
         return out;
     }
-    out.clear();
-    if resized
-        .write_to(&mut Cursor::new(&mut out), image::ImageFormat::Png)
-        .is_ok()
-        && out.len() >= 64
-    {
-        return out;
+    if format != image::ImageFormat::Png {
+        out.clear();
+        if resized
+            .write_to(&mut Cursor::new(&mut out), image::ImageFormat::Png)
+            .is_ok()
+            && out.len() >= 64
+        {
+            return out;
+        }
     }
     bytes
+}
+
+/// Width / height from the container header. Used while painting so a landscape
+/// banner is not center-cropped into a poster, and a real poster still fills.
+pub fn raster_size(bytes: &[u8]) -> Option<(u32, u32)> {
+    if bytes.len() >= 24 && bytes.starts_with(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]) {
+        let w = u32::from_be_bytes(bytes[16..20].try_into().ok()?);
+        let h = u32::from_be_bytes(bytes[20..24].try_into().ok()?);
+        return (w > 0 && h > 0).then_some((w, h));
+    }
+    if bytes.len() >= 10 && bytes.starts_with(b"GIF8") {
+        let w = u16::from_le_bytes(bytes[6..8].try_into().ok()?) as u32;
+        let h = u16::from_le_bytes(bytes[8..10].try_into().ok()?) as u32;
+        return (w > 0 && h > 0).then_some((w, h));
+    }
+    if bytes.len() >= 30 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
+        return webp_size(bytes);
+    }
+    if bytes.len() > 4 && bytes[0] == 0xFF && bytes[1] == 0xD8 {
+        return jpeg_size(bytes);
+    }
+    None
+}
+
+fn webp_size(bytes: &[u8]) -> Option<(u32, u32)> {
+    if bytes.len() >= 30 && &bytes[12..16] == b"VP8X" {
+        let w = 1 + u32::from_le_bytes([bytes[24], bytes[25], bytes[26], 0]);
+        let h = 1 + u32::from_le_bytes([bytes[27], bytes[28], bytes[29], 0]);
+        return (w > 1 && h > 1).then_some((w, h));
+    }
+    if bytes.len() >= 30 && &bytes[12..16] == b"VP8 " {
+        // Lossy: width/height are 14-bit fields at the start of the frame tag.
+        let w = u16::from_le_bytes(bytes[26..28].try_into().ok()?) as u32 & 0x3FFF;
+        let h = u16::from_le_bytes(bytes[28..30].try_into().ok()?) as u32 & 0x3FFF;
+        return (w > 0 && h > 0).then_some((w, h));
+    }
+    if bytes.len() >= 25 && &bytes[12..16] == b"VP8L" {
+        let b = &bytes[21..25];
+        let bits = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+        let w = (bits & 0x3FFF) + 1;
+        let h = ((bits >> 14) & 0x3FFF) + 1;
+        return Some((w, h));
+    }
+    None
+}
+
+fn jpeg_size(bytes: &[u8]) -> Option<(u32, u32)> {
+    let mut i = 2usize;
+    while i + 9 < bytes.len() {
+        if bytes[i] != 0xFF {
+            i += 1;
+            continue;
+        }
+        while i < bytes.len() && bytes[i] == 0xFF {
+            i += 1;
+        }
+        if i >= bytes.len() {
+            break;
+        }
+        let marker = bytes[i];
+        i += 1;
+        if marker == 0xD9 || marker == 0xDA {
+            break;
+        }
+        if marker == 0x01 || (0xD0..=0xD7).contains(&marker) {
+            continue;
+        }
+        if i + 1 >= bytes.len() {
+            break;
+        }
+        let len = u16::from_be_bytes([bytes[i], bytes[i + 1]]) as usize;
+        if len < 2 || i + len > bytes.len() {
+            break;
+        }
+        if matches!(marker, 0xC0 | 0xC1 | 0xC2) && len >= 7 {
+            let h = u16::from_be_bytes([bytes[i + 3], bytes[i + 4]]) as u32;
+            let w = u16::from_be_bytes([bytes[i + 5], bytes[i + 6]]) as u32;
+            if w > 0 && h > 0 {
+                return Some((w, h));
+            }
+        }
+        i += len;
+    }
+    None
+}
+
+/// Portrait art fills the poster frame. Logos, squares and banners stay whole.
+pub fn art_content_fit(handle: &Handle) -> iced::ContentFit {
+    let Handle::Bytes(_, bytes) = handle else {
+        return iced::ContentFit::Contain;
+    };
+    match raster_size(bytes) {
+        Some((w, h)) if h as f32 >= w as f32 * 1.2 => iced::ContentFit::Cover,
+        _ => iced::ContentFit::Contain,
+    }
 }
 
 fn legacy_disk_root() -> PathBuf {
@@ -689,11 +906,84 @@ mod tests {
     use super::*;
 
     #[test]
+    fn imdb_headshot_at_sign_is_percent_encoded() {
+        let raw = "https://m.media-amazon.com/images/M/MV5BMjI0MTg3MzI0M15BMl5BanBnXkFtZTcwMzQyODU2Mw@@._V1_.jpg";
+        let n = normalize_image_url(raw);
+        assert!(n.contains("Mw@@") || n.contains("%40"), "{n}");
+        let mut cache = ImageCache::default();
+        cache.insert_ui_bytes(n, vec![0xFF; 80]);
+        assert!(cache.get(raw).is_some());
+    }
+
+    #[test]
     fn normalize_encodes_unicode_path() {
         let raw = "https://upload.wikimedia.org/wikipedia/fr/thumb/a/a5/Mayotte_La_1ère_-_Logo_2018.svg/1200px-Mayotte_La_1ère_-_Logo_2018.svg.png";
         let n = normalize_image_url(raw);
         assert!(n.contains("%C3%A8") || n.contains("%c3%a8"), "got {n}");
         assert!(!n.contains('è'));
+    }
+
+    #[test]
+    fn portrait_bytes_cover_landscape_bytes_contain() {
+        let poster = Handle::from_bytes(fake_png(600, 900));
+        assert_eq!(art_content_fit(&poster), iced::ContentFit::Cover);
+        let banner = Handle::from_bytes(fake_png(1280, 720));
+        assert_eq!(art_content_fit(&banner), iced::ContentFit::Contain);
+        let logo = Handle::from_bytes(fake_png(256, 256));
+        assert_eq!(art_content_fit(&logo), iced::ContentFit::Contain);
+    }
+
+    #[test]
+    fn downscale_preserves_small_png_and_alpha() {
+        let tiny = image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            24,
+            24,
+            image::Rgba([8, 16, 32, 0]),
+        ));
+        let mut raw = Vec::new();
+        tiny.write_to(&mut Cursor::new(&mut raw), image::ImageFormat::Png)
+            .unwrap();
+        assert_eq!(downscale_for_ui(raw.clone(), 160), raw);
+
+        let wide = image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            400,
+            120,
+            image::Rgba([8, 16, 32, 128]),
+        ));
+        let mut big = Vec::new();
+        wide.write_to(&mut Cursor::new(&mut big), image::ImageFormat::Png)
+            .unwrap();
+        let out = downscale_for_ui(big, 160);
+        assert!(
+            out.starts_with(&[0x89, b'P', b'N', b'G']),
+            "alpha downscale must stay PNG"
+        );
+        assert!(image::load_from_memory(&out).unwrap().color().has_alpha());
+    }
+
+    fn fake_png(w: u32, h: u32) -> Vec<u8> {
+        let mut b = vec![0u8; 24];
+        b[0..8].copy_from_slice(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]);
+        b[16..20].copy_from_slice(&w.to_be_bytes());
+        b[20..24].copy_from_slice(&h.to_be_bytes());
+        b
+    }
+
+    #[test]
+    fn progressive_headshot_is_rewritten_to_baseline() {
+        let path = r"C:\Users\dxtrp\AppData\Local\Temp\steve-golin.jpg";
+        let Ok(bytes) = std::fs::read(path) else {
+            return;
+        };
+        assert!(is_progressive_jpeg(&bytes));
+        let out = downscale_for_ui(bytes, 480);
+        assert!(!is_progressive_jpeg(&out), "cast photo stayed progressive");
+        let img = image::load_from_memory(&out).unwrap().to_rgba8();
+        let p = *img.get_pixel(img.width() / 2, img.height() / 5);
+        assert!(
+            p[0] > 15 || p[1] > 15 || p[2] > 15,
+            "rewritten portrait decoded blank: {p:?}"
+        );
     }
 
     #[test]

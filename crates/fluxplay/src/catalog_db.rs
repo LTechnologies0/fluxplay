@@ -39,6 +39,53 @@ pub enum BundleApplyKind {
     Updated { preserved_meta: usize },
 }
 
+/// Which catalog tables to deserialize. The inactive tab stays on disk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CatalogParts {
+    pub channels: bool,
+    pub vod: bool,
+    pub series: bool,
+    pub epg: bool,
+}
+
+impl CatalogParts {
+    pub const fn all() -> Self {
+        Self {
+            channels: true,
+            vod: true,
+            series: true,
+            epg: true,
+        }
+    }
+
+    pub const fn live() -> Self {
+        Self {
+            channels: true,
+            vod: false,
+            series: false,
+            epg: true,
+        }
+    }
+
+    pub const fn vod() -> Self {
+        Self {
+            channels: false,
+            vod: true,
+            series: false,
+            epg: false,
+        }
+    }
+
+    pub const fn series() -> Self {
+        Self {
+            channels: false,
+            vod: false,
+            series: true,
+            epg: false,
+        }
+    }
+}
+
 pub struct CatalogDb {
     /// One SQLite connection per IPTV profile (`MediaSource.id`).
     conns: HashMap<Uuid, Connection>,
@@ -156,25 +203,26 @@ impl CatalogDb {
 
     /// True when every open profile is warm enough to skip portal re-sync.
     pub fn is_sync_fresh(&self) -> bool {
+        !self.sync_older_than(SYNC_FRESH_SECS)
+    }
+
+    /// True when a profile has never synced, or the last full sync is older than `secs`.
+    pub fn sync_older_than(&self, secs: u64) -> bool {
         if self.conns.is_empty() {
-            return false;
+            return true;
         }
         let (ch, vod, series) = self.counts();
         if ch + vod + series == 0 {
-            debug!("catalog sync not fresh — empty");
-            return false;
+            return true;
         }
         for id in self.source_ids() {
-            let Some(ts) = self.last_full_sync_secs(id) else {
-                debug!(%id, "catalog sync not fresh — no last_full_sync");
-                return false;
-            };
-            if now_secs().saturating_sub(ts) >= SYNC_FRESH_SECS {
-                debug!(%id, "catalog sync not fresh — stale");
-                return false;
+            match self.last_full_sync_secs(id) {
+                None => return true,
+                Some(ts) if now_secs().saturating_sub(ts) >= secs => return true,
+                Some(_) => {}
             }
         }
-        true
+        false
     }
 
     /// Remove profile DB + on-disk folder.
@@ -224,6 +272,32 @@ impl CatalogDb {
         }
 
         let sid = source_id.to_string();
+        // A 429 or a cut-off dump must not replace a full catalog with a handful of rows.
+        {
+            let conn = self.conn(source_id)?;
+            let old_ch = source_row_count(conn, "channels", &sid);
+            let old_vod = source_row_count(conn, "vod", &sid);
+            let old_series = source_row_count(conn, "series", &sid);
+            if dump_collapsed(old_ch, part.channels.len())
+                || dump_collapsed(old_vod, part.vod.len())
+                || dump_collapsed(old_series, part.series.len())
+            {
+                warn!(
+                    %source_id,
+                    old_ch,
+                    new_ch = part.channels.len(),
+                    old_vod,
+                    new_vod = part.vod.len(),
+                    old_series,
+                    new_series = part.series.len(),
+                    "catalog dump too small — kept the rows already stored"
+                );
+                return Err(rusqlite::Error::SqliteFailure(
+                    rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CONSTRAINT),
+                    Some("catalog dump too small — kept previous rows".into()),
+                ));
+            }
+        }
         let enriched_vod = self.load_enriched_vod_map(source_id, &sid)?;
         let enriched_series = self.load_enriched_series_map(source_id, &sid)?;
         let preserved_meta = enriched_vod.len() + enriched_series.len();
@@ -471,7 +545,7 @@ impl CatalogDb {
         let mut map = HashMap::new();
         let conn = self.conn(source_id)?;
         let mut stmt = conn.prepare(
-            "SELECT id, payload FROM series WHERE source_id = ?1 AND meta_ok = 1",
+            "SELECT id, payload FROM series WHERE source_id = ?1",
         )?;
         let rows = stmt.query_map(params![sid], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
@@ -634,7 +708,7 @@ impl CatalogDb {
             let Ok(conn) = self.conn(id) else {
                 continue;
             };
-            Self::load_bundle_from_conn(conn, &mut bundle)?;
+            Self::load_bundle_from_conn(conn, &mut bundle, CatalogParts::all())?;
         }
         info!(
             categories = bundle.categories.len(),
@@ -647,7 +721,34 @@ impl CatalogDb {
         Ok(bundle)
     }
 
-    fn load_bundle_from_conn(conn: &Connection, bundle: &mut PlaylistBundle) -> rusqlite::Result<()> {
+    pub fn load_bundle_parts(
+        &self,
+        ids: &[Uuid],
+        parts: CatalogParts,
+    ) -> rusqlite::Result<PlaylistBundle> {
+        let _prof = fluxplay_core::Stopwatch::start("catalog_load_parts");
+        let mut bundle = PlaylistBundle::default();
+        for &id in ids {
+            let Ok(conn) = self.conn(id) else {
+                continue;
+            };
+            Self::load_bundle_from_conn(conn, &mut bundle, parts)?;
+        }
+        info!(
+            channels = bundle.channels.len(),
+            vod = bundle.vod.len(),
+            series = bundle.series.len(),
+            ?parts,
+            "catalog load_parts"
+        );
+        Ok(bundle)
+    }
+
+    fn load_bundle_from_conn(
+        conn: &Connection,
+        bundle: &mut PlaylistBundle,
+        parts: CatalogParts,
+    ) -> rusqlite::Result<()> {
         {
             let mut stmt = conn.prepare("SELECT id, name, content FROM categories")?;
             let rows = stmt.query_map([], |row| {
@@ -666,7 +767,7 @@ impl CatalogDb {
                 bundle.categories.push(r);
             }
         }
-        {
+        if parts.channels {
             let mut stmt = conn.prepare("SELECT payload FROM channels")?;
             let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
             for raw in rows.flatten() {
@@ -675,7 +776,7 @@ impl CatalogDb {
                 }
             }
         }
-        {
+        if parts.vod {
             let mut stmt = conn.prepare("SELECT payload FROM vod")?;
             let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
             for raw in rows.flatten() {
@@ -684,7 +785,7 @@ impl CatalogDb {
                 }
             }
         }
-        {
+        if parts.series {
             let mut stmt = conn.prepare("SELECT payload FROM series")?;
             let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
             for raw in rows.flatten() {
@@ -695,7 +796,7 @@ impl CatalogDb {
                 }
             }
         }
-        {
+        if parts.epg {
             // What is on now and next, not the far future: `DESC LIMIT` kept the last
             // 8000 programmes of the guide and dropped today's.
             let now = chrono::Utc::now();
@@ -931,6 +1032,7 @@ impl CatalogDb {
             country: None,
             category_id: None,
             source_id: Some(source_id),
+            added: None,
         });
         if year.is_some() {
             item.year = year.map(str::to_string);
@@ -1019,6 +1121,7 @@ impl CatalogDb {
             seasons: Vec::new(),
             source_id: Some(source_id),
             category_id: None,
+            added: None,
         });
         if year.is_some() {
             item.year = year.map(str::to_string);
@@ -1057,6 +1160,55 @@ impl CatalogDb {
             params![payload, item.year, item.genre, sid, item.id],
         )?;
         Ok(())
+    }
+
+    /// Fill actors, director and runtime on series rows that were saved from the
+    /// list before `cast` was kept. Seasons and an existing synopsis stay.
+    pub fn patch_series_credits(
+        &self,
+        source_id: Uuid,
+        rows: &[(String, Option<String>, Option<String>, Option<String>)],
+    ) -> rusqlite::Result<usize> {
+        let sid = source_id.to_string();
+        let Ok(conn) = self.conn(source_id) else {
+            return Ok(0);
+        };
+        let tx = conn.unchecked_transaction()?;
+        let mut updated = 0usize;
+        for (id, actors, director, runtime) in rows {
+            let Some(actors) = actors.as_ref().filter(|s| !s.trim().is_empty()) else {
+                continue;
+            };
+            let raw: String = match tx.query_row(
+                "SELECT payload FROM series WHERE source_id = ?1 AND id = ?2",
+                params![sid, id],
+                |row| row.get(0),
+            ) {
+                Ok(raw) => raw,
+                Err(_) => continue,
+            };
+            let Ok(mut item) = serde_json::from_str::<SeriesItem>(&raw) else {
+                continue;
+            };
+            if item.actors.as_ref().is_some_and(|s| !s.trim().is_empty()) {
+                continue;
+            }
+            item.actors = Some(actors.clone());
+            if item.director.as_ref().map(|s| s.trim().is_empty()).unwrap_or(true) {
+                item.director = director.clone();
+            }
+            if item.runtime.as_ref().map(|s| s.trim().is_empty()).unwrap_or(true) {
+                item.runtime = runtime.clone();
+            }
+            let payload = serde_json::to_string(&item).unwrap_or_default();
+            tx.execute(
+                "UPDATE series SET payload = ?1, meta_ok = 1 WHERE source_id = ?2 AND id = ?3",
+                params![payload, sid, id],
+            )?;
+            updated += 1;
+        }
+        tx.commit()?;
+        Ok(updated)
     }
 
     /// OMDb/TVMaze response cache — avoids re-fetching the same cleaned title.
@@ -1581,6 +1733,21 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
+fn source_row_count(conn: &Connection, table: &str, sid: &str) -> i64 {
+    let sql = format!("SELECT COUNT(*) FROM {table} WHERE source_id = ?1");
+    conn.query_row(&sql, params![sid], |r| r.get(0))
+        .unwrap_or(0)
+}
+
+/// A portal answer that is empty or a small fraction of a large catalog is a
+/// failed fetch, not a real deletion. Keep the rows already stored.
+fn dump_collapsed(old: i64, new: usize) -> bool {
+    if old < 500 {
+        return false;
+    }
+    new == 0 || (old >= 2000 && (new as i64) * 5 < old)
+}
+
 fn checksum_meta_key(source_id: Uuid) -> String {
     format!("source_cksum:{source_id}")
 }
@@ -1690,8 +1857,16 @@ pub fn ingest_one_blocking(
 
 /// Load merged bundle off the UI thread (read path; WAL-friendly).
 pub fn load_bundle_blocking(source_ids: &[Uuid]) -> Result<PlaylistBundle, String> {
+    load_bundle_parts_blocking(source_ids, CatalogParts::all())
+}
+
+pub fn load_bundle_parts_blocking(
+    source_ids: &[Uuid],
+    parts: CatalogParts,
+) -> Result<PlaylistBundle, String> {
     let db = CatalogDb::open(source_ids).ok_or_else(|| "catalog db open failed".to_string())?;
-    db.load_bundle_of(source_ids).map_err(|e| e.to_string())
+    db.load_bundle_parts(source_ids, parts)
+        .map_err(|e| e.to_string())
 }
 
 pub fn portal_checksum(part: &PlaylistBundle) -> String {
@@ -1757,11 +1932,15 @@ pub fn portal_checksum(part: &PlaylistBundle) -> String {
                 v.name.as_str(),
                 v.poster.as_deref().unwrap_or(""),
                 v.category_id.as_deref().unwrap_or(""),
+                v.year.as_deref().unwrap_or(""),
+                v.rating.as_deref().unwrap_or(""),
+                v.genre.as_deref().unwrap_or(""),
+                v.added.unwrap_or(0),
             )
         })
         .collect();
     vod.sort_unstable_by(|a, b| a.0.cmp(b.0));
-    for (id, url, name, poster, cat) in vod {
+    for (id, url, name, poster, cat, year, rating, genre, added) in vod {
         hasher.update(id.as_bytes());
         hasher.update([0]);
         hasher.update(url.as_bytes());
@@ -1771,6 +1950,13 @@ pub fn portal_checksum(part: &PlaylistBundle) -> String {
         hasher.update(poster.as_bytes());
         hasher.update([0]);
         hasher.update(cat.as_bytes());
+        hasher.update([0]);
+        hasher.update(year.as_bytes());
+        hasher.update([0]);
+        hasher.update(rating.as_bytes());
+        hasher.update([0]);
+        hasher.update(genre.as_bytes());
+        hasher.update(added.to_le_bytes());
         hasher.update([0xff]);
     }
 
@@ -1785,13 +1971,18 @@ pub fn portal_checksum(part: &PlaylistBundle) -> String {
                 s.cover.as_deref().unwrap_or(""),
                 s.banner.as_deref().unwrap_or(""),
                 s.category_id.as_deref().unwrap_or(""),
+                s.year.as_deref().unwrap_or(""),
+                s.rating.as_deref().unwrap_or(""),
+                s.genre.as_deref().unwrap_or(""),
+                s.actors.as_deref().unwrap_or(""),
+                s.added.unwrap_or(0),
                 s.seasons.len(),
                 ep_count,
             )
         })
         .collect();
     series.sort_unstable_by(|a, b| a.0.cmp(b.0));
-    for (id, name, cover, banner, cat, seasons, eps) in series {
+    for (id, name, cover, banner, cat, year, rating, genre, actors, added, seasons, eps) in series {
         hasher.update(id.as_bytes());
         hasher.update([0]);
         hasher.update(name.as_bytes());
@@ -1802,6 +1993,14 @@ pub fn portal_checksum(part: &PlaylistBundle) -> String {
         hasher.update([0]);
         hasher.update(cat.as_bytes());
         hasher.update([0]);
+        hasher.update(year.as_bytes());
+        hasher.update([0]);
+        hasher.update(rating.as_bytes());
+        hasher.update([0]);
+        hasher.update(genre.as_bytes());
+        hasher.update([0]);
+        hasher.update(actors.as_bytes());
+        hasher.update(added.to_le_bytes());
         hasher.update(seasons.to_le_bytes());
         hasher.update(eps.to_le_bytes());
         hasher.update([0xff]);

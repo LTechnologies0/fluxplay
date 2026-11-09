@@ -214,6 +214,9 @@ pub struct VodItem {
     pub country: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub category_id: Option<String>,
+    /// Unix time the portal added this title. Missing on rows saved before this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub added: Option<i64>,
     pub source_id: Option<Uuid>,
 }
 
@@ -256,6 +259,9 @@ pub struct SeriesItem {
     pub source_id: Option<Uuid>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub category_id: Option<String>,
+    /// Unix time the portal added this series.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub added: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -278,6 +284,9 @@ pub struct SeriesEpisode {
     pub runtime: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub airdate: Option<String>,
+    /// Recommended age for this episode (`16`, `TV-14`…). Empty when the portal has none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rated: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub still: Option<String>,
 }
@@ -652,6 +661,30 @@ impl VideoQualityPref {
             Self::P1440 => "1440p",
             Self::P2160 => "4K / UHD",
         }
+    }
+
+    pub fn short_label(self) -> &'static str {
+        match self {
+            Self::Auto => "Auto",
+            Self::P360 => "360p",
+            Self::P480 => "480p",
+            Self::P720 => "720p",
+            Self::P1080 => "1080p",
+            Self::P1440 => "1440p",
+            Self::P2160 => "4K",
+        }
+    }
+
+    pub fn all() -> &'static [Self] {
+        &[
+            Self::Auto,
+            Self::P360,
+            Self::P480,
+            Self::P720,
+            Self::P1080,
+            Self::P1440,
+            Self::P2160,
+        ]
     }
 
     /// Max soft-present size when forced (even dims).
@@ -1067,6 +1100,12 @@ pub struct AppSettings {
     pub theme: ThemeMode,
     #[serde(default)]
     pub accent: AccentPreset,
+    /// Free color from the gradient picker. When set, it replaces `accent`.
+    #[serde(default)]
+    pub custom_accent: Option<[u8; 3]>,
+    /// Text color. `None` keeps the theme default.
+    #[serde(default)]
+    pub custom_ink: Option<[u8; 3]>,
     pub last_source_id: Option<Uuid>,
     pub volume: f32,
     pub remember_position: bool,
@@ -1086,6 +1125,9 @@ pub struct AppSettings {
     /// After ~75% of a series episode, prefetch the next episode to disk.
     #[serde(default = "default_true")]
     pub prefetch_next_episode: bool,
+    /// Jump past the opening and the end credits without asking.
+    #[serde(default)]
+    pub skip_credits_auto: bool,
     /// Cap for GUI periodic work (chrome autohide, prefetch pacing).
     #[serde(default)]
     pub fps_gui: FpsCapPref,
@@ -1124,6 +1166,12 @@ pub struct AppSettings {
     /// OMDb API key (IMDb gateway). Env `OMDB_API_KEY` overrides when set.
     #[serde(default)]
     pub omdb_api_key: String,
+    /// TMDB read-access token or v3 key. Env `TMDB_API_KEY` overrides when set.
+    #[serde(default)]
+    pub tmdb_api_key: String,
+    /// The first-launch question was answered. Stays quiet after that.
+    #[serde(default)]
+    pub tmdb_prompt_done: bool,
     /// DNS / WireGuard prefs for app HTTP (catalog, art, metadata).
     #[serde(default)]
     pub network: NetworkSettings,
@@ -1144,6 +1192,28 @@ pub struct AppSettings {
     /// Hide live channels, films and series not available in `pref_lang`.
     #[serde(default)]
     pub only_pref_lang: bool,
+    /// Hide films and series rated at or below this age (`0` = tout public).
+    /// `None` keeps the younger titles.
+    #[serde(default)]
+    pub hide_age_under: Option<u8>,
+    /// Hide films and series rated at or above this age (`18` = adults only).
+    /// `None` keeps the older titles.
+    #[serde(default)]
+    pub hide_age_over: Option<u8>,
+    /// Resume positions for films and episodes. Not one row per play.
+    #[serde(default)]
+    pub watch: Vec<WatchPoint>,
+    /// Series the viewer asked to be told about when a new episode appears.
+    #[serde(default)]
+    pub episode_alerts: Vec<EpisodeAlert>,
+}
+
+/// A series already on air, watched for a new episode.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EpisodeAlert {
+    pub series_id: String,
+    pub name: String,
+    pub episodes: u32,
 }
 
 fn default_true() -> bool {
@@ -1162,6 +1232,54 @@ pub struct RecentChannel {
     pub name: String,
     pub stream_url: String,
     pub played_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
+    /// Live TV is not kept. Older saves omit this and default to live.
+    #[serde(default)]
+    pub kind: ContentKind,
+    /// Poster saved with the play, so history can show the same art as the catalog.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logo: Option<String>,
+    /// Series history: which episode this entry resumes (`S02E04`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+/// Playback position for one film or episode, keyed by its catalog URL.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WatchPoint {
+    pub url: String,
+    pub position_secs: f64,
+    pub duration_secs: f64,
+    /// Unix seconds. Newest watch wins when several episodes of a series were played.
+    #[serde(default)]
+    pub at: i64,
+}
+
+/// `Show — Episode title` and `Show` are the same series in history.
+pub fn series_history_key(name: &str) -> String {
+    let head = name.split(" — ").next().unwrap_or(name);
+    let head = head.split(" – ").next().unwrap_or(head);
+    head.trim().to_lowercase()
+}
+
+impl RecentChannel {
+    /// Films and series only. A save from before `kind` existed still counts
+    /// when the group was the VOD / series marker.
+    pub fn is_media(&self) -> bool {
+        match self.kind {
+            ContentKind::Vod | ContentKind::Series => true,
+            ContentKind::Live => matches!(self.group.as_deref(), Some("VOD") | Some("Séries")),
+        }
+    }
+
+    pub fn media_kind(&self) -> ContentKind {
+        match self.kind {
+            ContentKind::Live if self.group.as_deref() == Some("Séries") => ContentKind::Series,
+            ContentKind::Live if self.group.as_deref() == Some("VOD") => ContentKind::Vod,
+            other => other,
+        }
+    }
 }
 
 impl Default for AppSettings {
@@ -1169,6 +1287,8 @@ impl Default for AppSettings {
         Self {
             theme: ThemeMode::System,
             accent: AccentPreset::Teal,
+            custom_accent: None,
+            custom_ink: None,
             last_source_id: None,
             volume: 0.85,
             remember_position: true,
@@ -1179,6 +1299,7 @@ impl Default for AppSettings {
             demux_secs: 8.0,
             low_latency: false,
             prefetch_next_episode: true,
+            skip_credits_auto: false,
             fps_gui: FpsCapPref::Auto,
             fps_video: FpsCapPref::Auto,
             video_quality: VideoQualityPref::Auto,
@@ -1193,12 +1314,18 @@ impl Default for AppSettings {
             favorites: Vec::new(),
             recent: Vec::new(),
             omdb_api_key: String::new(),
+            tmdb_api_key: String::new(),
+            tmdb_prompt_done: false,
             network: NetworkSettings::default(),
             gpu_choice: String::new(),
             download_dir: String::new(),
             pref_lang: String::new(),
             translate_meta: true,
             only_pref_lang: false,
+            hide_age_under: None,
+            hide_age_over: None,
+            watch: Vec::new(),
+            episode_alerts: Vec::new(),
         }
     }
 }
@@ -1218,9 +1345,103 @@ impl AppSettings {
         self.favorites.iter().any(|f| f == channel_id)
     }
 
+    pub fn watch_get(&self, url: &str) -> Option<&WatchPoint> {
+        self.watch.iter().find(|w| w.url == url)
+    }
+
+    /// Fraction watched, when we know the length. `None` if it was only opened.
+    pub fn watch_ratio(&self, url: &str) -> Option<f32> {
+        let w = self.watch_get(url)?;
+        if w.position_secs < 8.0 || w.duration_secs <= 20.0 {
+            return None;
+        }
+        Some((w.position_secs / w.duration_secs).clamp(0.0, 1.0) as f32)
+    }
+
+    pub fn note_watch(&mut self, url: &str, position: f64, duration: f64) {
+        if url.is_empty() || position < 8.0 {
+            return;
+        }
+        let at = Utc::now().timestamp();
+        if let Some(w) = self.watch.iter_mut().find(|w| w.url == url) {
+            w.position_secs = position;
+            if duration > 1.0 {
+                w.duration_secs = duration;
+            }
+            w.at = at;
+        } else {
+            self.watch.push(WatchPoint {
+                url: url.to_string(),
+                position_secs: position,
+                duration_secs: duration.max(0.0),
+                at,
+            });
+        }
+        if self.watch.len() > 400 {
+            self.watch.sort_by_key(|w| w.at);
+            let drop_n = self.watch.len() - 400;
+            self.watch.drain(0..drop_n);
+        }
+    }
+
+    /// One history row per series. Older builds stored one row per episode.
+    pub fn fold_series_history(&mut self) {
+        let mut seen = std::collections::HashSet::new();
+        self.recent.retain(|r| {
+            if r.media_kind() != ContentKind::Series {
+                return true;
+            }
+            seen.insert(series_history_key(&r.name))
+        });
+    }
+
+    /// Replace every episode row of this series with a single resume entry.
+    pub fn push_series_recent(
+        &mut self,
+        series_id: &str,
+        series_name: &str,
+        episode_url: &str,
+        poster: Option<String>,
+        note: Option<String>,
+    ) {
+        let key = series_history_key(series_name);
+        self.recent.retain(|r| {
+            if r.media_kind() != ContentKind::Series {
+                return true;
+            }
+            r.channel_id != series_id && series_history_key(&r.name) != key
+        });
+        self.recent.insert(
+            0,
+            RecentChannel {
+                channel_id: series_id.to_string(),
+                name: series_name.to_string(),
+                stream_url: episode_url.to_string(),
+                played_at: Utc::now(),
+                group: Some("Séries".into()),
+                kind: ContentKind::Series,
+                logo: poster,
+                note,
+            },
+        );
+        let mut kept = 0usize;
+        self.recent.retain(|r| {
+            if r.media_kind() != ContentKind::Series {
+                return true;
+            }
+            kept += 1;
+            kept <= 40
+        });
+    }
+
     pub fn push_recent(&mut self, ch: &Channel) {
-        trace!(channel_id = %ch.id, name = %ch.name, "push_recent");
-        self.recent.retain(|r| r.channel_id != ch.id);
+        if ch.kind == ContentKind::Live {
+            return;
+        }
+        trace!(channel_id = %ch.id, name = %ch.name, kind = ?ch.kind, "push_recent");
+        self.recent.retain(|r| {
+            r.is_media() && r.channel_id != ch.id && r.stream_url != ch.stream_url
+        });
         self.recent.insert(
             0,
             RecentChannel {
@@ -1228,9 +1449,33 @@ impl AppSettings {
                 name: ch.name.clone(),
                 stream_url: ch.stream_url.clone(),
                 played_at: Utc::now(),
+                group: ch.group.clone(),
+                kind: ch.kind,
+                logo: ch.logo.clone().or_else(|| ch.tvg_logo.clone()),
+                note: None,
             },
         );
-        self.recent.truncate(30);
+        // Keep films and series apart so one kind does not erase the other.
+        let mut kept = 0usize;
+        self.recent.retain(|r| {
+            if r.media_kind() != ch.kind {
+                return true;
+            }
+            kept += 1;
+            kept <= 40
+        });
+    }
+
+    pub fn clear_recent_kind(&mut self, kind: ContentKind) {
+        self.recent.retain(|r| r.media_kind() != kind);
+    }
+
+    pub fn remove_recent(&mut self, key: &str) {
+        if key.is_empty() {
+            return;
+        }
+        self.recent
+            .retain(|r| r.stream_url != key && r.channel_id != key);
     }
 }
 

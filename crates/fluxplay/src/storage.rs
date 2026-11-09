@@ -92,8 +92,12 @@ pub fn validate_downloads_dir(custom: &str) -> Result<String, String> {
     Ok(dir.to_string_lossy().into_owned())
 }
 
-/// `/home/me/x` → `~/x` for labels.
+/// `/home/me/x` → `~/x` for labels. Windows keeps the real path (`~` means nothing
+/// in Explorer).
 pub fn display_path(path: &Path) -> String {
+    if cfg!(windows) {
+        return path.display().to_string();
+    }
     if let Some(home) = dirs::home_dir() {
         if let Ok(rest) = path.strip_prefix(&home) {
             return if rest.as_os_str().is_empty() {
@@ -246,7 +250,9 @@ mod tests {
         assert_eq!(downloads_dir("  "), default_downloads_dir());
         if let Some(home) = dirs::home_dir() {
             assert_eq!(downloads_dir("~/Films"), home.join("Films"));
-            assert_eq!(display_path(&home.join("Films")), "~/Films");
+            if !cfg!(windows) {
+                assert_eq!(display_path(&home.join("Films")), "~/Films");
+            }
         }
         assert_eq!(downloads_dir("/srv/media"), PathBuf::from("/srv/media"));
     }
