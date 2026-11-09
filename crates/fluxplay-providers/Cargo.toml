@@ -27,3 +27,4 @@ flate2 = "1"
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 tracing-subscriber = { workspace = true }
+proptest = { workspace = true }

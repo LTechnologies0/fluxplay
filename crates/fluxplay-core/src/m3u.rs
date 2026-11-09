@@ -270,6 +270,7 @@ fn parse_bare_urls(text: &str, source_id: Option<Uuid>) -> PlaylistBundle {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     #[test]
     fn parses_classic_m3u_plus() {
@@ -304,5 +305,28 @@ http://cdn.example/3.ts
         assert_eq!(ch[1].epg_channel_id.as_deref(), Some("tf1.fr"));
         assert_eq!(ch[2].tvg_id, None);
         assert_eq!(ch[2].id, "ch-3");
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
+        /// Fuzz-style: arbitrary bytes must not panic the M3U parser.
+        #[test]
+        fn parse_m3u_never_panics(body in "\\PC{0,2000}") {
+            let _ = parse_m3u(&body, None);
+        }
+
+        #[test]
+        fn valid_skeleton_always_ok(
+            name in "[A-Za-z0-9 ]{1,40}",
+            url_host in "[a-z0-9.-]{1,20}",
+        ) {
+            let body = format!(
+                "#EXTM3U\n#EXTINF:-1,{name}\nhttps://{url_host}/stream.ts\n"
+            );
+            let bundle = parse_m3u(&body, None);
+            prop_assert!(bundle.is_ok(), "{bundle:?}");
+            prop_assert_eq!(bundle.unwrap().channels.len(), 1);
+        }
     }
 }

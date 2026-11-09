@@ -43,8 +43,6 @@ pub enum Icon {
     Forward10,
     #[allow(dead_code)]
     Stop,
-    #[allow(dead_code)]
-    Playlist,
     SkipPrevious,
     SkipNext,
     ChevronLeft,
@@ -85,7 +83,6 @@ impl Icon {
             Self::Replay10 => include_bytes!("../assets/icons/replay_10.svg"),
             Self::Forward10 => include_bytes!("../assets/icons/forward_10.svg"),
             Self::Stop => include_bytes!("../assets/icons/stop.svg"),
-            Self::Playlist => include_bytes!("../assets/icons/playlist_play.svg"),
             Self::SkipPrevious => include_bytes!("../assets/icons/skip_previous.svg"),
             Self::SkipNext => include_bytes!("../assets/icons/skip_next.svg"),
             Self::ChevronLeft => include_bytes!("../assets/icons/chevron_left.svg"),
@@ -97,7 +94,45 @@ impl Icon {
 
     #[cfg(not(target_os = "android"))]
     pub fn handle(self) -> SvgHandle {
-        SvgHandle::from_memory(self.bytes())
+        // One Arc per icon for the process lifetime — avoids re-wrapping static
+        // bytes on every chrome paint (nav rail / player transport).
+        use std::sync::OnceLock;
+        static HANDLES: OnceLock<Vec<SvgHandle>> = OnceLock::new();
+        let handles = HANDLES.get_or_init(|| {
+            [
+                Self::LiveTv,
+                Self::Movie,
+                Self::Series,
+                Self::Favorite,
+                Self::Epg,
+                Self::Sources,
+                Self::Settings,
+                Self::Add,
+                Self::Delete,
+                Self::Refresh,
+                Self::Paste,
+                Self::Play,
+                Self::Pause,
+                Self::VolumeUp,
+                Self::VolumeOff,
+                Self::Fullscreen,
+                Self::Close,
+                Self::More,
+                Self::Search,
+                Self::FolderOpen,
+                Self::Diagnose,
+                Self::Check,
+                Self::Replay10,
+                Self::Forward10,
+                Self::Stop,
+                Self::SkipPrevious,
+                Self::SkipNext,
+            ]
+            .into_iter()
+            .map(|k| SvgHandle::from_memory(k.bytes()))
+            .collect()
+        });
+        handles[self as usize].clone()
     }
 
     /// Raster PNG for Android GLES (white silhouette + alpha; tinted at draw time).
@@ -133,7 +168,6 @@ impl Icon {
             Self::Replay10 => include_bytes!("../assets/icons/png/replay_10.png"),
             Self::Forward10 => include_bytes!("../assets/icons/png/forward_10.png"),
             Self::Stop => include_bytes!("../assets/icons/png/stop.png"),
-            Self::Playlist => include_bytes!("../assets/icons/png/playlist_play.png"),
             Self::SkipPrevious => include_bytes!("../assets/icons/png/skip_previous.png"),
             Self::SkipNext => include_bytes!("../assets/icons/png/skip_next.png"),
             Self::ChevronLeft | Self::ChevronRight | Self::ExpandMore | Self::Bell => {
@@ -143,7 +177,7 @@ impl Icon {
     }
 
     /// ASCII-safe glyphs (Fira Sans / NativeActivity — no emoji).
-    #[allow(dead_code)]
+    #[cfg(target_os = "android")]
     pub fn text_glyph(self) -> &'static str {
         match self {
             Self::LiveTv => "TV",
@@ -173,7 +207,6 @@ impl Icon {
             Self::Replay10 => "-10",
             Self::Forward10 => "+10",
             Self::Stop => "[]",
-            Self::Playlist => "PL",
             Self::SkipPrevious => "<<",
             Self::SkipNext => ">>",
             Self::ChevronLeft => "<",

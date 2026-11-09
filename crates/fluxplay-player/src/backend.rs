@@ -123,21 +123,6 @@ impl BackendCaps {
     }
 }
 
-/// Soft RGBA into iced needs CPU-readable frames: map each zero-copy API to its
-/// `*-copy` twin. Already-`*-copy` / `no` names pass through.
-fn soft_hwdec_name(preferred: &str) -> &str {
-    match preferred {
-        "vaapi" => "vaapi-copy",
-        "cuda" | "nvdec" => "cuda-copy",
-        "d3d11va" => "d3d11va-copy",
-        "dxva2" => "dxva2-copy",
-        "videotoolbox" => "videotoolbox-copy",
-        "vulkan" => "vulkan-copy",
-        "auto" | "auto-safe" => "auto-copy",
-        other => other,
-    }
-}
-
 fn preferred_hwdec() -> &'static str {
     #[cfg(target_os = "android")]
     {
@@ -170,22 +155,13 @@ fn preferred_hwdec() -> &'static str {
                 lower.as_str(),
                 "no" | "none" | "software" | "auto" | "auto-safe" | "auto-copy"
                     | "vaapi" | "vaapi-copy" | "cuda" | "cuda-copy" | "nvdec" | "nvdec-copy"
-                    | "vulkan" | "vulkan-copy" | "d3d11va" | "d3d11va-copy" | "dxva2"
-                    | "dxva2-copy" | "videotoolbox" | "videotoolbox-copy"
+                    | "vulkan" | "d3d11va" | "d3d11va-copy" | "dxva2" | "dxva2-copy"
+                    | "videotoolbox"
             ) {
                 return Box::leak(lower.into_boxed_str());
             }
         }
-        // Soft present maps these to `*-copy` so iced gets CPU-readable frames.
-        // `auto` works everywhere; a platform default still helps when mpv's probe
-        // order prefers a zero-copy API that soft VO cannot use.
-        if cfg!(target_os = "windows") {
-            "d3d11va"
-        } else if cfg!(target_os = "macos") {
-            "videotoolbox"
-        } else {
-            "auto"
-        }
+        "auto"
     }
 }
 
@@ -737,6 +713,16 @@ enum SoftShot {
 }
 
 /// Controls native playback (in-process libmpv / FFmpeg, optional CLI child).
+/// One audio or subtitle track reported by the player.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MediaTrack {
+    pub id: i64,
+    pub label: String,
+    /// ISO-ish code from the demuxer (`fre`, `jpn`), empty when unknown.
+    pub lang: String,
+    pub selected: bool,
+}
+
 pub struct NativePlayer {
     backend: Option<BackendId>,
     #[cfg(all(feature = "native-mpv", fluxplay_has_libmpv))]
@@ -1065,18 +1051,24 @@ fn snapshot_scaled(w: u32, h: u32, pixels: &[u8]) -> (u32, u32, Arc<[u8]>) {
     /// Monitor refresh for soft present and native `display-fps-override`.
     pub fn set_present_hz(&mut self, hz: u32) {
         let hz = hz.clamp(24, 120);
-        self.present_hz = hz;
+        if self.present_hz == hz {
+            return;
+        }
         #[cfg(all(feature = "native-ffmpeg", fluxplay_has_ffmpeg))]
         if let Some(ff) = self.libffmpeg.as_ref() {
             ff.set_present_hz(hz);
         }
+        // This runs on every new frame. A blocking mpv lock here waits behind
+        // the render thread and freezes the picture for as long as that wait.
         #[cfg(all(feature = "native-mpv", fluxplay_has_libmpv))]
-        if self.android_present.uses_native_window() {
-            if let Some(mpv) = self.lock_mpv() {
-                let fps = format!("{hz}");
-                let _ = mpv.set_property("display-fps-override", &fps);
-            }
+        if self.android_present.uses_native_window() || self.android_present.uses_soft_rgba() {
+            let Some(mpv) = self.try_lock_mpv() else {
+                return;
+            };
+            let fps = format!("{hz}");
+            let _ = mpv.set_property("display-fps-override", &fps);
         }
+        self.present_hz = hz;
     }
 
     /// Next frame for the GPU video stage (embedded libmpv RGBA / FFmpeg YUV or
@@ -1728,6 +1720,45 @@ fn snapshot_scaled(w: u32, h: u32, pixels: &[u8]) -> (u32, u32, Arc<[u8]>) {
         Ok(())
     }
 
+    /// Audio or subtitle tracks. `None` means the player lock was busy — keep
+    /// the previous list instead of painting an empty menu for one frame.
+    pub fn tracks_polled(&self, kind: &str) -> Option<Vec<MediaTrack>> {
+        #[cfg(all(feature = "native-mpv", fluxplay_has_libmpv))]
+        {
+            if self.libmpv.is_some() {
+                let mpv = self.try_lock_mpv()?;
+                return Some(read_mpv_tracks(&mpv, kind));
+            }
+        }
+        Some(Vec::new())
+    }
+
+    pub fn set_audio_track(&mut self, id: i64) -> Result<()> {
+        let id_s = id.to_string();
+        debug!(id, "NativePlayer::set_audio_track");
+        #[cfg(all(feature = "native-mpv", fluxplay_has_libmpv))]
+        if let Some(mpv) = self.lock_mpv() {
+            return mpv.command(&["set", "aid", &id_s]);
+        }
+        if let Some(path) = &self.ipc_path {
+            return mpv_cmd(path, &["set", "aid", &id_s]);
+        }
+        Err(PlayerError::Unsupported("choix de piste audio".into()))
+    }
+
+    pub fn set_subtitle_track(&mut self, id: Option<i64>) -> Result<()> {
+        let id_s = id.map(|n| n.to_string()).unwrap_or_else(|| "no".into());
+        debug!(sid = %id_s, "NativePlayer::set_subtitle_track");
+        #[cfg(all(feature = "native-mpv", fluxplay_has_libmpv))]
+        if let Some(mpv) = self.lock_mpv() {
+            return mpv.command(&["set", "sid", &id_s]);
+        }
+        if let Some(path) = &self.ipc_path {
+            return mpv_cmd(path, &["set", "sid", &id_s]);
+        }
+        Err(PlayerError::Unsupported("choix des sous-titres".into()))
+    }
+
     pub fn cycle_subtitles(&mut self) -> Result<()> {
         debug!("NativePlayer::cycle_subtitles");
         #[cfg(all(feature = "native-mpv", fluxplay_has_libmpv))]
@@ -1753,6 +1784,44 @@ fn snapshot_scaled(w: u32, h: u32, pixels: &[u8]) -> (u32, u32, Arc<[u8]>) {
         Ok(())
     }
 
+    /// Re-open the audio device after sleep and, if playback was running,
+    /// nudge the clock. The file and the position stay.
+    pub fn wake_after_sleep(&mut self, paused: bool) -> Result<()> {
+        let _prof = Stopwatch::start("native_wake");
+        info!(paused, "NativePlayer::wake_after_sleep");
+        #[cfg(all(feature = "native-mpv", fluxplay_has_libmpv))]
+        if let Some(mpv) = self.lock_mpv() {
+            let _ = mpv.command(&["ao-reload"]);
+            if !paused {
+                let _ = mpv.command(&["seek", "0", "relative+exact"]);
+                let _ = mpv.set_property("pause", "no");
+            }
+            return Ok(());
+        }
+        if let Some(path) = &self.ipc_path {
+            let _ = mpv_cmd(path, &["ao-reload"]);
+            if !paused {
+                let _ = mpv_cmd(path, &["seek", "0", "relative+exact"]);
+                let _ = mpv_cmd(path, &["set", "pause", "no"]);
+            }
+            return Ok(());
+        }
+        Ok(())
+    }
+
+    /// Second try, once the audio device exists again. Does not seek.
+    pub fn wake_audio(&mut self) -> Result<()> {
+        #[cfg(all(feature = "native-mpv", fluxplay_has_libmpv))]
+        if let Some(mpv) = self.lock_mpv() {
+            let _ = mpv.command(&["ao-reload"]);
+            return Ok(());
+        }
+        if let Some(path) = &self.ipc_path {
+            let _ = mpv_cmd(path, &["ao-reload"]);
+        }
+        Ok(())
+    }
+
     /// Re-load the same URL (reconnect after stall / token refresh).
     pub fn restart(&mut self, url: &str) -> Result<()> {
         let _prof = Stopwatch::start("native_restart");
@@ -1761,10 +1830,17 @@ fn snapshot_scaled(w: u32, h: u32, pixels: &[u8]) -> (u32, u32, Arc<[u8]>) {
         #[cfg(all(feature = "native-mpv", fluxplay_has_libmpv))]
         if let Some(mpv) = self.lock_mpv() {
             mpv.command(&["loadfile", url, "replace"])?;
+            let _ = mpv.set_property("sid", "no");
+            let _ = mpv.set_property("secondary-sid", "no");
+            // After sleep the WASAPI device is gone; reload it or the picture stays stuck.
+            let _ = mpv.command(&["ao-reload"]);
             return Ok(());
         }
         if let Some(path) = &self.ipc_path {
             mpv_cmd(path, &["loadfile", url, "replace"])?;
+            let _ = mpv_cmd(path, &["set", "sid", "no"]);
+            let _ = mpv_cmd(path, &["set", "secondary-sid", "no"]);
+            let _ = mpv_cmd(path, &["ao-reload"]);
             return Ok(());
         }
         self.play(url)?;
@@ -1794,6 +1870,29 @@ fn snapshot_scaled(w: u32, h: u32, pixels: &[u8]) -> (u32, u32, Arc<[u8]>) {
             return Ok(());
         }
         Ok(())
+    }
+
+    /// Chapter start (seconds) and title. `None` if the file is not ready yet.
+    pub fn chapter_markers(&self) -> Option<Vec<(f64, String)>> {
+        #[cfg(all(feature = "native-mpv", fluxplay_has_libmpv))]
+        if let Some(mpv) = self.try_lock_mpv() {
+            let count = mpv
+                .get_property_string("chapter-list/count")?
+                .parse::<usize>()
+                .ok()?;
+            let mut out = Vec::with_capacity(count.min(64));
+            for i in 0..count.min(64) {
+                let time = mpv
+                    .get_property_f64(&format!("chapter-list/{i}/time"))
+                    .unwrap_or(0.0);
+                let title = mpv
+                    .get_property_string(&format!("chapter-list/{i}/title"))
+                    .unwrap_or_default();
+                out.push((time, title));
+            }
+            return Some(out);
+        }
+        None
     }
 
     /// Query playback position / duration (seconds).
@@ -1882,6 +1981,26 @@ fn snapshot_scaled(w: u32, h: u32, pixels: &[u8]) -> (u32, u32, Arc<[u8]>) {
                 })?;
             if w >= 16.0 && h >= 16.0 {
                 return Some((w as u32, h as u32));
+            }
+        }
+        let _ = &self;
+        None
+    }
+
+    /// Source display size before the window letterboxes it.
+    /// `video-out-params` can be the render target (black bars included).
+    pub fn video_source_wh(&self) -> Option<(u32, u32)> {
+        #[cfg(all(feature = "native-mpv", fluxplay_has_libmpv))]
+        if let Some(mpv) = self.try_lock_mpv() {
+            let (w, h) = mpv
+                .get_property_double("video-params/dw")
+                .zip(mpv.get_property_double("video-params/dh"))
+                .or_else(|| {
+                    mpv.get_property_double("video-params/w")
+                        .zip(mpv.get_property_double("video-params/h"))
+                })?;
+            if w >= 16.0 && h >= 16.0 {
+                return Some((w.round() as u32, h.round() as u32));
             }
         }
         let _ = &self;
@@ -2420,6 +2539,12 @@ fn snapshot_scaled(w: u32, h: u32, pixels: &[u8]) -> (u32, u32, Arc<[u8]>) {
         }
         soft_set(&mpv, "title", "FluxPlay");
         soft_set(&mpv, "osd-level", "0");
+        // Streams often carry DVB / closed-caption tracks. mpv would show the
+        // first one on its own. Stay off until the viewer picks a track.
+        soft_set(&mpv, "sid", "no");
+        soft_set(&mpv, "secondary-sid", "no");
+        soft_set(&mpv, "sub-auto", "no");
+        soft_set(&mpv, "sub-create-cc-track", "yes");
         soft_set(&mpv, "input-default-bindings", "no");
         soft_set(&mpv, "input-vo-keyboard", "no");
         // Soft present uploads async via iced — a large offset + framedrop=vo
@@ -2560,7 +2685,15 @@ fn snapshot_scaled(w: u32, h: u32, pixels: &[u8]) -> (u32, u32, Arc<[u8]>) {
                 // Soft RGBA and hybrid GPUs need *-copy. Native GPU VO uses zero-copy auto
                 // (Jellyfin hardwareDecoding=enabled → hwdec=auto).
                 let preferred = if present.uses_soft_rgba() || self.opts.hwdec_force_copy {
-                    soft_hwdec_name(preferred_hwdec())
+                    match preferred_hwdec() {
+                        "vaapi" => "vaapi-copy",
+                        "cuda" | "nvdec" => "cuda-copy",
+                        "d3d11va" => "d3d11va-copy",
+                        "dxva2" => "dxva2-copy",
+                        "vulkan" => "vulkan-copy",
+                        "auto" | "auto-safe" => "auto-copy",
+                        other => other,
+                    }
                 } else {
                     preferred_hwdec()
                 };
@@ -2580,39 +2713,25 @@ fn snapshot_scaled(w: u32, h: u32, pixels: &[u8]) -> (u32, u32, Arc<[u8]>) {
             let _ = mpv.set_option("hwdec", "no");
         }
         if present.uses_soft_rgba() {
-            // Soft path: cheap scalers; audio master; drop at VO when iced lags.
+            // Soft path: the pump renders off the UI thread. `audio` keeps the
+            // picture on the sound clock, so a long series does not drift.
+            // `desync` showed frames as soon as they decoded and the gap grew
+            // with every episode. Render itself must not sleep on a bad PTS
+            // (`MPV_RENDER_PARAM_BLOCK_FOR_TARGET_TIME = 0`).
             soft_set(&mpv, "scale", "bilinear");
             soft_set(&mpv, "cscale", "bilinear");
             soft_set(&mpv, "dscale", "bilinear");
             soft_set(&mpv, "correct-downscaling", "no");
             soft_set(&mpv, "sigmoid-upscaling", "no");
             soft_set(&mpv, "interpolation", "no");
-            // Platform AO: soft present is CPU-bound; a predictable audio clock
-            // (wasapi / coreaudio / pipewire) keeps A/V sync without display-resample.
-            #[cfg(target_os = "windows")]
-            if mpv.set_option("ao", "wasapi").is_err() {
-                soft_set(&mpv, "ao", "wasapi");
-            }
-            #[cfg(target_os = "macos")]
-            if mpv.set_option("ao", "coreaudio").is_err() {
-                soft_set(&mpv, "ao", "coreaudio");
-            }
             if mpv.set_option("video-sync", "audio").is_err() {
                 soft_set(&mpv, "video-sync", "audio");
             }
             if mpv.set_option("framedrop", "vo").is_err() {
                 soft_set(&mpv, "framedrop", "vo");
             }
-            // SoftPump / iced tick at the monitor rate — tell mpv so it does not
-            // produce frames faster than the UI can upload (same on every OS).
-            if self.present_hz >= 24 {
-                let fps = format!("{}", self.present_hz);
-                if mpv.set_option("display-fps-override", &fps).is_err() {
-                    soft_set(&mpv, "display-fps-override", &fps);
-                }
-            }
             // Initial fill still waits. A later cache pause was freezing playback
-            // until the progress bar flushed the cache (PR windows player).
+            // until the progress bar flushed the cache.
             soft_set(&mpv, "cache-pause", "no");
         } else {
             // Native VO HQ — matches dexeonify/mpv-config + Jellyfin display sync.
@@ -2644,6 +2763,12 @@ fn snapshot_scaled(w: u32, h: u32, pixels: &[u8]) -> (u32, u32, Arc<[u8]>) {
             soft_set(&mpv, "profile", "low-latency");
             soft_set(&mpv, "cache", "no");
             // Do not set untimed=yes with soft/embedded VO — iced upload is async A/V.
+        }
+        if url.contains("/v1/cinema/live.ts") {
+            soft_set(&mpv, "cache", "no");
+            soft_set(&mpv, "cache-secs", "0");
+            soft_set(&mpv, "demuxer-readahead-secs", "0.3");
+            soft_set(&mpv, "cache-pause", "no");
         }
 
         if let Some(ua) = &self.opts.user_agent {
@@ -2696,22 +2821,47 @@ fn snapshot_scaled(w: u32, h: u32, pixels: &[u8]) -> (u32, u32, Arc<[u8]>) {
             mpv.init_sw_render()?;
         }
         mpv.command(&["loadfile", url, "replace"])?;
+        // loadfile can still arm the first subtitle once the demuxer sees it.
+        let _ = mpv.set_property("sid", "no");
+        let _ = mpv.set_property("secondary-sid", "no");
         // Ensure AO audible after loadfile reconfig (OpenSL often start→stop→start).
         let _ = mpv.set_property("mute", "no");
         let _ = mpv.set_property(
             "volume",
             &format!("{}", (self.opts.volume * 100.0).clamp(0.0, 100.0) as u32),
         );
-        // Never force hwdec=no right after loadfile on any OS: IPTV/VOD streams
-        // have not opened their decoder yet (Windows/macOS always looked idle at
-        // 200 ms → CPU decode / stutter; Linux VA-API can attach just as late on
-        // a cold cache). `*-copy` / `auto-copy` fall back to software themselves
-        // when the GPU path fails; MediaCodec on Android attaches after packets.
+        // Linux only: brief settle so hwdec-current is meaningful. Never sleep on
+        // Android UI thread (ANR / frozen NativeActivity). On Windows/macOS the
+        // `*-copy` hwdec falls back to software by itself, and 200 ms after `loadfile`
+        // a network stream has not opened its decoder yet: this check always fired
+        // and pinned every stream to CPU decode (TF1 4K: ~62 % of all cores vs ~30 %).
+        #[cfg(target_os = "linux")]
         {
+            std::thread::sleep(std::time::Duration::from_millis(200));
             let hw = mpv
                 .get_property_string("hwdec-current")
                 .unwrap_or_else(|| "none".into());
-            info!(%endpoint, %hw, "hwdec after loadfile (may still be attaching)");
+            // Soft VO only: if preferred never engaged, force software (avoid black soft stage).
+            // Native GPU VO may still be attaching NVDEC/VAAPI — do not yank it to SW.
+            if present.uses_soft_rgba()
+                && self.opts.hwdec
+                && std::env::var_os("FLUXPLAY_HWDEC").is_none()
+                && (hw.is_empty()
+                    || hw.eq_ignore_ascii_case("no")
+                    || hw.eq_ignore_ascii_case("none"))
+            {
+                let _ = mpv.set_property("hwdec", "no");
+                warn!(%endpoint, "hwdec-current idle — forced software decode");
+            }
+        }
+        #[cfg(target_os = "android")]
+        {
+            // Do NOT force hwdec=no here — MediaCodec often attaches after the first
+            // packets. Premature SW fallback was decoding 4K on CPU (~10 fps).
+            let hw = mpv
+                .get_property_string("hwdec-current")
+                .unwrap_or_else(|| "none".into());
+            info!(%endpoint, %hw, "android hwdec after loadfile (may still be attaching)");
         }
         let hw = mpv
             .get_property_string("hwdec-current")
@@ -2771,6 +2921,10 @@ fn snapshot_scaled(w: u32, h: u32, pixels: &[u8]) -> (u32, u32, Arc<[u8]>) {
             // focus-on-open was removed; focus-on=never is the replacement.
             "--focus-on=never".into(),
             "--title=FluxPlay".into(),
+            "--sid=no".into(),
+            "--secondary-sid=no".into(),
+            "--sub-auto=no".into(),
+            "--sub-create-cc-track=yes".into(),
             "--ytdl=no".into(),
             format!("--input-ipc-server={}", ipc.display()),
             format!("--volume={}", (self.opts.volume * 100.0) as u32),
@@ -2837,6 +2991,14 @@ fn snapshot_scaled(w: u32, h: u32, pixels: &[u8]) -> (u32, u32, Arc<[u8]>) {
                 "--profile=low-latency".into(),
                 "--cache=no".into(),
                 "--untimed=yes".into(),
+            ]);
+        }
+        if url.contains("/v1/cinema/live.ts") {
+            args.extend([
+                "--cache=no".into(),
+                "--cache-secs=0".into(),
+                "--demuxer-readahead-secs=0.3".into(),
+                "--cache-pause=no".into(),
             ]);
         }
 
@@ -3140,6 +3302,141 @@ fn ipc_socket_path() -> PathBuf {
     }
 }
 
+#[cfg(all(feature = "native-mpv", fluxplay_has_libmpv))]
+fn read_mpv_tracks(mpv: &crate::mpv_ffi::LibMpv, kind: &str) -> Vec<MediaTrack> {
+    let count = mpv
+        .get_property_string("track-list/count")
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(0);
+    let mut out = Vec::new();
+    let mut nth = 0usize;
+    for i in 0..count.min(64) {
+        let ty = mpv
+            .get_property_string(&format!("track-list/{i}/type"))
+            .unwrap_or_default();
+        let ty = ty.trim().to_ascii_lowercase();
+        if ty != kind {
+            continue;
+        }
+        nth += 1;
+        let id = mpv
+            .get_property_string(&format!("track-list/{i}/id"))
+            .and_then(|s| s.parse::<i64>().ok())
+            .unwrap_or(0);
+        let lang = mpv.get_property_string(&format!("track-list/{i}/lang"));
+        let title = mpv.get_property_string(&format!("track-list/{i}/title"));
+        let codec = mpv.get_property_string(&format!("track-list/{i}/codec"));
+        let selected = mpv
+            .get_property_string(&format!("track-list/{i}/selected"))
+            .map(|s| {
+                let s = s.to_ascii_lowercase();
+                s == "yes" || s == "true" || s == "1"
+            })
+            .unwrap_or(false);
+        out.push(MediaTrack {
+            id,
+            label: track_label(
+                nth,
+                lang.as_deref(),
+                title.as_deref(),
+                codec.as_deref(),
+            ),
+            lang: lang.unwrap_or_default().trim().to_ascii_lowercase(),
+            selected,
+        });
+    }
+    disambiguate_labels(out)
+}
+
+fn track_label(
+    nth: usize,
+    lang: Option<&str>,
+    title: Option<&str>,
+    codec: Option<&str>,
+) -> String {
+    let lang = lang.map(pretty_lang).filter(|s| !s.is_empty());
+    let title = title
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("und"));
+    let codec = codec.and_then(pretty_sub_codec);
+    match (lang, title, codec) {
+        (Some(l), Some(t), _) if !t.eq_ignore_ascii_case(&l) => format!("{l} · {t}"),
+        (Some(l), _, Some(c)) => format!("{l} · {c}"),
+        (Some(l), _, _) => l.to_string(),
+        (None, Some(t), _) => t.to_string(),
+        (None, None, Some(c)) => c.to_string(),
+        _ => format!("Piste {nth}"),
+    }
+}
+
+fn pretty_sub_codec(codec: &str) -> Option<&'static str> {
+    match codec.trim().to_ascii_lowercase().as_str() {
+        "dvb_subtitle" | "dvbsub" | "dvb_sub" => Some("DVB"),
+        "dvb_teletext" | "libzvbi_teletextdec" => Some("Télétexte"),
+        "hdmv_pgs_subtitle" | "pgs" => Some("PGS"),
+        "subrip" | "srt" | "text" => Some("SRT"),
+        "ass" | "ssa" => Some("ASS"),
+        "webvtt" | "vtt" => Some("WebVTT"),
+        "mov_text" | "eia_608" | "eia_708" | "cc_dec" => Some("CC"),
+        "dvd_subtitle" | "dvdsub" => Some("DVD"),
+        _ => None,
+    }
+}
+
+fn pretty_lang(code: &str) -> String {
+    let raw = code.trim().to_ascii_lowercase();
+    let c = raw.split(['-', '_']).next().unwrap_or(&raw);
+    match c {
+        "fr" | "fre" | "fra" | "french" => "Français",
+        "en" | "eng" | "english" => "Anglais",
+        "es" | "spa" | "esp" => "Espagnol",
+        "de" | "ger" | "deu" => "Allemand",
+        "it" | "ita" => "Italien",
+        "pt" | "por" | "pob" => "Portugais",
+        "ja" | "jpn" => "Japonais",
+        "ko" | "kor" => "Coréen",
+        "zh" | "chi" | "zho" | "cmn" => "Chinois",
+        "ar" | "ara" => "Arabe",
+        "ru" | "rus" => "Russe",
+        "nl" | "dut" | "nld" => "Néerlandais",
+        "pl" | "pol" => "Polonais",
+        "tr" | "tur" => "Turc",
+        "sv" | "swe" => "Suédois",
+        "no" | "nor" | "nb" | "nn" => "Norvégien",
+        "da" | "dan" => "Danois",
+        "fi" | "fin" => "Finnois",
+        "hi" | "hin" => "Hindi",
+        "th" | "tha" => "Thaï",
+        "vi" | "vie" => "Vietnamien",
+        "uk" | "ukr" => "Ukrainien",
+        "cs" | "cze" | "ces" => "Tchèque",
+        "hu" | "hun" => "Hongrois",
+        "ro" | "rum" | "ron" => "Roumain",
+        "el" | "gre" | "ell" => "Grec",
+        "he" | "heb" => "Hébreu",
+        "und" | "" | "unknown" => "",
+        other => other,
+    }
+    .to_string()
+}
+
+fn disambiguate_labels(mut tracks: Vec<MediaTrack>) -> Vec<MediaTrack> {
+    let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for t in &tracks {
+        *counts.entry(t.label.clone()).or_insert(0) += 1;
+    }
+    let mut seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for t in &mut tracks {
+        if counts.get(&t.label).copied().unwrap_or(0) < 2 {
+            continue;
+        }
+        let n = seen.entry(t.label.clone()).or_insert(0);
+        *n += 1;
+        t.label = format!("{} · {n}", t.label);
+    }
+    tracks
+}
+
 const FFPLAY_WINDOW_TITLE: &str = "FluxPlay Video";
 
 /// Best-effort remote keys into the ffplay SDL window (requires xdotool on PATH).
@@ -3346,30 +3643,4 @@ fn mpv_cmd(ipc: &Path, parts: &[&str]) -> Result<()> {
         "mpv IPC: {}",
         last.unwrap_or("unavailable")
     )))
-}
-
-#[cfg(test)]
-mod soft_hwdec_tests {
-    use super::soft_hwdec_name;
-
-    #[test]
-    fn soft_present_maps_every_desktop_api_to_copy() {
-        assert_eq!(soft_hwdec_name("vaapi"), "vaapi-copy");
-        assert_eq!(soft_hwdec_name("cuda"), "cuda-copy");
-        assert_eq!(soft_hwdec_name("nvdec"), "cuda-copy");
-        assert_eq!(soft_hwdec_name("d3d11va"), "d3d11va-copy");
-        assert_eq!(soft_hwdec_name("dxva2"), "dxva2-copy");
-        assert_eq!(soft_hwdec_name("videotoolbox"), "videotoolbox-copy");
-        assert_eq!(soft_hwdec_name("vulkan"), "vulkan-copy");
-        assert_eq!(soft_hwdec_name("auto"), "auto-copy");
-        assert_eq!(soft_hwdec_name("auto-safe"), "auto-copy");
-    }
-
-    #[test]
-    fn already_copy_or_disabled_names_pass_through() {
-        assert_eq!(soft_hwdec_name("d3d11va-copy"), "d3d11va-copy");
-        assert_eq!(soft_hwdec_name("videotoolbox-copy"), "videotoolbox-copy");
-        assert_eq!(soft_hwdec_name("no"), "no");
-        assert_eq!(soft_hwdec_name("mediacodec-copy"), "mediacodec-copy");
-    }
 }

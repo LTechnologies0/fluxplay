@@ -22,6 +22,8 @@
 )]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![allow(missing_docs)]
+// wgpu Hub/Storage Send bounds need deeper trait solving than the default 128.
+#![recursion_limit = "256"]
 pub mod layer;
 pub mod primitive;
 pub mod settings;

@@ -310,8 +310,11 @@ impl Cache {
         // they reference a shared reusable atlas, not per-entry textures.
         #[cfg(feature = "image")]
         {
-            const TRIM_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
-            const TRIM_HARD_CAP: usize = 4096;
+            // Mosaic category browsing churns unique Handles; a 2s/4096 lag let the
+            // atlas pin hundreds of off-screen posters (200→600 Mo RSS). Trim sooner
+            // and hard-cap near the app ImageCache budget (~192) with headroom.
+            const TRIM_INTERVAL: std::time::Duration = std::time::Duration::from_millis(750);
+            const TRIM_HARD_CAP: usize = 384;
             let due = self.last_trim.elapsed() >= TRIM_INTERVAL;
             if !due && self.raster.cache.len() < TRIM_HARD_CAP {
                 return;

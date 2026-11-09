@@ -78,7 +78,6 @@ use crate::core::{
 use crate::overlay::menu::{self, Menu};
 
 use std::borrow::Borrow;
-use std::f32;
 
 /// A widget for selecting a single value from a list of options.
 ///
