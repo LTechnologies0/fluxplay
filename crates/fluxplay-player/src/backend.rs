@@ -2611,6 +2611,9 @@ fn snapshot_scaled(w: u32, h: u32, pixels: &[u8]) -> (u32, u32, Arc<[u8]>) {
                     soft_set(&mpv, "display-fps-override", &fps);
                 }
             }
+            // Initial fill still waits. A later cache pause was freezing playback
+            // until the progress bar flushed the cache (PR windows player).
+            soft_set(&mpv, "cache-pause", "no");
         } else {
             // Native VO HQ — matches dexeonify/mpv-config + Jellyfin display sync.
             soft_set(&mpv, "scale", "ewa_lanczos");

@@ -5,7 +5,7 @@ use fluxplay_core::Stopwatch;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, error, info, trace, warn};
 
-use crate::backend::{BackendId, NativePlayer, PlayOptions, VideoRect};
+use crate::backend::{BackendId, MediaTrack, NativePlayer, PlayOptions, VideoRect};
 use crate::{route, url_endpoint, RoutedStream};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -24,6 +24,9 @@ pub struct StreamSession {
     /// Embedded FFmpeg read-ahead, refreshed with the buffering state.
     pub buffer: Option<crate::BufferState>,
     pub channel: Option<Channel>,
+    /// When set, the player reads this URL while `channel.stream_url` stays the
+    /// catalog address (cinema relay: one portal connection, in ffmpeg).
+    pub playback_url: Option<String>,
     pub routed: Option<RoutedStream>,
     pub started_at: Option<DateTime<Utc>>,
     pub error: Option<String>,
@@ -60,6 +63,24 @@ pub struct StreamSession {
     pub bookmarks: Vec<Bookmark>,
     /// Cache for `elapsed_label` — the text changes once per second, not per frame.
     elapsed_label_cache: std::cell::RefCell<(i64, String)>,
+    /// Last tracks read while the player lock was free. The view must not
+    /// query mpv itself: a busy lock used to blank the options card every frame.
+    audio_tracks_cache: Vec<crate::MediaTrack>,
+    subtitle_tracks_cache: Vec<crate::MediaTrack>,
+    /// New streams start with subtitles off. Cleared when the viewer picks a track.
+    subs_hold_off: bool,
+    /// Auto-skip already jumped this opening, so a later seek back into it stays put.
+    intro_skipped: bool,
+    credits_skipped: bool,
+    /// Opening credits, once we know where they start and where to land after them.
+    opening: Option<OpeningSpan>,
+    opening_watch: OpeningWatch,
+    /// OS language (`fr`, `en`…). Empty means leave the demuxer's default track.
+    preferred_audio_lang: String,
+    /// The preferred track was applied, or the viewer picked one.
+    audio_lang_applied: bool,
+    /// Polls spent waiting for a matching track to show up.
+    audio_lang_wait: u8,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -278,6 +299,7 @@ impl Default for StreamSession {
             state: PlaybackState::Idle,
             buffer: None,
             channel: None,
+            playback_url: None,
             routed: None,
             started_at: None,
             error: None,
@@ -308,7 +330,79 @@ impl Default for StreamSession {
             color_base: (0, 0, 0, 0),
             bookmarks: Vec::new(),
             elapsed_label_cache: std::cell::RefCell::new((-1, String::new())),
+            audio_tracks_cache: Vec::new(),
+            subtitle_tracks_cache: Vec::new(),
+            subs_hold_off: true,
+            intro_skipped: false,
+            credits_skipped: false,
+            opening: None,
+            opening_watch: OpeningWatch::new(),
+            preferred_audio_lang: String::new(),
+            audio_lang_applied: false,
+            audio_lang_wait: 0,
         }
+    }
+}
+
+fn track_is_lang(track: &crate::MediaTrack, lang: &str) -> bool {
+    let want = lang.split(['-', '_']).next().unwrap_or(lang).trim();
+    if want.is_empty() {
+        return false;
+    }
+    let code = track
+        .lang
+        .split(['-', '_'])
+        .next()
+        .unwrap_or(track.lang.as_str())
+        .trim();
+    if !code.is_empty() && audio_codes_match(want, code) {
+        return true;
+    }
+    let label = track.label.to_ascii_lowercase();
+    // VOSTFR is a subtitle convention, not a French audio dub.
+    if label.contains("vostfr") || label.contains("vost") {
+        return false;
+    }
+    audio_names(want).iter().any(|name| {
+        label
+            .split(|c: char| !c.is_alphanumeric())
+            .any(|word| word == *name)
+    })
+}
+
+fn audio_codes_match(want: &str, have: &str) -> bool {
+    if want == have {
+        return true;
+    }
+    const GROUPS: &[&[&str]] = &[
+        &["fr", "fre", "fra"],
+        &["en", "eng"],
+        &["ja", "jpn"],
+        &["es", "spa", "esp"],
+        &["de", "ger", "deu"],
+        &["pt", "por", "pob"],
+        &["ko", "kor"],
+        &["zh", "chi", "zho", "cmn"],
+        &["it", "ita"],
+        &["ar", "ara"],
+        &["ru", "rus"],
+        &["nl", "dut", "nld"],
+    ];
+    GROUPS
+        .iter()
+        .any(|group| group.contains(&want) && group.contains(&have))
+}
+
+fn audio_names(lang: &str) -> &'static [&'static str] {
+    match lang {
+        "fr" | "fre" | "fra" => &["français", "francais", "french", "vf", "vff", "truefrench", "fr", "fre", "fra"],
+        "en" | "eng" => &["anglais", "english", "en", "eng"],
+        "ja" | "jpn" => &["japonais", "japanese", "ja", "jpn"],
+        "es" | "spa" | "esp" => &["espagnol", "spanish", "es", "spa"],
+        "de" | "ger" | "deu" => &["allemand", "german", "de", "ger", "deu"],
+        "ko" | "kor" => &["coréen", "coreen", "korean", "ko", "kor"],
+        "zh" | "chi" | "zho" => &["chinois", "chinese", "zh", "chi"],
+        _ => &[],
     }
 }
 
@@ -410,10 +504,23 @@ impl StreamSession {
         self.error = None;
         self.position_secs = 0.0;
         self.duration_secs = 0.0;
-        match route(&channel.stream_url) {
+        self.audio_tracks_cache.clear();
+        self.subtitle_tracks_cache.clear();
+        self.subs_hold_off = true;
+        self.intro_skipped = false;
+        self.credits_skipped = false;
+        self.opening = None;
+        self.opening_watch = OpeningWatch::new();
+        self.audio_lang_applied = false;
+        self.audio_lang_wait = 0;
+        let url = self
+            .playback_url
+            .clone()
+            .filter(|u| !u.is_empty())
+            .unwrap_or_else(|| channel.stream_url.clone());
+        match route(&url) {
             Ok(routed) => {
                 self.routed = Some(routed);
-                let url = channel.stream_url.clone();
                 self.native.options_mut().media_title = Some(channel.name.trim().to_string());
                 match self.native.play(&url) {
                     Ok(backend) => {
@@ -506,6 +613,8 @@ impl StreamSession {
         self.backend = None;
         self.position_secs = 0.0;
         self.duration_secs = 0.0;
+        self.audio_tracks_cache.clear();
+        self.subtitle_tracks_cache.clear();
     }
 
     pub fn toggle_mute(&mut self) {
@@ -577,6 +686,29 @@ impl StreamSession {
         }
     }
 
+    /// Keep the file. Reload the audio device, and nudge a running playback
+    /// so the picture does not stay on the pre-sleep frame.
+    pub fn wake_output(&mut self, paused: bool) {
+        if self.channel.is_none() {
+            return;
+        }
+        info!(paused, "StreamSession::wake_output");
+        if let Err(e) = self.native.wake_after_sleep(paused) {
+            warn!(error = %e, "wake output failed");
+        }
+        self.refresh_times();
+    }
+
+    pub fn wake_audio(&mut self) {
+        if self.channel.is_none() {
+            return;
+        }
+        if let Err(e) = self.native.wake_audio() {
+            warn!(error = %e, "wake audio failed");
+        }
+        self.refresh_times();
+    }
+
     pub fn restart(&mut self) {
         let Some(url) = self.channel.as_ref().map(|c| c.stream_url.clone()) else {
             warn!("StreamSession::restart with no channel");
@@ -588,6 +720,12 @@ impl StreamSession {
             Ok(()) => {
                 self.state = PlaybackState::Playing;
                 self.error = None;
+                self.intro_skipped = false;
+                self.credits_skipped = false;
+                self.opening = None;
+                self.opening_watch = OpeningWatch::new();
+                self.audio_lang_applied = false;
+                self.audio_lang_wait = 0;
                 self.started_at = Some(Utc::now());
                 self.backend = self.native.active_backend();
                 // The engine was rebuilt at `opts.volume`: re-apply the user's mute.
@@ -608,6 +746,111 @@ impl StreamSession {
     pub fn toggle_fullscreen(&mut self) {
         debug!("StreamSession::toggle_fullscreen");
         let _ = self.native.toggle_fullscreen();
+    }
+
+    /// Refresh the cached track lists. A busy player lock leaves the previous
+    /// lists in place so the options card does not blink empty.
+    /// Language the player should start on (`fr` for a French Windows).
+    pub fn set_preferred_audio_lang(&mut self, lang: &str) {
+        self.preferred_audio_lang = lang.trim().to_ascii_lowercase();
+    }
+
+    /// Switch to the system language once the demuxer lists it, and show that
+    /// track first. A later manual choice is left alone.
+    fn prefer_system_audio(&mut self) {
+        if self.audio_lang_applied || self.preferred_audio_lang.is_empty() {
+            return;
+        }
+        if self.audio_tracks_cache.is_empty() {
+            return;
+        }
+        let want = self.preferred_audio_lang.clone();
+        let Some(id) = self
+            .audio_tracks_cache
+            .iter()
+            .find(|t| track_is_lang(t, &want))
+            .map(|t| t.id)
+        else {
+            self.audio_lang_wait = self.audio_lang_wait.saturating_add(1);
+            if self.audio_lang_wait >= 12 {
+                self.audio_lang_applied = true;
+            }
+            return;
+        };
+        self.audio_tracks_cache.sort_by_key(|t| t.id != id);
+        let already = self
+            .audio_tracks_cache
+            .iter()
+            .any(|t| t.selected && t.id == id);
+        if !already {
+            if self.native.set_audio_track(id).is_ok() {
+                for track in &mut self.audio_tracks_cache {
+                    track.selected = track.id == id;
+                }
+            }
+        }
+        self.audio_lang_applied = true;
+    }
+
+    pub fn refresh_track_cache(&mut self) {
+        if let Some(tracks) = self.native.tracks_polled("audio") {
+            self.audio_tracks_cache = tracks;
+            self.prefer_system_audio();
+        }
+        if let Some(tracks) = self.native.tracks_polled("sub") {
+            if !tracks.is_empty() || self.subtitle_tracks_cache.is_empty() {
+                self.subtitle_tracks_cache = tracks;
+            }
+        }
+        // Demuxers often arm the first subtitle a moment after open.
+        if self.subs_hold_off && self.subtitle_tracks_cache.iter().any(|t| t.selected) {
+            if self.native.set_subtitle_track(None).is_ok() {
+                for track in &mut self.subtitle_tracks_cache {
+                    track.selected = false;
+                }
+            }
+        }
+    }
+
+    pub fn audio_tracks(&self) -> Vec<MediaTrack> {
+        self.audio_tracks_cache.clone()
+    }
+
+    pub fn subtitle_tracks(&self) -> Vec<MediaTrack> {
+        self.subtitle_tracks_cache.clone()
+    }
+
+    pub fn set_audio_track(&mut self, id: i64) -> bool {
+        // A manual pick wins over the automatic language choice.
+        self.audio_lang_applied = true;
+        match self.native.set_audio_track(id) {
+            Ok(()) => {
+                for track in &mut self.audio_tracks_cache {
+                    track.selected = track.id == id;
+                }
+                true
+            }
+            Err(e) => {
+                warn!(error = %e, id, "set_audio_track failed");
+                false
+            }
+        }
+    }
+
+    pub fn set_subtitle_track(&mut self, id: Option<i64>) -> bool {
+        self.subs_hold_off = id.is_none();
+        match self.native.set_subtitle_track(id) {
+            Ok(()) => {
+                for track in &mut self.subtitle_tracks_cache {
+                    track.selected = Some(track.id) == id;
+                }
+                true
+            }
+            Err(e) => {
+                warn!(error = %e, ?id, "set_subtitle_track failed");
+                false
+            }
+        }
     }
 
     pub fn cycle_audio(&mut self) -> bool {
@@ -723,6 +966,235 @@ impl StreamSession {
         }
         let _ = self.native.seek_absolute(secs);
         self.refresh_times();
+    }
+
+    /// « Passer le générique » during a detected opening, or for a series
+    /// during the first 90s. Animated openings have no title card, so the
+    /// picture scan never armed a button and nothing was drawn.
+    pub fn skip_prompt(&self) -> Option<&'static str> {
+        if self.intro_skipped || self.is_live() {
+            return None;
+        }
+        if let Some(span) = &self.opening {
+            if span.contains(self.position_secs) {
+                return Some("Passer le générique");
+            }
+        }
+        if self.series_opening_guess() {
+            return Some("Passer le générique");
+        }
+        None
+    }
+
+    /// Series episodes usually open with the générique and no chapter.
+    /// Hidden once a later opening has been found, so a cold open is not jumped.
+    fn series_opening_guess(&self) -> bool {
+        if self.intro_skipped || !self.playing_vod() {
+            return false;
+        }
+        if self.channel.as_ref().map(|c| c.kind) != Some(ContentKind::Series) {
+            return false;
+        }
+        if !(0.5..90.0).contains(&self.position_secs) {
+            return false;
+        }
+        if self
+            .opening
+            .as_ref()
+            .is_some_and(|s| s.start > self.position_secs + 8.0)
+        {
+            return false;
+        }
+        true
+    }
+
+    fn playing_vod(&self) -> bool {
+        !self.is_live()
+            && matches!(
+                self.state,
+                PlaybackState::Playing | PlaybackState::Paused | PlaybackState::Buffering
+            )
+    }
+
+    /// Read chapter titles once, then keep watching the picture until the
+    /// opening actually starts (it is not always at 0:00).
+    pub fn poll_opening(&mut self) {
+        if self.intro_skipped || self.is_live() || !self.playing_vod() {
+            return;
+        }
+        if self.opening.as_ref().is_some_and(|s| s.from_chapter) || self.opening_watch.gave_up {
+            return;
+        }
+        if !self.opening_watch.chapters_read && self.position_secs >= 0.3 {
+            match self.native.chapter_markers() {
+                Some(chapters) => {
+                    self.opening_watch.chapters_read = true;
+                    if let Some(span) = opening_from_chapters(
+                        &chapters,
+                        self.channel.as_ref().map(|c| c.kind) == Some(ContentKind::Series),
+                    ) {
+                        tracing::info!(start = span.start, end = span.end, "opening from chapters");
+                        self.opening = Some(span);
+                    }
+                }
+                None if self.position_secs > 8.0 => self.opening_watch.chapters_read = true,
+                None => {}
+            }
+        }
+    }
+
+    /// One already-decoded RGBA frame. Looks for a run of black or title cards,
+    /// which is how an opening shows up when the file has no chapters.
+    pub fn observe_opening_frame(&mut self, w: u32, h: u32, pitch: u32, rgba: &[u8]) {
+        if self.intro_skipped
+            || self.is_live()
+            || !self.playing_vod()
+            || self.opening.as_ref().is_some_and(|s| s.from_chapter)
+            || self.opening_watch.gave_up
+        {
+            return;
+        }
+        let pos = self.position_secs;
+        if !(0.4..200.0).contains(&pos) {
+            if pos >= 200.0 {
+                self.opening_watch.gave_up = true;
+            }
+            return;
+        }
+        if pos - self.opening_watch.last_pos > 2.5 {
+            self.opening_watch.run_slate = false;
+            self.opening_watch.seen_card = false;
+            self.opening_watch.grid.clear();
+        }
+        if pos - self.opening_watch.last_pos < 0.35 && self.opening_watch.last_pos > 0.0 {
+            return;
+        }
+        let grid = sample_luma_grid(w, h, pitch, rgba);
+        if grid.is_empty() {
+            return;
+        }
+        let motion = mean_abs_diff(&self.opening_watch.grid, &grid);
+        let luma = mean(&grid);
+        let flat = flatness(&grid, luma);
+        self.opening_watch.grid = grid;
+        self.opening_watch.last_pos = pos;
+        // A logo or a black card is flat. A scene, even a still one, is not.
+        let black = luma < 0.07;
+        let card = !black && flat > 0.78 && motion < 0.035;
+        let slate = black || card;
+        if slate {
+            if !self.opening_watch.run_slate {
+                self.opening_watch.run_slate = true;
+                self.opening_watch.seen_card = card;
+                self.opening_watch.run_at = pos;
+            } else if card {
+                self.opening_watch.seen_card = true;
+            }
+            let start = self.opening_watch.run_at;
+            // A fade from black is not a logo. Wait until a real card has been on screen.
+            if self.opening_watch.seen_card && pos - start >= 1.8 && self.opening.is_none() {
+                let guess = if self.channel.as_ref().map(|c| c.kind) == Some(ContentKind::Series) {
+                    90.0
+                } else {
+                    20.0
+                };
+                let mut end = start + guess;
+                if self.duration_secs > start + 10.0 {
+                    end = end.min(self.duration_secs - 1.0);
+                }
+                let span = OpeningSpan {
+                    start,
+                    end,
+                    from_chapter: false,
+                };
+                if span.end > span.start + 3.0 {
+                    tracing::info!(start = span.start, end = span.end, "opening from picture");
+                    self.opening = Some(span);
+                }
+            }
+        } else if self.opening_watch.run_slate {
+            let start = self.opening_watch.run_at;
+            let held = pos - start;
+            let saw_card = self.opening_watch.seen_card;
+            self.opening_watch.run_slate = false;
+            self.opening_watch.seen_card = false;
+            // A short card is the start of the opening (logo, then the animation).
+            // Closing the window here made the button vanish for the whole générique,
+            // and a click sought to "now" so nothing moved.
+            if saw_card && held >= 15.0 {
+                if let Some(span) = self.opening.as_mut() {
+                    if !span.from_chapter {
+                        span.end = pos.max(span.start + 3.0);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Seek past the opening. Same percent command as the progress bar — an
+    /// absolute second seek is ignored on a lot of these series streams, which
+    /// made the button look dead. The button stays if the seek did not land.
+    pub fn skip_generic(&mut self) -> bool {
+        if self.intro_skipped || self.is_live() {
+            return false;
+        }
+        let target = if let Some(span) = self.opening.clone() {
+            let in_span =
+                self.position_secs + 1.5 >= span.start && self.position_secs <= span.end + 2.0;
+            if in_span {
+                span.end.max(self.position_secs + 2.0)
+            } else if self.series_opening_guess() {
+                90.0
+            } else {
+                return false;
+            }
+        } else if self.series_opening_guess() {
+            90.0
+        } else {
+            return false;
+        };
+        let delta = target - self.position_secs;
+        if delta < 1.5 {
+            return false;
+        }
+        let result = if self.duration_secs > 1.0 {
+            let pct = (target / self.duration_secs * 100.0).clamp(0.0, 99.0);
+            match self.native.seek_percent(pct) {
+                Ok(()) => Ok(()),
+                Err(e) => {
+                    warn!(error = %e, "skip percent failed, trying relative");
+                    self.native.seek_relative(delta)
+                }
+            }
+        } else {
+            self.native.seek_relative(delta)
+        };
+        match result {
+            Ok(()) => {
+                self.intro_skipped = true;
+                self.credits_skipped = true;
+                self.refresh_times();
+                true
+            }
+            Err(e) => {
+                warn!(error = %e, target, "skip opening failed");
+                false
+            }
+        }
+    }
+
+    /// Once per play, when the automatic option is on, as soon as the opening starts.
+    pub fn auto_skip_generic(&mut self) -> bool {
+        if self.intro_skipped {
+            return false;
+        }
+        let Some(span) = self.opening.clone() else {
+            return false;
+        };
+        if self.position_secs + 0.15 < span.start || self.position_secs >= span.end - 0.4 {
+            return false;
+        }
+        self.skip_generic()
     }
 
     pub fn add_bookmark(&mut self) {
@@ -1090,6 +1562,157 @@ impl StreamSession {
             _ => "…".into(),
         }
     }
+}
+
+#[derive(Clone, Copy)]
+struct OpeningSpan {
+    start: f64,
+    end: f64,
+    from_chapter: bool,
+}
+
+impl OpeningSpan {
+    fn contains(self, pos: f64) -> bool {
+        pos + 0.15 >= self.start && pos < self.end - 0.25
+    }
+}
+
+struct OpeningWatch {
+    chapters_read: bool,
+    gave_up: bool,
+    run_slate: bool,
+    seen_card: bool,
+    run_at: f64,
+    last_pos: f64,
+    grid: Vec<f32>,
+}
+
+impl OpeningWatch {
+    fn new() -> Self {
+        Self {
+            chapters_read: false,
+            gave_up: false,
+            run_slate: false,
+            seen_card: false,
+            run_at: 0.0,
+            last_pos: 0.0,
+            grid: Vec::new(),
+        }
+    }
+}
+
+fn opening_from_chapters(chapters: &[(f64, String)], series: bool) -> Option<OpeningSpan> {
+    let guess = if series { 90.0 } else { 25.0 };
+    for (i, (start, title)) in chapters.iter().enumerate() {
+        if !looks_like_opening(title) {
+            continue;
+        }
+        let next = chapters.get(i + 1).map(|(t, _)| *t);
+        let end = next.unwrap_or(start + guess).min(start + 150.0);
+        if end > start + 3.0 {
+            return Some(OpeningSpan {
+                start: *start,
+                end,
+                from_chapter: true,
+            });
+        }
+    }
+    None
+}
+
+fn looks_like_opening(title: &str) -> bool {
+    let mut folded = String::new();
+    for c in title.chars() {
+        let c = match c {
+            'é' | 'è' | 'ê' | 'ë' => 'e',
+            'à' | 'â' | 'ä' => 'a',
+            'ù' | 'û' | 'ü' => 'u',
+            'î' | 'ï' => 'i',
+            'ô' | 'ö' => 'o',
+            'ç' => 'c',
+            other => other.to_ascii_lowercase(),
+        };
+        folded.push(c);
+    }
+    let t = format!(" {folded} ");
+    const BLOCK: &[&str] = &[
+        "ending",
+        "outro",
+        "preview",
+        "end credit",
+        "credits de fin",
+        "credit de fin",
+        "generique de fin",
+    ];
+    if BLOCK.iter().any(|k| t.contains(k)) {
+        return false;
+    }
+    const OPEN: &[&str] = &[
+        " intro",
+        "intro ",
+        "opening",
+        "generique",
+        " op ",
+        "o.p",
+        "theme",
+        "logo",
+        "studio",
+        "cold open",
+    ];
+    OPEN.iter().any(|k| t.contains(k)) || t.trim() == "op"
+}
+
+fn sample_luma_grid(w: u32, h: u32, pitch: u32, rgba: &[u8]) -> Vec<f32> {
+    if w < 16 || h < 16 || pitch < w.saturating_mul(4) {
+        return Vec::new();
+    }
+    const NX: u32 = 16;
+    const NY: u32 = 9;
+    let x0 = w / 5;
+    let x1 = w.saturating_sub(x0).max(x0 + 1);
+    let y0 = h / 5;
+    let y1 = h.saturating_sub(y0).max(y0 + 1);
+    let mut grid = Vec::with_capacity((NX * NY) as usize);
+    for iy in 0..NY {
+        let y = y0 + (y1 - y0) * iy / NY;
+        let row = y as usize * pitch as usize;
+        for ix in 0..NX {
+            let x = x0 + (x1 - x0) * ix / NX;
+            let off = row + x as usize * 4;
+            if off + 2 >= rgba.len() {
+                grid.push(0.0);
+                continue;
+            }
+            let r = rgba[off] as f32;
+            let g = rgba[off + 1] as f32;
+            let b = rgba[off + 2] as f32;
+            grid.push((0.2126 * r + 0.7152 * g + 0.0722 * b) / 255.0);
+        }
+    }
+    grid
+}
+
+fn mean(values: &[f32]) -> f32 {
+    if values.is_empty() {
+        return 0.0;
+    }
+    values.iter().sum::<f32>() / values.len() as f32
+}
+
+fn flatness(values: &[f32], luma: f32) -> f32 {
+    if values.is_empty() {
+        return 0.0;
+    }
+    let close = values.iter().filter(|v| (**v - luma).abs() < 0.08).count();
+    close as f32 / values.len() as f32
+}
+
+fn mean_abs_diff(prev: &[f32], next: &[f32]) -> f32 {
+    if prev.len() != next.len() || next.is_empty() {
+        return 1.0;
+    }
+    let sum: f32 = prev.iter().zip(next).map(|(a, b)| (a - b).abs()).sum();
+    sum / next.len() as f32
 }
 
 fn format_hms(secs: f64) -> String {

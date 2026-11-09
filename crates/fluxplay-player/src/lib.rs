@@ -29,8 +29,8 @@ use tracing::{debug, info, trace, warn};
 
 pub use android_quality::{AndroidDeviceCaps, AndroidPresentMode, CompatTier, SoftBudget};
 pub use backend::{
-    detect_backends, BackendCaps, BackendId, BackendInfo, NativePlayer, PlayOptions, PlayerEvent,
-    VideoRect,
+    detect_backends, BackendCaps, BackendId, BackendInfo, MediaTrack, NativePlayer, PlayOptions,
+    PlayerEvent, VideoRect,
 };
 pub use external::{
     detect_external_players, launch_external, pick_external_player, ExternalLaunch,
@@ -132,7 +132,7 @@ pub(crate) fn url_endpoint(raw: &str) -> String {
 /// A `file:` URL naming an existing file under `FLUXPLAY_DOWNLOAD_ROOT` (a download of
 /// this app). Both sides are canonicalized, so `root/../../etc/…` does not qualify.
 pub(crate) fn is_downloaded_file(url: &str) -> bool {
-    let Some(path) = url.strip_prefix("file://").or_else(|| url.strip_prefix("file:")) else {
+    let Some(path) = file_url_path(url) else {
         return false;
     };
     let Ok(root) = std::env::var("FLUXPLAY_DOWNLOAD_ROOT") else {
@@ -141,10 +141,29 @@ pub(crate) fn is_downloaded_file(url: &str) -> bool {
     if root.trim().is_empty() {
         return false;
     }
-    match (std::fs::canonicalize(path), std::fs::canonicalize(root.trim())) {
+    match (std::fs::canonicalize(&path), std::fs::canonicalize(root.trim())) {
         (Ok(p), Ok(r)) => p.is_file() && p.starts_with(&r),
         _ => false,
     }
+}
+
+/// `file:///C:/Films/a.mkv` and `file://C:\Films\a.mkv` both become a path.
+fn file_url_path(url: &str) -> Option<std::path::PathBuf> {
+    let rest = url.strip_prefix("file://")?;
+    if let Some(win) = rest.strip_prefix('/') {
+        let bytes = win.as_bytes();
+        if bytes.len() >= 2 && bytes[1] == b':' {
+            return Some(std::path::PathBuf::from(win.replace('/', "\\")));
+        }
+    }
+    let bytes = rest.as_bytes();
+    if bytes.len() >= 2 && bytes[1] == b':' {
+        return Some(std::path::PathBuf::from(rest.replace('/', "\\")));
+    }
+    if rest.is_empty() {
+        return None;
+    }
+    Some(std::path::PathBuf::from(rest))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -1190,6 +1190,24 @@ async fn run_instance<P>(
 
                         window.draw_preedit();
 
+                        let wake = sleep_wake_generation();
+                        if wake != window.wake_gen {
+                            window.wake_gen = wake;
+                            let physical_size = window.state.physical_size();
+                            if wake > 0
+                                && physical_size.width > 0
+                                && physical_size.height > 0
+                            {
+                                window.surface = Some(
+                                    current_compositor.create_surface(
+                                        window.raw.clone(),
+                                        physical_size.width,
+                                        physical_size.height,
+                                    ),
+                                );
+                            }
+                        }
+
                         let Some(surface) = window.surface.as_mut() else {
                             continue;
                         };
@@ -1346,6 +1364,12 @@ async fn run_instance<P>(
                             winit::event::WindowEvent::Resized(_)
                                 if !same_size_resize =>
                             {
+                                window.raw.request_redraw();
+                            }
+                            // A move does not change pixels. Without a present,
+                            // the flip swapchain keeps the picture at the old
+                            // screen position while the frame slides away.
+                            winit::event::WindowEvent::Moved(_) => {
                                 window.raw.request_redraw();
                             }
                             winit::event::WindowEvent::ThemeChanged(theme) => {
@@ -2209,4 +2233,23 @@ fn system_information(
         graphics_adapter: graphics.adapter,
         graphics_backend: graphics.backend,
     }
+}
+
+/// Wall-clock gap between presents. A suspended PC does not draw; every
+/// window must allocate a new swapchain once, or the one that presents
+/// second stays on the dead device and looks frozen.
+fn sleep_wake_generation() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+    static LAST_MS: AtomicU64 = AtomicU64::new(0);
+    static GEN: AtomicU64 = AtomicU64::new(0);
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let prev = LAST_MS.swap(now, Ordering::Relaxed);
+    if prev != 0 && now.saturating_sub(prev) > 90_000 {
+        let _ = GEN.fetch_add(1, Ordering::Relaxed);
+    }
+    GEN.load(Ordering::Relaxed)
 }

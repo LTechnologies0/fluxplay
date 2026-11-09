@@ -1,5 +1,5 @@
-// Release builds on Windows are GUI apps: no console window behind FluxPlay.
-#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+// Windows GUI app: no console window behind FluxPlay (debug included).
+#![cfg_attr(windows, windows_subsystem = "windows")]
 
 #[cfg(not(target_os = "android"))]
 #[global_allocator]

@@ -16,8 +16,11 @@ mod network;
 mod translate;
 mod wg_proxy;
 mod wg_tunnel;
+mod party;
 mod player_ui;
+mod qr;
 mod profile_io;
+mod rune_motion;
 mod storage;
 mod theme;
 #[cfg(not(target_os = "android"))]

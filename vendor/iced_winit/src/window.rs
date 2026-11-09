@@ -77,6 +77,7 @@ where
                 exit_on_close_request,
                 surface,
                 surface_version,
+                wake_gen: 0,
                 #[cfg(target_os = "android")]
                 android_last_cfg: None,
                 renderer,
@@ -172,6 +173,8 @@ where
     /// `None` after Android `Suspended` (NativeWindow destroyed) until `Resumed`.
     pub surface: Option<C::Surface>,
     pub surface_version: u64,
+    /// Last sleep-wake generation this window rebuilt its swapchain for.
+    pub wake_gen: u64,
     /// Last wgpu configure size — skip redundant Outdated reconfigure on Pixel.
     #[cfg(target_os = "android")]
     pub android_last_cfg: Option<(u32, u32)>,
