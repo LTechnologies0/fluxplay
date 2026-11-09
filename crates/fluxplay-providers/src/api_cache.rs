@@ -180,7 +180,7 @@ fn now_ms() -> u64 {
 /// Remember that the portal refused a call. Background calls must not hit it yet.
 pub fn note_portal_backoff() {
     let until = now_ms().saturating_add(30_000);
-    let _ = PORTAL_QUIET_UNTIL_MS.fetch_update(
+    let _ = PORTAL_QUIET_UNTIL_MS.try_update(
         std::sync::atomic::Ordering::Relaxed,
         std::sync::atomic::Ordering::Relaxed,
         |cur| Some(cur.max(until)),

@@ -21,12 +21,12 @@ use uuid::Uuid;
 
 /// Cap RAM handles — keep several mosaic viewports warm during fast flings.
 /// Handles hold the compressed (downscaled) file, ~15–40 KB each.
-const MAX_RAM_HANDLES: usize = 768;
+pub(crate) const MAX_RAM_HANDLES: usize = 72;
 const MAX_IMAGE_BYTES: usize = 2_500_000;
 /// Default soft cap when host caps are not applied yet.
 pub const MAX_INFLIGHT_IMAGES: usize = 24;
 /// Longest edge for GPU/RAM handles (overridden by host decode_edge_px).
-const MAX_UI_EDGE_PX: u32 = 480;
+pub(crate) const MAX_UI_EDGE_PX: u32 = 300;
 
 const URL_SOFT_FAIL: Duration = Duration::from_secs(12 * 60);
 /// Cap permanent-fail set — over cap, clear wholesale (worst case: one retry).

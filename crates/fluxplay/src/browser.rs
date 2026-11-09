@@ -25,6 +25,8 @@ use crate::app::{Message, PasteTarget, Shelf};
 
 /// One screen of posters. Each « Voir plus » loads the next screen only.
 pub const LIST_PAGE: usize = 24;
+/// Alias used by RAM invariants / mosaic page unlocks.
+pub const MOSAIC_PAGE_ITEMS: usize = LIST_PAGE;
 /// Chaînes et guide : un écran n'en montre qu'une vingtaine, un bloc en charge quatre.
 pub const LIVE_PAGE: usize = 96;
 /// Sidebar categories (Live / VOD / Series) — show the full catalog list.
@@ -38,7 +40,8 @@ pub const MAX_VIRTUAL_CONTENT_PX: f32 = 480_000.0;
 /// With the height ceiling this stays smooth up to ~1M mosaic rows.
 const VIRTUAL_ROW_TRAVEL_PX: f32 = 8.0;
 /// Rows rendered above/below the viewport (fast flings need deeper lead-in).
-pub const VIRTUAL_OVERSCAN: usize = 14;
+/// Tile geometry only — keep tiny so posters stay on-screen (RAM).
+pub const VIRTUAL_OVERSCAN: usize = 4;
 
 /// Indices into `bundle.channels` / `vod` / `series` for the active browse filter.
 ///

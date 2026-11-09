@@ -2303,13 +2303,13 @@ impl FluxPlay {
             // ids) then warm-fetch anything missing; art_warm alone skips RAM hits.
             self.refresh_browse_poster_gpu_textures();
             self.art_warm_cursor = 0;
-            self.art_warm_active = !self.browse_index.is_empty();
+            self.art_warm_active = false;
         } else if !self.browse_index.is_empty() {
             // Playback ended or zapped without clearing the stage — mosaic can still
             // sample stale atlas regions from soft RGBA uploads.
             self.refresh_browse_poster_gpu_textures();
             self.art_warm_cursor = 0;
-            self.art_warm_active = true;
+            self.art_warm_active = false;
         }
         #[cfg(target_os = "android")]
         {
@@ -3257,8 +3257,8 @@ impl FluxPlay {
                 let page = self.browse_page();
                 let base = self.list_limit.max(page);
                 self.list_limit = base.saturating_add(page).min(10_000);
-                self.art_warm_active = true;
-                return Task::batch([self.refresh_browse_art(), self.queue_visible_ages()]);
+                self.art_warm_active = false;
+                return Task::batch([self.prefetch_visible_art(), self.queue_visible_ages()]);
             }
             Message::BrowseScrolled(y, view_h) => {
                 let view_h = view_h.max(1.0);
@@ -8686,9 +8686,7 @@ impl FluxPlay {
 
 
     fn finish_browse_index_rebuild(&mut self) {
-        self.art_warm_active = !self.browse_index.is_empty()
-            && self.vod_detail.is_none()
-            && !(matches!(self.tab, Tab::Series) && self.series_detail.is_some());
+        self.art_warm_active = false;
         self.browse_slice =
             self.content_virtual_slice(self.browse_scroll_y, self.browse_view_h);
     }
@@ -9507,26 +9505,26 @@ impl FluxPlay {
             return Task::none();
         }
         self.art_warm_cursor = 0;
-        self.art_warm_active = !self.browse_index.is_empty();
+        self.art_warm_active = false;
         self.refresh_browse_art()
     }
 
     /// Visible window + background warm of the current filter.
     fn refresh_browse_art(&mut self) -> Task<Message> {
-        Task::batch([self.prefetch_visible_art(), self.pump_art_warm()])
+        self.art_warm_active = false;
+        self.prefetch_visible_art()
     }
 
     fn continue_art_warm(&mut self) -> Task<Message> {
-        if self.browse_parked || !self.art_warm_active || self.browse_flinging() {
-            return Task::none();
-        }
-        self.pump_art_warm()
+        let _ = self;
+        Task::none()
     }
 
     /// How many browse_index entries to warm after load (~8–12 mosaic screens).
     fn art_warm_target(&self) -> usize {
-        let cols = self.layout_metrics().cols.max(1);
-        (cols.saturating_mul(56)).clamp(160, 560).min(self.browse_index.len())
+        self.list_limit
+            .min(crate::images::MAX_RAM_HANDLES.saturating_sub(16))
+            .min(self.browse_index.len())
     }
 
     fn art_url_for_browse_pos(&self, pos: usize) -> Option<String> {
