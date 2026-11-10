@@ -16,12 +16,31 @@ edition = "2021"
 license = "MIT"
 authors = ["FluxPlay"]
 repository = "https://github.com/fluxplay/fluxplay"
+rust-version = "1.88"
+
+# Workspace-wide rustc / clippy lints (inherited by members that opt in with
+# `[lints] workspace = true`). Keep deny-ish: CI also uses `-D warnings`.
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "warn"
+missing_docs = "allow"
+unused_qualifications = "warn"
+rust_2024_compatibility = "allow"
+
+[workspace.lints.clippy]
+dbg_macro = "deny"
+todo = "warn"
+unimplemented = "warn"
+large_stack_arrays = "warn"
+mutex_integer = "warn"
+mem_forget = "warn"
+rest_pat_in_fully_bound_structs = "warn"
+# FFI / iced cast paths are intentional — keep as warn so CI stays green.
+fn_to_numeric_cast_any = "warn"
 
 [workspace.dependencies]
 fluxplay-core = { path = "crates/fluxplay-core" }
 fluxplay-providers = { path = "crates/fluxplay-providers" }
 fluxplay-player = { path = "crates/fluxplay-player", default-features = false }
-fluxplay-ffi = { path = "crates/fluxplay-ffi" }
 
 anyhow = "1"
 thiserror = "2"
@@ -31,9 +50,11 @@ url = "2"
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "gzip", "cookies", "socks"] }
+# 0.26 has a large API break (NameServerConfigGroup / DoH helpers). Stay on 0.25;
+# RUSTSEC-2026-0118 has no fix yet — documented ignore in deny.toml.
 hickory-resolver = { version = "0.25", default-features = false, features = ["tokio", "system-config", "tls-ring", "https-ring", "webpki-roots"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "fs"] }
-quick-xml = { version = "0.37", features = ["serialize"] }
+quick-xml = { version = "0.41", features = ["serialize"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 base64 = "0.22"
@@ -43,9 +64,11 @@ iced = { version = "0.14", default-features = false, features = ["wgpu", "crisp"
 dirs = "6"
 rfd = "0.15"
 open = "5"
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.41", features = ["bundled"] }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp"] }
-zip = "2"
+# ≥9.0 — symlink/extract CVEs in zip 2.x (RUSTSEC-2026-0367…0429)
+zip = { version = "9", default-features = false, features = ["deflate", "aes-crypto"] }
+proptest = "1"
 
 [patch.crates-io]
 iced = { path = "vendor/iced" }
@@ -56,7 +79,8 @@ iced_wgpu = { path = "vendor/iced_wgpu" }
 tokio-wireguard = { path = "vendor/tokio-wireguard" }
 
 # ── Release binaries: max opt, dead-code elimination, stripped ──────────────
-# Default: `cargo build --release` / `cargo install`
+# CPU/linker flags live in `.cargo/config.toml` (per OS/arch) + `scripts/rustc-flags.sh`.
+# Default: `cargo build --release` / `cargo install` / `cargo rel`
 [profile.release]
 opt-level = 3
 lto = "fat"
@@ -69,12 +93,14 @@ overflow-checks = false
 incremental = false
 rpath = false
 
-# Smaller download (CLI-style): prefer size over peak speed
+# Smaller download (CLI-style / APK size): prefer size over peak speed
 #   cargo build --profile release-size -p fluxplay
 [profile.release-size]
 inherits = "release"
 opt-level = "z"
 strip = "symbols"
+# Thin LTO still GC's well with -Z / size; keep fat for consistency with release
+# unless CI time hurts — override with release-ci for speed.
 
 # Faster CI compile while still better than stock release
 #   cargo build --profile release-ci -p fluxplay
@@ -87,4 +113,12 @@ strip = "symbols"
 # Dev: speed up heavy deps without slowing your edit–compile loop too much
 [profile.dev.package."*"]
 opt-level = 1
+
+# Decoder / crypto hot paths: always opt even in dev (soft RGBA, hash, XML).
+[profile.dev.package.fluxplay-player]
+opt-level = 2
+[profile.dev.package.fluxplay-core]
+opt-level = 2
+[profile.dev.package.fluxplay-providers]
+opt-level = 2
 

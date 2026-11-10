@@ -61,7 +61,12 @@ pub fn data_dir() -> PathBuf {
 /// Where film/episode downloads land: `custom` (settings) or the default.
 /// `~/…` expands to the home folder.
 pub fn downloads_dir(custom: &str) -> PathBuf {
-    let custom = custom.trim();
+    // PathBuf / OS APIs reject or truncate on NUL — scrub so UI never holds poison.
+    let custom: String = custom
+        .trim()
+        .chars()
+        .filter(|c| !c.is_control())
+        .collect();
     if custom.is_empty() {
         return default_downloads_dir();
     }
@@ -80,20 +85,27 @@ pub fn validate_downloads_dir(custom: &str) -> Result<String, String> {
     if custom.is_empty() {
         return Ok(String::new());
     }
+    if custom.chars().any(|c| c.is_control()) {
+        return Err("Chemin invalide (caractères de contrôle)".into());
+    }
     let dir = downloads_dir(custom);
     if !dir.is_absolute() {
         return Err(format!("Chemin absolu requis (ex. /home/…/Films) : {custom}"));
     }
-    std::fs::create_dir_all(&dir).map_err(|e| format!("Impossible de créer {} : {e}", dir.display()))?;
+    fs::create_dir_all(&dir).map_err(|e| format!("Impossible de créer {} : {e}", dir.display()))?;
     let probe = dir.join(".fluxplay-write-test");
-    std::fs::write(&probe, b"")
+    fs::write(&probe, b"")
         .map_err(|e| format!("Dossier non inscriptible {} : {e}", dir.display()))?;
-    let _ = std::fs::remove_file(&probe);
+    let _ = fs::remove_file(&probe);
     Ok(dir.to_string_lossy().into_owned())
 }
 
-/// `/home/me/x` → `~/x` for labels.
+/// `/home/me/x` → `~/x` for labels. Windows keeps the real path (`~` means nothing
+/// in Explorer).
 pub fn display_path(path: &Path) -> String {
+    if cfg!(windows) {
+        return path.display().to_string();
+    }
     if let Some(home) = dirs::home_dir() {
         if let Ok(rest) = path.strip_prefix(&home) {
             return if rest.as_os_str().is_empty() {
@@ -151,15 +163,25 @@ pub fn state_path() -> PathBuf {
     config_dir().join("state.json")
 }
 
+/// Parse persisted `state.json` without touching disk (fuzz / property surface).
+/// Corrupt JSON → `None` (callers fall back to defaults).
+pub fn parse_persisted_state(raw: &str) -> Option<PersistedState> {
+    // Cap pathological fuzz blobs before serde allocates.
+    if raw.len() > 4 * 1024 * 1024 {
+        return None;
+    }
+    serde_json::from_str(raw).ok()
+}
+
 pub fn load() -> PersistedState {
     let path = state_path();
     match fs::read_to_string(&path) {
-        Ok(raw) => match serde_json::from_str(&raw) {
-            Ok(state) => {
+        Ok(raw) => match parse_persisted_state(&raw) {
+            Some(state) => {
                 info!(path = %path.display(), "state loaded");
                 state
             }
-            Err(e) => {
+            None => {
                 // Keep the unreadable file: the next save would otherwise erase the
                 // sources and favorites for good.
                 let backup = path.with_extension(format!(
@@ -170,7 +192,11 @@ pub fn load() -> PersistedState {
                         .unwrap_or(0)
                 ));
                 let _ = fs::copy(&path, &backup);
-                warn!(path = %path.display(), backup = %backup.display(), error = %e, "state JSON corrupt — defaults");
+                warn!(
+                    path = %path.display(),
+                    backup = %backup.display(),
+                    "state JSON corrupt — defaults"
+                );
                 PersistedState::default()
             }
         },
@@ -246,7 +272,9 @@ mod tests {
         assert_eq!(downloads_dir("  "), default_downloads_dir());
         if let Some(home) = dirs::home_dir() {
             assert_eq!(downloads_dir("~/Films"), home.join("Films"));
-            assert_eq!(display_path(&home.join("Films")), "~/Films");
+            if !cfg!(windows) {
+                assert_eq!(display_path(&home.join("Films")), "~/Films");
+            }
         }
         assert_eq!(downloads_dir("/srv/media"), PathBuf::from("/srv/media"));
     }

@@ -1,0 +1,7 @@
+# Pin the workspace to stable so CI and local `cargo` agree.
+# Components (clippy/rustfmt) are installed by CI / `rustup component add`
+# — listing them here fights multi-toolchain desktops (nightly + stable).
+# Fuzz still uses `rustup run nightly` (see scripts/fuzz-common.sh).
+[toolchain]
+channel = "stable"
+profile = "minimal"

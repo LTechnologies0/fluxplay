@@ -15,26 +15,47 @@ use iced::{Color, Font};
 pub struct UiTheme {
     pub day: bool,
     pub accent: AccentPreset,
+    /// Picked color. When set, it replaces the preset for every accent role.
+    pub custom: Option<[u8; 3]>,
+    /// Picked text color. When set, it replaces the default ink.
+    pub ink_rgb: Option<[u8; 3]>,
 }
+
+/// Side of the gradient square in the color settings.
+pub const ACCENT_PICK: f32 = 220.0;
 
 impl UiTheme {
     pub fn new(day: bool, accent: AccentPreset) -> Self {
-        Self { day, accent }
+        Self {
+            day,
+            accent,
+            custom: None,
+            ink_rgb: None,
+        }
+    }
+
+    pub fn with_custom(mut self, rgb: Option<[u8; 3]>) -> Self {
+        self.custom = rgb;
+        self
+    }
+
+    pub fn with_ink(mut self, rgb: Option<[u8; 3]>) -> Self {
+        self.ink_rgb = rgb;
+        self
+    }
+
+    pub fn accent_label(self) -> &'static str {
+        if self.custom.is_some() {
+            "Personnalisé"
+        } else {
+            self.accent.label()
+        }
     }
 
     pub fn iced_theme(self) -> Theme {
-        let (bg, text, primary) = match (self.day, self.accent) {
-            (true, a) => (
-                self.shell(),
-                Color::from_rgb8(0x0F, 0x17, 0x22),
-                a.primary_day(),
-            ),
-            (false, a) => (
-                self.shell(),
-                Color::from_rgb8(0xE8, 0xEF, 0xF6),
-                a.primary_night(),
-            ),
-        };
+        let text = self.ink();
+        let bg = self.shell();
+        let primary = self.primary();
         Theme::custom(
             if self.day { "FluxPlay Day" } else { "FluxPlay Night" },
             Palette {
@@ -54,6 +75,9 @@ impl UiTheme {
     }
 
     pub fn primary(self) -> Color {
+        if let Some(t) = self.custom_tokens() {
+            return self.rgb(t.day, t.night);
+        }
         if self.day {
             self.accent.primary_day()
         } else {
@@ -62,6 +86,9 @@ impl UiTheme {
     }
 
     pub fn on_primary(self) -> Color {
+        if let Some(t) = self.custom_tokens() {
+            return self.rgb(t.on_primary_day, t.on_primary_night);
+        }
         if self.day {
             self.accent.on_primary_day()
         } else {
@@ -70,6 +97,9 @@ impl UiTheme {
     }
 
     pub fn primary_container(self) -> Color {
+        if let Some(t) = self.custom_tokens() {
+            return self.rgb(t.container_day, t.container_night);
+        }
         if self.day {
             self.accent.container_day()
         } else {
@@ -78,6 +108,9 @@ impl UiTheme {
     }
 
     pub fn on_primary_container(self) -> Color {
+        if let Some(t) = self.custom_tokens() {
+            return self.rgb(t.on_day, t.on_primary_night);
+        }
         if self.day {
             self.accent.on_container_day()
         } else {
@@ -87,16 +120,23 @@ impl UiTheme {
 
     // --- Secondary (selection / nav / chips) — distinct hue family per accent ---
     pub fn secondary(self) -> Color {
+        if let Some(t) = self.custom_tokens() {
+            return self.rgb(t.secondary_day, t.secondary_night);
+        }
         let t = accent_tokens(self.accent);
         let (r, g, b) = if self.day {
             t.secondary_day
         } else {
-            t.secondary_night
+            let (r, g, b) = t.secondary_night;
+            (restful(r), restful(g), restful(b))
         };
         Color::from_rgb8(r, g, b)
     }
 
     pub fn on_secondary(self) -> Color {
+        if let Some(t) = self.custom_tokens() {
+            return self.rgb(t.on_secondary, t.on_secondary);
+        }
         if self.day {
             let (r, g, b) = accent_tokens(self.accent).on_secondary;
             Color::from_rgb8(r, g, b)
@@ -107,12 +147,24 @@ impl UiTheme {
     }
 
     pub fn secondary_container(self) -> Color {
+        if let Some(t) = self.custom_tokens() {
+            return self.rgb(t.secondary_container_day, t.secondary_container_night);
+        }
         let t = accent_tokens(self.accent);
         let (r, g, b) = if self.day {
             t.secondary_container_day
         } else {
             t.secondary_container_night
         };
+        Color::from_rgb8(r, g, b)
+    }
+
+    fn custom_tokens(self) -> Option<AccentTokens> {
+        self.custom.map(tokens_from_rgb)
+    }
+
+    fn rgb(self, day: (u8, u8, u8), night: (u8, u8, u8)) -> Color {
+        let (r, g, b) = if self.day { day } else { night };
         Color::from_rgb8(r, g, b)
     }
 
@@ -196,10 +248,10 @@ impl UiTheme {
         }
     }
 
-    /// Favorite star (`tertiary`).
+    /// Favorite star (`tertiary`). Day gold darkened for ≥3:1 on surface.
     pub fn favorite(self) -> Color {
         if self.day {
-            Color::from_rgb8(0xC9, 0x8A, 0x00)
+            Color::from_rgb8(0x9A, 0x6A, 0x00)
         } else {
             Color::from_rgb8(0xF5, 0xC5, 0x42)
         }
@@ -223,7 +275,7 @@ impl UiTheme {
         if self.day {
             Color::from_rgb8(0xF7, 0xF9, 0xFC)
         } else {
-            Color::from_rgb8(0x11, 0x16, 0x1F)
+            Color::from_rgb8(0x0C, 0x10, 0x16)
         }
     }
 
@@ -231,7 +283,7 @@ impl UiTheme {
         if self.day {
             Color::from_rgb8(0xFF, 0xFF, 0xFF)
         } else {
-            Color::from_rgb8(0x1C, 0x25, 0x34)
+            Color::from_rgb8(0x16, 0x1C, 0x26)
         }
     }
 
@@ -244,18 +296,33 @@ impl UiTheme {
     }
 
     pub fn ink(self) -> Color {
+        if let Some([r, g, b]) = self.ink_rgb {
+            let c = Color::from_rgb8(r, g, b);
+            // Custom ink must keep AA body contrast on surface (≥4.5:1).
+            if contrast_ratio(c, self.surface()) >= 4.5 {
+                return c;
+            }
+        }
         if self.day {
             Color::from_rgb8(0x0F, 0x17, 0x22)
         } else {
-            Color::from_rgb8(0xE8, 0xEF, 0xF6)
+            Color::from_rgb8(0xD0, 0xD7, 0xE0)
         }
     }
 
     pub fn ink_muted(self) -> Color {
+        if let Some([r, g, b]) = self.ink_rgb {
+            let solid = Color::from_rgb8(r, g, b);
+            if contrast_ratio(solid, self.surface()) >= 4.5 {
+                // α 0.70 keeps muted role while solid ink already clears AA.
+                return Color::from_rgba8(r, g, b, 0.70);
+            }
+        }
         if self.day {
-            Color::from_rgba8(0x0F, 0x17, 0x22, 0.58)
+            // ≥4.5:1 on surface for small caption/body_s text (was 0.58 ≈ 4.35:1).
+            Color::from_rgba8(0x0F, 0x17, 0x22, 0.70)
         } else {
-            Color::from_rgba8(0xE8, 0xEF, 0xF6, 0.55)
+            Color::from_rgba8(0xD0, 0xD7, 0xE0, 0.62)
         }
     }
 
@@ -281,7 +348,7 @@ impl UiTheme {
         if self.day {
             Color::from_rgb8(0xEA, 0xF0, 0xF6)
         } else {
-            Color::from_rgb8(0x14, 0x1A, 0x24)
+            Color::from_rgb8(0x10, 0x14, 0x1C)
         }
     }
 
@@ -289,7 +356,7 @@ impl UiTheme {
         if self.day {
             Color::from_rgb8(0xE6, 0xEC, 0xF3)
         } else {
-            Color::from_rgb8(0x1A, 0x22, 0x30)
+            Color::from_rgb8(0x14, 0x1A, 0x24)
         }
     }
 
@@ -297,7 +364,7 @@ impl UiTheme {
         if self.day {
             Color::from_rgb8(0xDE, 0xE5, 0xEE)
         } else {
-            Color::from_rgb8(0x22, 0x2B, 0x3A)
+            Color::from_rgb8(0x1A, 0x22, 0x2E)
         }
     }
 
@@ -448,7 +515,7 @@ impl AccentColors for AccentPreset {
 
     fn primary_night(self) -> Color {
         let (r, g, b) = accent_tokens(self).night;
-        Color::from_rgb8(r, g, b)
+        Color::from_rgb8(restful(r), restful(g), restful(b))
     }
 
     fn container_day(self) -> Color {
@@ -476,8 +543,112 @@ impl AccentColors for AccentPreset {
     }
 
     fn on_primary_night(self) -> Color {
-        let (r, g, b) = accent_tokens(self).on_primary_night;
-        Color::from_rgb8(r, g, b)
+        match self {
+            _ => Color::from_rgb8(0xF4, 0xF6, 0xF8),
+        }
+    }
+}
+
+/// Pull a bright pastel toward a dim mid-tone so night accents stay readable
+/// without glowing. Hue is kept; only the highlights come down.
+fn restful(c: u8) -> u8 {
+    let v = c as f32 / 255.0;
+    let v = 0.30 + v * 0.32;
+    v.clamp(0.0, 1.0).mul_add(255.0, 0.0).round() as u8
+}
+
+/// Hue 0..360, saturation and value 0..1.
+pub(crate) fn hsv_to_rgb(h: f32, s: f32, v: f32) -> (u8, u8, u8) {
+    let h = h.rem_euclid(360.0);
+    let c = v * s;
+    let x = c * (1.0 - ((h / 60.0) % 2.0 - 1.0).abs());
+    let m = v - c;
+    let (r, g, b) = if h < 60.0 {
+        (c, x, 0.0)
+    } else if h < 120.0 {
+        (x, c, 0.0)
+    } else if h < 180.0 {
+        (0.0, c, x)
+    } else if h < 240.0 {
+        (0.0, x, c)
+    } else if h < 300.0 {
+        (x, 0.0, c)
+    } else {
+        (c, 0.0, x)
+    };
+    let to = |n: f32| ((n + m) * 255.0).round().clamp(0.0, 255.0) as u8;
+    (to(r), to(g), to(b))
+}
+
+pub(crate) fn rgb_to_hsv(r: u8, g: u8, b: u8) -> (f32, f32, f32) {
+    let r = r as f32 / 255.0;
+    let g = g as f32 / 255.0;
+    let b = b as f32 / 255.0;
+    let max = r.max(g).max(b);
+    let min = r.min(g).min(b);
+    let d = max - min;
+    let h = if d == 0.0 {
+        0.0
+    } else if max == r {
+        60.0 * (((g - b) / d) % 6.0)
+    } else if max == g {
+        60.0 * (((b - r) / d) + 2.0)
+    } else {
+        60.0 * (((r - g) / d) + 4.0)
+    };
+    let s = if max == 0.0 { 0.0 } else { d / max };
+    (h.rem_euclid(360.0), s, max)
+}
+
+/// Same mapping as the gradient square: x is hue, y fades toward black.
+pub(crate) fn pick_color(nx: f32, ny: f32) -> [u8; 3] {
+    let hue = nx.clamp(0.0, 1.0) * 360.0;
+    let v = 1.0 - ny.clamp(0.0, 1.0) * 0.92;
+    let (r, g, b) = hsv_to_rgb(hue, 1.0, v);
+    [r, g, b]
+}
+
+pub(crate) fn cursor_for_rgb(rgb: [u8; 3]) -> (f32, f32) {
+    let (h, _s, v) = rgb_to_hsv(rgb[0], rgb[1], rgb[2]);
+    let ny = ((1.0 - v) / 0.92).clamp(0.0, 1.0);
+    ((h / 360.0).clamp(0.0, 1.0), ny)
+}
+
+fn tokens_from_rgb(rgb: [u8; 3]) -> AccentTokens {
+    let (r, g, b) = (rgb[0], rgb[1], rgb[2]);
+    let mix = |a: u8, toward: u8, t: f32| -> u8 {
+        (a as f32 * (1.0 - t) + toward as f32 * t).round() as u8
+    };
+    let lum = 0.2126 * r as f32 + 0.7152 * g as f32 + 0.0722 * b as f32;
+    let ink = if lum > 150.0 {
+        (0x1A, 0x14, 0x08)
+    } else {
+        (0xF4, 0xF6, 0xF8)
+    };
+    let (h, s, v) = rgb_to_hsv(r, g, b);
+    // Same hue as the pick, a little deeper — not the opposite color.
+    let (sr, sg, sb) = hsv_to_rgb(
+        h,
+        (s * 0.72).clamp(0.35, 0.9),
+        (v * 0.72).clamp(0.28, 0.7),
+    );
+    AccentTokens {
+        day: (r, g, b),
+        night: (r, g, b),
+        container_day: (mix(r, 255, 0.72), mix(g, 255, 0.72), mix(b, 255, 0.72)),
+        container_night: (mix(r, 0x12, 0.62), mix(g, 0x14, 0.62), mix(b, 0x1A, 0.62)),
+        on_day: ink,
+        on_primary_day: ink,
+        on_primary_night: ink,
+        secondary_day: (sr, sg, sb),
+        secondary_night: (sr, sg, sb),
+        secondary_container_day: (mix(sr, 255, 0.7), mix(sg, 255, 0.7), mix(sb, 255, 0.7)),
+        secondary_container_night: (
+            mix(sr, 0x12, 0.55),
+            mix(sg, 0x14, 0.55),
+            mix(sb, 0x1A, 0.55),
+        ),
+        on_secondary: ink,
     }
 }
 
@@ -634,7 +805,8 @@ pub const RADIUS_FULL: f32 = 999.0;
 // Legacy aliases used across browser / player / app.
 pub const RADIUS_XS: f32 = RADIUS_EXTRA_SMALL;
 pub const RADIUS_SM: f32 = RADIUS_SMALL;
-pub const RADIUS_MD: f32 = RADIUS_LARGE;
+/// Material medium radius (12). Was aliased to LARGE (16) — mosaic/cards looked oversized.
+pub const RADIUS_MD: f32 = RADIUS_MEDIUM;
 pub const RADIUS_LG: f32 = RADIUS_LARGE_INCREASED;
 pub const RADIUS_XL: f32 = RADIUS_EXTRA_LARGE;
 pub const RADIUS_XXL: f32 = RADIUS_EXTRA_LARGE_INCREASED;
@@ -789,6 +961,25 @@ pub fn type_style(role: TypeRole, emphasized: bool) -> (f32, Font) {
     (type_size(role), type_font(emphasized))
 }
 
+/// Relative luminance (WCAG) for sRGB `Color` channels in 0..=1.
+fn relative_luminance(c: Color) -> f32 {
+    fn lin(u: f32) -> f32 {
+        if u <= 0.04045 {
+            u / 12.92
+        } else {
+            ((u + 0.055) / 1.055).powf(2.4)
+        }
+    }
+    0.2126 * lin(c.r) + 0.7152 * lin(c.g) + 0.0722 * lin(c.b)
+}
+
+/// WCAG contrast ratio between two opaque colors (≥1).
+pub fn contrast_ratio(a: Color, b: Color) -> f32 {
+    let (l1, l2) = (relative_luminance(a), relative_luminance(b));
+    let (hi, lo) = if l1 >= l2 { (l1, l2) } else { (l2, l1) };
+    (hi + 0.05) / (lo + 0.05)
+}
+
 /// Component measurement tokens (M3 Expressive).
 pub const TOOLBAR_H: f32 = 48.0;
 pub const TOOLBAR_OUTER_PAD: f32 = 12.0;
@@ -839,7 +1030,8 @@ pub const PLAYER_PAD: f32 = SPACE_LG;
 
 /// Minimum mosaic tile width (logical px) before dropping a column.
 pub const MOSAIC_TILE_MIN: f32 = 120.0;
-pub const MOSAIC_GAP: f32 = 14.0;
+/// Mosaic gutter — Material `SPACE_MD` (was ad-hoc 10).
+pub const MOSAIC_GAP: f32 = SPACE_MD;
 
 /// Screen class from window width — M3 window size classes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -897,10 +1089,24 @@ pub struct LayoutMetrics {
     pub short: bool,
     /// Phone landscape: single-row tab strip instead of 2-col grid.
     pub nav_strip: bool,
+    /// Minimum interactive hit target (from [`crate::ui_surface::UiSurface`]).
+    pub hit: f32,
 }
 
 impl LayoutMetrics {
     pub fn compute(width: f32, height: f32) -> Self {
+        Self::compute_with(width, height, None, 1.0, 48.0)
+    }
+
+    /// `force_bp` / `type_scale` / `hit` come from [`crate::ui_surface::UiSurface`]
+    /// (passed as primitives to avoid a theme ↔ ui_surface import cycle).
+    pub fn compute_with(
+        width: f32,
+        height: f32,
+        force_bp: Option<Breakpoint>,
+        type_scale: f32,
+        hit: f32,
+    ) -> Self {
         let w = width.max(280.0);
         let h = height.max(200.0);
         // Phone landscape is often ≥600 wide but ~360 tall — width-only breakpoints
@@ -908,11 +1114,15 @@ impl LayoutMetrics {
         let short = h < 520.0;
         let landscape = w > h * 1.05;
         let compact = w.min(h) < 520.0 || h < 480.0 || (landscape && h < 560.0);
-        let bp = if compact {
-            Breakpoint::Phone
-        } else {
-            Breakpoint::from_width(w)
-        };
+        let bp = force_bp.unwrap_or_else(|| {
+            if compact {
+                Breakpoint::Phone
+            } else {
+                Breakpoint::from_width(w)
+            }
+        });
+        // Television forces Tv breakpoint even on compact 720p panels.
+        let compact = compact && !matches!(bp, Breakpoint::Tv);
 
         #[cfg(target_os = "android")]
         let pad = if short { 6.0_f32 } else { 8.0_f32 };
@@ -942,14 +1152,19 @@ impl LayoutMetrics {
             }
         };
 
-        let mut chrome = pad * 2.0;
-        if rail_w > 0.0 {
-            chrome += gap + pad * 2.0;
-        }
-        if cat_w > 0.0 {
-            chrome += gap + pad * 2.0;
-        }
-        let content_w = (w - rail_w - cat_w - chrome).max(120.0);
+        // Pane padding lives *inside* rail_w / cat_w / the content pane.
+        // Subtracting it again left a wide empty band beside the posters.
+        let gaps = match (rail_w > 0.0, cat_w > 0.0) {
+            (true, true) => gap * 2.0,
+            (true, false) | (false, true) => gap,
+            (false, false) => 0.0,
+        };
+        #[cfg(target_os = "android")]
+        let pane_pad = SPACE_SM;
+        #[cfg(not(target_os = "android"))]
+        let pane_pad = SPACE_MD;
+        let content_outer = (w - pad * 2.0 - rail_w - cat_w - gaps).max(160.0);
+        let content_w = (content_outer - pane_pad * 2.0 - 8.0).max(120.0);
 
         let max_cols = match bp {
             Breakpoint::Phone if short && landscape => 3,
@@ -967,19 +1182,40 @@ impl LayoutMetrics {
         };
 
         // Type ladder: Phone / Tablet / Desktop / Tv (Laptop shares Desktop).
+        let scale = type_scale.clamp(1.0, 1.5);
         let (title_size, body_size, rail_size, thumb, player_chrome_h) = match bp {
             Breakpoint::Phone => (
-                TYPE_TITLE_L,
-                TYPE_BODY_M,
-                TYPE_LABEL_M,
+                TYPE_TITLE_L * scale,
+                TYPE_BODY_M * scale,
+                TYPE_LABEL_M * scale,
                 if short { 36.0 } else { 40.0 },
                 if short { 96.0 } else { 108.0 },
             ),
-            Breakpoint::Tablet => (TYPE_HEADLINE_S, TYPE_BODY_M, TYPE_LABEL_L, 44.0, 112.0),
-            Breakpoint::Laptop | Breakpoint::Desktop => {
-                (TYPE_HEADLINE_M, TYPE_BODY_L, TYPE_TITLE_M, if matches!(bp, Breakpoint::Desktop) { 52.0 } else { 48.0 }, 116.0)
-            }
-            Breakpoint::Tv => (TYPE_DISPLAY_S, TYPE_BODY_L, TYPE_LABEL_L, 64.0, 128.0),
+            Breakpoint::Tablet => (
+                TYPE_HEADLINE_S * scale,
+                TYPE_BODY_M * scale,
+                TYPE_LABEL_L * scale,
+                44.0,
+                112.0,
+            ),
+            Breakpoint::Laptop | Breakpoint::Desktop => (
+                TYPE_HEADLINE_M * scale,
+                TYPE_BODY_L * scale,
+                TYPE_TITLE_M * scale,
+                if matches!(bp, Breakpoint::Desktop) {
+                    52.0
+                } else {
+                    48.0
+                },
+                116.0,
+            ),
+            Breakpoint::Tv => (
+                TYPE_DISPLAY_S * scale,
+                TYPE_BODY_L * scale,
+                TYPE_LABEL_L * scale,
+                64.0_f32.max(hit),
+                128.0,
+            ),
         };
 
         Self {
@@ -999,10 +1235,15 @@ impl LayoutMetrics {
             rail_size,
             thumb,
             player_chrome_h,
-            stack_header: matches!(bp, Breakpoint::Phone) || search_w >= content_w * 0.85,
+            // Below ~240 px the search pill (icon + clear + paste) leaves no room to
+            // type: put it full-width under the title instead.
+            stack_header: matches!(bp, Breakpoint::Phone)
+                || search_w >= content_w * 0.85
+                || search_w < 240.0,
             top_nav,
             short,
             nav_strip: top_nav && short && landscape,
+            hit: hit.max(40.0),
         }
     }
 }
@@ -1022,7 +1263,8 @@ fn mosaic_scroll_rail() -> f32 {
 /// How many mosaic columns fit in `content_width`.
 pub fn mosaic_cols(content_width: f32) -> usize {
     let w = (content_width - mosaic_scroll_rail()).max(80.0);
-    let cols = ((w + MOSAIC_GAP) / (MOSAIC_TILE_MIN + MOSAIC_GAP)).floor() as usize;
+    let tile_min = crate::policy::get().browse.mosaic_tile_min;
+    let cols = ((w + MOSAIC_GAP) / (tile_min + MOSAIC_GAP)).floor() as usize;
     cols.clamp(1, 14)
 }
 
@@ -1032,4 +1274,41 @@ pub fn mosaic_tile_width(content_width: f32, cols: usize) -> f32 {
     let usable = (content_width - mosaic_scroll_rail()).max(80.0);
     // Slack so button padding cannot overflow the row.
     ((usable - gaps) / cols - 4.0).clamp(96.0, 320.0)
+}
+
+#[cfg(test)]
+mod contrast_tests {
+    use super::*;
+
+    #[test]
+    fn day_muted_and_favorite_meet_aa() {
+        let ui = UiTheme::new(true, AccentPreset::default());
+        // Blend muted over surface (α compositing) before measuring.
+        let muted = ui.ink_muted();
+        let surf = ui.surface();
+        let a = muted.a;
+        let blended = Color {
+            r: muted.r * a + surf.r * (1.0 - a),
+            g: muted.g * a + surf.g * (1.0 - a),
+            b: muted.b * a + surf.b * (1.0 - a),
+            a: 1.0,
+        };
+        assert!(
+            contrast_ratio(blended, surf) >= 4.5,
+            "day ink_muted on surface {:.2}",
+            contrast_ratio(blended, surf)
+        );
+        assert!(
+            contrast_ratio(ui.favorite(), surf) >= 3.0,
+            "day favorite on surface {:.2}",
+            contrast_ratio(ui.favorite(), surf)
+        );
+    }
+
+    #[test]
+    fn weak_custom_ink_falls_back() {
+        // Near-white ink on day surface fails AA → default dark ink.
+        let ui = UiTheme::new(true, AccentPreset::default()).with_ink(Some([0xF0, 0xF2, 0xF5]));
+        assert!(contrast_ratio(ui.ink(), ui.surface()) >= 4.5);
+    }
 }

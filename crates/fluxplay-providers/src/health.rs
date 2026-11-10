@@ -6,6 +6,11 @@ use tracing::{debug, error, info, warn};
 
 use crate::{http_client, ProviderError, Result};
 
+/// Auth / category JSON budget for health probes (same order as player_api caps).
+const MAX_HEALTH_JSON: usize = 16 * 1024 * 1024;
+/// get.php / HLS probe bodies — only need a small prefix.
+const MAX_PROBE_BODY: usize = 2 * 1024 * 1024;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PortalHealth {
     pub portal: String,
@@ -31,8 +36,8 @@ pub async fn check_xtream_portal(portal: &str, username: &str, password: &str) -
     if !base.contains("://") {
         base = format!("http://{base}");
     }
-    // Never log password — portal + username only.
-    info!(portal = %base, user = %username, "portal health check start");
+    // Never log username/password — portal host only.
+    info!(portal = %base, "portal health check start");
 
     // Credentials go through the query encoder: `&`, `#` or `+` in a password must not
     // split the query string.
@@ -77,7 +82,10 @@ pub async fn check_xtream_portal(portal: &str, username: &str, password: &str) -
             notes: vec!["player_api injoignable".into()],
         });
     }
-    let auth: serde_json::Value = auth_resp.json().await?;
+    let auth_raw = http_client::read_body_capped(auth_resp, MAX_HEALTH_JSON).await?;
+    let auth: serde_json::Value = serde_json::from_slice(&auth_raw).map_err(|e| {
+        ProviderError::Message(format!("xtream JSON parse: {e}"))
+    })?;
     let ui = auth.get("user_info").cloned().unwrap_or_default();
     let auth_ok = matches!(
         ui.get("auth").and_then(|v| v.as_u64().or_else(|| v.as_i64().map(|i| i as u64))),
@@ -98,7 +106,7 @@ pub async fn check_xtream_portal(portal: &str, username: &str, password: &str) -
         .unwrap_or(0) as u32;
 
     if !auth_ok {
-        error!(portal = %base, user = %username, %status, "portal auth rejected");
+        error!(portal = %base, %status, "portal auth rejected");
     } else {
         debug!(
             portal = %base,
@@ -120,7 +128,10 @@ pub async fn check_xtream_portal(portal: &str, username: &str, password: &str) -
     let get_url = with_query("get.php", &[("type", "m3u_plus"), ("output", "ts")]);
     let get_php_ok = match client.get(&get_url).send().await {
         Ok(r) if r.status().is_success() => {
-            let n = r.bytes().await.map(|b| b.len()).unwrap_or(0);
+            let n = match http_client::read_body_capped(r, MAX_PROBE_BODY).await {
+                Ok(b) => b.len(),
+                Err(_) => MAX_PROBE_BODY.saturating_add(1),
+            };
             debug!(bytes = n, "get.php probe succeeded");
             n > 64
         }
@@ -150,7 +161,11 @@ pub async fn check_xtream_portal(portal: &str, username: &str, password: &str) -
     let mut stream_final_url = None;
     let cats_url = with_query("player_api.php", &[("action", "get_live_categories")]);
     if let Ok(r) = client.get(&cats_url).send().await {
-        if let Ok(v) = r.json::<serde_json::Value>().await {
+        let v = match http_client::read_body_capped(r, MAX_HEALTH_JSON).await {
+            Ok(raw) => serde_json::from_slice::<serde_json::Value>(&raw).ok(),
+            Err(_) => None,
+        };
+        if let Some(v) = v {
             let cats = v.as_array().cloned().unwrap_or_default();
             let cat_ids: Vec<(String, String)> = cats
                 .iter()
@@ -182,7 +197,10 @@ pub async fn check_xtream_portal(portal: &str, username: &str, password: &str) -
                 let Ok(sr) = client.get(&streams_url).send().await else {
                     continue;
                 };
-                let Ok(sv) = sr.json::<serde_json::Value>().await else {
+                let Ok(raw) = http_client::read_body_capped(sr, MAX_HEALTH_JSON).await else {
+                    continue;
+                };
+                let Ok(sv) = serde_json::from_slice::<serde_json::Value>(&raw) else {
                     continue;
                 };
                 let ids: Vec<String> = sv
@@ -208,8 +226,12 @@ pub async fn check_xtream_portal(portal: &str, username: &str, password: &str) -
                     );
                     match client.get(&stream_url).send().await {
                         Ok(r) if r.status().is_success() => {
-                            let final_u = r.url().to_string();
-                            let body = r.text().await.unwrap_or_default();
+                            let final_u = crate::xtream_url::redact_media_url(r.url().as_str());
+                            let body = match http_client::read_body_capped(r, MAX_PROBE_BODY).await
+                            {
+                                Ok(b) => String::from_utf8_lossy(&b).into_owned(),
+                                Err(_) => String::new(),
+                            };
                             if body.contains("#EXTM3U") {
                                 if body.contains("/hls/") {
                                     notes.push(
@@ -218,7 +240,7 @@ pub async fn check_xtream_portal(portal: &str, username: &str, password: &str) -
                                     );
                                 }
                                 stream_ok = true;
-                                // Store for diagnostics but do not log (may contain creds).
+                                // Diagnostics only — credentials already scrubbed.
                                 stream_final_url = Some(final_u);
                                 debug!(stream_id = %sid, "stream probe HLS OK");
                                 break 'probe;

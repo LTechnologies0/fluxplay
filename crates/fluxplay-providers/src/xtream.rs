@@ -19,6 +19,12 @@ use crate::{ProviderError, Result};
 /// Same UA string IPTV Smarters Pro sends on many panels.
 pub const SMARTERS_UA: &str = "IPTVSmartersPlayer";
 
+/// Hard cap for `player_api` JSON bodies (CWE-400).
+const MAX_API_JSON: usize = 48 * 1024 * 1024;
+/// Soft caps after JSON parse — truncate with warn (panels can dump millions of rows).
+const MAX_CATEGORIES: usize = 10_000;
+const MAX_CATALOG_ITEMS: usize = 100_000;
+
 #[derive(Clone)]
 pub struct XtreamClient {
     /// Portal base used for API calls (may include :8080 and path prefix `/c`).
@@ -38,7 +44,7 @@ impl std::fmt::Debug for XtreamClient {
         f.debug_struct("XtreamClient")
             .field("portal", &self.portal.as_str())
             .field("stream_base", &self.stream_base.as_str())
-            .field("username", &self.username)
+            .field("username", &"***")
             .field("password", &"***")
             .field("prefer_m3u8", &self.prefer_m3u8)
             .finish_non_exhaustive()
@@ -58,11 +64,10 @@ impl XtreamClient {
         }
         let parsed = Url::parse(&base).map_err(|e| ProviderError::Message(e.to_string()))?;
         let url = crate::xtream_url::portal_base_from_url(&parsed);
-        // Never log password.
+        // Never log username/password (portal host only).
         debug!(
             source_id = %source_id,
             portal = %url,
-            user = %username,
             "XtreamClient from_credentials"
         );
         Ok(Self {
@@ -105,7 +110,7 @@ impl XtreamClient {
     }
 
     async fn get_json(&self, action: Option<&str>) -> Result<Value> {
-        self.fetch_api_json(action, &[]).await
+        self.fetch_api_json(action, &[], false).await
     }
 
     pub(crate) async fn get_json_action(
@@ -114,10 +119,26 @@ impl XtreamClient {
         extra: &[(&str, &str)],
     ) -> Result<Value> {
         let extras: Vec<&str> = extra.iter().flat_map(|(k, v)| [*k, *v]).collect();
-        self.fetch_api_json(Some(action), &extras).await
+        self.fetch_api_json(Some(action), &extras, false).await
     }
 
-    async fn fetch_api_json(&self, action: Option<&str>, extras: &[&str]) -> Result<Value> {
+    /// Same as [`Self::get_json_action`], but this call is the page the viewer opened.
+    /// It waits out a 429 quiet window instead of failing into an empty fiche.
+    pub(crate) async fn get_json_action_priority(
+        &self,
+        action: &str,
+        extra: &[(&str, &str)],
+    ) -> Result<Value> {
+        let extras: Vec<&str> = extra.iter().flat_map(|(k, v)| [*k, *v]).collect();
+        self.fetch_api_json(Some(action), &extras, true).await
+    }
+
+    async fn fetch_api_json(
+        &self,
+        action: Option<&str>,
+        extras: &[&str],
+        priority: bool,
+    ) -> Result<Value> {
         let _prof = Stopwatch::start("xtream_get_json");
         let action_label = action.unwrap_or("auth");
         // Do not log password or full auth URL — action + portal only.
@@ -132,13 +153,21 @@ impl XtreamClient {
         let key = crate::api_cache::key(self.portal.as_str(), &account, action_label, extras);
         let ttl = crate::api_cache::ttl_for_action(action);
         if let Some(cached) = crate::api_cache::get_fresh(&key, ttl) {
-            tracing::info!(
-                target: "fluxplay::net",
-                action = %action_label,
-                portal = %self.portal,
-                "net.cache_hit"
-            );
-            return Ok(cached);
+            // An empty series_info must not stick for 24h — reopen would stay blank forever.
+            let empty_series = action == Some("get_series_info")
+                && !crate::api_cache::series_info_has_episodes(&cached);
+            if empty_series {
+                crate::api_cache::forget(&key);
+                warn!(%action_label, "dropping empty series_info cache");
+            } else {
+                tracing::info!(
+                    target: "fluxplay::net",
+                    action = %action_label,
+                    portal = %self.portal,
+                    "net.cache_hit"
+                );
+                return Ok(cached);
+            }
         }
 
         let mut url = self.api_url(action)?;
@@ -167,6 +196,8 @@ impl XtreamClient {
                         if k.eq_ignore_ascii_case("password")
                             || k.eq_ignore_ascii_case("pass")
                             || k.eq_ignore_ascii_case("token")
+                            || k.eq_ignore_ascii_case("username")
+                            || k.eq_ignore_ascii_case("user")
                         {
                             q.append_pair(&k, "***");
                         } else {
@@ -188,7 +219,8 @@ impl XtreamClient {
                 .get(url.clone())
                 .header(reqwest::header::USER_AGENT, SMARTERS_UA)
                 .send()
-                .await?;
+                .await
+                .map_err(|e| ProviderError::Http(e))?;
             let status = resp.status();
             let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
             tracing::info!(
@@ -209,32 +241,115 @@ impl XtreamClient {
                 warn!(%action_label, status = %status, "xtream API HTTP error");
                 return Err(crate::xtream_url::status_error(status.as_u16()));
             }
-            Ok(resp.json::<Value>().await?)
+            // Cap JSON body before serde (panels can be tens of MB).
+            let raw = crate::http_client::read_body_capped(resp, MAX_API_JSON)
+                .await
+                .map_err(map_xtream_body_err)?;
+            serde_json::from_slice(&raw).map_err(|e| {
+                ProviderError::Message(format!("xtream JSON parse: {e}"))
+            })
         };
 
-        match crate::api_cache::with_portal_limit(fetch).await {
-            Ok(value) => {
-                if action.is_some() {
-                    crate::api_cache::put(&key, &value);
-                } else if check_auth(&value).is_ok() {
-                    // The auth answer echoes the password; the disk cache does not need it.
-                    let mut stored = value.clone();
-                    if let Some(ui) = stored.get_mut("user_info").and_then(|u| u.as_object_mut()) {
-                        ui.remove("password");
+        // A film or series page is the request the viewer is waiting on. Other
+        // calls must not touch the portal during a 429 quiet window: each extra
+        // hit restarts the ban and the fiche stays empty.
+        let user_waiting = priority || action == Some("get_series_info");
+        if !user_waiting && !crate::api_cache::portal_quiet_remaining().is_zero() {
+            if let Some(stale) = crate::api_cache::get_stale(&key) {
+                let empty_series = action == Some("get_series_info")
+                    && !crate::api_cache::series_info_has_episodes(&stale);
+                if !empty_series {
+                    warn!(%action_label, "portal quiet — stale cache");
+                    return Ok(stale);
+                }
+            }
+            return Err(ProviderError::Message(
+                "HTTP 429 Too Many Requests — ralentissez / cache".into(),
+            ));
+        }
+        let attempts = if user_waiting { 2 } else { 1 };
+        for attempt in 0..attempts {
+            // The page the viewer opened tries at once. A full quiet sleep (30s)
+            // made the synopsis look stuck. One short retry is enough after a 429.
+            if user_waiting && attempt > 0 {
+                let wait = crate::api_cache::portal_quiet_remaining()
+                    .min(std::time::Duration::from_secs(2));
+                if !wait.is_zero() {
+                    tokio::time::sleep(wait).await;
+                }
+            }
+            match crate::api_cache::with_portal_limit(&fetch).await {
+                Ok(value) => {
+                    if action.is_some() {
+                        let skip_empty_series = action == Some("get_series_info")
+                            && !crate::api_cache::series_info_has_episodes(&value);
+                        if skip_empty_series {
+                            warn!(%action_label, "not caching empty series_info");
+                        } else {
+                            crate::api_cache::put(&key, &value);
+                        }
+                    } else if check_auth(&value).is_ok() {
+                        // The auth answer echoes the password; the disk cache does not need it.
+                        let mut stored = value.clone();
+                        if let Some(ui) = stored.get_mut("user_info").and_then(|u| u.as_object_mut())
+                        {
+                            ui.remove("password");
+                        }
+                        crate::api_cache::put(&key, &stored);
                     }
-                    crate::api_cache::put(&key, &stored);
+                    trace!(%action_label, "xtream get_json OK");
+                    return Ok(value);
                 }
-                trace!(%action_label, "xtream get_json OK");
-                Ok(value)
-            }
-            Err(e) => {
-                if let Some(stale) = crate::api_cache::get_stale(&key) {
-                    warn!(error = %e, %action_label, "serving stale xtream cache");
-                    Ok(stale)
-                } else {
-                    Err(e)
+                Err(e) => {
+                    let rate_limited = e.to_string().contains("429");
+                    if rate_limited {
+                        crate::api_cache::note_portal_backoff();
+                    }
+                    if let Some(stale) = crate::api_cache::get_stale(&key) {
+                        let empty_series = action == Some("get_series_info")
+                            && !crate::api_cache::series_info_has_episodes(&stale);
+                        if !empty_series {
+                            warn!(error = %e, %action_label, "serving stale xtream cache");
+                            return Ok(stale);
+                        }
+                        crate::api_cache::forget(&key);
+                    }
+                    if rate_limited && attempt + 1 < attempts {
+                        warn!(%action_label, attempt, "portal 429, series info will retry after quiet");
+                        continue;
+                    }
+                    return Err(self.remap_path_policy_err(e).await);
                 }
             }
+        }
+        Err(ProviderError::Message(
+            "HTTP 429 Too Many Requests — ralentissez / cache".into(),
+        ))
+    }
+
+    /// After TCP RST on player_api, distinguish dead host vs filtered-egress path block.
+    async fn remap_path_policy_err(&self, e: ProviderError) -> ProviderError {
+        let s = e.to_string().to_ascii_lowercase();
+        let looks_rst = s.contains("reset")
+            || s.contains("broken pipe")
+            || s.contains("tcp-reset")
+            || s.contains("os { code: 104");
+        if !looks_rst {
+            return e;
+        }
+        let origin = {
+            let mut o = format!("{}://{}", self.portal.scheme(), self.portal.host_str().unwrap_or(""));
+            if let Some(p) = self.portal.port() {
+                o.push(':');
+                o.push_str(&p.to_string());
+            }
+            o
+        };
+        match crate::http_client::probe_http_path_policy(&origin).await {
+            crate::http_client::HttpPathPolicy::RootOnly => {
+                ProviderError::Message(crate::http_client::path_policy_blocked_msg(&origin))
+            }
+            _ => e,
         }
     }
 
@@ -254,20 +369,30 @@ impl XtreamClient {
     /// Applies `server_info`; returns `user_info.max_connections` when known.
     pub async fn probe_auth(&mut self, timeout: std::time::Duration) -> Result<Option<u32>> {
         let client = crate::api_cache::shared_http()?;
-        let resp = client
+        let resp = match client
             .get(self.api_url(None)?)
             .header(reqwest::header::USER_AGENT, SMARTERS_UA)
             .timeout(timeout)
             .send()
             .await
-            .map_err(|e| ProviderError::Message(crate::redact_error(&e)))?;
+        {
+            Ok(r) => r,
+            Err(e) => {
+                return Err(self
+                    .remap_path_policy_err(ProviderError::Message(crate::redact_error(&e)))
+                    .await);
+            }
+        };
         if !resp.status().is_success() {
             return Err(ProviderError::Message(format!("HTTP {}", resp.status())));
         }
-        let auth: Value = resp
-            .json()
+        // Same JSON budget as `fetch_api_json` — probe must not bypass DoS caps.
+        let raw = crate::http_client::read_body_capped(resp, MAX_API_JSON)
             .await
-            .map_err(|e| ProviderError::Message(crate::redact_error(&e)))?;
+            .map_err(map_xtream_body_err)?;
+        let auth: Value = serde_json::from_slice(&raw).map_err(|e| {
+            ProviderError::Message(format!("xtream JSON parse: {e}"))
+        })?;
         if auth_flag(&auth) != Some(1) {
             return Err(ProviderError::Auth("Xtream auth failed".into()));
         }
@@ -311,11 +436,17 @@ impl XtreamClient {
 
         // Keep portal port if server advertises :80 but we reached API on :8080
         // and streams also work on the portal port (common CDN split). Prefer portal
-        // when its host matches.
+        // when its host matches. Reject arbitrary CDN hosts (trust-panel SSRF class).
         let portal_host = self.portal.host_str().unwrap_or("");
         if portal_host.eq_ignore_ascii_case(host) {
             // Same host: use portal origin (preserves :8080 when needed).
             self.stream_base = self.portal.clone();
+        } else if !server_info_host_allowed(portal_host, host) {
+            warn!(
+                portal = %portal_host,
+                advertised = %host,
+                "Xtream server_info host rejected (SSRF/private) — keeping portal stream_base"
+            );
         } else if let Ok(mut u) = Url::parse(&format!("{proto}://{host}:{port}/")) {
             let _ = u.set_host(Some(host));
             self.stream_base = u;
@@ -387,13 +518,12 @@ impl XtreamClient {
         info!(
             source_id = %self.source_id,
             portal = %self.portal,
-            user = %self.username,
             "Xtream load_bundle start"
         );
         // Auth + server_info first (exactly like Smarters login).
         let auth = self.get_json(None).await?;
         if let Err(e) = check_auth(&auth) {
-            error!(portal = %self.portal, user = %self.username, error = %e, "Xtream auth failed");
+            error!(portal = %self.portal, error = %e, "Xtream auth failed");
             return Err(e);
         }
         debug!(portal = %self.portal, "Xtream auth OK");
@@ -421,7 +551,7 @@ impl XtreamClient {
 
         let mut categories = Vec::new();
         if let Some(Value::Array(arr)) = live_cats {
-            for item in arr {
+            for item in take_capped(arr, MAX_CATEGORIES, "live_categories") {
                 if let Ok(c) = serde_json::from_value::<XcCategory>(item) {
                     categories.push(Category {
                         id: c.category_id,
@@ -433,7 +563,7 @@ impl XtreamClient {
         }
         let mut vod_cat_list = Vec::new();
         if let Some(Value::Array(arr)) = vod_cats {
-            for item in arr {
+            for item in take_capped(arr, MAX_CATEGORIES, "vod_categories") {
                 if let Ok(c) = serde_json::from_value::<XcCategory>(item) {
                     vod_cat_list.push(c.category_id.clone());
                     categories.push(Category {
@@ -446,7 +576,7 @@ impl XtreamClient {
         }
         let mut series_cat_list = Vec::new();
         if let Some(Value::Array(arr)) = series_cats {
-            for item in arr {
+            for item in take_capped(arr, MAX_CATEGORIES, "series_categories") {
                 if let Ok(c) = serde_json::from_value::<XcCategory>(item) {
                     series_cat_list.push(c.category_id.clone());
                     categories.push(Category {
@@ -460,6 +590,7 @@ impl XtreamClient {
 
         let mut channels = Vec::new();
         if let Value::Array(arr) = live {
+            let arr = take_capped(arr, MAX_CATALOG_ITEMS, "live_streams");
             let client = self.clone();
             match tokio::task::spawn_blocking(move || client.map_live_streams(arr)).await {
                 Ok(mapped) => channels = mapped,
@@ -594,6 +725,8 @@ impl XtreamClient {
                 source_id: Some(self.source_id),
                 kind: ContentKind::Live,
                 catchup: None,
+                http_user_agent: None,
+                http_referer: None,
             });
         }
         channels
@@ -608,6 +741,7 @@ impl XtreamClient {
             // Tiny payloads often mean "need category_id".
             return None;
         }
+        let arr = take_capped(arr, MAX_CATALOG_ITEMS, "vod_streams");
         let client = self.clone();
         match tokio::task::spawn_blocking(move || client.map_vod_dump(arr)).await {
             Ok(out) => {
@@ -645,6 +779,7 @@ impl XtreamClient {
                 rating: s.rating,
                 genre: s.genre,
                 imdb_id: s.imdb_id.filter(|id| !id.is_empty() && id != "0"),
+                tmdb_id: None,
                 actors: None,
                 director: None,
                 writer: None,
@@ -654,6 +789,7 @@ impl XtreamClient {
                 language: None,
                 country: None,
                 category_id: s.category_id,
+                added: s.added,
                 source_id: Some(self.source_id),
             });
         }
@@ -668,6 +804,7 @@ impl XtreamClient {
         if arr.is_empty() || arr.len() < 8 {
             return None;
         }
+        let arr = take_capped(arr, MAX_CATALOG_ITEMS, "series");
         let client = self.clone();
         match tokio::task::spawn_blocking(move || client.map_series_dump(arr)).await {
             Ok(out) => {
@@ -699,10 +836,11 @@ impl XtreamClient {
                 rating: s.rating,
                 genre: s.genre,
                 imdb_id: s.imdb_id.filter(|id| !id.is_empty() && id != "0"),
-                actors: None,
-                director: None,
+                tmdb_id: None,
+                actors: s.cast,
+                director: s.director,
                 writer: None,
-                runtime: None,
+                runtime: s.episode_run_time,
                 rated: None,
                 awards: None,
                 language: None,
@@ -710,6 +848,7 @@ impl XtreamClient {
                 seasons: Vec::new(),
                 source_id: Some(self.source_id),
                 category_id: s.category_id,
+                added: s.added,
             });
         }
         Some(out)
@@ -743,11 +882,15 @@ impl XtreamClient {
         let value = self
             .get_json_action("get_vod_streams", &[("category_id", category_id)])
             .await?;
-        let mut out = Vec::new();
         let Value::Array(arr) = value else {
-            return Ok(out);
+            // Object / error JSON must not look like an empty catalog — callers
+            // used to wipe the shelf on `Ok([])`.
+            return Err(ProviderError::Message(
+                "xtream JSON: réponse get_vod_streams invalide (tableau attendu)".into(),
+            ));
         };
-        out.reserve(arr.len());
+        let arr = take_capped(arr, MAX_CATALOG_ITEMS, "vod_category");
+        let mut out = Vec::with_capacity(arr.len());
         for item in arr {
             let Ok(s) = serde_json::from_value::<XcVodStream>(item) else {
                 continue;
@@ -768,6 +911,7 @@ impl XtreamClient {
                 rating: s.rating,
                 genre: s.genre,
                 imdb_id: s.imdb_id.filter(|id| !id.is_empty() && id != "0"),
+                tmdb_id: None,
                 actors: None,
                 director: None,
                 writer: None,
@@ -777,6 +921,7 @@ impl XtreamClient {
                 language: None,
                 country: None,
                 category_id: s.category_id.or_else(|| Some(category_id.to_string())),
+                added: s.added,
                 source_id: Some(self.source_id),
             });
         }
@@ -790,11 +935,13 @@ impl XtreamClient {
         let value = self
             .get_json_action("get_series", &[("category_id", category_id)])
             .await?;
-        let mut out = Vec::new();
         let Value::Array(arr) = value else {
-            return Ok(out);
+            return Err(ProviderError::Message(
+                "xtream JSON: réponse get_series invalide (tableau attendu)".into(),
+            ));
         };
-        out.reserve(arr.len());
+        let arr = take_capped(arr, MAX_CATALOG_ITEMS, "series_category");
+        let mut out = Vec::with_capacity(arr.len());
         for item in arr {
             let Ok(s) = serde_json::from_value::<XcSeries>(item) else {
                 continue;
@@ -809,10 +956,11 @@ impl XtreamClient {
                 rating: s.rating,
                 genre: s.genre,
                 imdb_id: s.imdb_id.filter(|id| !id.is_empty() && id != "0"),
-                actors: None,
-                director: None,
+                tmdb_id: None,
+                actors: s.cast,
+                director: s.director,
                 writer: None,
-                runtime: None,
+                runtime: s.episode_run_time,
                 rated: None,
                 awards: None,
                 language: None,
@@ -820,6 +968,7 @@ impl XtreamClient {
                 seasons: Vec::new(),
                 source_id: Some(self.source_id),
                 category_id: s.category_id.or_else(|| Some(category_id.to_string())),
+                added: s.added,
             });
         }
         debug!(%category_id, n = out.len(), "load_series_category done");
@@ -828,8 +977,9 @@ impl XtreamClient {
 
     pub async fn series_info(&self, series_id: &str) -> Result<SeriesItem> {
         debug!(%series_id, "series_info");
+        // Same priority path as `vod_info_now`: the viewer is waiting on this page.
         let value = self
-            .get_json_action("get_series_info", &[("series_id", series_id)])
+            .get_json_action_priority("get_series_info", &[("series_id", series_id)])
             .await?;
 
         let info = value.get("info").cloned().unwrap_or(Value::Null);
@@ -864,14 +1014,7 @@ impl XtreamClient {
                     .and_then(|v| v.as_str())
                     .map(str::to_string)
             });
-        // Empty strings are common here and must not blank a known synopsis.
-        let plot = info
-            .get("plot")
-            .or_else(|| info.get("description"))
-            .and_then(|v| v.as_str())
-            .map(str::trim)
-            .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("n/a"))
-            .map(str::to_string);
+        let plot = media_plot(&info);
         // "2025-03-01" → "2025"
         let year = info
             .get("releaseDate")
@@ -883,6 +1026,8 @@ impl XtreamClient {
         let rating = info
             .get("rating")
             .and_then(|v| v.as_str().map(str::to_string).or_else(|| v.as_f64().map(|n| format!("{n:.1}"))));
+        let runtime = info.get("episode_run_time").and_then(json_text);
+        let rated = content_age(&info);
         let genre = info.get("genre").and_then(|v| match v {
             Value::String(s) if !s.trim().is_empty() => Some(s.trim().to_string()),
             Value::Array(a) => {
@@ -910,72 +1055,7 @@ impl XtreamClient {
             .filter(|s| !s.is_empty() && *s != "0")
             .map(str::to_string);
 
-        let mut seasons = Vec::new();
-        if let Some(episodes) = value.get("episodes").and_then(|e| e.as_object()) {
-            for (season_key, eps) in episodes {
-                let season_number = season_key.parse().unwrap_or(0);
-                let mut list = Vec::new();
-                if let Some(arr) = eps.as_array() {
-                    for ep in arr {
-                        let id = ep
-                            .get("id")
-                            .and_then(|v| v.as_str())
-                            .map(str::to_string)
-                            .or_else(|| {
-                                ep.get("id")
-                                    .and_then(|v| v.as_u64())
-                                    .map(|n| n.to_string())
-                            })
-                            .unwrap_or_default();
-                        if id.trim().is_empty() {
-                            continue;
-                        }
-                        let title = ep
-                            .get("title")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("Episode")
-                            .to_string();
-                        // Panels send `"episode_num": 3` or `"3"`.
-                        let episode_num = ep
-                            .get("episode_num")
-                            .and_then(|v| {
-                                v.as_u64().or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()))
-                            })
-                            .and_then(|n| u32::try_from(n).ok())
-                            .unwrap_or(0);
-                        let ext = self.vod_ext(
-                            ep.get("container_extension")
-                                .and_then(|v| v.as_str())
-                                .map(str::trim)
-                                .filter(|s| !s.is_empty()),
-                        );
-                        let stream_url = ep
-                            .get("direct_source")
-                            .and_then(|v| v.as_str())
-                            .map(str::trim)
-                            .filter(|s| !s.is_empty())
-                            .map(str::to_string)
-                            .unwrap_or_else(|| self.series_stream_url(&id, ext));
-                        list.push(SeriesEpisode {
-                            id: id.clone(),
-                            title,
-                            stream_url,
-                            episode_num,
-                            plot: None,
-                            rating: None,
-                            runtime: None,
-                            airdate: None,
-                            still: None,
-                        });
-                    }
-                }
-                list.sort_by_key(|e| e.episode_num);
-                seasons.push(SeriesSeason {
-                    season_number,
-                    episodes: list,
-                });
-            }
-        }
+        let mut seasons = self.parse_series_episodes(value.get("episodes"));
         seasons.sort_by_key(|s| s.season_number);
 
         info!(
@@ -994,13 +1074,8 @@ impl XtreamClient {
             rating,
             genre,
             imdb_id,
-            actors: info
-                .get("cast")
-                .or_else(|| info.get("actors"))
-                .and_then(|v| v.as_str())
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(str::to_string),
+            tmdb_id: None,
+            actors: media_people(&info),
             director: info
                 .get("director")
                 .and_then(|v| v.as_str())
@@ -1008,8 +1083,8 @@ impl XtreamClient {
                 .filter(|s| !s.is_empty())
                 .map(str::to_string),
             writer: None,
-            runtime: None,
-            rated: None,
+            runtime,
+            rated,
             awards: None,
             language: None,
             country: info
@@ -1021,15 +1096,153 @@ impl XtreamClient {
             seasons,
             source_id: Some(self.source_id),
             category_id: None,
+            added: None,
+        })
+    }
+
+    /// Panels disagree on the `episodes` JSON shape:
+    /// - object of season → array of episodes (Xtream Codes classic)
+    /// - object of season → object of ep_key → episode
+    /// - flat array with a `season` / `season_number` field on each row
+    fn parse_series_episodes(&self, episodes: Option<&Value>) -> Vec<SeriesSeason> {
+        let Some(episodes) = episodes else {
+            return Vec::new();
+        };
+        let mut by_season: std::collections::BTreeMap<u32, Vec<SeriesEpisode>> =
+            std::collections::BTreeMap::new();
+
+        let push_ep = |season_number: u32, ep: &Value, map: &mut std::collections::BTreeMap<u32, Vec<SeriesEpisode>>| {
+            let Some(parsed) = self.parse_one_episode(ep) else {
+                return;
+            };
+            map.entry(season_number).or_default().push(parsed);
+        };
+
+        match episodes {
+            Value::Object(seasons) => {
+                for (season_key, eps) in seasons {
+                    let season_number = season_key.parse().unwrap_or(0);
+                    match eps {
+                        Value::Array(arr) => {
+                            for ep in arr {
+                                push_ep(season_number, ep, &mut by_season);
+                            }
+                        }
+                        Value::Object(map) => {
+                            for (_k, ep) in map {
+                                push_ep(season_number, ep, &mut by_season);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Value::Array(arr) => {
+                for ep in arr {
+                    let season_number = ep
+                        .get("season")
+                        .or_else(|| ep.get("season_number"))
+                        .or_else(|| ep.get("season_num"))
+                        .and_then(|v| {
+                            v.as_u64()
+                                .or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()))
+                        })
+                        .and_then(|n| u32::try_from(n).ok())
+                        .unwrap_or(1);
+                    push_ep(season_number, ep, &mut by_season);
+                }
+            }
+            _ => {}
+        }
+
+        by_season
+            .into_iter()
+            .map(|(season_number, mut list)| {
+                list.sort_by_key(|e| e.episode_num);
+                SeriesSeason {
+                    season_number,
+                    episodes: list,
+                }
+            })
+            .collect()
+    }
+
+    fn parse_one_episode(&self, ep: &Value) -> Option<SeriesEpisode> {
+        let id = ep
+            .get("id")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .or_else(|| ep.get("id").and_then(|v| v.as_u64()).map(|n| n.to_string()))
+            .or_else(|| {
+                ep.get("episode_id")
+                    .and_then(|v| v.as_str().map(str::to_string).or_else(|| v.as_u64().map(|n| n.to_string())))
+            })
+            .unwrap_or_default();
+        if id.trim().is_empty() {
+            return None;
+        }
+        let title = ep
+            .get("title")
+            .and_then(|v| v.as_str())
+            .unwrap_or("Episode")
+            .to_string();
+        let episode_num = ep
+            .get("episode_num")
+            .or_else(|| ep.get("episode_number"))
+            .or_else(|| ep.get("ep"))
+            .and_then(|v| {
+                v.as_u64()
+                    .or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()))
+            })
+            .and_then(|n| u32::try_from(n).ok())
+            .unwrap_or(0);
+        let ext = self.vod_ext(
+            ep.get("container_extension")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty()),
+        );
+        let stream_url = ep
+            .get("direct_source")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| self.series_stream_url(&id, ext));
+        let (plot, still, rating, runtime, airdate, rated) = episode_details(&self.portal, ep);
+        Some(SeriesEpisode {
+            id,
+            title,
+            stream_url,
+            episode_num,
+            plot,
+            rating,
+            runtime,
+            airdate,
+            rated,
+            still,
         })
     }
 
     /// Full VOD metadata (`get_vod_info`) — plot, cast, director like series_info.
     pub async fn vod_info(&self, vod_id: &str) -> Result<VodItem> {
-        debug!(%vod_id, "vod_info");
-        let value = self
-            .get_json_action("get_vod_info", &[("vod_id", vod_id)])
-            .await?;
+        self.vod_info_with(vod_id, false).await
+    }
+
+    /// Same fiche, but this is the title the viewer just opened: wait out a 429.
+    pub async fn vod_info_now(&self, vod_id: &str) -> Result<VodItem> {
+        self.vod_info_with(vod_id, true).await
+    }
+
+    async fn vod_info_with(&self, vod_id: &str, priority: bool) -> Result<VodItem> {
+        debug!(%vod_id, priority, "vod_info");
+        let value = if priority {
+            self.get_json_action_priority("get_vod_info", &[("vod_id", vod_id)])
+                .await?
+        } else {
+            self.get_json_action("get_vod_info", &[("vod_id", vod_id)])
+                .await?
+        };
 
         let info = value.get("info").cloned().unwrap_or(Value::Null);
         let movie = value.get("movie_data").cloned().unwrap_or(Value::Null);
@@ -1050,13 +1263,7 @@ impl XtreamClient {
             .and_then(|v| v.as_str())
             .map(str::to_string);
 
-        let plot = info
-            .get("plot")
-            .or_else(|| info.get("description"))
-            .and_then(|v| v.as_str())
-            .map(str::trim)
-            .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("n/a"))
-            .map(str::to_string);
+        let plot = media_plot(&info);
 
         let year = info
             .get("releasedate")
@@ -1068,11 +1275,7 @@ impl XtreamClient {
                     .map(str::to_string)
                     .or_else(|| v.as_u64().map(|n| n.to_string()))
             })
-            .map(|s| {
-                // "2024-05-02" → "2024"
-                s.chars().take(4).collect::<String>()
-            })
-            .filter(|s| s.len() == 4 && s.chars().all(|c| c.is_ascii_digit()));
+            .and_then(|s| portal_year(&s));
 
         let rating = info
             .get("rating")
@@ -1101,13 +1304,7 @@ impl XtreamClient {
             _ => None,
         });
 
-        let actors = info
-            .get("actors")
-            .or_else(|| info.get("cast"))
-            .and_then(|v| v.as_str())
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_string);
+        let actors = media_people(&info);
 
         let director = info
             .get("director")
@@ -1166,6 +1363,7 @@ impl XtreamClient {
             rating,
             genre,
             imdb_id,
+            tmdb_id: None,
             actors,
             director,
             writer: None,
@@ -1178,13 +1376,64 @@ impl XtreamClient {
                 .get("category_id")
                 .and_then(|v| v.as_str().map(str::to_string).or_else(|| v.as_u64().map(|n| n.to_string()))),
             source_id: Some(self.source_id),
+            added: None,
         })
     }
+
+    /// Series list already on disk (`plot`, `cast`, `director`). No portal call.
+    pub fn cached_series_list(&self) -> Option<Vec<SeriesItem>> {
+        let account = format!("{}\0{}", self.username, self.password);
+        let key = crate::api_cache::key(self.portal.as_str(), &account, "get_series", &[]);
+        let value = crate::api_cache::get_fresh(
+            &key,
+            crate::api_cache::ttl_for_action(Some("get_series")),
+        )?;
+        let Value::Array(arr) = value else {
+            return None;
+        };
+        self.map_series_dump(arr)
+    }
+}
+
+/// `2024-05-02` and `08 May 2026` both carry a year. The first four characters do not.
+fn portal_year(raw: &str) -> Option<String> {
+    let b = raw.as_bytes();
+    let mut i = 0;
+    while i + 4 <= b.len() {
+        if b[i..i + 4].iter().all(|c| c.is_ascii_digit()) && (i == 0 || !b[i - 1].is_ascii_digit())
+        {
+            let y = &raw[i..i + 4];
+            if let Ok(n) = y.parse::<u16>() {
+                if (1900..=2100).contains(&n) {
+                    return Some(y.to_string());
+                }
+            }
+        }
+        i += 1;
+    }
+    None
 }
 
 fn is_adult_category(name: &str) -> bool {
     let n = name.to_ascii_uppercase();
     n.contains("XXX") || n.contains("ADULT") || n.contains("FOR ADULTS") || n.contains("+18")
+}
+
+fn map_xtream_body_err(e: ProviderError) -> ProviderError {
+    match e {
+        ProviderError::Message(m) if m.contains("trop volumineuse") => {
+            ProviderError::Message(format!("xtream JSON oversize: {m}"))
+        }
+        other => other,
+    }
+}
+
+fn take_capped(mut arr: Vec<Value>, max: usize, label: &str) -> Vec<Value> {
+    if arr.len() > max {
+        warn!(n = arr.len(), max, %label, "xtream catalog array truncated");
+        arr.truncate(max);
+    }
+    arr
 }
 
 async fn parallel_map_categories(
@@ -1309,6 +1558,8 @@ struct XcVodStream {
     genre: Option<String>,
     #[serde(default, deserialize_with = "de_opt_strish")]
     imdb_id: Option<String>,
+    #[serde(default, deserialize_with = "de_opt_i64")]
+    added: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1336,8 +1587,16 @@ struct XcSeries {
     genre: Option<String>,
     #[serde(default, deserialize_with = "de_opt_strish")]
     imdb_id: Option<String>,
+    #[serde(default, deserialize_with = "de_opt_strish")]
+    cast: Option<String>,
+    #[serde(default, deserialize_with = "de_opt_strish")]
+    director: Option<String>,
+    #[serde(default, deserialize_with = "de_opt_strish")]
+    episode_run_time: Option<String>,
     #[serde(default, deserialize_with = "de_opt_id")]
     category_id: Option<String>,
+    #[serde(default, deserialize_with = "de_opt_i64")]
+    added: Option<i64>,
 }
 
 /// `user_info.auth` as a number, whether the panel sends `1` or `"1"`.
@@ -1401,6 +1660,26 @@ where
 }
 
 /// Genre may arrive as string or array of strings.
+fn de_opt_i64<'de, D>(deserializer: D) -> std::result::Result<Option<i64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let v = Option::<Value>::deserialize(deserializer)?;
+    Ok(match v {
+        None | Some(Value::Null) => None,
+        Some(Value::Number(n)) => n.as_i64().or_else(|| n.as_f64().map(|f| f as i64)),
+        Some(Value::String(s)) => {
+            let t = s.trim();
+            if t.is_empty() {
+                None
+            } else {
+                t.parse().ok()
+            }
+        }
+        Some(_) => None,
+    })
+}
+
 fn de_opt_strish<'de, D>(deserializer: D) -> std::result::Result<Option<String>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -1437,6 +1716,204 @@ where
             }
         }
     })
+}
+
+/// Plot, still, rating, runtime and air date from one `get_series_info` episode.
+/// Panels nest them under `info` (`movie_image`, `plot`, `duration`).
+/// `mpaa_rating`, `age`, and the usual aliases. Star ratings stay out of this.
+fn content_age(info: &Value) -> Option<String> {
+    for key in [
+        "mpaa_rating",
+        "age",
+        "rating_mpaa",
+        "content_rating",
+        "age_rating",
+    ] {
+        if let Some(s) = info.get(key).and_then(json_text) {
+            return Some(s);
+        }
+    }
+    None
+}
+
+fn media_plot(info: &Value) -> Option<String> {
+    for key in ["plot", "description", "overview", "synopsis"] {
+        if let Some(text) = info.get(key).and_then(loose_text) {
+            return Some(text);
+        }
+    }
+    None
+}
+
+fn media_people(info: &Value) -> Option<String> {
+    for key in ["actors", "cast", "casting"] {
+        if let Some(text) = info.get(key).and_then(loose_text) {
+            return Some(text);
+        }
+    }
+    None
+}
+
+/// String, list of names, or `{ "name": "…" }` from a panel fiche.
+fn loose_text(v: &Value) -> Option<String> {
+    match v {
+        Value::String(s) => {
+            let t = s.trim();
+            if t.is_empty() || t.eq_ignore_ascii_case("n/a") || t == "0" {
+                None
+            } else {
+                Some(t.to_string())
+            }
+        }
+        Value::Array(items) => {
+            let parts: Vec<String> = items.iter().filter_map(loose_text).collect();
+            if parts.is_empty() {
+                None
+            } else {
+                Some(parts.join(", "))
+            }
+        }
+        Value::Object(obj) => ["name", "actor", "plot", "description"]
+            .iter()
+            .find_map(|key| obj.get(*key).and_then(loose_text)),
+        _ => None,
+    }
+}
+
+fn json_text(v: &Value) -> Option<String> {
+    let s = v
+        .as_str()
+        .map(str::to_string)
+        .or_else(|| v.as_u64().map(|n| n.to_string()))
+        .or_else(|| v.as_i64().map(|n| n.to_string()))?;
+    let s = s.trim();
+    if s.is_empty() || s.eq_ignore_ascii_case("n/a") || s == "0" {
+        None
+    } else {
+        Some(s.to_string())
+    }
+}
+
+fn episode_details(
+    portal: &Url,
+    ep: &Value,
+) -> (
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+) {
+    let nested = ep.get("info").unwrap_or(&Value::Null);
+    let text = |keys: &[&str]| -> Option<String> {
+        keys.iter().find_map(|k| {
+            let v = nested.get(*k).or_else(|| ep.get(*k))?;
+            let s = v
+                .as_str()
+                .map(str::to_string)
+                .or_else(|| v.as_u64().map(|n| n.to_string()))
+                .or_else(|| v.as_i64().map(|n| n.to_string()))
+                .or_else(|| {
+                    v.as_f64().map(|n| {
+                        if n.fract() == 0.0 {
+                            format!("{}", n as i64)
+                        } else {
+                            format!("{n:.1}")
+                        }
+                    })
+                })?;
+            let s = s.trim();
+            if s.is_empty() || s.eq_ignore_ascii_case("n/a") || s == "0" {
+                None
+            } else {
+                Some(s.to_string())
+            }
+        })
+    };
+    let still = text(&["movie_image", "cover_big", "stream_icon"]).and_then(|raw| {
+        if raw.starts_with("http://") || raw.starts_with("https://") {
+            return Some(raw);
+        }
+        if let Some(path) = raw.strip_prefix("//") {
+            return Some(format!("https://{path}"));
+        }
+        raw.strip_prefix('/').and_then(|path| {
+            let mut u = portal.clone();
+            u.set_path("");
+            u.join(path).ok().map(|u| u.to_string())
+        })
+    });
+    let runtime = text(&["duration", "duration_secs", "info_duration"]).map(|raw| {
+        if raw.contains(':') {
+            return raw;
+        }
+        match raw.parse::<u32>() {
+            Ok(n) if (60..20_000).contains(&n) => format!("{} min", n / 60),
+            Ok(n) if (1..60).contains(&n) => format!("{n} min"),
+            _ => raw,
+        }
+    });
+    (
+        text(&["plot", "description", "overview"]),
+        still,
+        text(&["rating"]),
+        runtime,
+        airdate_text(nested, ep),
+        text(&["age", "mpaa_rating", "rating_mpaa", "content_rating"]),
+    )
+}
+
+/// A full day when the panel has one. `2023-01-01` with a year-only sibling stays the year:
+/// panels use 1 January as an empty date.
+fn airdate_text(nested: &Value, ep: &Value) -> Option<String> {
+    let mut full: Option<String> = None;
+    let mut year: Option<String> = None;
+    for key in ["releasedate", "release_date", "air_date"] {
+        let Some(v) = nested.get(key).or_else(|| ep.get(key)) else {
+            continue;
+        };
+        let raw = json_text(v).or_else(|| v.get("date").and_then(json_text));
+        let Some(raw) = raw else { continue };
+        let day = raw.split(['T', ' ']).next().unwrap_or(raw.as_str());
+        if day.len() >= 10 && day.as_bytes().get(4) == Some(&b'-') {
+            if day.ends_with("-01-01") {
+                year = year.or_else(|| Some(day[..4].to_string()));
+            } else if full.is_none() {
+                full = Some(day.to_string());
+            }
+        } else if year.is_none() && raw.chars().take(4).all(|c| c.is_ascii_digit()) && raw.len() >= 4 {
+            year = Some(raw.chars().take(4).collect());
+        }
+    }
+    full.or(year)
+}
+
+/// Whether `server_info.url` may replace the portal media base.
+///
+/// Panels routinely advertise a separate CDN hostname (Smarters model) — that
+/// stays allowed. Block localhost / private / link-local / cloud-metadata IPs
+/// so a hostile portal cannot steer media GETs at the LAN or IMDS.
+fn server_info_host_allowed(portal_host: &str, candidate: &str) -> bool {
+    let c = candidate.trim().trim_matches(|ch| ch == '[' || ch == ']');
+    if c.is_empty() {
+        return false;
+    }
+    if portal_host.eq_ignore_ascii_case(c) {
+        return true;
+    }
+    let cl = c.to_ascii_lowercase();
+    if cl == "localhost" || cl.ends_with(".localhost") || cl.ends_with(".local") || cl.ends_with(".internal")
+    {
+        return false;
+    }
+    if c.parse::<std::net::IpAddr>().is_ok() {
+        // Literal IP retarget only when it is the portal itself (self-hosted).
+        // Any other IP (LAN / IMDS / CGNAT) is refused — use a hostname CDN instead.
+        return false;
+    }
+    // Public hostname CDN retarget (Smarters).
+    true
 }
 
 #[cfg(test)]
@@ -1498,5 +1975,86 @@ mod tests {
             "url": "cdn.example", "port": "80", "https_port": "8443", "server_protocol": "https"
         }}));
         assert_eq!(c.stream_base.as_str(), "https://cdn.example:8443/");
+    }
+
+    #[test]
+    fn server_info_rejects_private_and_metadata_hosts() {
+        assert!(server_info_host_allowed("panel.example", "cdn.example"));
+        assert!(server_info_host_allowed("panel.example", "panel.example"));
+        assert!(!server_info_host_allowed("panel.example", "127.0.0.1"));
+        assert!(!server_info_host_allowed("panel.example", "10.0.0.5"));
+        assert!(!server_info_host_allowed("panel.example", "192.168.1.1"));
+        assert!(!server_info_host_allowed("panel.example", "169.254.169.254"));
+        assert!(!server_info_host_allowed("panel.example", "localhost"));
+        assert!(!server_info_host_allowed("panel.example", "foo.local"));
+        // Same literal IP is fine (self-hosted).
+        assert!(server_info_host_allowed("203.0.113.9", "203.0.113.9"));
+    }
+
+    #[test]
+    fn server_info_keeps_portal_when_host_forbidden() {
+        let mut c = client();
+        let before = c.stream_base.clone();
+        c.apply_server_info(&json!({ "server_info": {
+            "url": "169.254.169.254", "port": "80", "server_protocol": "http"
+        }}));
+        assert_eq!(c.stream_base, before);
+    }
+
+    #[test]
+    fn episode_info_keeps_plot_and_still() {
+        let portal = Url::parse("http://panel.example:8080/").unwrap();
+        let (plot, still, rating, runtime, air, rated) = episode_details(
+            &portal,
+            &json!({
+                "title": "Pilot",
+                "info": {
+                    "plot": "Le premier jour.",
+                    "movie_image": "http://cdn.example/ep1.jpg",
+                    "rating": 8.2,
+                    "duration_secs": 2580,
+                    "releasedate": "2020-01-02",
+                    "age": "12"
+                }
+            }),
+        );
+        assert_eq!(plot.as_deref(), Some("Le premier jour."));
+        assert_eq!(still.as_deref(), Some("http://cdn.example/ep1.jpg"));
+        assert_eq!(rating.as_deref(), Some("8.2"));
+        assert_eq!(runtime.as_deref(), Some("43 min"));
+        assert_eq!(air.as_deref(), Some("2020-01-02"));
+        assert_eq!(rated.as_deref(), Some("12"));
+        let (_, still, _, _, _, _) = episode_details(
+            &portal,
+            &json!({ "info": { "movie_image": "/images/ep.jpg" } }),
+        );
+        assert_eq!(still.as_deref(), Some("http://panel.example:8080/images/ep.jpg"));
+    }
+
+    #[test]
+    fn series_episodes_accept_object_map_and_flat_array() {
+        let c = client();
+        let classic = c.parse_series_episodes(Some(&json!({
+            "1": [{ "id": "10", "episode_num": 1, "title": "Pilot", "container_extension": "mkv" }],
+            "2": { "1": { "id": 20, "episode_num": "1", "title": "S2E1" } }
+        })));
+        assert_eq!(classic.len(), 2);
+        assert_eq!(classic[0].episodes.len(), 1);
+        assert_eq!(classic[1].episodes.len(), 1);
+        assert!(classic[0].episodes[0].stream_url.contains("/series/"));
+
+        let flat = c.parse_series_episodes(Some(&json!([
+            { "id": "30", "season": 1, "episode_num": 2, "title": "Two" },
+            { "id": "31", "season_number": "1", "episode_num": 1, "title": "One" }
+        ])));
+        assert_eq!(flat.len(), 1);
+        assert_eq!(flat[0].episodes.len(), 2);
+        assert_eq!(flat[0].episodes[0].title, "One");
+        assert_eq!(flat[0].episodes[1].title, "Two");
+
+        assert!(!crate::api_cache::series_info_has_episodes(&json!({ "info": {} })));
+        assert!(crate::api_cache::series_info_has_episodes(&json!({
+            "episodes": { "1": [{ "id": "1" }] }
+        })));
     }
 }

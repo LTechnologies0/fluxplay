@@ -6,7 +6,10 @@
 
 mod android_quality;
 mod backend;
+mod chapter_classify;
 mod external;
+#[cfg(test)]
+mod prop_route;
 #[cfg(all(feature = "native-ffmpeg", fluxplay_has_ffmpeg))]
 mod ffmpeg_ffi;
 #[cfg(all(feature = "native-ffmpeg", fluxplay_has_ffmpeg))]
@@ -20,6 +23,8 @@ mod platform;
 mod session;
 mod video_frame;
 
+use fluxplay_core::codes::{classify_io, classify_message, FpCode, HasFpCode};
+use fluxplay_core::redact_urls;
 use fluxplay_core::protocol::{DeliveryKind, StreamScheme, StreamUrl};
 use fluxplay_core::Channel;
 use fluxplay_core::Stopwatch;
@@ -29,8 +34,12 @@ use tracing::{debug, info, trace, warn};
 
 pub use android_quality::{AndroidDeviceCaps, AndroidPresentMode, CompatTier, SoftBudget};
 pub use backend::{
-    detect_backends, BackendCaps, BackendId, BackendInfo, NativePlayer, PlayOptions, PlayerEvent,
-    VideoRect,
+    detect_backends, BackendCaps, BackendId, BackendInfo, MediaTrack, NativePlayer, PlayOptions,
+    PlayerEvent, VideoRect,
+};
+pub use chapter_classify::{
+    classify_chapter_title, credits_from_chapters as credits_start_from_chapters,
+    opening_from_chapters as opening_span_from_chapters, set_chapter_keyword_extras, ChapterClass,
 };
 pub use external::{
     detect_external_players, launch_external, pick_external_player, ExternalLaunch,
@@ -54,23 +63,135 @@ pub use session::{
 
 #[derive(Debug, Error)]
 pub enum PlayerError {
-    #[error("unsupported protocol: {0}")]
+    #[error("{}", display_unsupported(.0))]
     Unsupported(String),
-    #[error("invalid url: {0}")]
+    #[error("{}", display_invalid_url(.0))]
     InvalidUrl(String),
-    #[error("backend: {0}")]
+    #[error("{}", display_backend(.0))]
     Backend(String),
-    #[error("core: {0}")]
+    #[error("{}", display_core(.0))]
     Core(#[from] fluxplay_core::Error),
-    #[error("http: {0}")]
+    #[error("{}", display_http(.0))]
     Http(#[from] reqwest::Error),
-    #[error("io: {0}")]
+    #[error("{}", display_io(.0))]
     Io(#[from] std::io::Error),
-    #[error("{0}")]
+    #[error("{}", display_message(.0))]
     Message(String),
 }
 
 pub type Result<T> = std::result::Result<T, PlayerError>;
+
+fn backend_code(msg: &str) -> FpCode {
+    classify_message(msg)
+}
+
+fn display_unsupported(msg: &str) -> String {
+    FpCode::AvUnsupportedScheme.ensure_coded(format!("unsupported protocol: {msg}"))
+}
+
+fn display_invalid_url(msg: &str) -> String {
+    FpCode::AvInvalidUrl.ensure_coded(format!("invalid url: {msg}"))
+}
+
+fn display_backend(msg: &str) -> String {
+    backend_code(msg).ensure_coded(format!("backend: {msg}"))
+}
+
+fn display_core(e: &fluxplay_core::Error) -> String {
+    format!("core: {e}")
+}
+
+fn display_http(e: &reqwest::Error) -> String {
+    // Prefer provider classifier when available; fall back to message heuristics.
+    // reqwest Display often embeds the full request URL (Xtream creds in query).
+    let code = http_code(e);
+    code.ensure_coded(format!("http: {}", redact_urls(&e.to_string())))
+}
+
+fn http_code(e: &reqwest::Error) -> FpCode {
+    let s = e.to_string().to_ascii_lowercase();
+    if e.is_timeout() {
+        FpCode::NetHttpTimeout
+    } else if e.is_connect() {
+        if s.contains("dns") || s.contains("resolve") {
+            FpCode::NetDnsServfail
+        } else if s.contains("certificate") || s.contains("cert") {
+            FpCode::NetHttpsCert
+        } else if s.contains("tls") || s.contains("ssl") {
+            FpCode::NetHttpsTls
+        } else {
+            FpCode::NetTcpConnect
+        }
+    } else if s.contains("certificate") {
+        FpCode::NetHttpsCert
+    } else if s.contains("tls") || s.contains("ssl") {
+        FpCode::NetHttpsTls
+    } else {
+        classify_message(&s)
+    }
+}
+
+fn display_io(e: &std::io::Error) -> String {
+    classify_io(e).ensure_coded(format!("io: {e}"))
+}
+
+fn display_message(msg: &str) -> String {
+    classify_message(msg).ensure_coded(msg)
+}
+
+impl HasFpCode for PlayerError {
+    fn fp_code(&self) -> FpCode {
+        match self {
+            Self::Unsupported(_) => FpCode::AvUnsupportedScheme,
+            Self::InvalidUrl(_) => FpCode::AvInvalidUrl,
+            Self::Backend(m) => backend_code(m),
+            Self::Core(e) => e.fp_code(),
+            Self::Http(e) => http_code(e),
+            Self::Io(e) => classify_io(e),
+            Self::Message(m) => classify_message(m),
+        }
+    }
+}
+
+impl PlayerError {
+    /// Display already includes `[FP-…]`.
+    pub fn coded(&self) -> String {
+        self.to_string()
+    }
+}
+
+#[cfg(test)]
+mod code_tests {
+    use super::*;
+
+    #[test]
+    fn backend_intent_code() {
+        let e = PlayerError::Backend("EXTERNAL_NEEDS_INTENT".into());
+        assert_eq!(e.fp_code(), FpCode::AvIntentRefuse);
+        assert!(e.to_string().contains("[FP-AV-INTENT-REFUSE]"));
+    }
+
+    #[test]
+    fn soft_rgba_code() {
+        let e = PlayerError::Backend("SOFT_RGBA".into());
+        assert_eq!(e.fp_code(), FpCode::AvSoftRgba);
+    }
+
+    #[test]
+    fn unsupported_scheme_code() {
+        let e = PlayerError::Unsupported("rtsp".into());
+        assert_eq!(e.fp_code(), FpCode::AvUnsupportedScheme);
+        assert!(e.to_string().starts_with("[FP-AV-SCHEME]"));
+    }
+
+    #[test]
+    fn redact_urls_scrubs_password_query() {
+        let raw = "error sending request for url (https://x.example/get.php?username=u&password=s3cret)";
+        let out = redact_urls(raw);
+        assert!(out.contains("<url>"), "{out}");
+        assert!(!out.contains("s3cret"), "{out}");
+    }
+}
 
 /// Network read-ahead of the embedded player (seconds of video already downloaded).
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
@@ -132,7 +253,7 @@ pub(crate) fn url_endpoint(raw: &str) -> String {
 /// A `file:` URL naming an existing file under `FLUXPLAY_DOWNLOAD_ROOT` (a download of
 /// this app). Both sides are canonicalized, so `root/../../etc/…` does not qualify.
 pub(crate) fn is_downloaded_file(url: &str) -> bool {
-    let Some(path) = url.strip_prefix("file://").or_else(|| url.strip_prefix("file:")) else {
+    let Some(path) = file_url_path(url) else {
         return false;
     };
     let Ok(root) = std::env::var("FLUXPLAY_DOWNLOAD_ROOT") else {
@@ -141,10 +262,29 @@ pub(crate) fn is_downloaded_file(url: &str) -> bool {
     if root.trim().is_empty() {
         return false;
     }
-    match (std::fs::canonicalize(path), std::fs::canonicalize(root.trim())) {
+    match (std::fs::canonicalize(&path), std::fs::canonicalize(root.trim())) {
         (Ok(p), Ok(r)) => p.is_file() && p.starts_with(&r),
         _ => false,
     }
+}
+
+/// `file:///C:/Films/a.mkv` and `file://C:\Films\a.mkv` both become a path.
+fn file_url_path(url: &str) -> Option<std::path::PathBuf> {
+    let rest = url.strip_prefix("file://")?;
+    if let Some(win) = rest.strip_prefix('/') {
+        let bytes = win.as_bytes();
+        if bytes.len() >= 2 && bytes[1] == b':' {
+            return Some(std::path::PathBuf::from(win.replace('/', "\\")));
+        }
+    }
+    let bytes = rest.as_bytes();
+    if bytes.len() >= 2 && bytes[1] == b':' {
+        return Some(std::path::PathBuf::from(rest.replace('/', "\\")));
+    }
+    if rest.is_empty() {
+        return None;
+    }
+    Some(std::path::PathBuf::from(rest))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -330,6 +470,31 @@ pub struct HlsProbe {
     pub bytes: usize,
 }
 
+/// Pure HLS/m3u8 body probe — no network. Safe for fuzz / property tests.
+pub fn parse_hls_manifest_body(text: &str) -> HlsProbe {
+    // Cap work on pathological multi-megabyte fuzz inputs.
+    let slice = if text.len() > 512 * 1024 {
+        &text[..512 * 1024]
+    } else {
+        text
+    };
+    let is_master = slice.contains("#EXT-X-STREAM-INF");
+    let variants = slice
+        .lines()
+        .filter(|l| l.starts_with("#EXT-X-STREAM-INF"))
+        .count();
+    let media_seq = slice
+        .lines()
+        .find_map(|l| l.strip_prefix("#EXT-X-MEDIA-SEQUENCE:"))
+        .and_then(|s| s.trim().parse().ok());
+    HlsProbe {
+        is_master,
+        variant_count: variants,
+        media_sequence: media_seq,
+        bytes: text.len(),
+    }
+}
+
 pub async fn probe_hls_manifest(url: &str) -> Result<HlsProbe> {
     let _prof = Stopwatch::start("probe_hls_manifest");
     let endpoint = url_endpoint(url);
@@ -347,21 +512,7 @@ pub async fn probe_hls_manifest(url: &str) -> Result<HlsProbe> {
         .timeout(std::time::Duration::from_secs(20))
         .build()?;
     let text = client.get(url).send().await?.error_for_status()?.text().await?;
-    let is_master = text.contains("#EXT-X-STREAM-INF");
-    let variants = text
-        .lines()
-        .filter(|l| l.starts_with("#EXT-X-STREAM-INF"))
-        .count();
-    let media_seq = text
-        .lines()
-        .find_map(|l| l.strip_prefix("#EXT-X-MEDIA-SEQUENCE:"))
-        .and_then(|s| s.trim().parse().ok());
-    let probe = HlsProbe {
-        is_master,
-        variant_count: variants,
-        media_sequence: media_seq,
-        bytes: text.len(),
-    };
+    let probe = parse_hls_manifest_body(&text);
     info!(
         %endpoint,
         is_master = probe.is_master,
@@ -370,4 +521,20 @@ pub async fn probe_hls_manifest(url: &str) -> Result<HlsProbe> {
         "probe_hls_manifest ok"
     );
     Ok(probe)
+}
+
+/// Stable surface for libFuzzer harnesses (`--features fuzzing`).
+#[cfg(feature = "fuzzing")]
+pub mod fuzz_api {
+    pub use crate::android_quality::{
+        AndroidDeviceCaps, AndroidPresentMode, CompatTier, SoftBudget,
+    };
+    pub use crate::chapter_classify::{
+        classify_chapter_title, credits_from_chapters, opening_from_chapters, ChapterClass,
+    };
+    pub use crate::parse_hls_manifest_body;
+    pub use crate::route;
+    pub use crate::support_matrix;
+    pub use crate::video_frame::{yuv_to_rgb_coeffs, ColorMatrix, PixelLayout};
+    pub use crate::HlsProbe;
 }

@@ -75,22 +75,22 @@ pub fn target_profile() -> TargetProfile {
                     platform: Platform::Linux,
                     ui_shell: "iced (desktop)",
                     preferred_backends: &["mpv", "ffmpeg", "external"],
-                    hw_accel: "vaapi / vulkan / cuda",
-                    notes: "mpv embeds FFmpeg; VA-API for HW decode",
+                    hw_accel: "vaapi-copy / cuda-copy / auto-copy → iced soft RGBA",
+                    notes: "soft present shares one SoftPump; hwdec *-copy, never forced SW after loadfile",
                 },
                 Platform::MacOs => TargetProfile {
                     platform: Platform::MacOs,
                     ui_shell: "iced (desktop)",
                     preferred_backends: &["mpv", "ffmpeg", "external"],
-                    hw_accel: "videotoolbox",
-                    notes: "mpv + VideoToolbox; IINA/mpv as external fallback",
+                    hw_accel: "videotoolbox-copy → iced soft RGBA (no Metal VT zero-copy into iced)",
+                    notes: "soft present + VideoToolbox copy only — iced/wgpu has no Metal CVPixelBuffer import; coreaudio; IINA/mpv external",
                 },
                 Platform::Windows => TargetProfile {
                     platform: Platform::Windows,
                     ui_shell: "iced (desktop)",
                     preferred_backends: &["mpv", "ffmpeg", "external"],
-                    hw_accel: "d3d11va / dxva2",
-                    notes: "mpv + D3D11VA; bundle libmpv in installer",
+                    hw_accel: "d3d11va-copy → iced soft RGBA",
+                    notes: "libmpv-2.dll delay-loaded; soft present + D3D11VA copy; wasapi clock",
                 },
                 Platform::Android => TargetProfile {
                     platform: Platform::Android,
@@ -102,9 +102,11 @@ pub fn target_profile() -> TargetProfile {
                 Platform::Ios => TargetProfile {
                     platform: Platform::Ios,
                     ui_shell: "SwiftUI + fluxplay-ffi",
-                    preferred_backends: &["avplayer"],
-                    hw_accel: "VideoToolbox",
-                    notes: "AVPlayer; Rust core via UniFFI",
+                    // Detect lists AvPlayer available:false until Swift play bridge exists;
+                    // do not recommend a decoder Rust `play` always rejects.
+                    preferred_backends: &["external"],
+                    hw_accel: "none (shell not wired)",
+                    notes: "AVPlayer not wired — Rust play is a stub; use external / shell bridge",
                 },
                 Platform::Unknown => TargetProfile {
                     platform: Platform::Unknown,

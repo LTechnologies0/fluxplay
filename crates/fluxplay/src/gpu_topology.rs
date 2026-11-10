@@ -6,6 +6,11 @@
 //! - **Copy** (`*-copy`, soft RGBA): decode can run on the stronger GPU, but soft
 //!   present / composite budgets follow the **weaker display** GPU.
 //! - Android phones rarely expose two GPUs; MediaCodec ≠ a second GL device.
+//!
+//! ## Env split (W4-08)
+//! - `FLUXPLAY_GPU` — iced/wgpu **present** adapter (display / panel only).
+//! - `FLUXPLAY_DECODE_GPU` — mpv/ffmpeg vendor steer (`cuda-copy` / VAAPI / D3D11).
+//! - `FLUXPLAY_GPU_NODE` — Linux DRM `/dev/dri/renderD*` for libva only (never DXGI).
 
 use fluxplay_core::models::GpuTier;
 use serde::{Deserialize, Serialize};
@@ -18,7 +23,8 @@ use tracing::{debug, info};
 pub struct GpuDevice {
     pub name: String,
     pub tier: GpuTier,
-    /// DRM render node when known (`/dev/dri/renderD128`).
+    /// Linux: DRM render node (`/dev/dri/renderD128`). Windows: full DXGI/GDI
+    /// adapter description for `d3d11-adapter` (UI `name` may be truncated).
     #[serde(default)]
     pub render_node: Option<String>,
 }
@@ -82,8 +88,6 @@ impl GpuTopology {
     }
 
     /// True when decode≠display → force `vaapi-copy` / `mediacodec-copy` / soft.
-    /// Hybrid multi-GPU is a desktop probe; Android is always single-SoC.
-    #[cfg(any(test, not(target_os = "android")))]
     pub fn requires_copy_path(&self) -> bool {
         // Two identical cards still sit on different render nodes: either difference
         // means frames cross devices.
@@ -179,7 +183,100 @@ pub fn topology_from_devices(mut devices: Vec<GpuDevice>) -> GpuTopology {
         decode,
         policy,
     };
-    info!(summary = %topo.summary(), "GPU topology");
+    // resolve_caps may re-probe often — log the summary once per process.
+    static LOGGED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    let _ = LOGGED.get_or_init(|| {
+        info!(summary = %topo.summary(), "GPU topology");
+    });
     debug!(?topo, "GPU topology detail");
     topo
+}
+
+/// Windows pin for mpv `--d3d11-adapter=` (DXGI description, prefix match).
+/// Prefers `render_node` when it holds a non-DRM adapter string; never returns a
+/// truncated UI name that contains an ellipsis (would fail to match).
+pub fn d3d11_adapter_from_device(dev: &GpuDevice) -> Option<String> {
+    if let Some(n) = dev.render_node.as_deref() {
+        if !n.is_empty() && !n.starts_with("/dev/dri/") {
+            return Some(n.to_owned());
+        }
+    }
+    let n = dev.name.as_str();
+    (!n.is_empty() && !n.contains('…')).then(|| dev.name.clone())
+}
+
+#[cfg(test)]
+mod d3d11_pin_tests {
+    use super::*;
+    use fluxplay_core::models::GpuTier;
+
+    #[test]
+    fn prefers_full_render_node_over_truncated_name() {
+        let dev = GpuDevice {
+            name: "NVIDIA GeForce RTX 4090 Laptop GPU With A Very Long…".into(),
+            tier: GpuTier::Discrete,
+            render_node: Some("NVIDIA GeForce RTX 4090 Laptop GPU".into()),
+        };
+        assert_eq!(
+            d3d11_adapter_from_device(&dev).as_deref(),
+            Some("NVIDIA GeForce RTX 4090 Laptop GPU")
+        );
+    }
+
+    #[test]
+    fn rejects_ellipsis_only_name_without_render_node() {
+        let dev = GpuDevice {
+            name: "Some Extremely Long Adapter Name That Got…".into(),
+            tier: GpuTier::Integrated,
+            render_node: None,
+        };
+        assert_eq!(d3d11_adapter_from_device(&dev), None);
+    }
+
+    #[test]
+    fn ignores_linux_drm_render_node() {
+        let dev = GpuDevice {
+            name: "Intel UHD Graphics".into(),
+            tier: GpuTier::Integrated,
+            render_node: Some("/dev/dri/renderD128".into()),
+        };
+        assert_eq!(
+            d3d11_adapter_from_device(&dev).as_deref(),
+            Some("Intel UHD Graphics")
+        );
+    }
+}
+
+
+#[cfg(test)]
+mod topology_policy_tests {
+    use super::*;
+    use fluxplay_core::models::GpuTier;
+
+    #[test]
+    fn strong_decode_requires_copy() {
+        let igpu = GpuDevice {
+            name: "Intel".into(),
+            tier: GpuTier::Integrated,
+            render_node: Some("/dev/dri/renderD128".into()),
+        };
+        let dgpu = GpuDevice {
+            name: "NVIDIA".into(),
+            tier: GpuTier::Discrete,
+            render_node: Some("/dev/dri/renderD129".into()),
+        };
+        let topo = GpuTopology {
+            devices: vec![dgpu.clone(), igpu.clone()],
+            display: igpu,
+            decode: dgpu,
+            policy: GpuDecodePolicy::StrongDecodeCopy,
+        };
+        assert!(topo.requires_copy_path());
+    }
+
+    #[test]
+    fn same_display_no_copy() {
+        let topo = GpuTopology::single("Intel", GpuTier::Integrated);
+        assert!(!topo.requires_copy_path());
+    }
 }

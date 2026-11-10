@@ -91,6 +91,8 @@ fn run_one(url: &str, pref: PlayerBackendPref) -> Result<(), String> {
         source_id: None,
         kind: ContentKind::Vod,
         catchup: None,
+        http_user_agent: None,
+        http_referer: None,
     };
 
     session

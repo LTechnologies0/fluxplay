@@ -3,20 +3,24 @@ package app.fluxplay.android;
 import android.app.Activity;
 import android.app.NativeActivity;
 import android.app.PictureInPictureParams;
+import android.Manifest;
 import android.content.Intent;
+import android.content.pm.PackageManager;
 import android.content.pm.ActivityInfo;
 import android.content.res.Configuration;
 import android.database.Cursor;
 import android.graphics.PixelFormat;
-import android.media.AudioAttributes;
-import android.media.AudioFocusRequest;
 import android.media.AudioManager;
 import android.media.MediaCodecInfo;
 import android.media.MediaCodecList;
+import android.net.ConnectivityManager;
+import android.net.Network;
 import android.net.Uri;
+import android.media.session.MediaSession;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Looper;
+import android.os.PowerManager;
 import android.provider.OpenableColumns;
 import android.util.DisplayMetrics;
 import android.util.Log;
@@ -54,7 +58,6 @@ public class FluxPlayNativeActivity extends NativeActivity {
     private static final int REQ_CREATE = 4102;
 
     static {
-        // media-kit FFmpeg MediaCodec needs JNI/JavaVM registration via this helper.
         try {
             System.loadLibrary("mediakitandroidhelper");
             Log.i(TAG, "loaded mediakitandroidhelper");
@@ -63,6 +66,102 @@ public class FluxPlayNativeActivity extends NativeActivity {
         }
     }
 
+    private static native void nativeOnAudioFocusChange(int focusChange);
+
+    private static native void nativeAbandonAudioFocus();
+
+    private static native void nativeRequestAudioFocus();
+
+    private static native void nativeNetworkChanged(boolean online);
+
+    private static native void nativeMediaAction(int code);
+
+    private static ConnectivityManager.NetworkCallback sNetworkCallback;
+
+    /** Activity handle for Rust JNI (null before onCreate / after onDestroy). */
+    public static android.app.Activity activityForNative() {
+        return sInstance;
+    }
+
+    /** Shared listener — forwards focus events to Rust. */
+    public static AudioManager.OnAudioFocusChangeListener audioFocusListenerForNative() {
+        if (sNativeAudioFocusListener == null) {
+            sNativeAudioFocusListener = focusChange -> nativeOnAudioFocusChange(focusChange);
+        }
+        return sNativeAudioFocusListener;
+    }
+
+    public static void registerDefaultNetworkCallbackNative() {
+        FluxPlayNativeActivity a = sInstance;
+        if (a == null || sNetworkCallback != null) {
+            return;
+        }
+        try {
+            ConnectivityManager cm =
+                    (ConnectivityManager) a.getSystemService(CONNECTIVITY_SERVICE);
+            if (cm == null) {
+                return;
+            }
+            sNetworkCallback = new ConnectivityManager.NetworkCallback() {
+                @Override
+                public void onAvailable(Network network) {
+                    nativeNetworkChanged(true);
+                }
+
+                @Override
+                public void onLost(Network network) {
+                    nativeNetworkChanged(false);
+                }
+            };
+            cm.registerDefaultNetworkCallback(sNetworkCallback);
+            Log.i(TAG, "network callback registered (Rust)");
+        } catch (Exception e) {
+            Log.e(TAG, "registerDefaultNetworkCallbackNative", e);
+        }
+    }
+
+    public static void unregisterDefaultNetworkCallbackNative() {
+        FluxPlayNativeActivity a = sInstance;
+        if (a == null || sNetworkCallback == null) {
+            sNetworkCallback = null;
+            return;
+        }
+        try {
+            ConnectivityManager cm =
+                    (ConnectivityManager) a.getSystemService(CONNECTIVITY_SERVICE);
+            if (cm != null) {
+                cm.unregisterNetworkCallback(sNetworkCallback);
+            }
+        } catch (Exception e) {
+            Log.w(TAG, "unregisterDefaultNetworkCallbackNative", e);
+        }
+        sNetworkCallback = null;
+    }
+
+    /** MediaSession transport → Rust (lock screen / BT). */
+    public static void attachMediaSessionCallback(MediaSession session) {
+        if (session == null) {
+            return;
+        }
+        session.setCallback(new MediaSession.Callback() {
+            @Override
+            public void onPlay() {
+                nativeMediaAction(1);
+            }
+
+            @Override
+            public void onPause() {
+                nativeMediaAction(2);
+            }
+
+            @Override
+            public void onStop() {
+                nativeMediaAction(3);
+            }
+        });
+    }
+
+    private static AudioManager.OnAudioFocusChangeListener sNativeAudioFocusListener;
     private static FluxPlayNativeActivity sInstance;
     private static volatile boolean sInPip = false;
     /** Cached system insets [L,T,R,B,dpi] — updated on UI thread only. */
@@ -70,8 +169,6 @@ public class FluxPlayNativeActivity extends NativeActivity {
 
     private String pendingCreateSource;
     private String pendingMime = "*/*";
-    private AudioFocusRequest audioFocusRequest;
-    private AudioManager.OnAudioFocusChangeListener audioFocusListener;
 
     /** MediaCodec SurfaceView above iced GLES (mpv-android wid model). */
     private SurfaceView videoSurfaceView;
@@ -102,6 +199,8 @@ public class FluxPlayNativeActivity extends NativeActivity {
     private volatile boolean bufferTransformDirty = false;
     /** True when SurfaceView is attached via WindowManager (above NativeActivity GLES). */
     private volatile boolean videoSurfaceViaWm = false;
+    /** API 29+ — refresh device_caps.json when thermal status changes (SoftBudget demotion). */
+    private PowerManager.OnThermalStatusChangedListener thermalListener = null;
     private final Runnable reattachSurfaceRunnable = new Runnable() {
         @Override
         public void run() {
@@ -198,6 +297,7 @@ public class FluxPlayNativeActivity extends NativeActivity {
             // leaves a dead Surface (create→destroy within ~1s on Pixel).
             decor.post(() -> {
                 refreshInsetsFromDecor();
+                ensurePostNotificationsPermissionNative();
                 writeDeviceCaps();
                 // First CreateWindow can still see 0×0 before layout — poke once.
                 if (decor.getWidth() <= 0 || decor.getHeight() <= 0) {
@@ -298,12 +398,51 @@ public class FluxPlayNativeActivity extends NativeActivity {
         }
         surfaceSessionWanted = false;
         removeVideoSurfaceView();
+        clearThermalListener();
         if (sInstance == this) {
-            abandonAudioFocusInner();
-            writeAudioFocusFlag(false);
+            unregisterDefaultNetworkCallbackNative();
+            nativeAbandonAudioFocus();
             sInstance = null;
         }
         super.onDestroy();
+    }
+
+    /** Register once — SoftBudget re-reads caps on the next poll after thermal changes. */
+    private void ensureThermalListener() {
+        if (Build.VERSION.SDK_INT < 29 || thermalListener != null) {
+            return;
+        }
+        try {
+            PowerManager pm = (PowerManager) getSystemService(POWER_SERVICE);
+            if (pm == null) {
+                return;
+            }
+            thermalListener = status -> {
+                Log.i(TAG, "thermal status → " + status);
+                writeDeviceCaps();
+            };
+            pm.addThermalStatusListener(thermalListener);
+            Log.i(TAG, "thermal listener registered");
+        } catch (Throwable e) {
+            Log.w(TAG, "ensureThermalListener", e);
+            thermalListener = null;
+        }
+    }
+
+    private void clearThermalListener() {
+        if (Build.VERSION.SDK_INT < 29 || thermalListener == null) {
+            thermalListener = null;
+            return;
+        }
+        try {
+            PowerManager pm = (PowerManager) getSystemService(POWER_SERVICE);
+            if (pm != null) {
+                pm.removeThermalStatusListener(thermalListener);
+            }
+        } catch (Throwable e) {
+            Log.w(TAG, "clearThermalListener", e);
+        }
+        thermalListener = null;
     }
 
     private void scheduleSurfaceReattach(long delayMs) {
@@ -484,7 +623,15 @@ public class FluxPlayNativeActivity extends NativeActivity {
             return false;
         }
         int type = a.getResources().getConfiguration().uiMode & Configuration.UI_MODE_TYPE_MASK;
-        return type == Configuration.UI_MODE_TYPE_TELEVISION;
+        if (type == Configuration.UI_MODE_TYPE_TELEVISION) {
+            return true;
+        }
+        // Leanback-only boxes may omit UI_MODE_TYPE_TELEVISION.
+        try {
+            return a.getPackageManager().hasSystemFeature(PackageManager.FEATURE_LEANBACK);
+        } catch (Exception ignored) {
+            return false;
+        }
     }
 
     private static void cacheInsetsFrom(WindowInsets insets) {
@@ -676,130 +823,99 @@ public class FluxPlayNativeActivity extends NativeActivity {
         a.runOnUiThread(a::finish);
     }
 
-    /** ACTION_VIEW from Activity UI thread (ndk_context is often Application). */
-    public static void openUrl(String url, String mime) {
+    /**
+     * ACTION_VIEW from Activity UI thread (ndk_context is often Application).
+     * Returns false when Activity is gone, URL empty, or no handler (honest JNI).
+     * Pre-checks resolveActivity on the caller thread, then posts startActivity
+     * without a multi-second latch (iced update must not ANR on Intent).
+     */
+    public static boolean openUrl(String url, String mime) {
         FluxPlayNativeActivity a = sInstance;
         if (a == null || url == null || url.isEmpty()) {
-            return;
+            return false;
         }
-        final String u = url;
-        final String m = mime;
-        a.runOnUiThread(() -> {
+        final Intent intent = new Intent(Intent.ACTION_VIEW, Uri.parse(url));
+        if (mime != null && !mime.isEmpty()) {
+            intent.setDataAndType(Uri.parse(url), mime);
+        }
+        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+        try {
+            if (intent.resolveActivity(a.getPackageManager()) == null) {
+                return false;
+            }
+        } catch (Exception e) {
+            Log.e(TAG, "openUrl resolve failed", e);
+            return false;
+        }
+        // Already on UI thread — start immediately; honest result.
+        if (Looper.myLooper() == Looper.getMainLooper()) {
             try {
-                Intent intent = new Intent(Intent.ACTION_VIEW, Uri.parse(u));
-                if (m != null && !m.isEmpty()) {
-                    intent.setDataAndType(Uri.parse(u), m);
-                }
                 a.startActivity(intent);
+                return true;
             } catch (Exception e) {
                 Log.e(TAG, "openUrl failed", e);
+                return false;
             }
-        });
-    }
-
-    public static void requestAudioFocus() {
-        FluxPlayNativeActivity a = sInstance;
-        if (a == null) {
-            return;
         }
-        // Sync when possible so Rust poll after request sees GRANTED before open_channel.
-        if (Looper.myLooper() == Looper.getMainLooper()) {
-            a.requestAudioFocusInner();
-            return;
-        }
+        // Fire-and-forget: resolveActivity already proved a handler exists.
+        // Cap await ≤200ms so iced update never stalls a full frame budget×N.
+        final boolean[] ok = {false};
         final java.util.concurrent.CountDownLatch done =
                 new java.util.concurrent.CountDownLatch(1);
         a.runOnUiThread(() -> {
             try {
-                a.requestAudioFocusInner();
+                a.startActivity(intent);
+                ok[0] = true;
+            } catch (Exception e) {
+                Log.e(TAG, "openUrl failed", e);
+                ok[0] = false;
             } finally {
                 done.countDown();
             }
         });
         try {
-            done.await(750, java.util.concurrent.TimeUnit.MILLISECONDS);
+            if (!done.await(200, java.util.concurrent.TimeUnit.MILLISECONDS)) {
+                // Intent posted; treat as launched (handler pre-checked).
+                Log.w(TAG, "openUrl UI-thread timeout — Intent posted");
+                return true;
+            }
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
+            return false;
         }
+        return ok[0];
     }
 
-    public static void abandonAudioFocus() {
+    private static volatile boolean sNotifPermPrompted;
+
+    /** API 33+: one-shot runtime grant for MediaStyle / lock-screen transport. */
+    public static void ensurePostNotificationsPermissionNative() {
+        if (Build.VERSION.SDK_INT < 33) {
+            return;
+        }
         FluxPlayNativeActivity a = sInstance;
         if (a == null) {
             return;
         }
-        a.runOnUiThread(a::abandonAudioFocusInner);
+        if (a.checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS)
+                == PackageManager.PERMISSION_GRANTED) {
+            return;
+        }
+        if (sNotifPermPrompted) {
+            return;
+        }
+        sNotifPermPrompted = true;
+        a.requestPermissions(new String[]{Manifest.permission.POST_NOTIFICATIONS}, 9001);
+        Log.i(TAG, "POST_NOTIFICATIONS runtime prompt");
     }
 
-    private void requestAudioFocusInner() {
-        try {
-            AudioManager am = (AudioManager) getSystemService(AUDIO_SERVICE);
-            if (am == null) {
-                return;
-            }
-            if (audioFocusListener == null) {
-                audioFocusListener = focusChange -> {
-                    if (focusChange == AudioManager.AUDIOFOCUS_LOSS
-                            || focusChange == AudioManager.AUDIOFOCUS_LOSS_TRANSIENT) {
-                        writeAudioFocusFlag(false);
-                        Log.i(TAG, "audio focus lost: " + focusChange);
-                    } else if (focusChange == AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK) {
-                        // Keep held=true — Rust should not hard-pause for duck.
-                        Log.i(TAG, "audio focus duck");
-                    } else if (focusChange == AudioManager.AUDIOFOCUS_GAIN) {
-                        writeAudioFocusFlag(true);
-                    }
-                };
-            }
-            int granted;
-            if (Build.VERSION.SDK_INT >= 26) {
-                if (audioFocusRequest == null) {
-                    AudioAttributes attrs = new AudioAttributes.Builder()
-                            .setUsage(AudioAttributes.USAGE_MEDIA)
-                            .setContentType(AudioAttributes.CONTENT_TYPE_MOVIE)
-                            .build();
-                    audioFocusRequest = new AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
-                            .setAudioAttributes(attrs)
-                            .setOnAudioFocusChangeListener(audioFocusListener)
-                            .setWillPauseWhenDucked(false)
-                            .setAcceptsDelayedFocusGain(true)
-                            .build();
-                }
-                granted = am.requestAudioFocus(audioFocusRequest);
-            } else {
-                granted = am.requestAudioFocus(
-                        audioFocusListener,
-                        AudioManager.STREAM_MUSIC,
-                        AudioManager.AUDIOFOCUS_GAIN);
-            }
-            if (granted == AudioManager.AUDIOFOCUS_REQUEST_GRANTED) {
-                writeAudioFocusFlag(true);
-            } else if (granted == AudioManager.AUDIOFOCUS_REQUEST_DELAYED) {
-                // Neither true (fake hold) nor false (kills OpenSL) — wait for GAIN.
-                Log.i(TAG, "audio focus DELAYED — waiting for GAIN");
-            } else {
-                writeAudioFocusFlag(false);
-            }
-        } catch (Exception e) {
-            Log.e(TAG, "requestAudioFocus failed", e);
-        }
+    /** Delegates to Rust AudioManager (single listener → nativeOnAudioFocusChange). */
+    public static void requestAudioFocus() {
+        nativeRequestAudioFocus();
     }
 
-    private void abandonAudioFocusInner() {
-        try {
-            AudioManager am = (AudioManager) getSystemService(AUDIO_SERVICE);
-            if (am == null) {
-                return;
-            }
-            if (Build.VERSION.SDK_INT >= 26 && audioFocusRequest != null) {
-                am.abandonAudioFocusRequest(audioFocusRequest);
-            } else if (audioFocusListener != null) {
-                am.abandonAudioFocus(audioFocusListener);
-            }
-            writeAudioFocusFlag(false);
-        } catch (Exception e) {
-            Log.e(TAG, "abandonAudioFocus failed", e);
-        }
+    public static void abandonAudioFocus() {
+        nativeAbandonAudioFocus();
     }
 
     private File safInboxDir() {
@@ -848,18 +964,6 @@ public class FluxPlayNativeActivity extends NativeActivity {
         }
     }
 
-    private void writeAudioFocusFlag(boolean held) {
-        try {
-            File meta = new File(safInboxDir(), "audio_focus.json");
-            String json = "{\"held\":" + (held ? "true" : "false") + "}";
-            try (FileOutputStream fos = new FileOutputStream(meta)) {
-                fos.write(json.getBytes("UTF-8"));
-            }
-        } catch (Exception e) {
-            Log.e(TAG, "writeAudioFocusFlag", e);
-        }
-    }
-
     /** Detach SurfaceView from WindowManager or content hierarchy. */
     private void removeVideoSurfaceView() {
         if (videoSurfaceView == null) {
@@ -887,8 +991,8 @@ public class FluxPlayNativeActivity extends NativeActivity {
      * Create SurfaceView as a CHILD of the content view, z-ordered BEHIND the
      * translucent NativeActivity window (layer system). iced clears the video stage
      * with alpha=0 so MediaCodec shows through; player chrome composites on top.
-     * The view is always MATCH_PARENT — cover fitting is done via SurfaceControl
-     * transform (setVideoBufferSize), never by relayouting the view.
+     * Cover fitting uses view LayoutParams (+ gated setFixedSize after wid lock)
+     * via setVideoBufferSize / applyVideoCoverTransform — not SurfaceControl.
      */
     private void ensureVideoSurface() {
         // Already attached — keep it (reattach path calls remove first).
@@ -1230,8 +1334,12 @@ public class FluxPlayNativeActivity extends NativeActivity {
         int dispW = Math.round(videoAspectW * cover);
         int dispH = Math.round(videoAspectH * cover);
         try {
-            // Pin the Surface buffer to the decoded size (idempotent).
-            videoSurfaceView.getHolder().setFixedSize(videoBufferW, videoBufferH);
+            // After wid lock, NEVER setFixedSize — it recreates the Surface and
+            // kills MediaCodec embed (black video + audio on Tensor/Pixel).
+            // Cover fit is view LayoutParams only once surfaceSizeLocked.
+            if (!surfaceSizeLocked) {
+                videoSurfaceView.getHolder().setFixedSize(videoBufferW, videoBufferH);
+            }
             ViewGroup.LayoutParams raw = videoSurfaceView.getLayoutParams();
             if (raw instanceof FrameLayout.LayoutParams) {
                 FrameLayout.LayoutParams lp = (FrameLayout.LayoutParams) raw;
@@ -1245,7 +1353,8 @@ public class FluxPlayNativeActivity extends NativeActivity {
             }
             bufferTransformDirty = false;
             Log.i(TAG, "video cover layout buf=" + videoBufferW + "x" + videoBufferH
-                    + " view=" + dispW + "x" + dispH + " scr=" + (int) scrW + "x" + (int) scrH);
+                    + " view=" + dispW + "x" + dispH + " scr=" + (int) scrW + "x" + (int) scrH
+                    + " locked=" + surfaceSizeLocked);
         } catch (Exception e) {
             Log.w(TAG, "applyVideoCoverTransform", e);
         }
@@ -1299,12 +1408,26 @@ public class FluxPlayNativeActivity extends NativeActivity {
                             rate > 1f ? rate : 60f,
                             Surface.FRAME_RATE_COMPATIBILITY_DEFAULT);
                 }
-                // Do NOT applyPreferredDisplayMode here — thrashing preferred modes
-                // storms NativeWindowResized on Pixel and blacks Soft/SurfaceView.
+                // Phone/Soft: setFrameRate hint only. Heavy HDMI mode switches
+                // (preferredDisplayModeId) are TV-gated via setPreferredDisplayModeHz.
             } catch (Exception e) {
                 Log.w(TAG, "setVideoFrameRate", e);
             }
         });
+    }
+
+    /**
+     * TV / leanback only: one-shot {@code preferredDisplayModeId} for true 24/25/30
+     * HDMI modes. Debounced (≥2s / same modeId) to avoid NativeWindowResized thrash.
+     * Phones must keep {@link #setVideoFrameRate} only.
+     */
+    public static void setPreferredDisplayModeHz(float targetHz) {
+        FluxPlayNativeActivity a = sInstance;
+        if (a == null || !isTelevision()) {
+            return;
+        }
+        final float rate = targetHz;
+        a.runOnUiThread(() -> a.applyPreferredDisplayModeDebounced(rate));
     }
 
     public static void setHdrColorMode(boolean hdr) {
@@ -1338,11 +1461,17 @@ public class FluxPlayNativeActivity extends NativeActivity {
         });
     }
 
+    /** Last preferredDisplayModeId apply — debounce thrash on Pixel / Fire TV. */
+    private long lastPreferredModeAtMs = 0L;
+    private int lastPreferredModeId = 0;
+    private static final long PREFERRED_MODE_DEBOUNCE_MS = 2000L;
+
     /**
      * Pick display mode: nearest supported refresh ≥ content target (or peak if target≤0).
      * Avoids always locking 120/165 when content is 24/30 — saves power, less judder.
+     * Debounced: skip if same modeId or within {@link #PREFERRED_MODE_DEBOUNCE_MS}.
      */
-    private void applyPreferredDisplayMode(float targetHz) {
+    private void applyPreferredDisplayModeDebounced(float targetHz) {
         if (Build.VERSION.SDK_INT < 23) {
             return;
         }
@@ -1365,22 +1494,34 @@ public class FluxPlayNativeActivity extends NativeActivity {
                     float delta = hz - targetHz;
                     score = delta >= -0.5f ? delta : 1000f - delta;
                 } else {
-                    // Peak Hz when no content hint.
-                    score = -hz;
+                    // No content hint — keep current (never jump to peak).
+                    score = Math.abs(hz - current.getRefreshRate());
                 }
                 if (score < bestScore) {
                     bestScore = score;
                     best = m;
                 }
             }
+            int modeId = best.getModeId();
+            long now = android.os.SystemClock.uptimeMillis();
+            // Same modeId: no-op. Different mode within debounce: skip (thrash guard).
+            if (modeId == lastPreferredModeId) {
+                return;
+            }
+            if (lastPreferredModeAtMs != 0L
+                    && (now - lastPreferredModeAtMs) < PREFERRED_MODE_DEBOUNCE_MS) {
+                return;
+            }
             WindowManager.LayoutParams lp = getWindow().getAttributes();
-            if (lp.preferredDisplayModeId != best.getModeId()) {
-                lp.preferredDisplayModeId = best.getModeId();
+            if (lp.preferredDisplayModeId != modeId) {
+                lp.preferredDisplayModeId = modeId;
                 getWindow().setAttributes(lp);
                 Log.i(TAG, "preferredDisplayMode " + best.getPhysicalWidth() + "x"
                         + best.getPhysicalHeight() + "@" + best.getRefreshRate()
                         + " targetHz=" + targetHz);
             }
+            lastPreferredModeId = modeId;
+            lastPreferredModeAtMs = now;
         } catch (Exception e) {
             Log.w(TAG, "applyPreferredDisplayMode", e);
         }
@@ -1531,6 +1672,19 @@ public class FluxPlayNativeActivity extends NativeActivity {
             }
             hdrLabels.append(']');
             boolean panelOled = guessOledPanel();
+            // PowerManager thermal: NONE=0 … SHUTDOWN=6 (API 29+). SoftBudget demotes on SEVERE+.
+            int thermalStatus = 0;
+            if (Build.VERSION.SDK_INT >= 29) {
+                try {
+                    PowerManager pm = (PowerManager) getSystemService(POWER_SERVICE);
+                    if (pm != null) {
+                        thermalStatus = pm.getCurrentThermalStatus();
+                    }
+                } catch (Throwable ignored) {
+                    thermalStatus = 0;
+                }
+            }
+            ensureThermalListener();
             String json = "{"
                     + "\"soc\":\"" + esc(soc) + "\","
                     + "\"board\":\"" + esc(Build.BOARD) + "\","
@@ -1551,6 +1705,7 @@ public class FluxPlayNativeActivity extends NativeActivity {
                     + "\"mediacodec_max_w\":" + mcMaxW + ","
                     + "\"mediacodec_max_h\":" + mcMaxH + ","
                     + "\"panel_oled\":" + (panelOled ? "true" : "false") + ","
+                    + "\"thermal_status\":" + thermalStatus + ","
                     + "\"surface_ready\":" + (surfaceReady ? "true" : "false") + ","
                     + "\"surface_w\":" + surfaceW + ","
                     + "\"surface_h\":" + surfaceH
@@ -1565,6 +1720,7 @@ public class FluxPlayNativeActivity extends NativeActivity {
                     + " mc4k=" + mc4k + " mcHdr=" + mcHdr + " mcVideo=" + mcVideo
                     + " max=" + mcMaxW + "x" + mcMaxH
                     + " oled=" + panelOled
+                    + " thermal=" + thermalStatus
                     + " surface=" + surfaceReady + " cores=" + cores
                     + " sdk=" + Build.VERSION.SDK_INT);
         } catch (Exception e) {

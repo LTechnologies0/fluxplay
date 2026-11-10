@@ -102,15 +102,27 @@ impl StalkerClient {
                 return Err(e.into());
             }
         };
-        let resp = match resp.error_for_status() {
-            Ok(r) => r,
-            Err(e) => {
-                warn!(%action, error = %crate::redact_error(&e), "Stalker request HTTP error");
-                return Err(e.into());
-            }
-        };
-        let value: Value = resp.json().await?;
-        Ok(value)
+        let status = resp.status();
+        if !status.is_success() {
+            warn!(%action, status = status.as_u16(), "Stalker request HTTP error");
+            return Err(ProviderError::Message(format!(
+                "stalker API HTTP {}",
+                status.as_u16()
+            )));
+        }
+        // Cap JSON before serde — hostile portal.php can OOM (parity with Xtream).
+        const MAX_STALKER_JSON: usize = 8 * 1024 * 1024;
+        let raw = http_client::read_body_capped(resp, MAX_STALKER_JSON)
+            .await
+            .map_err(|e| match e {
+                ProviderError::Message(m) => {
+                    ProviderError::Message(format!("stalker body: {m}"))
+                }
+                other => other,
+            })?;
+        serde_json::from_slice(&raw).map_err(|e| {
+            ProviderError::Message(format!("stalker JSON parse: {e}"))
+        })
     }
 
     pub async fn handshake(&mut self) -> Result<()> {
@@ -120,6 +132,8 @@ impl StalkerClient {
         let token = value
             .pointer("/js/token")
             .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
             .ok_or_else(|| {
                 error!(portal = %self.portal, "Stalker handshake: no token");
                 ProviderError::Auth("Stalker handshake: no token".into())
@@ -130,7 +144,7 @@ impl StalkerClient {
         info!(portal = %self.portal, "Stalker handshake OK");
 
         // get_profile is required by many portals after handshake.
-        let _ = self
+        if let Err(e) = self
             .request(
                 "stb",
                 "get_profile",
@@ -145,7 +159,15 @@ impl StalkerClient {
                     ("hw_version", "1.7-BD-00"),
                 ],
             )
-            .await;
+            .await
+        {
+            // Soft-fail: some portals omit get_profile; keep token, never log secrets.
+            warn!(
+                portal = %self.portal,
+                error = %e,
+                "Stalker get_profile failed — continuing with handshake token"
+            );
+        }
         debug!(portal = %self.portal, "Stalker get_profile done");
         Ok(())
     }
@@ -177,6 +199,7 @@ impl StalkerClient {
 
         // ITV ordered list, page by page (a page is 14–20 channels on most portals).
         const MAX_PAGES: u32 = 500;
+        const MAX_CHANNELS: usize = 100_000;
         let mut arr = Vec::new();
         for page in 1..=MAX_PAGES {
             let p = page.to_string();
@@ -217,6 +240,15 @@ impl StalkerClient {
                 break;
             }
             arr.extend(items);
+            if arr.len() >= MAX_CHANNELS {
+                warn!(
+                    channels = arr.len(),
+                    max = MAX_CHANNELS,
+                    "Stalker channel cap reached — truncating catalog"
+                );
+                arr.truncate(MAX_CHANNELS);
+                break;
+            }
             let total = value
                 .pointer("/js/total_items")
                 .and_then(|v| v.as_u64().or_else(|| v.as_str().and_then(|s| s.parse().ok())));
@@ -282,6 +314,8 @@ impl StalkerClient {
                 source_id: Some(self.source_id),
                 kind: ContentKind::Live,
                 catchup: None,
+                http_user_agent: None,
+                http_referer: None,
             });
         }
 
@@ -333,4 +367,62 @@ fn device_id(mac: &str) -> String {
     let mut h = Sha256::new();
     h.update(format!("fluxplay-{mac}").as_bytes());
     hex::encode(h.finalize())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fluxplay_core::HasFpCode;
+
+    #[test]
+    fn normalize_mac_accepts_common_forms() {
+        assert_eq!(
+            normalize_mac("AA:BB:CC:DD:EE:FF").unwrap(),
+            "aa:bb:cc:dd:ee:ff"
+        );
+        assert_eq!(
+            normalize_mac("aa-bb-cc-dd-ee-ff").unwrap(),
+            "aa:bb:cc:dd:ee:ff"
+        );
+        assert_eq!(normalize_mac("aabbccddeeff").unwrap(), "aa:bb:cc:dd:ee:ff");
+    }
+
+    #[test]
+    fn normalize_mac_rejects_short() {
+        let err = normalize_mac("aa:bb").unwrap_err();
+        assert_eq!(err.fp_code(), fluxplay_core::FpCode::CatStalkerAuth);
+        assert!(err.to_string().contains("[FP-CAT-STALKER-AUTH]"));
+        // Never echo the raw MAC back (none here, but message must stay generic).
+        assert!(!err.to_string().contains("aa:bb:cc"));
+    }
+
+    #[test]
+    fn debug_omits_mac_and_token() {
+        let c = StalkerClient {
+            portal: Url::parse("http://portal.example/portal.php").unwrap(),
+            mac: "aa:bb:cc:dd:ee:ff".into(),
+            source_id: uuid::Uuid::nil(),
+            token: Some("super-secret-token".into()),
+        };
+        let s = format!("{c:?}");
+        assert!(!s.contains("aa:bb"));
+        assert!(!s.contains("super-secret"));
+        assert!(s.contains("has_token: true"));
+    }
+
+    #[test]
+    fn strip_cmd_prefix_ffmpeg() {
+        assert_eq!(
+            strip_cmd_prefix("ffmpeg http://ex/stream.ts"),
+            "http://ex/stream.ts"
+        );
+        assert_eq!(strip_cmd_prefix("http://ex/stream.ts"), "http://ex/stream.ts");
+    }
+
+    #[test]
+    fn stalker_api_message_maps_fp() {
+        let e = ProviderError::Message("stalker JSON parse: eof".into());
+        assert_eq!(e.fp_code(), fluxplay_core::FpCode::CatStalkerApi);
+        assert!(e.to_string().contains("[FP-CAT-STALKER-API]"));
+    }
 }

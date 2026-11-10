@@ -53,11 +53,15 @@ pub fn present(frame: VideoFrame) -> Option<VideoFrame> {
 }
 
 /// Drop the picture (playback stopped); its textures go at the next frame.
-pub fn clear() -> Option<VideoFrame> {
-    let mut feed = FEED.lock().ok()?;
+///
+/// Returns `(pending, spent)` so callers can recycle SoftPump CPU buffers —
+/// silently clearing `spent` leaked up to [`MAX_SPENT`] RGBA frames.
+pub fn clear() -> (Option<VideoFrame>, Vec<VideoFrame>) {
+    let Ok(mut feed) = FEED.lock() else {
+        return (None, Vec::new());
+    };
     feed.cleared = true;
-    feed.spent.clear();
-    feed.pending.take()
+    (feed.pending.take(), std::mem::take(&mut feed.spent))
 }
 
 /// Uploaded CPU frames whose buffers the player can reuse.
@@ -431,8 +435,20 @@ impl StagePipeline {
 
 fn push_spent(frame: VideoFrame) {
     if let Ok(mut feed) = FEED.lock() {
-        if feed.spent.len() < MAX_SPENT {
-            feed.spent.push(frame);
+        // Prefer retaining for `take_spent` / `clear` recycle (W3-01 F2). Soft
+        // target is [`MAX_SPENT`]; UI drains every present. Hard ceiling avoids
+        // unbounded growth if the UI stalls mid-upload.
+        feed.spent.push(frame);
+        const HARD_CAP: usize = MAX_SPENT * 4;
+        while feed.spent.len() > HARD_CAP {
+            let dropped = feed.spent.remove(0);
+            tracing::warn!(
+                layout = ?dropped.layout,
+                w = dropped.width,
+                h = dropped.height,
+                "video_stage spent overflow — dropped CPU frame (caller must take_spent)"
+            );
+            drop(dropped);
         }
     }
 }
@@ -872,6 +888,8 @@ mod gpu_tests {
                 source_id: None,
                 kind: ContentKind::Vod,
                 catchup: None,
+                http_user_agent: None,
+                http_referer: None,
             })
             .expect("open");
         let deadline = Instant::now() + Duration::from_secs(8);
@@ -1056,6 +1074,8 @@ mod gpu_tests {
                 source_id: None,
                 kind: ContentKind::Vod,
                 catchup: None,
+                http_user_agent: None,
+                http_referer: None,
             })
             .expect("open");
         // Warm-up: decoder init, first attach.

@@ -57,6 +57,7 @@ extern "C" {
     fn flux_ffmpeg_frame_size(p: *mut FluxFfmpegPlayer, w: *mut c_int, h: *mut c_int) -> c_int;
     fn flux_ffmpeg_set_output_size(p: *mut FluxFfmpegPlayer, w: c_int, h: c_int);
     fn flux_ffmpeg_set_present_hz(p: *mut FluxFfmpegPlayer, hz: c_int);
+    fn flux_ffmpeg_content_fps(p: *mut FluxFfmpegPlayer) -> f64;
     fn flux_ffmpeg_is_alive(p: *mut FluxFfmpegPlayer) -> c_int;
     fn flux_ffmpeg_has_frame(p: *mut FluxFfmpegPlayer) -> c_int;
     fn flux_ffmpeg_pause(p: *mut FluxFfmpegPlayer, paused: c_int);
@@ -134,6 +135,10 @@ pub struct LibFfmpeg {
     gpu_slots: std::sync::Mutex<Option<std::sync::Arc<dyn std::any::Any + Send + Sync>>>,
 }
 
+// SAFETY: C embed (`ffmpeg_embed.c`) guards shared player / GPU slot state with
+// `p->mu` / `gpu.mu` (open/close is single-owner). Soft pump + UI share
+// `Arc<LibFfmpeg>`; every Rust entry point hits those C locks or only touches
+// Rust-owned Mutex fields (`pull_buf` / `gpu_slots`).
 unsafe impl Send for LibFfmpeg {}
 unsafe impl Sync for LibFfmpeg {}
 
@@ -226,8 +231,15 @@ impl LibFfmpeg {
     }
 
     pub fn set_present_hz(&self, hz: u32) {
-        let hz = hz.clamp(24, 120);
+        // Soft embed must match NativePlayer / iced soft ≤60 (AO-safe).
+        let hz = hz.clamp(24, 60);
         unsafe { flux_ffmpeg_set_present_hz(self.ptr, hz as c_int) };
+    }
+
+    /// Container/stream fps once demux knows it (≥20), else None.
+    pub fn content_fps(&self) -> Option<f64> {
+        let fps = unsafe { flux_ffmpeg_content_fps(self.ptr) };
+        (fps >= 20.0 && fps.is_finite()).then_some(fps)
     }
 
     pub fn pull_rgba(&self, w: u32, h: u32) -> Option<(u32, u32, Vec<u8>)> {
@@ -430,9 +442,6 @@ impl LibFfmpeg {
         Some((gw as u32, gh as u32, out))
     }
 
-    pub fn shutdown(self) {
-        // Drop closes.
-    }
 }
 
 impl Drop for LibFfmpeg {

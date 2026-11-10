@@ -315,9 +315,11 @@ pub(crate) async fn run(
     if holes.is_empty() {
         return Ok(());
     }
-    let file = std::fs::OpenOptions::new()
-        .write(true)
-        .open(&d.part)
+    // Clone of the locked handle: on Windows a second open of the `.part` cannot
+    // write through the exclusive `LockFileEx` lock (positional writes only).
+    let file = d
+        .lock
+        .try_clone()
         .map_err(|e| Fatal(format!("écriture disque : {e}")))?;
     if file.metadata().map(|m| m.len()).unwrap_or(0) < total {
         file.set_len(total)

@@ -86,6 +86,8 @@ fn fluxplay_activity_class_local<'a>(
     if context.is_null() {
         return None;
     }
+    // SAFETY: `ndk_context` jobject is process-lifetime Application/Activity.
+    // Borrow as JObject without DeleteLocalRef / AutoLocal ownership.
     let ctx = unsafe { JObject::from_raw(context) };
 
     // Preferred: Application/Activity ClassLoader (works from any attached thread).
@@ -219,9 +221,17 @@ fn surface_state_path() -> Option<PathBuf> {
 
 /// Cached GlobalRef for the video Surface jobject (mpv wid lifetime).
 static VIDEO_SURFACE_REF: OnceLock<Mutex<Option<GlobalRef>>> = OnceLock::new();
+/// Previous Surface GlobalRefs kept alive until mpv rebinds/detaches `wid` (avoid UAF).
+/// Vec so a second acquire before `drop_stale_video_surface_ref` never Drop's a
+/// ref mpv may still hold.
+static VIDEO_SURFACE_STALE: OnceLock<Mutex<Vec<GlobalRef>>> = OnceLock::new();
 
 fn video_surface_slot() -> &'static Mutex<Option<GlobalRef>> {
     VIDEO_SURFACE_REF.get_or_init(|| Mutex::new(None))
+}
+
+fn stale_surface_slot() -> &'static Mutex<Vec<GlobalRef>> {
+    VIDEO_SURFACE_STALE.get_or_init(|| Mutex::new(Vec::new()))
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -264,6 +274,8 @@ struct DeviceCapsJson {
     panel_oled: bool,
     #[serde(default)]
     hdr_labels: Vec<String>,
+    #[serde(default)]
+    thermal_status: u8,
     #[serde(default)]
     surface_ready: bool,
     #[serde(default)]
@@ -312,6 +324,7 @@ pub fn poll_android_device_caps() -> Option<fluxplay_player::AndroidDeviceCaps> 
         surface_ready: caps.surface_ready,
         surface_w: caps.surface_w,
         surface_h: caps.surface_h,
+        thermal_status: caps.thermal_status,
     })
 }
 
@@ -485,6 +498,11 @@ pub fn video_surface_size() -> Option<(u32, u32)> {
 }
 
 /// Acquire Surface jobject as mpv `wid` (GlobalRef kept alive until release).
+///
+/// Invariant: returned `wid` is always backed by a live GlobalRef in
+/// [`VIDEO_SURFACE_REF`]. On Surface identity change the previous GlobalRef is
+/// stashed in [`VIDEO_SURFACE_STALE`] until [`drop_stale_video_surface_ref`]
+/// (call after mpv `wid` rebind) — never Drop the old ref while mpv still holds it.
 pub fn acquire_video_surface_wid() -> Option<i64> {
     let (vm, activity) = vm_activity()?;
     let mut env = vm.attach_current_thread().ok()?;
@@ -499,17 +517,44 @@ pub fn acquire_video_surface_wid() -> Option<i64> {
     let global = env.new_global_ref(&obj).ok()?;
     // jobject pointer value is what mpv's ANativeWindow_fromSurface expects as wid.
     let wid = global.as_raw() as isize as i64;
-    if let Ok(mut slot) = video_surface_slot().lock() {
-        *slot = Some(global);
+    // Poison → into_inner: never return wid without retaining the GlobalRef.
+    let mut slot = video_surface_slot()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if let Some(prev) = slot.as_ref() {
+        if env.is_same_object(prev.as_obj(), &obj).unwrap_or(false) {
+            let existing = prev.as_raw() as isize as i64;
+            drop(global);
+            return Some(existing);
+        }
+    }
+    if let Some(old) = slot.replace(global) {
+        // Park — never Drop while mpv may still hold that jobject as wid.
+        stale_surface_slot()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(old);
     }
     info!(wid, "android video Surface wid acquired");
     Some(wid)
 }
 
+/// Drop parked Surface GlobalRefs after mpv has rebound `wid` (or detached).
+pub fn drop_stale_video_surface_ref() {
+    stale_surface_slot()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
+}
+
 pub fn release_video_surface_wid() {
-    if let Ok(mut slot) = video_surface_slot().lock() {
+    {
+        let mut slot = video_surface_slot()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         *slot = None;
     }
+    drop_stale_video_surface_ref();
     // End Surface session — stop reattach loop; keep punch-through off.
     // Caller must have already run NativePlayer::detach_android_surface (vo=null, wid=0).
     set_video_surface_visible(false);
@@ -540,10 +585,35 @@ pub fn set_video_frame_rate(fps: f32) {
     }
 }
 
+/// TV/leanback only: one-shot `preferredDisplayModeId` (HDMI 24/25/30).
+/// Phone no-ops in Java (`isTelevision` gate). Debounce lives on the Java side.
+pub fn set_preferred_display_mode_hz(fps: f32) {
+    static LAST: AtomicU32 = AtomicU32::new(0);
+    let bits = fps.to_bits();
+    if LAST.swap(bits, Ordering::Relaxed) == bits {
+        return;
+    }
+    let Some((vm, activity)) = vm_activity() else {
+        return;
+    };
+    let Ok(mut env) = vm.attach_current_thread() else {
+        return;
+    };
+    let Some(cls) = fp_class_obj(&mut env, activity) else {
+        return;
+    };
+    if env
+        .call_static_method(cls, "setPreferredDisplayModeHz", "(F)V", &[JValue::Float(fps)])
+        .is_err()
+    {
+        clear_ex(&mut env);
+    }
+}
+
 /// Match MediaCodec buffer to video size — stops SurfaceFlinger stretch/squash.
 /// Push video geometry: `bw/bh` = decoded buffer size, `dw/dh` = display
-/// (SAR-corrected) size. Java cover-fits the buffer onto the screen via a
-/// SurfaceControl transform — the SurfaceView itself is never relayouted.
+/// (SAR-corrected) size. Java cover-fits via view LayoutParams (+ gated
+/// setFixedSize after wid lock) — not a SurfaceControl transform path.
 pub fn set_video_buffer_size(bw: u32, bh: u32, dw: u32, dh: u32) {
     // Cache: re-pushing identical dims re-runs the transform needlessly.
     static LAST: AtomicU32 = AtomicU32::new(0);

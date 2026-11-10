@@ -22,3 +22,17 @@ crates/fluxplay-android/debug.keystore
 # Local FluxPlay state may contain portal credentials
 **/state.json
 fluxplay-state.json
+
+# proptest failure corpora (reproducers committed only when intentional)
+**/proptest-regressions/
+
+# Fuzz: keep harness + curated seeds/dicts; ignore generated corpus/artifacts
+fuzz/corpus/
+fuzz/artifacts/
+fuzz/target/
+fuzz/Cargo.lock
+!fuzz/seeds/
+!fuzz/dictionaries/
+
+# Local screenshots
+tmp_fp_*.png

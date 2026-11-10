@@ -3,6 +3,8 @@ name = "fluxplay-providers"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+authors.workspace = true
+repository.workspace = true
 description = "IPTV access providers: M3U, Xtream Codes, Stalker Portal, XMLTV"
 
 [dependencies]
@@ -27,3 +29,7 @@ flate2 = "1"
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 tracing-subscriber = { workspace = true }
+proptest = { workspace = true }
+
+[lints]
+workspace = true

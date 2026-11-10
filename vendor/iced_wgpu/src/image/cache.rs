@@ -310,8 +310,11 @@ impl Cache {
         // they reference a shared reusable atlas, not per-entry textures.
         #[cfg(feature = "image")]
         {
-            const TRIM_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
-            const TRIM_HARD_CAP: usize = 4096;
+            // Mosaic category browsing churns unique Handles; a 2s/4096 lag let the
+            // atlas pin hundreds of off-screen posters (200→600 Mo RSS). Trim sooner
+            // and hard-cap near the app ImageCache budget (~192) with headroom.
+            const TRIM_INTERVAL: std::time::Duration = std::time::Duration::from_millis(750);
+            const TRIM_HARD_CAP: usize = 384;
             let due = self.last_trim.elapsed() >= TRIM_INTERVAL;
             if !due && self.raster.cache.len() < TRIM_HARD_CAP {
                 return;
@@ -475,7 +478,6 @@ mod worker {
                 atlases: [None, None, None, None, None],
                 atlas_binds: [None, None, None, None, None],
                 atlas_cursor: 0,
-                poster_atlas: None,
             };
 
             let handle = thread::spawn(move || instance.run());
@@ -534,9 +536,6 @@ mod worker {
         /// `Job::Drop` releases it — otherwise the compositor samples a wiped layer.
         atlas_binds: [Option<Arc<wgpu::BindGroup>>; 5],
         atlas_cursor: usize,
-        /// Posters and logos. Never reset — video frames use `atlases` and wipe
-        /// them every frame, which made every mosaic tile show the last upload.
-        poster_atlas: Option<Atlas>,
     }
 
     #[derive(Debug)]
@@ -639,10 +638,11 @@ mod worker {
 
             // Video frames rotate worker atlases. Prefer a slot whose previous
             // bind group was already dropped — resetting a live atlas is the
-            // full-frame blink. Posters stay on a separate never-reset atlas.
+            // full-frame blink. Posters get their own per-image atlas.
             let needed = width.max(height).max(2);
             let is_frame = matches!(handle, image::Handle::Rgba { .. });
             let mut frame_slot: Option<usize> = None;
+            let mut poster_atlas: Option<Atlas> = None;
             let atlas = if is_frame {
                 let mut chosen = None;
                 for i in 0..5 {
@@ -683,19 +683,16 @@ mod worker {
                     }
                 }
             } else {
-                let slot = &mut self.poster_atlas;
-                match slot {
-                    Some(a) if a.size() >= needed || needed > atlas::WORKER_MAX_SIZE => a,
-                    slot => {
-                        let size = needed.next_power_of_two().max(atlas::DEFAULT_SIZE);
-                        slot.insert(Atlas::with_size_uncapped(
-                            &self.device,
-                            self.backend,
-                            self.texture_layout.clone(),
-                            size,
-                        ))
-                    }
-                }
+                // Large posters/logos: one atlas per image, as upstream. Its texture
+                // lives exactly as long as the entry's bind group, so `trim` frees it.
+                // A shared never-reset poster atlas was never deallocated (trim only
+                // drops bind groups) and grew by 16 MB layers for the whole session.
+                poster_atlas.insert(Atlas::with_size(
+                    &self.device,
+                    self.backend,
+                    self.texture_layout.clone(),
+                    needed,
+                ))
             };
 
             let Some(entry) = atlas.upload(

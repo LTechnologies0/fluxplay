@@ -40,7 +40,9 @@ use tokio::io::AsyncWriteExt;
 /// streams forever.
 const MAX_BYTES: u64 = 128 * 1024 * 1024 * 1024;
 /// Abort one attempt when the server sends nothing for this long (then retry).
-const STALL_TIMEOUT: Duration = Duration::from_secs(45);
+fn stall_timeout() -> Duration {
+    Duration::from_secs(crate::policy::get().downloads.stall_timeout_secs)
+}
 const PROGRESS_EVERY: Duration = Duration::from_millis(500);
 /// Fewer, larger writes: one `spawn_blocking` per MiB instead of per 16 KiB chunk.
 const WRITE_BUFFER: usize = 1024 * 1024;
@@ -53,10 +55,22 @@ const META_MAGIC: &str = "fluxplay-download 1";
 /// Segmented `.part` (preallocated, holes listed in `todo=`). A new magic so
 /// older builds never mistake the preallocated length for progress.
 const META_MAGIC_SEGMENTED: &str = "fluxplay-download 2";
+/// Hard ceiling for parallel download workers (submodules + loops).
+pub(crate) const MAX_CONNECTIONS: usize = 8;
 /// Connections per account when the panel does not say (`max_connections`).
-const DEFAULT_CONNECTIONS: usize = 2;
-/// Never more than this per account, whatever the panel allows.
-const MAX_CONNECTIONS: usize = 8;
+fn default_connections() -> usize {
+    crate::policy::get()
+        .downloads
+        .default_connections
+        .clamp(1, MAX_CONNECTIONS)
+}
+/// Effective max from policy, never above the hard ceiling.
+fn effective_max_connections() -> usize {
+    crate::policy::get()
+        .downloads
+        .max_connections
+        .clamp(1, MAX_CONNECTIONS)
+}
 /// First wait before renewing a stream token another player keeps taking back.
 const RENEW_WAIT: Duration = Duration::from_secs(15);
 const KNOWN_EXTENSIONS: &[&str] = &[
@@ -153,6 +167,9 @@ pub struct DownloadRequest {
     /// Runs while the user watches (next-episode preload): skipped when the
     /// account allows a single connection, which playback already holds.
     pub background: bool,
+    /// Viewer already holds the panel stream (play does not share `Account`
+    /// leases). With `max_connections=1`, refuse like `background`.
+    pub playback_busy: bool,
 }
 
 /// Resolved transfer plan: every server of the file, and the account whose
@@ -167,10 +184,19 @@ pub(crate) struct Plan {
 pub fn run(req: DownloadRequest) -> impl Stream<Item = DownloadEvent> {
     iced::stream::channel(16, async move |mut tx: mpsc::Sender<DownloadEvent>| {
         let (plan, referer, max_connections) = resolve_plan(&req).await;
-        // Preloading while the viewer watches is a second stream: the panel
-        // would revoke playback's on a single-stream account.
-        let lease = if req.background {
-            match plan.account.try_lease().filter(|_| max_connections != Some(1)) {
+        // Playback does not take an Account lease. On a single-stream panel,
+        // a second transfer (preload or user download) fights the live slot.
+        let single_busy =
+            max_connections == Some(1) && (req.background || req.playback_busy);
+        let lease = if single_busy {
+            let _ = tx
+                .send(DownloadEvent::Finished(Err(
+                    "connexions du compte déjà occupées".into(),
+                )))
+                .await;
+            return;
+        } else if req.background {
+            match plan.account.try_lease() {
                 Some(lease) => lease,
                 None => {
                     let _ = tx
@@ -217,7 +243,7 @@ async fn resolve_plan(req: &DownloadRequest) -> (Plan, Option<String>, Option<u3
         return (
             Plan {
                 links: Arc::new(Links::new(vec![req.url.clone()], RENEW_WAIT)),
-                account: Account::shared("", DEFAULT_CONNECTIONS, MAX_PARALLEL),
+                account: Account::shared("", default_connections(), MAX_PARALLEL),
                 tuning: parallel::Tuning::DEFAULT,
             },
             None,
@@ -240,10 +266,11 @@ async fn resolve_plan(req: &DownloadRequest) -> (Plan, Option<String>, Option<u3
 
 /// Connections a download starts with. They share one stream, so the
 /// announced limit only scales the start; probing finds the rest.
-fn connections_for(max_connections: Option<u32>) -> usize {
-    match max_connections {
-        Some(n) => (n as usize).clamp(DEFAULT_CONNECTIONS, MAX_CONNECTIONS),
-        None => DEFAULT_CONNECTIONS,
+/// Panel `max_connections=1` must stay at 1 — starting 2 fights the live slot.
+fn connections_for(panel_max: Option<u32>) -> usize {
+    match panel_max {
+        Some(n) => (n as usize).clamp(1, effective_max_connections()),
+        None => default_connections(),
     }
 }
 
@@ -262,7 +289,10 @@ fn streams_for(max_connections: Option<u32>) -> usize {
 /// is still recognised.
 pub fn url_key(url: &str) -> String {
     let url = url.trim();
-    hash_key(xtream_media_path(url).unwrap_or(url))
+    let stable = xtream_media_path(url)
+        .map(|path| path.split(['?', '#']).next().unwrap_or(path))
+        .unwrap_or(url);
+    hash_key(stable)
 }
 
 /// Key used before servers were interchangeable (whole URL).
@@ -273,8 +303,15 @@ fn legacy_url_key(url: &str) -> String {
 /// Every key `url` may be stored under, current first.
 pub fn url_keys(url: &str) -> Vec<String> {
     let mut keys = vec![url_key(url)];
+    // Downloads saved before the query string was ignored.
+    if let Some(path) = xtream_media_path(url.trim()) {
+        let with_query = hash_key(path);
+        if with_query != keys[0] {
+            keys.push(with_query);
+        }
+    }
     let legacy = legacy_url_key(url);
-    if legacy != keys[0] {
+    if !keys.contains(&legacy) {
         keys.push(legacy);
     }
     keys
@@ -310,11 +347,29 @@ pub fn forget_partial(partials: &mut HashMap<String, Partial>, url: &str) {
     }
 }
 
-/// Resumable downloads left in `dir`, by [`url_key`].
+/// Resumable downloads left under `dir`, by [`url_key`].
+///
+/// Also looks in `films/` and `series/<titre>/`, the folders a download is
+/// actually written into. It does not walk the rest of the tree.
 pub fn scan_partials(dir: &Path) -> HashMap<String, Partial> {
     let mut out = HashMap::new();
+    collect_partials(dir, &mut out);
+    collect_partials(&films_dir(dir), &mut out);
+    let series = dir.join("series");
+    if let Ok(entries) = std::fs::read_dir(&series) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                collect_partials(&path, &mut out);
+            }
+        }
+    }
+    out
+}
+
+fn collect_partials(dir: &Path, out: &mut HashMap<String, Partial>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
-        return out;
+        return;
     };
     for entry in entries.flatten() {
         let path = entry.path();
@@ -336,7 +391,62 @@ pub fn scan_partials(dir: &Path) -> HashMap<String, Partial> {
             },
         );
     }
-    out
+}
+
+/// `root/films`. Films are files in this folder, never next to the series tree.
+pub fn films_dir(root: &Path) -> PathBuf {
+    root.join("films")
+}
+
+/// `root/series/<titre>`. Created for a single episode as well as a season.
+///
+/// An existing folder with the same title is reused, so the next episode stays
+/// with the first one. The result is always inside `root`: a title cannot
+/// climb out with `..` or a slash, and a folder chosen later in the settings
+/// becomes the new root instead of a place we write beside.
+pub fn series_title_dir(root: &Path, series: &str) -> PathBuf {
+    let title = series_folder_name(series);
+    let parent = root.join("series");
+    if let Some(existing) = existing_titled_dir(&parent, &title) {
+        return existing;
+    }
+    parent.join(title)
+}
+
+/// Catalog titles often start with `|FR|`. The folder uses the show name only.
+fn series_folder_name(series: &str) -> String {
+    let shown = crate::names::display_title(series);
+    let trimmed = shown.trim();
+    let bare = trimmed
+        .strip_prefix('|')
+        .and_then(|rest| rest.split_once('|'))
+        .filter(|(code, _)| {
+            let code = code.trim();
+            (2..=3).contains(&code.len()) && code.chars().all(|c| c.is_ascii_alphabetic())
+        })
+        .map(|(_, after)| after.trim())
+        .filter(|after| !after.is_empty())
+        .unwrap_or(trimmed);
+    sanitize_file_name(bare)
+}
+
+/// A directory directly inside `parent` whose sanitized name matches `title`.
+fn existing_titled_dir(parent: &Path, title: &str) -> Option<PathBuf> {
+    let want = title.to_lowercase();
+    let entries = std::fs::read_dir(parent).ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if sanitize_file_name(name).to_lowercase() == want && path.starts_with(parent) {
+            return Some(path);
+        }
+    }
+    None
 }
 
 /// Delete a `.part` and its sidecar (user cancelled).
@@ -452,7 +562,18 @@ pub fn find_by_name(dir: &Path, name: &str) -> Option<PathBuf> {
 /// passed verbatim (mpv percent-decodes `file://` paths).
 pub fn local_play_url(file: &Path) -> Option<String> {
     let s = file.to_str()?;
-    (file.is_absolute() && !s.contains('%') && file.is_file()).then(|| format!("file://{s}"))
+    if !file.is_absolute() || s.contains('%') || !file.is_file() {
+        return None;
+    }
+    // mpv percent-decodes `file://` and wants forward slashes. On Windows the
+    // form is `file:///C:/…`, not `file://C:\…`.
+    let forward = s.replace('\\', "/");
+    let url = if forward.starts_with('/') {
+        format!("file://{forward}")
+    } else {
+        format!("file:///{forward}")
+    };
+    Some(url)
 }
 
 /// Where an unfinished download lives and the lock that keeps a second
@@ -633,7 +754,7 @@ async fn download_into(
 
     let mut builder = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(20))
-        .read_timeout(STALL_TIMEOUT)
+        .read_timeout(stall_timeout())
         .tcp_keepalive(Duration::from_secs(30))
         // Compressed transfer hides the real length and breaks byte ranges;
         // video does not compress anyway.
@@ -645,8 +766,14 @@ async fn download_into(
         builder = builder.default_headers(headers);
     }
     if let Some(px) = fluxplay_providers::required_proxy() {
-        let proxy = reqwest::Proxy::all(px).map_err(|e| format!("proxy tunnel : {e}"))?;
+        let proxy = reqwest::Proxy::all(&px).map_err(|e| {
+            fluxplay_core::FpCode::NetProxyRefuse
+                .ensure_coded(format!("proxy tunnel : {e}"))
+        })?;
         builder = builder.proxy(proxy);
+    } else {
+        // Match portal client: never inherit HTTP(S)_PROXY / Tor when WG is off.
+        builder = builder.no_proxy();
     }
     let client = builder.build().map_err(|e| e.to_string())?;
 
@@ -854,7 +981,10 @@ async fn attempt(
     }
     d.save_meta();
 
-    let file = d.lock.try_clone().map_err(|e| Fatal(e.to_string()))?;
+    let mut file = d.lock.try_clone().map_err(|e| Fatal(e.to_string()))?;
+    // Sequential `.part`s grow at the end (the handle is not opened in append mode).
+    std::io::Seek::seek(&mut file, std::io::SeekFrom::End(0))
+        .map_err(|e| Fatal(format!("écriture disque : {e}")))?;
     let mut out = tokio::io::BufWriter::with_capacity(WRITE_BUFFER, tokio::fs::File::from_std(file));
     let mut done = d.len().map_err(Fatal)?;
     let mut meter = RateMeter::new(done);
@@ -993,11 +1123,7 @@ fn find_resumable(dir: &Path, keys: &[String], stem: &str) -> Result<Option<Dest
 
 fn open_existing(part: PathBuf, meta: Meta) -> Result<Dest, String> {
     let path = final_path_for(&part).ok_or("nom de fichier invalide")?;
-    let lock = std::fs::OpenOptions::new()
-        .append(true)
-        .open(&part)
-        .map_err(|e| e.to_string())?;
-    lock_exclusive(&lock)?;
+    let lock = open_part(&part)?;
     let dest = Dest {
         path,
         part,
@@ -1010,11 +1136,7 @@ fn open_existing(part: PathBuf, meta: Meta) -> Result<Dest, String> {
 
 async fn create_destination(dir: &Path, stem: &str, ext: &str, key: &str) -> Result<Dest, String> {
     let (path, part) = reserve_destination(dir, stem, ext).await?;
-    let lock = std::fs::OpenOptions::new()
-        .append(true)
-        .open(&part)
-        .map_err(|e| e.to_string())?;
-    lock_exclusive(&lock)?;
+    let lock = open_part(&part)?;
     Ok(Dest {
         path,
         part,
@@ -1024,6 +1146,21 @@ async fn create_destination(dir: &Path, stem: &str, ext: &str, key: &str) -> Res
             ..Meta::default()
         },
     })
+}
+
+/// Open a `.part` read+write (not `append`) and lock it for this process.
+///
+/// Windows: an append-only handle lacks `FILE_WRITE_DATA`, so `set_len` (segmented
+/// preallocation) failed with "Accès refusé"; and `LockFileEx` is per file object,
+/// so every writer must be a clone of this handle (`try_clone`), never a new open.
+fn open_part(part: &Path) -> Result<std::fs::File, String> {
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(part)
+        .map_err(|e| e.to_string())?;
+    lock_exclusive(&lock)?;
+    Ok(lock)
 }
 
 fn lock_exclusive(file: &std::fs::File) -> Result<(), String> {
@@ -1180,11 +1317,72 @@ pub fn sanitize_file_name(name: &str) -> String {
         .collect::<Vec<_>>()
         .join(" ");
     let trimmed = collapsed.trim_start_matches('.').trim_end_matches(['.', ' ']);
-    let mut out: String = trimmed.chars().take(150).collect();
-    if out.is_empty() {
-        out = "FluxPlay".into();
+    // Cap both Unicode scalars (UI) and UTF-8 bytes (PATH_MAX / file:// safety).
+    // 150 emoji ≈ 600 B otherwise — Windows MAX_PATH and Android content URIs choke.
+    const MAX_CHARS: usize = 150;
+    const MAX_BYTES: usize = 240;
+    let mut out = String::new();
+    for c in trimmed.chars().take(MAX_CHARS) {
+        let mut buf = [0u8; 4];
+        let enc = c.encode_utf8(&mut buf);
+        if out.len() + enc.len() > MAX_BYTES {
+            break;
+        }
+        out.push_str(enc);
     }
-    out
+    let out = out.trim_end_matches(['.', ' ']).to_string();
+    if out.is_empty() {
+        return "FluxPlay".into();
+    }
+    // Windows reserved device names (CON/PRN/…) are illegal path leaves even
+    // with an extension-less stem — rewrite so downloads stay portable.
+    let stem = out.split_once('.').map(|(s, _)| s).unwrap_or(&out);
+    let reserved = matches!(
+        stem.to_ascii_uppercase().as_str(),
+        "CON"
+            | "PRN"
+            | "AUX"
+            | "NUL"
+            | "COM1"
+            | "COM2"
+            | "COM3"
+            | "COM4"
+            | "COM5"
+            | "COM6"
+            | "COM7"
+            | "COM8"
+            | "COM9"
+            | "LPT1"
+            | "LPT2"
+            | "LPT3"
+            | "LPT4"
+            | "LPT5"
+            | "LPT6"
+            | "LPT7"
+            | "LPT8"
+            | "LPT9"
+    );
+    let out = if reserved {
+        format!("_{out}")
+    } else {
+        out
+    };
+    // Re-cap after the reserved-name prefix so we never exceed the UI/PATH budgets.
+    let mut capped = String::new();
+    for c in out.chars().take(MAX_CHARS) {
+        let mut buf = [0u8; 4];
+        let enc = c.encode_utf8(&mut buf);
+        if capped.len() + enc.len() > MAX_BYTES {
+            break;
+        }
+        capped.push_str(enc);
+    }
+    let capped = capped.trim_end_matches(['.', ' ']).to_string();
+    if capped.is_empty() {
+        "FluxPlay".into()
+    } else {
+        capped
+    }
 }
 
 /// `Série — S01E02 — Titre`. Panel titles often already carry `S01E02` (and
@@ -1270,6 +1468,15 @@ mod tests {
         assert_eq!(sanitize_file_name("a\u{0}b\nc"), "a b c");
         assert_eq!(sanitize_file_name(&"x".repeat(400)).chars().count(), 150);
         assert_eq!(sanitize_file_name("100% Loup"), "100 Loup");
+        assert_eq!(sanitize_file_name("CON"), "_CON");
+        assert_eq!(sanitize_file_name("nul"), "_nul");
+        assert_eq!(sanitize_file_name("com1"), "_com1");
+        // Reserved rewrite must not blow the char ceiling.
+        let long_reserved = format!("NUL{}", "I".repeat(200));
+        let s = sanitize_file_name(&long_reserved);
+        assert!(s.chars().count() <= 150);
+        assert!(s.len() <= 240);
+        assert_ne!(s.to_ascii_uppercase(), "NUL");
     }
 
     #[test]
@@ -1326,6 +1533,68 @@ mod tests {
         assert_eq!(extension_for("/a.b.c/123", "video/mp2t"), "ts");
         assert_eq!(extension_for("/stream", ""), "mp4");
         assert_eq!(extension_for("/x.php", ""), "mp4");
+    }
+
+    #[test]
+    fn folders_stay_inside_the_selected_root() {
+        let root = scratch_dir("folders");
+        std::fs::create_dir_all(&root).unwrap();
+
+        let film = films_dir(&root);
+        assert_eq!(film, root.join("films"));
+        assert!(film.starts_with(&root));
+
+        let one = series_title_dir(&root, "|FR| Dark");
+        assert_eq!(one, root.join("series").join("Dark"));
+        assert!(one.starts_with(&root));
+        // One episode is enough: the title folder is the destination.
+        std::fs::create_dir_all(&one).unwrap();
+        std::fs::write(one.join("Dark — S01E01 — Début.mkv"), b"ep").unwrap();
+
+        // A later episode reuses that folder, it does not start a second one.
+        let again = series_title_dir(&root, "Dark");
+        assert_eq!(again, one);
+
+        // A different general folder is a new root. Nothing is written outside it.
+        let other = scratch_dir("folders-other");
+        std::fs::create_dir_all(&other).unwrap();
+        let moved = series_title_dir(&other, "Dark");
+        assert_eq!(moved, other.join("series").join("Dark"));
+        assert!(moved.starts_with(&other));
+        assert!(!moved.starts_with(&root));
+
+        let escaped = series_title_dir(&root, r"..\..\Windows\System32");
+        assert!(escaped.starts_with(&root));
+        assert!(!escaped.components().any(|c| matches!(c, std::path::Component::ParentDir)));
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&other);
+    }
+
+    #[test]
+    fn partials_are_found_inside_series_and_film_folders() {
+        let root = scratch_dir("partials-nested");
+        let series = series_title_dir(&root, "Dark");
+        let films = films_dir(&root);
+        std::fs::create_dir_all(&series).unwrap();
+        std::fs::create_dir_all(&films).unwrap();
+        let part = series.join("Dark — S01E01.mkv.part");
+        std::fs::write(&part, vec![0u8; 10]).unwrap();
+        let meta = Meta {
+            key: "abc".into(),
+            total: Some(100),
+            ..Meta::default()
+        };
+        meta.write(&meta_path(&part)).unwrap();
+        let found = scan_partials(&root);
+        assert_eq!(
+            found.get("abc"),
+            Some(&Partial {
+                done: 10,
+                total: Some(100)
+            })
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -2144,6 +2413,7 @@ mod tests {
             user_agent: "VLC/3.0.20 LibVLC/3.0.20".into(),
             dir: dir.clone(),
             background: false,
+            playback_busy: false,
         });
         tokio::pin!(events);
         let started = Instant::now();
@@ -2185,9 +2455,9 @@ mod tests {
         assert_eq!(streams_for(Some(1)), 1);
         assert_eq!(streams_for(Some(2)), 1);
         assert_eq!(streams_for(Some(4)), 3);
-        assert_eq!(connections_for(None), DEFAULT_CONNECTIONS);
-        assert_eq!(connections_for(Some(1)), DEFAULT_CONNECTIONS);
+        assert_eq!(connections_for(None), default_connections());
+        assert_eq!(connections_for(Some(1)), 1);
         assert_eq!(connections_for(Some(4)), 4);
-        assert_eq!(connections_for(Some(100)), MAX_CONNECTIONS);
+        assert_eq!(connections_for(Some(100)), effective_max_connections());
     }
 }

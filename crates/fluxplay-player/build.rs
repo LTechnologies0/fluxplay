@@ -47,6 +47,18 @@ fn setup_libmpv() {
     println!("cargo:rerun-if-env-changed=FLUXPLAY_REQUIRE_LIBMPV");
     println!("cargo:rerun-if-env-changed=PKG_CONFIG_PATH");
 
+    // Windows MSVC: `mpv_ffi` imports `libmpv-2.dll` via `raw-dylib` (no import lib
+    // or headers needed). The app's build.rs delay-loads it so the exe still starts without the DLL and
+    // the player falls back cleanly (`mpv_ffi::libmpv_available`).
+    let target = env::var("TARGET").unwrap_or_default();
+    if target.contains("windows-msvc") {
+        // Covers this crate's own tests/examples; dependents set it in their build.rs.
+        println!("cargo:rustc-link-arg=/DELAYLOAD:libmpv-2.dll");
+        println!("cargo:rustc-link-arg=delayimp.lib");
+        println!("cargo:rustc-cfg=fluxplay_has_libmpv");
+        return;
+    }
+
     let want_static = env::var_os("CARGO_FEATURE_STATIC_LINK").is_some()
         || env::var("FLUXPLAY_STATIC_MPV").ok().as_deref() == Some("1");
     let require = env::var("FLUXPLAY_REQUIRE_LIBMPV").ok().as_deref() == Some("1")

@@ -3,6 +3,8 @@ name = "fluxplay-android"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+authors.workspace = true
+repository.workspace = true
 description = "FluxPlay Android / Android TV — iced NativeActivity (same UI as desktop)"
 publish = false
 
@@ -42,13 +44,11 @@ name = "android.permission.INTERNET"
 name = "android.permission.ACCESS_NETWORK_STATE"
 
 [[package.metadata.android.uses_permission]]
+name = "android.permission.POST_NOTIFICATIONS"
+
+# Keep OLED awake during playback (window FLAG_KEEP_SCREEN_ON + optional wake lock).
+[[package.metadata.android.uses_permission]]
 name = "android.permission.WAKE_LOCK"
-
-[[package.metadata.android.uses_permission]]
-name = "android.permission.FOREGROUND_SERVICE"
-
-[[package.metadata.android.uses_permission]]
-name = "android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK"
 
 [[package.metadata.android.uses_feature]]
 name = "android.hardware.touchscreen"
@@ -90,7 +90,8 @@ data = [{ mime_type = "*/*" }]
 [package.metadata.android.application]
 label = "FluxPlay"
 icon = "@mipmap/ic_launcher"
-# TV leanback row image (also under resources/drawable/banner.png).
+# Android TV launcher row (320×180) — also res/drawable/banner.png.
+banner = "@drawable/banner"
 # Translucent so MediaCodec SurfaceView can show under iced chrome (Phase A).
 theme = "@style/FluxPlay.Transparent"
 # Prefer false for store/release; local debug builds can still use adb jdwp via NDK.
@@ -137,3 +138,6 @@ categories = ["android.intent.category.LAUNCHER"]
 [[package.metadata.android.application.activity.intent_filter]]
 actions = ["android.intent.action.MAIN"]
 categories = ["android.intent.category.LEANBACK_LAUNCHER"]
+
+[lints]
+workspace = true

@@ -1,0 +1,1 @@
+error fetching https://user:pass@portal.example/player_api.php?username=u&password=p

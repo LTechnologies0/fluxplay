@@ -1,12 +1,16 @@
 use std::path::Path;
 
+use fluxplay_core::codes::{FpCode, HasFpCode};
 use fluxplay_core::m3u;
 use fluxplay_core::models::{MediaSource, PlaylistBundle};
 use fluxplay_core::Stopwatch;
 use tracing::{debug, error, info, warn};
 
 use crate::user_agents::agents_for;
-use crate::{http_client, xtream_url, Result};
+use crate::{http_client, xtream_url, ProviderError, Result};
+
+/// Hard budget for HTTP / local / inline M3U bodies (CWE-400).
+const MAX_M3U_BYTES: usize = 32 * 1024 * 1024;
 
 pub async fn load_m3u_source(source: &MediaSource) -> Result<PlaylistBundle> {
     let _prof = Stopwatch::start("load_m3u_source");
@@ -16,18 +20,17 @@ pub async fn load_m3u_source(source: &MediaSource) -> Result<PlaylistBundle> {
         fetch_playlist_body(endpoint, source).await?
     } else if Path::new(endpoint).exists() {
         debug!("reading playlist from local path");
-        tokio::fs::read_to_string(endpoint)
-            .await
-            .map_err(|e| crate::ProviderError::Message(format!("read playlist: {e}")))?
+        read_local_playlist(endpoint).await?
     } else {
         debug!("treating endpoint as inline playlist body");
+        enforce_m3u_body_budget(endpoint.as_bytes().len())?;
         endpoint.to_string()
     };
 
     if body.trim().is_empty() {
         error!(source_id = %source.id, "playlist empty");
-        return Err(crate::ProviderError::Message(
-            "playlist vide (serveur a renvoyé un corps vide)".into(),
+        return Err(m3u_empty_err(
+            "playlist vide (serveur a renvoyé un corps vide)",
         ));
     }
 
@@ -39,6 +42,42 @@ pub async fn load_m3u_source(source: &MediaSource) -> Result<PlaylistBundle> {
         "M3U parsed"
     );
     Ok(bundle)
+}
+
+async fn read_local_playlist(path: &str) -> Result<String> {
+    let meta = tokio::fs::metadata(path)
+        .await
+        .map_err(|e| ProviderError::Message(format!("read playlist: {e}")))?;
+    if meta.len() as usize > MAX_M3U_BYTES {
+        return Err(m3u_oversize_err(format!(
+            "M3U playlist oversize (local file {} o, max {MAX_M3U_BYTES})",
+            meta.len()
+        )));
+    }
+    let body = tokio::fs::read_to_string(path)
+        .await
+        .map_err(|e| ProviderError::Message(format!("read playlist: {e}")))?;
+    // TOCTOU: size can grow between metadata and read.
+    enforce_m3u_body_budget(body.len())?;
+    Ok(body)
+}
+
+fn enforce_m3u_body_budget(len: usize) -> Result<()> {
+    if len > MAX_M3U_BYTES {
+        Err(m3u_oversize_err(format!(
+            "M3U playlist oversize ({len} o, max {MAX_M3U_BYTES})"
+        )))
+    } else {
+        Ok(())
+    }
+}
+
+fn m3u_oversize_err(msg: impl Into<String>) -> ProviderError {
+    ProviderError::Message(FpCode::CatM3uOversize.ensure_coded(msg.into()))
+}
+
+fn m3u_empty_err(msg: impl Into<String>) -> ProviderError {
+    ProviderError::Message(FpCode::CatM3uEmpty.ensure_coded(msg.into()))
 }
 
 /// Download playlist text, rotating IPTV User-Agents on 885 / 403 / empty body.
@@ -85,9 +124,27 @@ pub async fn fetch_playlist_body(endpoint: &str, source: &MediaSource) -> Result
                         }
                         continue;
                     }
-                    return Err(crate::ProviderError::Message(last_err));
+                    return Err(ProviderError::Message(last_err));
                 }
-                let body = resp.text().await?;
+                // Cap playlist download (hostile/huge get.php → OOM before parse).
+                let raw = match http_client::read_body_capped(resp, MAX_M3U_BYTES).await {
+                    Ok(b) => b,
+                    Err(e) => {
+                        warn!(error = %e, %ua, attempt = i + 1, "playlist body rejected");
+                        last_err = e.to_string();
+                        // Do not rotate UA on oversize — same body under another UA.
+                        if last_err.contains("trop volumineuse")
+                            || last_err.contains("oversize")
+                            || e.fp_code() == FpCode::CatM3uOversize
+                        {
+                            return Err(m3u_oversize_err(format!(
+                                "M3U playlist oversize (max {MAX_M3U_BYTES} o)"
+                            )));
+                        }
+                        continue;
+                    }
+                };
+                let body = String::from_utf8_lossy(&raw).into_owned();
                 if body.trim().is_empty() {
                     warn!(%ua, attempt = i + 1, "playlist empty body — trying next UA");
                     last_err = "corps vide".into();
@@ -116,9 +173,36 @@ pub async fn fetch_playlist_body(endpoint: &str, source: &MediaSource) -> Result
         last_err = %last_err,
         "all User-Agents failed for playlist fetch"
     );
-    Err(crate::ProviderError::Message(format!(
+    Err(ProviderError::Message(format!(
         "échec get.php/M3U après {} User-Agents (dernier: HTTP {last_status} — {last_err}). \
          Si c'est un panel Xtream, FluxPlay bascule sur player_api.",
         agents.len()
     )))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn oversize_error_carries_fp_code() {
+        let e = m3u_oversize_err("M3U playlist oversize (max 1)");
+        let s = e.to_string();
+        assert!(s.contains("[FP-CAT-M3U-OVERSIZE]"), "{s}");
+        assert_eq!(e.fp_code(), FpCode::CatM3uOversize);
+    }
+
+    #[test]
+    fn empty_error_carries_fp_code() {
+        let e = m3u_empty_err("playlist vide");
+        let s = e.to_string();
+        assert!(s.contains("[FP-CAT-M3U-EMPTY]"), "{s}");
+        assert_eq!(e.fp_code(), FpCode::CatM3uEmpty);
+    }
+
+    #[test]
+    fn inline_budget_rejects_huge_body() {
+        let err = enforce_m3u_body_budget(MAX_M3U_BYTES + 1).unwrap_err();
+        assert_eq!(err.fp_code(), FpCode::CatM3uOversize);
+    }
 }

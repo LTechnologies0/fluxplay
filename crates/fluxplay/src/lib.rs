@@ -1,7 +1,11 @@
 //! FluxPlay desktop UI (iced) — also the Android / Android TV shell.
 
+// iced/wgpu Pipeline Sync bounds exceed rustc's default trait recursion depth (see #159228).
+#![recursion_limit = "256"]
+
 mod app;
 mod async_jobs;
+mod browse_tiles;
 mod browser;
 mod catalog_db;
 mod demo;
@@ -13,13 +17,70 @@ mod images;
 mod metadata;
 mod names;
 mod network;
+mod api_assist;
+mod policy;
+mod skip_db;
 mod translate;
 mod wg_proxy;
 mod wg_tunnel;
+mod party;
 mod player_ui;
+mod qr;
 mod profile_io;
+mod rune_motion;
 mod storage;
 mod theme;
+mod ui_surface;
+mod invariants;
+#[cfg(test)]
+mod prop_names;
+#[cfg(test)]
+mod prop_surface;
+#[cfg(test)]
+mod prop_security;
+#[cfg(test)]
+mod prop_browser;
+#[cfg(test)]
+mod prop_metadata;
+#[cfg(test)]
+mod prop_persist;
+#[cfg(test)]
+mod prop_skip;
+
+/// Stable surface for libFuzzer / AFL harnesses (`--features fuzzing`).
+#[cfg(feature = "fuzzing")]
+pub mod fuzz_api {
+    pub use crate::browse_tiles::{
+        BrowseTile, BrowseTileCache, BrowseViewportHealth, BROWSE_TILE_CACHE_CAP,
+        BROWSE_TILE_FETCH_LIMIT,
+    };
+    pub use crate::browser::{
+        list_row_height, mosaic_row_height, virtual_content_height, virtual_slice, VirtualSlice,
+        MAX_VIRTUAL_CONTENT_PX, VIRTUAL_OVERSCAN,
+    };
+    pub use crate::downloads::{
+        episode_title, extension_for, human_size, progress_text, sanitize_file_name, url_key,
+    };
+    pub use crate::images::is_fetchable_image_url;
+    pub use crate::invariants::{
+        assert_viewport_sane, soft_present_within_budget, DECODE_EDGE_HARD_CAP,
+        SOFT_PRESENT_MAX_H, SOFT_PRESENT_MAX_W,
+    };
+    pub use crate::metadata::{
+        age_rank, age_rating, clean_text, clean_title, display_genres, fmt_airdate, fmt_genre,
+        fmt_people, fmt_plot, fmt_rated, fmt_rating, fmt_runtime, fmt_year, parse_title_query,
+    };
+    pub use crate::names::{
+        category_label, display_channel, display_title, parse_category, parse_channel,
+        parse_item_title,
+    };
+    pub use crate::skip_db::{parse_movie_json, parse_series_json, SkipHit};
+    pub use crate::storage::{
+        downloads_dir, parse_persisted_state, validate_downloads_dir, PersistedState,
+    };
+    pub use crate::ui_surface::UiSurface;
+    pub use crate::wg_proxy::parse_profile as parse_wg_profile;
+}
 #[cfg(not(target_os = "android"))]
 mod video_stage;
 
@@ -27,12 +88,16 @@ mod video_stage;
 mod android_intent;
 #[cfg(target_os = "android")]
 mod android_bridge;
+#[cfg(target_os = "android")]
+pub mod android_platform;
 
 use tracing_subscriber::EnvFilter;
 
 /// Desktop / Linux entry used by the `fluxplay` binary.
 pub fn run() -> iced::Result {
     init_tracing();
+    let _ = policy::init();
+    policy::ensure_default_file();
     tracing::info!("FluxPlay starting (desktop)");
     if fluxplay_core::profiling_enabled() {
         tracing::info!(
@@ -49,6 +114,8 @@ pub fn run() -> iced::Result {
 #[cfg(target_os = "android")]
 pub fn run_android(android_app: android_activity::AndroidApp) -> iced::Result {
     init_tracing_android();
+    let _ = policy::init();
+    policy::ensure_default_file();
     tracing::info!(target: "fluxplay::boot", "FluxPlay starting (android iced)");
     if fluxplay_core::profiling_enabled() {
         tracing::info!(
@@ -78,16 +145,34 @@ fn init_tracing() {
              iced=info,iced_winit=info,iced_wgpu=warn,iced_runtime=info,profiler=trace",
         );
     }
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-            if fluxplay_core::full_logs_enabled() {
-                fluxplay_core::FULL_ENV_FILTER.into()
-            } else {
-                fluxplay_core::DEFAULT_ENV_FILTER.into()
-            }
-        }))
-        .try_init();
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        if fluxplay_core::full_logs_enabled() {
+            fluxplay_core::FULL_ENV_FILTER.into()
+        } else {
+            fluxplay_core::DEFAULT_ENV_FILTER.into()
+        }
+    });
+    // Windows GUI subsystem has no console: log to `%LOCALAPPDATA%luxplayluxplay.log`
+    // (truncated each launch) so problems stay diagnosable.
+    #[cfg(windows)]
+    if let Some(file) = windows_log_file() {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_ansi(false)
+            .with_writer(std::sync::Mutex::new(file))
+            .try_init();
+        fluxplay_player::log_native_verbosity_banner();
+        return;
+    }
+    let _ = tracing_subscriber::fmt().with_env_filter(filter).try_init();
     fluxplay_player::log_native_verbosity_banner();
+}
+
+#[cfg(windows)]
+fn windows_log_file() -> Option<std::fs::File> {
+    let dir = dirs::data_local_dir()?.join("fluxplay");
+    std::fs::create_dir_all(&dir).ok()?;
+    std::fs::File::create(dir.join("fluxplay.log")).ok()
 }
 
 #[cfg(target_os = "android")]

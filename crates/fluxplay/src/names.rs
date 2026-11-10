@@ -323,7 +323,7 @@ fn desuperscript(c: char) -> Option<char> {
 fn clean_decorations(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut in_sup = false;
-    for c in s.chars() {
+    for c in scrub_controls(s).chars() {
         if let Some(plain) = desuperscript(c) {
             if !in_sup && !out.ends_with([' ', '/']) && !out.is_empty() {
                 out.push(' ');
@@ -342,8 +342,18 @@ fn clean_decorations(s: &str) -> String {
     collapse_ws(&out)
 }
 
+/// Drop C0 controls (NUL, etc.) that break iced text / FFI while keeping tabs/spaces.
+fn scrub_controls(s: &str) -> String {
+    s.chars()
+        .filter(|c| *c == '\t' || *c == '\n' || !c.is_control())
+        .collect()
+}
+
 fn collapse_ws(s: &str) -> String {
-    s.split_whitespace().collect::<Vec<_>>().join(" ")
+    scrub_controls(s)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn fold_upper(word: &str) -> String {
@@ -522,7 +532,7 @@ pub fn parse_category(raw: &str) -> CategoryInfo {
             // `MULTI SUB` = subtitles only, audio stays the category language.
             "MULTI" if words.get(i + 1).map(|n| n == "SUB").unwrap_or(false) => {}
             "MULTI" => lang.multi = true,
-            "ADULT" | "ADULTS" | "XXX" | "HANIME" => lang.adult = true,
+            "ADULT" | "ADULTS" | "XXX" | "HANIME" | "HENTAI" | "ECCHI" => lang.adult = true,
             _ => {}
         }
     }
@@ -540,16 +550,339 @@ pub fn parse_category(raw: &str) -> CategoryInfo {
 }
 
 /// Sidebar label: `FR · Sport UHD`, `Original Netflix Multi`, `18+ · Adults`.
+/// A plain cartoon shelf is marked `enfants`. Manga shelves are split later
+/// into `Manga` and `Animé adulte`.
 pub fn category_label(raw: &str) -> String {
     let info = parse_category(raw);
     if info.title.is_empty() {
         return collapse_ws(raw);
     }
-    match info.code.as_deref() {
+    let mut label = match info.code.as_deref() {
         Some(c) if c == "+18" => format!("18+ · {}", info.title),
         Some(c) => format!("{} · {}", c.to_ascii_uppercase(), info.title),
-        None => info.title,
+        None => info.title.clone(),
+    };
+    if let Some(tag) = audience_tag(&info.title) {
+        label.push_str(" · ");
+        label.push_str(tag);
     }
+    label
+}
+
+/// Order of a film or series category among the others of the same language.
+/// Lower comes first: new releases, then children's cartoons and family,
+/// superhero animation, manga / anime (the older cartoons), then the
+/// provider's own order. Adult shelves stay last via [`lang_rank`].
+pub fn category_audience(raw: &str) -> u8 {
+    let title = parse_category(raw).title;
+    let words = audience_words(&title);
+    if is_spotlight(&words) {
+        0
+    } else if has_word(&words, MANGA_WORDS) {
+        3
+    } else if has_word(&words, ANIM_WORDS) && has_word(&words, HERO_WORDS) {
+        2
+    } else if has_word(&words, ANIM_WORDS) || has_word(&words, KIDS_WORDS) {
+        1
+    } else {
+        4
+    }
+}
+
+const ANIM_WORDS: &[&str] = &["ANIMATION", "ANIMATIONS", "ANIMAZIONE", "ANIMACAO"];
+const MANGA_WORDS: &[&str] = &["MANGA", "MANGAS", "ANIME", "ANIMES"];
+const HERO_WORDS: &[&str] = &["HERO", "HEROS", "SUPEREROI", "SUPEREROE"];
+const KIDS_WORDS: &[&str] = &[
+    "ENFANT", "ENFANTS", "KIDS", "KID", "BAMBINI", "BAMBINO", "BAMBINA", "FAMILLE", "FAMILLES",
+    "FAMILIAL", "FAMIGLIA", "FAMILIA", "JEUNESSE", "COCUK", "COCUKLAR", "CHILDREN", "INFANTIL",
+    "DISNEY",
+];
+
+fn audience_words(title: &str) -> Vec<String> {
+    title
+        .split(|c: char| !c.is_alphanumeric() && c != '+')
+        .filter(|w| !w.is_empty())
+        .map(|w| {
+            fold_upper(w)
+                .replace('Ã', "A")
+                .replace('Õ', "O")
+                .replace('ã', "A")
+                .replace('õ', "O")
+        })
+        .collect()
+}
+
+fn has_word(words: &[String], needles: &[&str]) -> bool {
+    words.iter().any(|w| needles.contains(&w.as_str()))
+}
+
+fn is_spotlight(words: &[String]) -> bool {
+    has_word(
+        words,
+        &["NOUVEAUTE", "NOUVEAUTES", "RECENTI", "RECENTE", "RECENTES"],
+    ) || words.windows(2).any(|p| p[0] == "BOX" && p[1] == "OFFICE")
+}
+
+/// Audience hint added only when the category name does not already say it.
+fn audience_tag(title: &str) -> Option<&'static str> {
+    let words = audience_words(title);
+    if has_word(&words, ANIM_WORDS)
+        && !has_word(&words, HERO_WORDS)
+        && !has_word(&words, KIDS_WORDS)
+        && !has_word(&words, MANGA_WORDS)
+    {
+        return Some("enfants");
+    }
+    None
+}
+
+/// A portal shelf that mixes Japanese manga with adult animation
+/// (`MANGA ET ANIME`). The sidebar splits it in two.
+pub fn is_manga_category(raw: &str) -> bool {
+    has_word(&audience_words(&parse_category(raw).title), MANGA_WORDS)
+}
+
+/// Which half of a split category is selected.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CategoryShelf {
+    /// A normal portal category.
+    Plain,
+    /// Manga / anime that is not an adult cartoon.
+    Manga,
+    /// Adult animation that shared the manga shelf (South Park, Hellsing, …).
+    Adult,
+}
+
+const MANGA_SHELF: &str = "::manga";
+const ADULT_SHELF: &str = "::adulte";
+
+/// `2070::adulte` → (`2070`, Adult). A plain id stays plain.
+pub fn category_shelf(id: &str) -> (&str, CategoryShelf) {
+    if let Some(base) = id.strip_suffix(ADULT_SHELF) {
+        (base, CategoryShelf::Adult)
+    } else if let Some(base) = id.strip_suffix(MANGA_SHELF) {
+        (base, CategoryShelf::Manga)
+    } else {
+        (id, CategoryShelf::Plain)
+    }
+}
+
+/// Sidebar label for one half of a manga category: `FR · Manga`, `FR · Animé adulte`.
+pub fn shelf_label(raw: &str, adult: bool) -> String {
+    let info = parse_category(raw);
+    let title = if adult { "Animé adulte" } else { "Manga" };
+    match info.code.as_deref() {
+        Some(c) if c == "+18" => format!("18+ · {title}"),
+        Some(c) => format!("{} · {title}", c.to_ascii_uppercase()),
+        None => title.to_string(),
+    }
+}
+
+/// A kids / family / comedy shelf where portals dump adult cartoons
+/// (`Animation | Familial`, `Comédie dramatique`). Manga is split on its own.
+pub fn is_adult_donor_category(raw: &str) -> bool {
+    if is_manga_category(raw) {
+        return false;
+    }
+    let words = audience_words(&parse_category(raw).title);
+    if is_spotlight(&words) {
+        return false;
+    }
+    has_word(&words, ANIM_WORDS)
+        || has_word(&words, KIDS_WORDS)
+        || has_word(
+            &words,
+            &["COMEDIE", "COMEDY", "HORREUR", "HORROR", "MARVEL", "CRIME"],
+        )
+}
+
+/// Item belongs on the shelf the viewer picked.
+/// `adult_pool` lists other categories (same language) whose adult cartoons
+/// join the adult shelf. `strip_adult` hides those titles from a donor shelf.
+pub fn in_category_shelf(
+    selected: &str,
+    item_cat: Option<&str>,
+    name: &str,
+    adult_pool: &[String],
+    strip_adult: bool,
+) -> bool {
+    let (base, shelf) = category_shelf(selected);
+    match shelf {
+        CategoryShelf::Plain => {
+            item_cat == Some(base) && !(strip_adult && is_adult_anime(name))
+        }
+        CategoryShelf::Manga => item_cat == Some(base) && !is_adult_anime(name),
+        CategoryShelf::Adult => {
+            if !is_adult_anime(name) {
+                return false;
+            }
+            item_cat == Some(base)
+                || item_cat.is_some_and(|c| adult_pool.iter().any(|id| id == c))
+        }
+    }
+}
+
+/// Adult cartoons portals file under manga or under family animation:
+/// South Park, Rick et Morty, Hazbin Hotel, Hellsing. `Berserk of Gluttony`
+/// stays manga. A live-action title that only shares a word (`Ricky Zoom`,
+/// `Invincible Fight Girl`) stays put.
+pub fn is_adult_anime(title: &str) -> bool {
+    // `Bob's` must stay one word. A split apostrophe turns it into `BOB S`
+    // and the phrase never matches, so the show stays on the kids shelf.
+    let stripped = title.replace(['\'', '\u{2019}', '\u{2018}', '`'], "");
+    let words = audience_words(&stripped);
+    if words.iter().any(|w| w == "GLUTTONY") {
+        return false;
+    }
+    let blob = words
+        .iter()
+        .map(|w| match w.as_str() {
+            "ET" | "AND" => "X",
+            other => other,
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    // Whole words only: `Désenchantées` (live-action) must not match
+    // `Désenchantée`, and `Le casse de Central Park` must not match the cartoon.
+    let padded = format!(" {blob} ");
+    const PHRASES: &[&str] = &[
+        "HENTAI",
+        "ECCHI",
+        "HANIME",
+        "EROTIQUE",
+        "EROTIC",
+        "ADULTE",
+        "PORNO",
+        "SANS CENSURE",
+        "UNCENSORED",
+        "SOUTH PARK",
+        "PRISON SCHOOL",
+        "SHIMONETA",
+        "SHIMOSEKA",
+        "DEVILMAN",
+        "HELLSING",
+        "ELFEN LIED",
+        "GOBLIN SLAYER",
+        "REDO OF HEALER",
+        "CASTLEVANIA",
+        "FAMILY GUY",
+        "AMERICAN DAD",
+        "RICK X MORTY",
+        "BOJACK",
+        "BIG MOUTH",
+        "SOLAR OPPOSITES",
+        "BRICKLEBERRY",
+        "ROBOT CHICKEN",
+        "BOONDOCKS",
+        "FUTURAMA",
+        "F IS FOR FAMILY",
+        "HAZBIN",
+        "HELLUVA",
+        "BLUE EYE SAMURAI",
+        "EDGERUNNERS",
+        "LOVE DEATH",
+        "VOX MACHINA",
+        "SMILING FRIENDS",
+        "MIDNIGHT GOSPEL",
+        "HUMAN RESOURCES",
+        "INSIDE JOB",
+        "CLOSE ENOUGH",
+        "CHICAGO PARTY AUNT",
+        "CAPTAIN FALL",
+        "PARADISE POLICE",
+        "PARADISE PD",
+        "STRANGE PLANET",
+        "LOWER DECKS",
+        "BOBS BURGERS",
+        "GREAT NORTH",
+        "DIGITAL CIRCUS",
+        "TERMINATOR ZERO",
+        "COMMON SIDE EFFECTS",
+        "FINAL SPACE",
+        "AGENT ELVIS",
+        "TUCA BERTIE",
+        "KRAPOPOLIS",
+        "EXPLODING KITTENS",
+        "CREATURE COMMANDOS",
+        "DEVIL MAY CRY",
+        "BLOOD OF ZEUS",
+        "SCAVENGERS REIGN",
+        "MR PICKLES",
+        "DIABOLICAL",
+        "DIABOLICO",
+        "HOUSEBROKEN",
+        "Q FORCE",
+        "YASUKE",
+        "DESENCHANTEE",
+        "DISENCHANTMENT",
+        "FARZAR",
+        "BLACK DYNAMITE",
+        "BLESS THE HARTS",
+        "HAUNTED HOTEL",
+        "KITE MAN",
+        "MATING SEASON",
+        "MIKE TYSON MYSTERIES",
+        "MOMMA NAMED ME SHERIFF",
+        "OUR CARTOON PRESIDENT",
+        "ROYAL CRACKERS",
+        "SANTA INC",
+        "SATURDAY MORNING ALL STAR",
+        "SECRET LEVEL",
+        "SILEX X THE CITY",
+        "SON OF ZORN",
+        "SUPERMANSION",
+        "CLEVELAND SHOW",
+        "FREAK BROTHERS",
+        "MIGHTY NEIN",
+        "TRAILER PARK BOYS THE ANIMATED",
+        "SCOTT PILGRIM",
+        "FIONNA",
+        "SPACE DANDY",
+        "POUR ADULTES",
+        "FOR ADULTS",
+        "NE CONVIENT PAS",
+        "DIABLE MALGRE",
+        "CE MONDE NE MAURA",
+        "COUILLE",
+        "18+",
+        "+18",
+        "BERSERK",
+    ];
+    if PHRASES.iter().any(|n| padded.contains(&format!(" {n} "))) {
+        return true;
+    }
+    const SKIP: &[&str] = &[
+        "FR", "EN", "IT", "PT", "AR", "DE", "ES", "MULTI", "VOST", "VOSTFR", "HEVC", "UHD", "VF",
+        "SUB", "MULTi",
+    ];
+    let rest: Vec<&str> = words
+        .iter()
+        .filter(|w| !SKIP.contains(&w.as_str()) && !w.chars().all(|c| c.is_ascii_digit()))
+        .map(String::as_str)
+        .collect();
+    const EXACT: &[&str] = &[
+        "ARCHER",
+        "INVINCIBLE",
+        "HOOPS",
+        "UNDONE",
+        "MULLIGAN",
+        "FAIRFAX",
+        "GRIMSBURG",
+        "VELMA",
+        "TIGTONE",
+        "DARIA",
+    ];
+    if rest.len() == 1 && EXACT.contains(&rest[0]) {
+        return true;
+    }
+    // These words also name live-action films (`Le casse de Central Park`,
+    // `Birds of Prey … Harley Quinn`). Only the cartoon whose title *is*
+    // those words moves.
+    rest.as_slice() == ["GOOD", "TIMES"]
+        || rest.as_slice() == ["CENTRAL", "PARK"]
+        || rest.as_slice() == ["HARLEY", "QUINN"]
+        || rest.as_slice() == ["BATMAN", "ET", "HARLEY", "QUINN"]
+        || rest.as_slice() == ["BATMAN", "AND", "HARLEY", "QUINN"]
 }
 
 // ---------------------------------------------------------------------------
@@ -831,8 +1164,9 @@ fn peel_tail(t: &mut String, lang: &mut LangInfo, year: &mut Option<String>) {
 
 /// Dashes unified, superscript badges spelled out, `Hannah*s` → `Hannah's`.
 fn normalize_item_chars(s: &str) -> String {
-    let chars: Vec<char> = s.chars().collect();
-    let mut out = String::with_capacity(s.len());
+    let scrubbed = scrub_controls(s);
+    let chars: Vec<char> = scrubbed.chars().collect();
+    let mut out = String::with_capacity(scrubbed.len());
     for (i, &c) in chars.iter().enumerate() {
         match c {
             '\u{2013}' | '\u{2014}' => out.push('-'),
@@ -1222,6 +1556,111 @@ mod tests {
         // Origin tags stay: they tell versions apart and are not the audio language.
         assert_eq!(display_title("هل ستكون منا؟ (TR)"), "هل ستكون منا؟ (TR)");
         assert_eq!(display_title("House of Cards (US)_msub"), "House of Cards (US)");
+        assert_eq!(category_label("|FR| ANIMATION"), "FR · Animation · enfants");
+        assert_eq!(category_label("|FR| ANIMATION DISNEY"), "FR · Animation Disney");
+        assert_eq!(category_label("|FR| ANIMATION HERO"), "FR · Animation Hero");
+        assert_eq!(
+            category_label("|FR| FAMILLES ET ENFANTS"),
+            "FR · Familles Et Enfants"
+        );
+        assert_eq!(category_label("|FR| MANGA ET ANIME"), "FR · Manga Et Anime");
+        assert_eq!(shelf_label("|FR| MANGA ET ANIME", false), "FR · Manga");
+        assert_eq!(shelf_label("|FR| MANGA | ANIME", true), "FR · Animé adulte");
+        assert!(is_adult_anime("|FR| South Park (Ne convient pas aux enfants)"));
+        assert!(is_adult_anime("|FR| Prison school (VOST)"));
+        assert!(is_adult_anime("|FR| Hellsing Ultimate (VOST)"));
+        assert!(is_adult_anime("Archer"));
+        assert!(is_adult_anime("|FR| Rick et Morty (MULTI)"));
+        assert!(is_adult_anime("|FR| Rick et Morty : L’Anime"));
+        assert!(is_adult_anime("|FR| Rick and Morty (MULTI)"));
+        assert!(is_adult_anime("|FR| Futurama (MULTI)"));
+        assert!(is_adult_anime("|FR| Hazbin Hotel (MULTI)"));
+        assert!(is_adult_anime("|FR| Désenchantée (MULTI)"));
+        assert!(is_adult_anime("|FR| Velma (MULTI)"));
+        assert!(is_adult_anime("|FR| Invincible (MULTI)"));
+        assert!(!is_adult_anime("|FR| Bluey"));
+        assert!(!is_adult_anime("|FR| Dragons : les neuf royaumes (MULTI)"));
+        assert!(!is_adult_anime("|FR| Invincible Fight Girl (MULTI)"));
+        assert!(!is_adult_anime("|FR| Ricky Zoom"));
+        assert!(!is_adult_anime("|FR| Berserk of Gluttony (VOST)"));
+        assert!(!is_adult_anime("|FR| Spy x Family Code: White"));
+        assert!(is_adult_anime("|FR| Bob's Burgers"));
+        assert!(is_adult_anime("|FR| Bob’s Burgers"));
+        assert!(is_adult_anime("|FR| Central Park (MULTI)"));
+        assert!(is_adult_anime("|FR| Harley Quinn"));
+        assert!(is_adult_anime("|FR| Batman et Harley Quinn"));
+        assert!(is_adult_anime("|FR| Diable malgrè lui (MULTI)"));
+        assert!(is_adult_anime("|FR| Ce monde ne m'aura pas (MULTI)"));
+        assert!(is_adult_anime("|FR| Daria"));
+        assert!(is_adult_anime("|FR| Trailer Park Boys: The Animated Series"));
+        assert!(!is_adult_anime("|FR| Désenchantées"));
+        assert!(!is_adult_anime("|FR| Le casse de Central Park"));
+        assert!(!is_adult_anime("|FR| Panique à Central Park"));
+        assert!(!is_adult_anime(
+            "|FR| Birds of Prey et la fantabuleuse histoire de Harley Quinn"
+        ));
+        assert!(!is_adult_anime("|FR| Trailer Park Boys (VOST)"));
+        assert!(!is_adult_anime("|FR| Les P'tits Diables"));
+        assert!(!is_adult_anime("|FR| Hot in Cleveland (MULTI)"));
+        assert!(is_adult_donor_category("|FR| ANIMATION | FAMILIAL"));
+        assert!(!is_adult_donor_category("|FR| MANGA | ANIME"));
+        assert!(in_category_shelf(
+            "2070::adulte",
+            Some("2070"),
+            "South Park",
+            &[],
+            false
+        ));
+        assert!(!in_category_shelf(
+            "2070::manga",
+            Some("2070"),
+            "South Park",
+            &[],
+            false
+        ));
+        assert!(in_category_shelf(
+            "2070::manga",
+            Some("2070"),
+            "Spy x Family",
+            &[],
+            false
+        ));
+        let pool = vec!["3045".to_string()];
+        assert!(in_category_shelf(
+            "3055::adulte",
+            Some("3045"),
+            "|FR| Futurama (MULTI)",
+            &pool,
+            false
+        ));
+        assert!(!in_category_shelf(
+            "3045",
+            Some("3045"),
+            "|FR| Futurama (MULTI)",
+            &[],
+            true
+        ));
+        assert!(in_category_shelf(
+            "3045",
+            Some("3045"),
+            "|FR| Bluey",
+            &[],
+            true
+        ));
+        assert_eq!(category_label("|IT| ANIMAZIONE"), "IT · Animazione · enfants");
+        assert_eq!(category_label("|PT| ANIMAÇÃO"), "PT · Animação · enfants");
+        assert_eq!(category_label("|FR| ANIMATION | FAMILIAL"), "FR · Animation | Familial");
+        assert_eq!(category_audience("|FR| NOUVEAUTES"), 0);
+        assert_eq!(category_audience("|FR| BOX OFFICE 2025"), 0);
+        assert_eq!(category_audience("|FR| ANIMATION"), 1);
+        assert_eq!(category_audience("|FR| ANIMATION DISNEY"), 1);
+        assert_eq!(category_audience("|FR| FAMILLES ET ENFANTS"), 1);
+        assert_eq!(category_audience("|AR| ARABIC KIDS"), 1);
+        assert_eq!(category_audience("|FR| ANIMATION HERO"), 2);
+        assert_eq!(category_audience("|FR| MANGA ET ANIME"), 3);
+        assert_eq!(category_audience("|FR| ACTION ET AVENTURE"), 4);
+        assert_eq!(category_audience("|IT| BOX-OFFICE 2024"), 0);
+        assert!(parse_category("|FR| HENTAI").lang.adult);
         assert_eq!(category_label("|TR| ✪ ROMANTİK"), "TR · Romantik");
         assert_eq!(category_label("|EN| ✪ GANGSTER|MAFIA"), "EN · Gangster|Mafia");
         assert!(parse_category("|AS| ✪ KANNADA").lang.matches("hi"));

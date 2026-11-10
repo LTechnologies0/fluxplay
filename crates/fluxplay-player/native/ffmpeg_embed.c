@@ -207,21 +207,11 @@ struct FluxFfmpegPlayer {
     pthread_cond_t vq_cv;
     pthread_t present_thread;
     int present_started;
-    /* Software frames waiting on the scale pool. Decode never scales. */
-    struct {
-        AVFrame *frame;
-        double pts;
-        int gen;
-        int want_w, want_h;
-    } jobs[8];
-    int job_r;
-    int job_n;
-    pthread_cond_t job_cv;
-    pthread_t scale_threads[8];
-    int nscale;
-    int scale_started;
-    /* Present cadence (monitor refresh). Decode thread drops extras; UI never waits. */
+    /* Present cadence (soft ≤60). present_thread uses this as min_gap with content_fps. */
     int present_hz;
+    /* Per-player sws colorspace cache (never process-global — multi-open safe). */
+    int sws_last_cs;
+    int sws_last_range;
     /* Content frame rate from the stream (24/25/30/60…). Used when PTS repeats. */
     double content_fps;
     int64_t last_present_us;
@@ -356,7 +346,6 @@ FluxFfmpegPlayer *flux_ffmpeg_open(const FluxFfmpegOpenOpts *opts) {
     if (!p) return NULL;
     pthread_mutex_init(&p->mu, NULL);
     pthread_cond_init(&p->vq_cv, NULL);
-    pthread_cond_init(&p->job_cv, NULL);
     pthread_cond_init(&p->pq_cv, NULL);
     pthread_mutex_init(&p->gpu.mu, NULL);
     p->gpu.last_slot = -1;
@@ -379,6 +368,8 @@ FluxFfmpegPlayer *flux_ffmpeg_open(const FluxFfmpegOpenOpts *opts) {
     p->want_w = 1920;
     p->want_h = 1080;
     p->present_hz = 60;
+    p->sws_last_cs = -1;
+    p->sws_last_range = -1;
     p->content_fps = 30.0;
     p->eof_retries = 0;
 
@@ -410,11 +401,7 @@ void flux_ffmpeg_close(FluxFfmpegPlayer *p) {
         if (p->vq[i].hw) av_frame_free(&p->vq[i].hw);
     }
     if (p->last_hw) av_frame_free(&p->last_hw);
-    for (int i = 0; i < 8; i++) {
-        if (p->jobs[i].frame) av_frame_free(&p->jobs[i].frame);
-    }
     pthread_cond_destroy(&p->vq_cv);
-    pthread_cond_destroy(&p->job_cv);
     pthread_cond_destroy(&p->pq_cv);
     if (p->sws) sws_freeContext(p->sws);
     if (p->sws_yuv) sws_freeContext(p->sws_yuv);
@@ -718,10 +705,19 @@ void flux_ffmpeg_set_output_size(FluxFfmpegPlayer *p, int w, int h) {
 void flux_ffmpeg_set_present_hz(FluxFfmpegPlayer *p, int hz) {
     if (!p) return;
     if (hz < 24) hz = 24;
-    if (hz > 120) hz = 120;
+    /* Soft path AO budget is ≤60 — never accept a higher soft present ceiling. */
+    if (hz > 60) hz = 60;
     pthread_mutex_lock(&p->mu);
     p->present_hz = hz;
     pthread_mutex_unlock(&p->mu);
+}
+
+double flux_ffmpeg_content_fps(FluxFfmpegPlayer *p) {
+    if (!p) return 0.0;
+    pthread_mutex_lock(&p->mu);
+    double fps = p->content_fps;
+    pthread_mutex_unlock(&p->mu);
+    return (isfinite(fps) && fps >= 20.0) ? fps : 0.0;
 }
 
 int flux_ffmpeg_is_alive(FluxFfmpegPlayer *p) {
@@ -959,9 +955,10 @@ static void *demux_thread(void *arg) {
     return NULL;
 }
 
-static int store_frame(struct SwsContext **sws_io, AVFrame *frame, int target_w, int target_h,
+static int store_frame(FluxFfmpegPlayer *p, AVFrame *frame, int target_w, int target_h,
                        uint8_t **rgba, size_t *cap, int *out_w, int *out_h) {
-    if (!sws_io || !rgba || !cap || !frame || frame->width < 2 || frame->height < 2) return 0;
+    if (!p || !rgba || !cap || !frame || frame->width < 2 || frame->height < 2) return 0;
+    struct SwsContext **sws_io = &p->sws;
     int tw = target_w > 0 ? target_w : frame->width;
     int th = target_h > 0 ? target_h : frame->height;
     if (tw > 3840) tw = 3840;
@@ -1016,6 +1013,8 @@ static int store_frame(struct SwsContext **sws_io, AVFrame *frame, int target_w,
     if (!reuse) {
         if (sws) sws_freeContext(sws);
         sws = sws_alloc_context();
+        p->sws_last_cs = -1;
+        p->sws_last_range = -1;
         if (sws) {
             long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
             if (ncpu < 1) ncpu = 1;
@@ -1037,23 +1036,24 @@ static int store_frame(struct SwsContext **sws_io, AVFrame *frame, int target_w,
     pthread_mutex_unlock(&sws_init_mu);
     if (!sws) return 0;
     *sws_io = sws;
-    /* Match the stream matrix (HD vs SD). Wrong matrix looks soft and grey. */
+    /* Match the stream matrix (HD / SD / BT2020). Wrong matrix looks soft and grey;
+     * BT2020 forced through 709 crushed HDR soft iced. PQ/HLG TRC tonemap stays
+     * libmpv soft-path (iced RGBA is SDR); Pref::Ffmpeg soft is matrix-honest SDR. */
     int cs = SWS_CS_ITU709;
     if (frame->colorspace == AVCOL_SPC_BT470BG || frame->colorspace == AVCOL_SPC_SMPTE170M)
         cs = SWS_CS_ITU601;
+    else if (frame->colorspace == AVCOL_SPC_BT2020_NCL || frame->colorspace == AVCOL_SPC_BT2020_CL)
+        cs = SWS_CS_BT2020;
     int range = frame->color_range == AVCOL_RANGE_JPEG;
     /* Rebuilding the matrix every frame hitching the scale. Once per change. */
-    static int last_cs = -1, last_range = -1;
-    static struct SwsContext *last_sws;
-    if (cs != last_cs || range != last_range || sws != last_sws) {
+    if (cs != p->sws_last_cs || range != p->sws_last_range) {
         sws_setColorspaceDetails(
             sws,
             sws_getCoefficients(cs), range,
             sws_getCoefficients(cs), 0,
             0, 1 << 16, 1 << 16);
-        last_cs = cs;
-        last_range = range;
-        last_sws = sws;
+        p->sws_last_cs = cs;
+        p->sws_last_range = range;
     }
 
     size_t need = (size_t)tw * (size_t)th * 4;
@@ -1311,37 +1311,65 @@ static void *present_thread(void *arg) {
                 if (gen == gen0 && !isnan(pts0)) clock0 += 10000;
                 continue;
             }
-            /* Absolute film clock (ffplay-style). Never reseat on mild lateness —
-             * that dumped the queue at CPU speed (accelerated video). */
+            /* Prefer audio as master when AO clock is known (lip-sync vs sink).
+             * Fall back to absolute film clock (ffplay-style) otherwise. */
             if (gen != gen0 || isnan(pts0) || isnan(pts)) {
                 pts0 = isnan(pts) ? 0.0 : pts;
                 clock0 = av_gettime_relative();
                 gen0 = gen;
             } else {
-                double delta = pts - pts0;
-                if (delta < 0.5 * frame_dur) delta = frame_dur;
-                if (delta > 1.0) delta = 1.0; /* seek / discontinuity cap */
-                int64_t target = clock0 + (int64_t)(delta * 1000000.0);
-                int64_t now = av_gettime_relative();
-                int64_t late = now - target;
-                if (late > (int64_t)(frame_dur * 2500000.0)) {
-                    /* >2.5 frames late: drop only when a newer picture is
-                     * already queued (ffplay). When decode is slower than the
-                     * film (CPU 4K), every frame is late — dropping them all
-                     * left the screen black while audio kept playing. */
-                    pthread_mutex_lock(&p->mu);
-                    int newer = p->vq_n > 0;
-                    pthread_mutex_unlock(&p->mu);
-                    if (newer) skip_publish = 1;
-                    pts0 = pts;
-                    clock0 = now;
-                } else if (target > now + 500) {
-                    sleep_until_us(target);
+                double audio_master = NAN;
+                pthread_mutex_lock(&p->mu);
+                if (isfinite(p->audio_clock)) audio_master = p->audio_clock;
+                pthread_mutex_unlock(&p->mu);
+
+                if (isfinite(audio_master) && isfinite(pts)) {
+                    /* Video PTS relative to AO clock — wait/drop to hold A/V. */
+                    double ahead = pts - audio_master;
+                    if (ahead > frame_dur * 0.15) {
+                        int64_t sleep_us = (int64_t)(ahead * 1000000.0);
+                        if (sleep_us > 40000) sleep_us = 40000; /* max 40 ms slice */
+                        if (sleep_us > 500) usleep((useconds_t)sleep_us);
+                    } else if (ahead < -2.5 * frame_dur) {
+                        pthread_mutex_lock(&p->mu);
+                        int newer = p->vq_n > 0;
+                        pthread_mutex_unlock(&p->mu);
+                        if (newer) skip_publish = 1;
+                        pts0 = pts;
+                        clock0 = av_gettime_relative();
+                    }
+                } else {
+                    double delta = pts - pts0;
+                    if (delta < 0.5 * frame_dur) delta = frame_dur;
+                    if (delta > 1.0) delta = 1.0; /* seek / discontinuity cap */
+                    int64_t target = clock0 + (int64_t)(delta * 1000000.0);
+                    int64_t now = av_gettime_relative();
+                    int64_t late = now - target;
+                    if (late > (int64_t)(frame_dur * 2500000.0)) {
+                        /* >2.5 frames late: drop only when a newer picture is
+                         * already queued (ffplay). When decode is slower than the
+                         * film (CPU 4K), every frame is late — dropping them all
+                         * left the screen black while audio kept playing. */
+                        pthread_mutex_lock(&p->mu);
+                        int newer = p->vq_n > 0;
+                        pthread_mutex_unlock(&p->mu);
+                        if (newer) skip_publish = 1;
+                        pts0 = pts;
+                        clock0 = now;
+                    } else if (target > now + 500) {
+                        sleep_until_us(target);
+                    }
                 }
-                /* Cap present rate to content fps even when catching up — otherwise
-                 * a full queue dumps in <10 ms (accelerated video / black flashes). */
+                /* Cap present rate to content fps and soft present_hz (AO-safe ≤60). */
                 if (!skip_publish && last_pub_us > 0) {
-                    int64_t min_gap = (int64_t)(frame_dur * 0.90 * 1000000.0);
+                    int phz = 60;
+                    pthread_mutex_lock(&p->mu);
+                    if (p->present_hz >= 24 && p->present_hz <= 60) phz = p->present_hz;
+                    pthread_mutex_unlock(&p->mu);
+                    double soft_dur = 1.0 / (double)phz;
+                    double gap = frame_dur * 0.90;
+                    if (soft_dur > gap) gap = soft_dur;
+                    int64_t min_gap = (int64_t)(gap * 1000000.0);
                     int64_t earliest = last_pub_us + min_gap;
                     int64_t n2 = av_gettime_relative();
                     if (earliest > n2 + 500) sleep_until_us(earliest);
@@ -1485,28 +1513,43 @@ static int gpu_name_has(const char *hay, const char *needle) {
 }
 
 static int try_init_hw(FluxFfmpegPlayer *p, const AVCodec *codec, AVCodecContext *vctx) {
-    /* One GPU does decode and display. FLUXPLAY_GPU is the user's choice
-     * (or the panel GPU). Do not open CUDA on a machine whose screen is AMD. */
-    const char *gpu = getenv("FLUXPLAY_GPU");
+    /* Decode GPU may differ from iced present (`FLUXPLAY_GPU`). Prefer
+     * FLUXPLAY_DECODE_GPU (W4-08/11 present/decode split); fall back to FLUXPLAY_GPU.
+     * Do not open CUDA when the decode choice is Intel/AMD. */
+    const char *decode = getenv("FLUXPLAY_DECODE_GPU");
+    const char *gpu = (decode && decode[0]) ? decode : getenv("FLUXPLAY_GPU");
     const char *node = getenv("FLUXPLAY_GPU_NODE");
     int want_nvidia = gpu_name_has(gpu, "nvidia") || gpu_name_has(gpu, "geforce");
     int want_amd = gpu_name_has(gpu, "amd") || gpu_name_has(gpu, "radeon")
         || gpu_name_has(gpu, "rembrandt");
-    static const enum AVHWDeviceType kTypes[] = {
+    int want_intel = gpu_name_has(gpu, "intel") || gpu_name_has(gpu, "iris")
+        || gpu_name_has(gpu, "uhd") || gpu_name_has(gpu, "arc")
+        || gpu_name_has(gpu, "xe ");
+    /* CUDA first only when the chosen GPU is NVIDIA. Intel/AMD/unknown prefer
+     * VAAPI/QSV so hybrid laptops do not open discrete CUDA against an iGPU display. */
+    static const enum AVHWDeviceType kTypesNvidia[] = {
+        AV_HWDEVICE_TYPE_CUDA,
+        AV_HWDEVICE_TYPE_VAAPI,
+        AV_HWDEVICE_TYPE_VDPAU,
+        AV_HWDEVICE_TYPE_VULKAN,
+        AV_HWDEVICE_TYPE_NONE,
+    };
+    static const enum AVHWDeviceType kTypesVaapiFirst[] = {
 #if defined(__ANDROID__)
         AV_HWDEVICE_TYPE_MEDIACODEC,
 #endif
-        AV_HWDEVICE_TYPE_CUDA,
         AV_HWDEVICE_TYPE_VAAPI,
+        AV_HWDEVICE_TYPE_QSV,
+        AV_HWDEVICE_TYPE_CUDA,
         AV_HWDEVICE_TYPE_VDPAU,
         AV_HWDEVICE_TYPE_VULKAN,
         AV_HWDEVICE_TYPE_D3D11VA,
         AV_HWDEVICE_TYPE_DXVA2,
         AV_HWDEVICE_TYPE_VIDEOTOOLBOX,
-        AV_HWDEVICE_TYPE_QSV,
         AV_HWDEVICE_TYPE_DRM,
         AV_HWDEVICE_TYPE_NONE,
     };
+    const enum AVHWDeviceType *kTypes = want_nvidia ? kTypesNvidia : kTypesVaapiFirst;
     for (int t = 0; kTypes[t] != AV_HWDEVICE_TYPE_NONE; t++) {
         enum AVHWDeviceType type = kTypes[t];
         enum AVPixelFormat hw_pix = AV_PIX_FMT_NONE;
@@ -1521,6 +1564,9 @@ static int try_init_hw(FluxFfmpegPlayer *p, const AVCodec *codec, AVCodecContext
         if (hw_pix == AV_PIX_FMT_NONE) continue;
         if (want_nvidia && type != AV_HWDEVICE_TYPE_CUDA) continue;
         if (want_amd && type != AV_HWDEVICE_TYPE_VAAPI) continue;
+        if (want_intel && type != AV_HWDEVICE_TYPE_VAAPI && type != AV_HWDEVICE_TYPE_QSV
+            && type != AV_HWDEVICE_TYPE_DRM)
+            continue;
 
         AVBufferRef *dev = NULL;
         AVDictionary *devopts = NULL;
@@ -1546,6 +1592,7 @@ static int try_init_hw(FluxFfmpegPlayer *p, const AVCodec *codec, AVCodecContext
     return 0;
 }
 
+/* 1 s PCM ring (stack-local AudioQueue — do not grow without heap alloc). */
 enum { FLUX_AUDIO_RATE = 48000, FLUX_AUDIO_CH = 2, FLUX_AUDIO_Q_CAP = 48000 * 2 * 2 };
 
 static int audio_sink_write(FILE *sink, const void *buf, size_t bytes);
@@ -1566,9 +1613,30 @@ typedef struct AudioQueue {
 static int audio_q_push(AudioQueue *q, const void *src, size_t n) {
     if (!q || !q->started || !src || n == 0) return 0;
     pthread_mutex_lock(&q->mu);
-    if (q->stop || q->fill + n > FLUX_AUDIO_Q_CAP) {
+    if (q->stop) {
         pthread_mutex_unlock(&q->mu);
         return 0;
+    }
+    if (q->fill + n > FLUX_AUDIO_Q_CAP) {
+        /* Wait up to ~100 ms with refreshed deadlines (vq_push style). A single
+         * 20 ms timedwait then drop still crackled under SoftPump/UI load. */
+        for (int attempt = 0; attempt < 5; attempt++) {
+            struct timespec ts;
+            clock_gettime(CLOCK_REALTIME, &ts);
+            ts.tv_nsec += 20000000L; /* 20 ms */
+            if (ts.tv_nsec >= 1000000000L) {
+                ts.tv_sec += 1;
+                ts.tv_nsec -= 1000000000L;
+            }
+            while (q->fill + n > FLUX_AUDIO_Q_CAP && !q->stop) {
+                if (pthread_cond_timedwait(&q->cv, &q->mu, &ts) != 0) break;
+            }
+            if (q->stop || q->fill + n <= FLUX_AUDIO_Q_CAP) break;
+        }
+        if (q->stop || q->fill + n > FLUX_AUDIO_Q_CAP) {
+            pthread_mutex_unlock(&q->mu);
+            return 0;
+        }
     }
     size_t w = (q->r + q->fill) % FLUX_AUDIO_Q_CAP;
     size_t first = FLUX_AUDIO_Q_CAP - w;
@@ -1598,6 +1666,7 @@ static void *audio_q_thread(void *arg) {
         if (n > first) memcpy(tmp + first, q->data, n - first);
         q->r = (q->r + n) % FLUX_AUDIO_Q_CAP;
         q->fill -= n;
+        pthread_cond_signal(&q->cv); /* wake audio_q_push waiters */
         FILE *sink = q->sink;
         pthread_mutex_unlock(&q->mu);
         if (!sink) break;
@@ -1661,10 +1730,9 @@ static void audio_q_stop(AudioQueue *q) {
 }
 
 
-/** Blocking PCM write — the sink drain rate (sound card clock) IS the master
- * throttle for the whole decode loop: without it, demux/decoding of VOD runs
- * at full CPU speed, audio_clock races ahead, video frames get skip_store'd
- * (frozen/black stage) and excess PCM is dropped (fast-forward sounding audio).
+/** Non-blocking PCM write into the AO pipe (O_NONBLOCK). EAGAIN requeues in
+ * audio_q_thread; successful drain paces audible output. Video is paced by
+ * present_thread against audio_clock (or film fallback), not by this write.
  * EINTR-safe; partial writes resume. */
 static int audio_sink_write(FILE *sink, const void *buf, size_t bytes) {
     int fd = fileno(sink);
@@ -1849,16 +1917,26 @@ static void play_audio_frame(FluxFfmpegPlayer *p, AVCodecContext *actx, SwrConte
         int16_t *pcm = (int16_t *)out_planes[0];
         apply_volume_s16(pcm, converted * FLUX_AUDIO_CH, volume);
         size_t bytes = (size_t)converted * (size_t)FLUX_AUDIO_CH * sizeof(int16_t);
+        /* Only advance master clock after a successful enqueue — advancing on
+         * drop made video chase PTS ahead of audible PCM (lip-sync/crackle).
+         * ffplay -sync audio: audclk = PTS − (ring fill + est pipe latency).
+         * Present falls back to film clock when audio_clock is non-finite. */
         if (audio_q_push(aq, pcm, bytes)) {
-            /* ok */
-        }
-        /* Advance the master clock even when the PCM ring is full — otherwise
-         * video waits forever on a stale aclock and the picture freezes. */
-        if (ast && frame->best_effort_timestamp != AV_NOPTS_VALUE) {
-            double apts = frame->best_effort_timestamp * av_q2d(ast->time_base);
-            pthread_mutex_lock(&p->mu);
-            p->audio_clock = apts;
-            pthread_mutex_unlock(&p->mu);
+            if (ast && frame->best_effort_timestamp != AV_NOPTS_VALUE) {
+                double apts = frame->best_effort_timestamp * av_q2d(ast->time_base);
+                double bps = (double)(FLUX_AUDIO_RATE * FLUX_AUDIO_CH * (int)sizeof(int16_t));
+                double ahead_s = 0.0;
+                pthread_mutex_lock(&aq->mu);
+                /* fill includes this chunk; audible ≈ apts − prior_fill/bps − pipe. */
+                if (aq->fill > bytes)
+                    ahead_s = (double)(aq->fill - bytes) / bps;
+                pthread_mutex_unlock(&aq->mu);
+                /* ~25 ms pw-play/pacat write-buffer estimate. */
+                const double pipe_lat = 0.025;
+                pthread_mutex_lock(&p->mu);
+                p->audio_clock = apts - ahead_s - pipe_lat;
+                pthread_mutex_unlock(&p->mu);
+            }
         }
     }
     av_freep(&out_planes[0]);
@@ -1979,7 +2057,7 @@ static void emit_video_frame(FluxFfmpegPlayer *p, AVStream *st, AVFrame *frame, 
             const char *name = av_get_pix_fmt_name(use->format);
             if (ok && name && strncmp(name, "yuvj", 4) == 0) pic.full_range = 0;
         } else {
-            ok = store_frame(&p->sws, use, want_w, want_h, &buf, &cap, &pic.w, &pic.h);
+            ok = store_frame(p, use, want_w, want_h, &buf, &cap, &pic.w, &pic.h);
             pic.pitch = pic.w * 4;
             pic.format = FLUX_FMT_RGBA;
             pic.sar_num = pic.sar_den = 1; /* letterboxed with the SAR already */
@@ -2223,14 +2301,12 @@ static void *decode_thread(void *arg) {
 
     fprintf(stderr, "flux_ffmpeg: decode loop start\n");
 
-    int64_t clock0 = av_gettime_relative();
-    double pts0 = NAN;
+    /* Film pacing lives in present_thread (audio_clock / film clock) — no locals here. */
     int pause_flushed = 0;
     int send_err_logged = 0;
     int xfer_err_logged = 0;
     int frames_out = 0;
     int frames_since_flush = 0;
-    int skipped_run = 0;
     int cur_serial = 0;
     double rebuffer_goal = 0.0;
     int64_t last_rebuffer_us = 0;
@@ -2260,18 +2336,8 @@ static void *decode_thread(void *arg) {
                 p->frame_ready = 0;
                 p->play_gen++;
                 p->vq_n = 0;
-                while (p->job_n > 0) {
-                    AVFrame *f = p->jobs[p->job_r].frame;
-                    p->jobs[p->job_r].frame = NULL;
-                    p->job_r = (p->job_r + 1) % 8;
-                    p->job_n--;
-                    if (f) av_frame_free(&f);
-                }
                 pthread_cond_broadcast(&p->vq_cv);
-                pthread_cond_broadcast(&p->job_cv);
                 pthread_mutex_unlock(&p->mu);
-                pts0 = NAN;
-                clock0 = av_gettime_relative();
                 if (audio_q.started) {
                     int16_t z[FLUX_AUDIO_RATE / 10 * FLUX_AUDIO_CH];
                     memset(z, 0, sizeof(z));
@@ -2289,11 +2355,24 @@ static void *decode_thread(void *arg) {
                 pause_flushed = 1;
             }
             usleep(20000);
-            clock0 = av_gettime_relative();
-            pts0 = NAN;
             continue;
         }
         pause_flushed = 0;
+
+        /* AO back-pressure: ring >75% full → yield so sink drains instead of
+         * dropping PCM chunks (pairs with audio_q_push ~100 ms wait). */
+        if (audio_q.started) {
+            size_t fill;
+            int aq_stop;
+            pthread_mutex_lock(&audio_q.mu);
+            fill = audio_q.fill;
+            aq_stop = audio_q.stop;
+            pthread_mutex_unlock(&audio_q.mu);
+            if (!aq_stop && fill > (FLUX_AUDIO_Q_CAP * 3) / 4) {
+                usleep(5000);
+                continue;
+            }
+        }
 
         {
             PktNode *n = NULL;

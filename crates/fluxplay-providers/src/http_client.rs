@@ -20,7 +20,8 @@ use crate::{ProviderError, Result};
 
 static NET: OnceLock<Mutex<NetworkSettings>> = OnceLock::new();
 static PORTAL: OnceLock<Mutex<Option<reqwest::Client>>> = OnceLock::new();
-static GENERIC: OnceLock<Mutex<Option<reqwest::Client>>> = OnceLock::new();
+/// Cached generic client keyed by `user_agent|timeout_secs`.
+static GENERIC: OnceLock<Mutex<Option<(String, reqwest::Client)>>> = OnceLock::new();
 static SOCKS: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 
 fn net_lock() -> &'static Mutex<NetworkSettings> {
@@ -31,7 +32,7 @@ fn portal_lock() -> &'static Mutex<Option<reqwest::Client>> {
     PORTAL.get_or_init(|| Mutex::new(None))
 }
 
-fn generic_lock() -> &'static Mutex<Option<reqwest::Client>> {
+fn generic_lock() -> &'static Mutex<Option<(String, reqwest::Client)>> {
     GENERIC.get_or_init(|| Mutex::new(None))
 }
 
@@ -118,24 +119,77 @@ pub fn shared_http() -> Result<reqwest::Client> {
 }
 
 /// Generic app HTTP (images / metadata) — same DNS prefs, shorter timeouts.
-pub fn app_http(_user_agent: &str, timeout_secs: u64) -> Result<reqwest::Client> {
+///
+/// `user_agent` is honored (IPTV logo CDNs often require a Smarters-like UA).
+/// Clients are cached per `(user_agent, timeout_secs)` and reset on network/SOCKS changes.
+pub fn app_http(user_agent: &str, timeout_secs: u64) -> Result<reqwest::Client> {
+    let timeout_secs = timeout_secs.max(8);
+    let cache_key = format!("{user_agent}|{timeout_secs}");
     let mut slot = generic_lock()
         .lock()
         .map_err(|_| ProviderError::Message("http client lock poisoned".into()))?;
-    if let Some(c) = slot.as_ref() {
-        return Ok(c.clone());
+    if let Some((key, c)) = slot.as_ref() {
+        if key == &cache_key {
+            return Ok(c.clone());
+        }
     }
     let net = current_network_settings();
     let client = build_client(
-        "FluxPlay/0.2 (+catalog; images; metadata)",
-        Duration::from_secs(timeout_secs.max(14)),
+        user_agent,
+        Duration::from_secs(timeout_secs),
         Duration::from_secs(8),
         true,
         &net,
     )?;
-    debug!("shared app HTTP client initialized");
-    *slot = Some(client.clone());
+    debug!(ua = user_agent, timeout_secs, "shared app HTTP client initialized");
+    *slot = Some((cache_key, client.clone()));
     Ok(client)
+}
+
+/// Last-resort HTTP client that still respects WireGuard fail-closed.
+///
+/// Prefer [`app_http`] / [`shared_http`]. This path exists so `unwrap_or_else`
+/// callers never fall through to a clearnet builder while the tunnel is required.
+pub fn emergency_http(user_agent: &str, timeout_secs: u64) -> reqwest::Client {
+    match app_http(user_agent, timeout_secs) {
+        Ok(c) => c,
+        Err(e) => {
+            warn!(error = %e, "app_http failed — building fail-closed emergency client");
+            let net = current_network_settings();
+            match build_client(
+                user_agent,
+                Duration::from_secs(timeout_secs.max(8)),
+                Duration::from_secs(6),
+                true,
+                &net,
+            ) {
+                Ok(c) => c,
+                Err(_) => {
+                    // Absolute last resort: still never clearnet when WG is on.
+                    let mut b = reqwest::Client::builder()
+                        .user_agent(user_agent)
+                        .timeout(Duration::from_secs(timeout_secs.max(8)))
+                        .connect_timeout(Duration::from_secs(6))
+                        .redirect(reqwest::redirect::Policy::limited(8))
+                        .referer(false);
+                    if let Some(px) = required_proxy() {
+                        match reqwest::Proxy::all(&px) {
+                            Ok(proxy) => b = b.proxy(proxy),
+                            Err(_) => {
+                                b = b.proxy(
+                                    reqwest::Proxy::all(DEAD_PROXY)
+                                        .expect("DEAD_PROXY is a valid socks URL"),
+                                );
+                            }
+                        }
+                    } else {
+                        b = b.no_proxy();
+                    }
+                    b.build().expect("emergency http client")
+                }
+            }
+        }
+    }
 }
 
 fn build_client(
@@ -159,8 +213,12 @@ fn build_client(
 
     // App-scoped WireGuard proxy takes priority over "no env proxy".
     if let Some(ref socks) = socks {
-        let proxy = reqwest::Proxy::all(socks)
-            .map_err(|e| ProviderError::Message(format!("tunnel proxy URL: {e}")))?;
+        let proxy = reqwest::Proxy::all(socks).map_err(|e| {
+            ProviderError::Message(
+                fluxplay_core::FpCode::NetProxyRefuse
+                    .ensure_coded(format!("tunnel proxy URL: {e}")),
+            )
+        })?;
         b = b.proxy(proxy);
         debug!("HTTP client routed via WireGuard proxy (tunnel DNS)");
     } else {
@@ -174,8 +232,47 @@ fn build_client(
         }
     }
 
-    b.build()
-        .map_err(|e| ProviderError::Message(format!("http client build failed: {e}")))
+    b.build().map_err(|e| {
+        ProviderError::Message(
+            fluxplay_core::FpCode::NetTcpConnect
+                .ensure_coded(format!("http client build failed: {e}")),
+        )
+    })
+}
+
+/// Read a response body with a hard byte budget (CWE-400).
+/// Rejects oversized `Content-Length` before buffering; streams otherwise.
+pub async fn read_body_capped(
+    mut resp: reqwest::Response,
+    max_bytes: usize,
+) -> Result<Vec<u8>> {
+    if let Some(len) = resp.content_length() {
+        if len as usize > max_bytes {
+            return Err(ProviderError::Message(
+                fluxplay_core::FpCode::NetHttpBody.ensure_coded(format!(
+                    "réponse trop volumineuse ({len} o, max {max_bytes})"
+                )),
+            ));
+        }
+    }
+    let mut out = Vec::with_capacity(max_bytes.min(64 * 1024));
+    loop {
+        match resp.chunk().await {
+            Ok(Some(chunk)) => {
+                if out.len().saturating_add(chunk.len()) > max_bytes {
+                    return Err(ProviderError::Message(
+                        fluxplay_core::FpCode::NetHttpBody.ensure_coded(format!(
+                            "réponse trop volumineuse (max {max_bytes} o)"
+                        )),
+                    ));
+                }
+                out.extend_from_slice(&chunk);
+            }
+            Ok(None) => break,
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(out)
 }
 
 struct HickoryResolve {
@@ -200,14 +297,21 @@ fn build_dns_resolver(net: &NetworkSettings) -> Option<Arc<HickoryResolve>> {
     if matches!(net.dns_mode, DnsMode::System) {
         return None;
     }
+    // Non-System modes must never silently fall back to OS DNS (UI would lie).
+    // Incomplete Custom/DoH/DoT → Cloudflare preset matching the selected mode.
     let config = match resolver_config(net) {
         Some(c) => c,
         None => {
+            let fallback = match net.dns_mode {
+                DnsMode::Dot => ResolverConfig::cloudflare_tls(),
+                DnsMode::Custom => ResolverConfig::cloudflare(),
+                DnsMode::Doh | DnsMode::System => ResolverConfig::cloudflare_https(),
+            };
             warn!(
                 mode = net.dns_mode.label(),
-                "DNS config incomplete — falling back to system"
+                "DNS config incomplete — using Cloudflare preset (not system DNS)"
             );
-            return None;
+            fallback
         }
     };
     let mut opts = ResolverOpts::default();
@@ -337,6 +441,125 @@ pub async fn bootstrap_lookup_ip(bootstrap_dns: &str, host: &str) -> std::io::Re
         .await
         .map_err(|e| std::io::Error::other(e.to_string()))?;
     Ok(lookup.iter().collect())
+}
+
+/// Outcome of a cheap `/` vs deep-path probe (WAF / sortie filtrée).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HttpPathPolicy {
+    /// Both root and a deep path answered (or deep path gave HTTP, not RST).
+    Open,
+    /// TCP works for `/` but any deeper path is reset — WAF on filtered egress
+    /// (home Wi‑Fi, phone hotspot, phone/system VPN exit, ISP DPI).
+    RootOnly,
+    /// Host unreachable / root also fails.
+    Unreachable,
+}
+
+/// Detect “landing page OK, every IPTV path RST” (origine.one / drm-cloud class).
+///
+/// Used after a `connection reset` on `player_api` / media so the UI can say
+/// path policy instead of a vague TCP error — DNSCrypt/`127.0.0.1` is fine.
+pub async fn probe_http_path_policy(origin: &str) -> HttpPathPolicy {
+    let origin = origin.trim_end_matches('/');
+    if origin.is_empty() {
+        return HttpPathPolicy::Unreachable;
+    }
+    let client = match shared_http() {
+        Ok(c) => c,
+        Err(_) => return HttpPathPolicy::Unreachable,
+    };
+    let root = format!("{origin}/");
+    let deep = format!("{origin}/player_api.php");
+    let root_ok = match client
+        .get(&root)
+        .timeout(Duration::from_secs(4))
+        .send()
+        .await
+    {
+        Ok(r) => r.status().as_u16() < 500,
+        Err(_) => false,
+    };
+    if !root_ok {
+        return HttpPathPolicy::Unreachable;
+    }
+    match client
+        .get(&deep)
+        .timeout(Duration::from_secs(4))
+        .send()
+        .await
+    {
+        Ok(_) => HttpPathPolicy::Open,
+        Err(e) => {
+            let blob = e.to_string().to_ascii_lowercase();
+            if blob.contains("reset") || blob.contains("broken pipe") {
+                warn!(
+                    origin = %origin,
+                    "HTTP path policy: root OK, deep path RST (filtered egress/WAF)"
+                );
+                HttpPathPolicy::RootOnly
+            } else {
+                // Timeout/refused on deep while root works — still treat as path policy.
+                HttpPathPolicy::RootOnly
+            }
+        }
+    }
+}
+
+/// Human + coded error when [`HttpPathPolicy::RootOnly`] is confirmed.
+pub fn path_policy_blocked_msg(origin: &str) -> String {
+    fluxplay_core::FpCode::NetClearnetBlocked.ensure_coded(format!(
+        "Réseau filtré: {origin} répond sur `/` mais RST sur player_api/live/movie — hotspot téléphone, VPN téléphone/système (pas FluxPlay) ou FAI ; DNSCrypt OK. Autre réseau, coupe le VPN du téléphone, ou tunnel FluxPlay"
+    ))
+}
+
+/// Best-effort public egress IP (via app HTTP client / SOCKS when tunnel is up).
+pub async fn probe_egress_ip() -> Option<String> {
+    let client = shared_http().ok()?;
+    // Plain HTTP avoids TLS traps on locked-down nets; body is a single IPv4/IPv6.
+    let resp = client
+        .get("http://api.ipify.org/")
+        .timeout(Duration::from_secs(4))
+        .send()
+        .await
+        .ok()?;
+    let body = resp.text().await.ok()?;
+    let ip = body.trim();
+    if ip.is_empty() || ip.len() > 64 || ip.contains(char::is_whitespace) {
+        return None;
+    }
+    Some(ip.to_string())
+}
+
+/// Egress IP + optional portal `/` vs deep-path (no DNS line — caller prepends).
+pub async fn probe_egress_and_path(portal_origin: Option<&str>) -> String {
+    let mut parts = Vec::with_capacity(2);
+    match probe_egress_ip().await {
+        Some(ip) => parts.push(format!(
+            "sortie {ip} (si ≠ IP mobile/FAI attendue → VPN téléphone/système probable)"
+        )),
+        None => parts.push("sortie publique: indisponible".into()),
+    }
+    if let Some(origin) = portal_origin.map(str::trim).filter(|s| !s.is_empty()) {
+        let origin = origin.trim_end_matches('/');
+        let path = match probe_http_path_policy(origin).await {
+            HttpPathPolicy::Open => format!("{origin} chemins IPTV OK"),
+            HttpPathPolicy::RootOnly => {
+                format!("{origin} `/` OK mais chemins IPTV RST (réseau/VPN filtré)")
+            }
+            HttpPathPolicy::Unreachable => format!("{origin} injoignable"),
+        };
+        parts.push(path);
+    }
+    parts.join(" · ")
+}
+
+/// Settings “Tester DNS”: resolver + egress IP + optional portal `/` vs deep-path.
+pub async fn probe_network_diag(dns_host: &str, portal_origin: Option<&str>) -> String {
+    format!(
+        "{} · {}",
+        probe_dns(dns_host).await,
+        probe_egress_and_path(portal_origin).await
+    )
 }
 
 /// Quick connectivity probe for settings UI (does not throw).

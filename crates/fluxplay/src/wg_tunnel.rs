@@ -64,6 +64,13 @@ pub async fn probe_dns(host: &str) -> String {
     }
 }
 
+/// Settings probe: DNS (+ tunnel if up) + public egress + portal path policy.
+pub async fn probe_network_diag(host: &str, portal_origin: Option<String>) -> String {
+    let dns = probe_dns(host).await;
+    let rest = fluxplay_providers::probe_egress_and_path(portal_origin.as_deref()).await;
+    format!("{dns} · {rest}")
+}
+
 /// Rewrite `Endpoint = hostname:port` → IP using bootstrap DNS (profile `DNS=`).
 async fn prepare_conf_with_bootstrap(conf: &str, bootstrap_dns: &str) -> Result<String, String> {
     let mut out = String::with_capacity(conf.len() + 32);
@@ -100,18 +107,26 @@ async fn prepare_conf_with_bootstrap(conf: &str, bootstrap_dns: &str) -> Result<
         let ips = if bootstrap_dns.trim().is_empty() {
             tokio::net::lookup_host((host.as_str(), port))
                 .await
-                .map_err(|e| format!("bootstrap Endpoint (DNS système) {host}: {e}"))?
+                .map_err(|e| {
+                    fluxplay_core::FpCode::NetDnsServfail.ensure_coded(format!(
+                        "bootstrap Endpoint (DNS système) {host}: {e}"
+                    ))
+                })?
                 .map(|sa| sa.ip())
                 .collect::<Vec<_>>()
         } else {
             fluxplay_providers::bootstrap_lookup_ip(bootstrap_dns, &host)
                 .await
-                .map_err(|e| format!("bootstrap Endpoint ({bootstrap_dns}) {host}: {e}"))?
+                .map_err(|e| {
+                    fluxplay_core::FpCode::NetDnsServfail.ensure_coded(format!(
+                        "bootstrap Endpoint ({bootstrap_dns}) {host}: {e}"
+                    ))
+                })?
         };
-        let ip = ips
-            .into_iter()
-            .next()
-            .ok_or_else(|| format!("bootstrap Endpoint: aucune IP pour {host}"))?;
+        let ip = ips.into_iter().next().ok_or_else(|| {
+            fluxplay_core::FpCode::NetDnsNxdomain
+                .ensure_coded(format!("bootstrap Endpoint: aucune IP pour {host}"))
+        })?;
         let rewritten = format!("{ip}:{port}");
         info!(%host, %rewritten, bootstrap = %bootstrap_dns, "WG Endpoint rewritten via bootstrap DNS");
         out.push_str("Endpoint = ");
@@ -145,7 +160,10 @@ pub async fn start_tunnel_from_file(path: &Path, bootstrap_dns: &str) -> Result<
     START_IN_FLIGHT.store(true, std::sync::atomic::Ordering::SeqCst);
     let result = async {
         stop_tunnel();
-        let raw = std::fs::read_to_string(path).map_err(|e| format!("lecture profil: {e}"))?;
+        let raw = std::fs::read_to_string(path).map_err(|e| {
+            fluxplay_core::FpCode::NetTunnelDown
+                .ensure_coded(format!("lecture profil WireGuard: {e}"))
+        })?;
         let bootstrap = bootstrap_from_conf_or_settings(&raw, bootstrap_dns);
         let conf = prepare_conf_with_bootstrap(&raw, &bootstrap).await?;
         start_tunnel_from_prepared(&conf).await
@@ -164,10 +182,13 @@ pub async fn start_tunnel_from_str(conf: &str, bootstrap_dns: &str) -> Result<St
 }
 
 async fn start_tunnel_from_prepared(conf: &str) -> Result<String, String> {
-    let profile = parse_profile(conf).map_err(|e| format!("profil WireGuard : {e}"))?;
-    let proxy = WgProxy::start(&profile)
-        .await
-        .map_err(|e| format!("démarrage tunnel WireGuard : {e}"))?;
+    let profile = parse_profile(conf).map_err(|e| {
+        fluxplay_core::FpCode::NetTunnelDown.ensure_coded(format!("profil WireGuard : {e}"))
+    })?;
+    let proxy = WgProxy::start(&profile).await.map_err(|e| {
+        fluxplay_core::FpCode::NetTunnelDown
+            .ensure_coded(format!("démarrage tunnel WireGuard : {e}"))
+    })?;
     let local_addr = proxy.addr().to_string();
     let socks = proxy.socks_url();
     if let Ok(mut g) = proxy_lock().lock() {

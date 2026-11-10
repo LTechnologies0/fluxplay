@@ -32,7 +32,7 @@ pub const DEFAULT_ENV_FILTER: &str = concat!(
 );
 
 /// Full diagnostic filter: every FluxPlay crate + major deps (deps capped to avoid naga flood).
-/// Used when `RUST_LOG` is unset and `FLUXPLAY_QUIET` is not set.
+/// Used when `RUST_LOG` is unset and `FLUXPLAY_FULL_LOGS=1`.
 pub const FULL_ENV_FILTER: &str = concat!(
     "fluxplay=debug,",
     "fluxplay_core=debug,",
@@ -66,12 +66,17 @@ pub const FULL_ENV_FILTER: &str = concat!(
     "profiler=trace"
 );
 
-/// True unless `FLUXPLAY_QUIET=1` — enables FULL_ENV_FILTER + native verbose seeding.
+/// Opt-in full diagnostics (`FLUXPLAY_FULL_LOGS=1`): FULL_ENV_FILTER + native verbose
+/// seeding. Off by default — debug/trace logging and per-frame profiling cost CPU and RAM.
+/// `FLUXPLAY_QUIET=1` always wins.
 pub fn full_logs_enabled() -> bool {
-    !matches!(
-        std::env::var("FLUXPLAY_QUIET").ok().as_deref(),
-        Some("1") | Some("true") | Some("yes") | Some("on")
-    )
+    let truthy = |k: &str| {
+        matches!(
+            std::env::var(k).ok().as_deref(),
+            Some("1") | Some("true") | Some("yes") | Some("on")
+        )
+    };
+    truthy("FLUXPLAY_FULL_LOGS") && !truthy("FLUXPLAY_QUIET")
 }
 
 /// Emit a **profiler** line (TRACE on target `profiler`).
