@@ -316,7 +316,7 @@ impl FpCode {
             NetProxyDead => "Proxy: tunnel mort (fail-closed)",
             NetProxyRefuse => "Proxy: connexion refusée",
             NetTunnelDown => "Tunnel WG/SOCKS inactif",
-            NetClearnetBlocked => "Clearnet bloqué (politique réseau)",
+            NetClearnetBlocked => "Réseau: chemins IPTV coupés (Wi‑Fi/FAI/WAF)",
 
             CatM3uEmpty => "M3U: liste vide",
             CatM3uParse => "M3U: parse échoué",
@@ -691,6 +691,19 @@ pub fn classify_message(msg: &str) -> FpCode {
     }
     // Transport before catalog: reqwest "error sending request for url (…player_api…)"
     // must not become FP-CAT-XTREAM-API just because the path contains player_api.
+    // RST on IPTV paths (player_api/live/movie) = Wi‑Fi/FAI/WAF, not a random TCP blip.
+    if (has("connection reset") || has("broken pipe") || (has("reset") && has("error sending")))
+        && (has("player_api")
+            || has("/movie/")
+            || has("/live/")
+            || has("/series/")
+            || has("get.php")
+            || has("xtream")
+            || has("chemins iptv")
+            || has("coupe player_api"))
+    {
+        return FpCode::NetClearnetBlocked;
+    }
     if has("error sending request")
         || has("connection reset")
         || has("connection refused")
@@ -807,7 +820,23 @@ pub fn classify_message(msg: &str) -> FpCode {
         return FpCode::NetHttpsTls;
     }
     if has("clearnet")
+        || has("path policy")
+        || has("chemins iptv")
+        || has("coupe player_api")
+        || has("root only")
+        || (has("wifi") && (has("fai") || has("waf") || has("rst")))
         || (has("leak") && (has("tunnel") || has("proxy") || has("http-proxy") || has("clearnet")))
+    {
+        return FpCode::NetClearnetBlocked;
+    }
+    // RST on Xtream/media paths is almost always DPI/WAF, not a random TCP blip.
+    if has("reset")
+        && (has("player_api")
+            || has("/movie/")
+            || has("/live/")
+            || has("/series/")
+            || has("xtream")
+            || has("get.php"))
     {
         return FpCode::NetClearnetBlocked;
     }
@@ -992,6 +1021,10 @@ mod tests {
         assert_eq!(
             classify_message("Connection reset by peer"),
             FpCode::NetTcpReset
+        );
+        assert_eq!(
+            classify_message("error sending request for url (http://x/player_api.php): connection reset"),
+            FpCode::NetClearnetBlocked
         );
         assert_eq!(
             classify_message("Stalker handshake: no token"),

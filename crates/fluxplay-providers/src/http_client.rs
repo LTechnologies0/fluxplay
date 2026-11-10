@@ -443,6 +443,74 @@ pub async fn bootstrap_lookup_ip(bootstrap_dns: &str, host: &str) -> std::io::Re
     Ok(lookup.iter().collect())
 }
 
+/// Outcome of a cheap `/` vs deep-path probe (Wi‑Fi/FAI WAF class).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HttpPathPolicy {
+    /// Both root and a deep path answered (or deep path gave HTTP, not RST).
+    Open,
+    /// TCP works for `/` but any deeper path is reset — classic DPI/WAF on clearnet Wi‑Fi.
+    RootOnly,
+    /// Host unreachable / root also fails.
+    Unreachable,
+}
+
+/// Detect “landing page OK, every IPTV path RST” (origine.one / drm-cloud class).
+///
+/// Used after a `connection reset` on `player_api` / media so the UI can say
+/// clearnet/Wi‑Fi policy instead of a vague TCP error — DNSCrypt/`127.0.0.1` is fine.
+pub async fn probe_http_path_policy(origin: &str) -> HttpPathPolicy {
+    let origin = origin.trim_end_matches('/');
+    if origin.is_empty() {
+        return HttpPathPolicy::Unreachable;
+    }
+    let client = match shared_http() {
+        Ok(c) => c,
+        Err(_) => return HttpPathPolicy::Unreachable,
+    };
+    let root = format!("{origin}/");
+    let deep = format!("{origin}/player_api.php");
+    let root_ok = match client
+        .get(&root)
+        .timeout(Duration::from_secs(4))
+        .send()
+        .await
+    {
+        Ok(r) => r.status().as_u16() < 500,
+        Err(_) => false,
+    };
+    if !root_ok {
+        return HttpPathPolicy::Unreachable;
+    }
+    match client
+        .get(&deep)
+        .timeout(Duration::from_secs(4))
+        .send()
+        .await
+    {
+        Ok(_) => HttpPathPolicy::Open,
+        Err(e) => {
+            let blob = e.to_string().to_ascii_lowercase();
+            if blob.contains("reset") || blob.contains("broken pipe") {
+                warn!(
+                    origin = %origin,
+                    "HTTP path policy: root OK, deep path RST (Wi‑Fi/FAI/WAF)"
+                );
+                HttpPathPolicy::RootOnly
+            } else {
+                // Timeout/refused on deep while root works — still treat as path policy.
+                HttpPathPolicy::RootOnly
+            }
+        }
+    }
+}
+
+/// Human + coded error when [`HttpPathPolicy::RootOnly`] is confirmed.
+pub fn path_policy_blocked_msg(origin: &str) -> String {
+    fluxplay_core::FpCode::NetClearnetBlocked.ensure_coded(format!(
+        "Wi‑Fi/FAI: {origin} répond sur `/` mais coupe player_api/live/movie (RST) — changez de réseau ou activez un tunnel"
+    ))
+}
+
 /// Quick connectivity probe for settings UI (does not throw).
 pub async fn probe_dns(hostname: &str) -> String {
     let net = current_network_settings();

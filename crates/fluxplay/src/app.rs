@@ -4453,9 +4453,14 @@ impl FluxPlay {
                         }
                         #[cfg(not(target_os = "android"))]
                         {
-                            self.status = ensure_status(format!(
-                                "{e} — essayez Externe ou installez mpv"
-                            ));
+                            let msg = e.to_string();
+                            self.status = ensure_status(if msg.contains("CLEARNET-BLOCKED")
+                                || msg.contains("chemins IPTV")
+                            {
+                                msg
+                            } else {
+                                format!("{msg} — essayez Externe ou installez mpv")
+                            });
                             self.persist();
                             return take_queue_task(
                                 vec![epg_task, art_task, self.open_or_focus_player()],
@@ -7238,7 +7243,7 @@ impl FluxPlay {
                 };
                 self.status = if err > 0 && ok == 0 {
                     ensure_status(format!(
-                        "Sync live impossible ({err} échec) — conservation du catalogue SQLite…"
+                        "Sync live impossible ({err} échec) — catalogue SQLite conservé (souvent Wi‑Fi/FAI qui coupe player_api)"
                     ))
                 } else {
                     format!(
@@ -7286,6 +7291,7 @@ impl FluxPlay {
                         } else {
                             format!("Échec chargement: {e}")
                         });
+                        // Keep browsing the on-disk catalog even when ingest failed.
                     }
                 }
             }
@@ -11622,6 +11628,46 @@ impl FluxPlay {
 
     /// Open `ch` on the fastest server of its profile; when that server
     /// refuses, the next one (profiles with mirrors only).
+    /// Rewrite RST/open failures into an honest Wi‑Fi/FAI path-block message when
+    /// the error chain looks like TCP reset on an IPTV media path.
+    fn explain_playback_net_error(
+        err: fluxplay_player::PlayerError,
+        stream_url: &str,
+    ) -> fluxplay_player::PlayerError {
+        let s = err.to_string();
+        let low = s.to_ascii_lowercase();
+        let iptv_path = stream_url.contains("/movie/")
+            || stream_url.contains("/live/")
+            || stream_url.contains("/series/")
+            || stream_url.contains("player_api")
+            || stream_url.contains("get.php");
+        let reset = low.contains("reset")
+            || low.contains("broken pipe")
+            || low.contains("tcp-reset")
+            || low.contains("connection refused")
+            || s.contains("FP-NET-TCP-RESET");
+        if iptv_path && reset {
+            let host = url::Url::parse(stream_url)
+                .ok()
+                .and_then(|u| {
+                    let h = u.host_str()?.to_string();
+                    let mut o = format!("{}://{h}", u.scheme());
+                    if let Some(p) = u.port() {
+                        o.push(':');
+                        o.push_str(&p.to_string());
+                    }
+                    Some(o)
+                })
+                .unwrap_or_else(|| "portail".into());
+            return fluxplay_player::PlayerError::Message(
+                fluxplay_core::FpCode::NetClearnetBlocked.ensure_coded(format!(
+                    "Wi‑Fi/FAI: {host} coupe les chemins IPTV (RST) — la page `/` peut encore répondre ; changez de réseau ou activez un tunnel"
+                )),
+            );
+        }
+        err
+    }
+
     fn open_with_failover(&mut self, mut ch: Channel) -> fluxplay_player::Result<()> {
         // Soft ≤60 + panel Hz for native VO before libmpv options are locked in.
         self.sync_player_hz();
@@ -11673,7 +11719,10 @@ impl FluxPlay {
                 }
             }
         }
-        Err(last.unwrap_or_else(|| fluxplay_player::PlayerError::Message("URL vide".into())))
+        Err(Self::explain_playback_net_error(
+            last.unwrap_or_else(|| fluxplay_player::PlayerError::Message("URL vide".into())),
+            &ch.stream_url,
+        ))
     }
 
     /// Enabled profiles speaking the Xtream API (category ids are per panel, so a

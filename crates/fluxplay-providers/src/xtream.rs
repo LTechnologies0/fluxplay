@@ -219,7 +219,8 @@ impl XtreamClient {
                 .get(url.clone())
                 .header(reqwest::header::USER_AGENT, SMARTERS_UA)
                 .send()
-                .await?;
+                .await
+                .map_err(|e| ProviderError::Http(e))?;
             let status = resp.status();
             let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
             tracing::info!(
@@ -317,13 +318,39 @@ impl XtreamClient {
                         warn!(%action_label, attempt, "portal 429, series info will retry after quiet");
                         continue;
                     }
-                    return Err(e);
+                    return Err(self.remap_path_policy_err(e).await);
                 }
             }
         }
         Err(ProviderError::Message(
             "HTTP 429 Too Many Requests — ralentissez / cache".into(),
         ))
+    }
+
+    /// After TCP RST on player_api, distinguish dead host vs Wi‑Fi/FAI path block.
+    async fn remap_path_policy_err(&self, e: ProviderError) -> ProviderError {
+        let s = e.to_string().to_ascii_lowercase();
+        let looks_rst = s.contains("reset")
+            || s.contains("broken pipe")
+            || s.contains("tcp-reset")
+            || s.contains("os { code: 104");
+        if !looks_rst {
+            return e;
+        }
+        let origin = {
+            let mut o = format!("{}://{}", self.portal.scheme(), self.portal.host_str().unwrap_or(""));
+            if let Some(p) = self.portal.port() {
+                o.push(':');
+                o.push_str(&p.to_string());
+            }
+            o
+        };
+        match crate::http_client::probe_http_path_policy(&origin).await {
+            crate::http_client::HttpPathPolicy::RootOnly => {
+                ProviderError::Message(crate::http_client::path_policy_blocked_msg(&origin))
+            }
+            _ => e,
+        }
     }
 
     /// Auth once so `stream_base` / `prefer_m3u8` match the panel CDN (needed for series/VOD URLs).
@@ -342,13 +369,20 @@ impl XtreamClient {
     /// Applies `server_info`; returns `user_info.max_connections` when known.
     pub async fn probe_auth(&mut self, timeout: std::time::Duration) -> Result<Option<u32>> {
         let client = crate::api_cache::shared_http()?;
-        let resp = client
+        let resp = match client
             .get(self.api_url(None)?)
             .header(reqwest::header::USER_AGENT, SMARTERS_UA)
             .timeout(timeout)
             .send()
             .await
-            .map_err(|e| ProviderError::Message(crate::redact_error(&e)))?;
+        {
+            Ok(r) => r,
+            Err(e) => {
+                return Err(self
+                    .remap_path_policy_err(ProviderError::Message(crate::redact_error(&e)))
+                    .await);
+            }
+        };
         if !resp.status().is_success() {
             return Err(ProviderError::Message(format!("HTTP {}", resp.status())));
         }
