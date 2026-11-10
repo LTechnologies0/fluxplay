@@ -3,7 +3,7 @@
 //! Resilience for huge IPTV catalogs:
 //! - per-URL soft-fail TTL (no permanent blacklist on transient errors)
 //! - per-host circuit breaker (dead CDNs stop flooding retries/logs)
-//! - SOCKS (WireGuard) → clearnet fallback for image GETs only
+//! - image GETs use the shared HTTP client (WireGuard fail-closed; no clearnet bypass)
 //! - proper percent-encoding (Wikimedia / unicode paths → no more HTTP 400)
 
 use std::collections::{HashMap, HashSet};
@@ -35,7 +35,6 @@ pub(crate) const MAX_UI_EDGE_PX: u32 = 300;
 /// Cap host-circuit map — clear-on-full (hosts rotate forever on IPTV CDNs).
 const HOST_CIRCUIT_CAP: usize = 512;
 
-const URL_SOFT_FAIL: Duration = Duration::from_secs(12 * 60);
 /// Cap permanent-fail set — over cap, clear wholesale (worst case: one retry).
 const FAILED_CAP: usize = 768;
 /// Sweep expired soft-fail entries once the map passes this size.
@@ -44,9 +43,19 @@ const SOFT_FAIL_SWEEP_AT: usize = 256;
 const NORMALIZE_CACHE_CAP: usize = 512;
 /// Cap for per-host warn throttle map.
 const WARN_HOST_CAP: usize = 256;
-const HOST_COOLDOWN: Duration = Duration::from_secs(25 * 60);
-const HOST_FAIL_TRIP: u32 = 5;
 const HOST_WARN_INTERVAL: Duration = Duration::from_secs(90);
+
+fn url_soft_fail() -> Duration {
+    Duration::from_secs(crate::policy::get().images.soft_fail_secs)
+}
+
+fn host_cooldown() -> Duration {
+    Duration::from_secs(crate::policy::get().images.host_cooldown_secs)
+}
+
+fn host_fail_trip() -> u32 {
+    crate::policy::get().images.host_fail_trip
+}
 
 #[derive(Debug, Clone)]
 struct HostCircuit {
@@ -117,6 +126,12 @@ impl ImageCache {
         self.inflight.clear();
         self.inflight_source.clear();
         self.clock = self.clock.wrapping_add(1);
+    }
+
+    /// Cancel in-flight fetches only (keep decoded handles for overlapping shelves).
+    pub fn inflight_clear(&mut self) {
+        self.inflight.clear();
+        self.inflight_source.clear();
     }
 
     /// Keep only URLs still needed for the current mosaic (visible + warm band).
@@ -241,6 +256,15 @@ impl ImageCache {
             return;
         }
         debug!(target: "fluxplay::images", %url, len = bytes.len(), "insert handle");
+        // Seed ContentFit memo before view() so mosaic redraws avoid header parses.
+        seed_art_content_fit(&bytes);
+        // Same JPEG bytes → keep the existing iced Handle id (no wgpu re-upload).
+        if let Some(Handle::Bytes(_, existing)) = self.handles.get(&url) {
+            if existing.as_ref() == bytes.as_slice() {
+                self.promote(&url);
+                return;
+            }
+        }
         if self.handles.contains_key(&url) {
             self.handles.insert(url.clone(), Handle::from_bytes(bytes));
             self.promote(&url);
@@ -276,7 +300,7 @@ impl ImageCache {
         if self.soft_fail.len() >= SOFT_FAIL_SWEEP_AT {
             self.soft_fail.retain(|_, until| *until > now);
         }
-        let until = now + URL_SOFT_FAIL;
+        let until = now + url_soft_fail();
         self.soft_fail.insert(url.clone(), until);
         if let Some(host) = host_key(&url) {
             if self.host_circuit.len() >= HOST_CIRCUIT_CAP
@@ -292,12 +316,14 @@ impl ImageCache {
                 return;
             }
             entry.fails = entry.fails.saturating_add(1);
-            if entry.fails >= HOST_FAIL_TRIP {
-                entry.cool_until = Some(Instant::now() + HOST_COOLDOWN);
+            let trip = host_fail_trip();
+            let cool = host_cooldown();
+            if entry.fails >= trip {
+                entry.cool_until = Some(Instant::now() + cool);
                 entry.fails = 0;
                 warn!(
                     %host,
-                    secs = HOST_COOLDOWN.as_secs(),
+                    secs = cool.as_secs(),
                     "image host circuit open — skipping further fetches"
                 );
             }
@@ -327,34 +353,9 @@ fn host_key(url: &str) -> Option<String> {
 
 fn shared_http() -> reqwest::Client {
     fluxplay_providers::app_http("IPTVSmartersPlayer", 15).unwrap_or_else(|e| {
-        error!(error = %e, "image http client build failed — emergency default");
-        reqwest::Client::builder()
-            .user_agent("IPTVSmartersPlayer")
-            .timeout(std::time::Duration::from_secs(15))
-            .connect_timeout(std::time::Duration::from_secs(6))
-            .no_proxy()
-            .build()
-            .expect("image http client")
+        error!(error = %e, "image http client build failed — fail-closed emergency");
+        fluxplay_providers::emergency_http("IPTVSmartersPlayer", 15)
     })
-}
-
-/// Direct clearnet client (no SOCKS) — fallback when WireGuard cannot reach image CDNs.
-fn clearnet_image_http() -> reqwest::Client {
-    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
-    CLIENT
-        .get_or_init(|| {
-            reqwest::Client::builder()
-                .user_agent("IPTVSmartersPlayer")
-                .timeout(Duration::from_secs(12))
-                .connect_timeout(Duration::from_secs(6))
-                .redirect(reqwest::redirect::Policy::limited(8))
-                .gzip(true)
-                .pool_max_idle_per_host(4)
-                .no_proxy()
-                .build()
-                .expect("clearnet image http")
-        })
-        .clone()
 }
 
 fn warn_host_cache() -> &'static Mutex<HashMap<String, Instant>> {
@@ -440,12 +441,24 @@ fn normalized_cached(url: &str) -> String {
 
 pub fn is_fetchable_image_url(url: &str) -> bool {
     let url = url.trim();
+    // Embedded NUL / controls break HTTP clients and extension checks.
+    if url.is_empty() || url.chars().any(|c| c.is_control()) {
+        return false;
+    }
     if !(url.starts_with("http://") || url.starts_with("https://")) {
         return false;
     }
-    // Workspace `image` crate has no SVG decoder — skip remote .svg logos.
-    let path = url.split('?').next().unwrap_or(url).to_ascii_lowercase();
-    if path.ends_with(".svg") || path.contains(".svg/") {
+    // Workspace `image` crate has no SVG decoder — skip remote .svg / .svgz logos.
+    let path = url
+        .split(['?', '#'])
+        .next()
+        .unwrap_or(url)
+        .to_ascii_lowercase();
+    if path.ends_with(".svg")
+        || path.ends_with(".svgz")
+        || path.contains(".svg/")
+        || path.contains(".svgz/")
+    {
         trace!(target: "fluxplay::images", %url, "reject svg logo url");
         return false;
     }
@@ -462,37 +475,9 @@ pub fn is_fetchable_image_url(url: &str) -> bool {
     true
 }
 
-fn is_connect_like(err: &reqwest::Error) -> bool {
-    err.is_connect()
-        || err.is_timeout()
-        || err.is_request()
-        || format!("{err}").contains("error sending request")
-}
-
 async fn image_get(url: &str) -> Result<reqwest::Response, reqwest::Error> {
-    let primary = shared_http();
-    match primary.get(url).send().await {
-        Ok(r) => Ok(r),
-        Err(e) => {
-            let via_socks = fluxplay_providers::socks_proxy().is_some();
-            if via_socks && is_connect_like(&e) {
-                // When WireGuard is enabled, never fall back to clearnet (DNS/CDN leak).
-                if std::env::var_os("FLUXPLAY_ALLOW_CLEARNET_IMAGES").is_some() {
-                    let host = host_key(url).unwrap_or_else(|| "?".into());
-                    warn_host_once(
-                        &host,
-                        "image via WireGuard SOCKS failed — clearnet fallback (explicit allow)",
-                        &e.to_string(),
-                    );
-                    clearnet_image_http().get(url).send().await
-                } else {
-                    Err(e)
-                }
-            } else {
-                Err(e)
-            }
-        }
-    }
+    // Fail closed: never clearnet-fallback while WireGuard/SOCKS is required.
+    shared_http().get(url).send().await
 }
 
 pub async fn fetch_image_bytes(
@@ -533,7 +518,7 @@ pub async fn fetch_image_bytes(
     let host = host_key(&url).unwrap_or_else(|| "?".into());
     let mut last_err = String::new();
 
-    // One primary attempt (+ internal clearnet fallback). Retry only for 408/429.
+    // One primary attempt. Retry only for 408/429.
     for attempt in 0..2u8 {
         if attempt > 0 {
             tokio::time::sleep(Duration::from_millis(400)).await;
@@ -543,7 +528,7 @@ pub async fn fetch_image_bytes(
             Err(e) => {
                 last_err = e.to_string();
                 warn_host_once(&host, "image HTTP send failed", &last_err);
-                // Don't hammer the same dead path — clearnet already tried inside image_get.
+                // Don't hammer the same dead path.
                 break;
             }
         };
@@ -806,20 +791,76 @@ fn jpeg_size(bytes: &[u8]) -> Option<(u32, u32)> {
     None
 }
 
-/// Portrait art fills the poster frame. Logos, squares and banners stay whole.
-pub fn art_content_fit(handle: &Handle) -> iced::ContentFit {
-    let Handle::Bytes(_, bytes) = handle else {
-        return iced::ContentFit::Contain;
-    };
+fn fit_cache() -> &'static Mutex<HashMap<u64, iced::ContentFit>> {
+    static CACHE: OnceLock<Mutex<HashMap<u64, iced::ContentFit>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::with_capacity(128)))
+}
+
+fn bytes_fit_key(bytes: &[u8]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    bytes.len().hash(&mut h);
+    let head = bytes.len().min(64);
+    bytes[..head].hash(&mut h);
+    if bytes.len() > 80 {
+        bytes[bytes.len() - 16..].hash(&mut h);
+    }
+    h.finish()
+}
+
+fn compute_art_content_fit(bytes: &[u8]) -> iced::ContentFit {
     match raster_size(bytes) {
         Some((w, h)) if h as f32 >= w as f32 * 1.2 => iced::ContentFit::Cover,
         _ => iced::ContentFit::Contain,
     }
 }
 
+fn seed_art_content_fit(bytes: &[u8]) {
+    let key = bytes_fit_key(bytes);
+    let fit = compute_art_content_fit(bytes);
+    if let Ok(mut cache) = fit_cache().lock() {
+        if cache.len() >= 512 {
+            cache.clear();
+        }
+        cache.insert(key, fit);
+    }
+}
+
+/// Portrait art fills the poster frame. Logos, squares and banners stay whole.
+///
+/// Result is memoized: mosaic `view()` calls this once per tile per frame and
+/// re-parsing JPEG/PNG/WebP headers on every redraw was pure UI overhead.
+pub fn art_content_fit(handle: &Handle) -> iced::ContentFit {
+    let Handle::Bytes(_, bytes) = handle else {
+        return iced::ContentFit::Contain;
+    };
+    let key = bytes_fit_key(bytes);
+    if let Ok(cache) = fit_cache().lock() {
+        if let Some(fit) = cache.get(&key).copied() {
+            return fit;
+        }
+    }
+    let fit = compute_art_content_fit(bytes);
+    if let Ok(mut cache) = fit_cache().lock() {
+        if cache.len() >= 512 {
+            cache.clear();
+        }
+        cache.insert(key, fit);
+    }
+    fit
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fetchable_rejects_svgz_and_controls() {
+        assert!(!is_fetchable_image_url("http://cdn.test/logo.svgz"));
+        assert!(!is_fetchable_image_url("https://cdn.test/a.svg"));
+        assert!(!is_fetchable_image_url("http://:0/\0\rts.svgz"));
+        assert!(is_fetchable_image_url("https://cdn.test/poster.jpg"));
+    }
 
     #[test]
     fn normalize_encodes_unicode_path() {
@@ -833,7 +874,7 @@ mod tests {
     fn host_circuit_trips_after_threshold() {
         let mut c = ImageCache::default();
         let url = "http://dead.example:8080/a.png".to_string();
-        for _ in 0..HOST_FAIL_TRIP {
+        for _ in 0..host_fail_trip() {
             c.mark_soft_failed(url.clone());
         }
         assert!(c.host_blocked(&url));

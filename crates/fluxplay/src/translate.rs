@@ -19,10 +19,7 @@ const MYMEMORY_CHUNK: usize = 450;
 fn http() -> reqwest::Client {
     fluxplay_providers::app_http("Mozilla/5.0 (X11; Linux x86_64) FluxPlay/0.2", 12)
         .unwrap_or_else(|_| {
-            reqwest::Client::builder()
-                .timeout(Duration::from_secs(12))
-                .build()
-                .expect("translate HTTP client")
+            fluxplay_providers::emergency_http("Mozilla/5.0 (X11; Linux x86_64) FluxPlay/0.2", 12)
         })
 }
 

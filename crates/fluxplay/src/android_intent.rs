@@ -25,6 +25,8 @@ fn fluxplay_activity_class<'a>(
     if context.is_null() {
         return None;
     }
+    // SAFETY: `ndk_context` jobject is process-lifetime Application/Activity.
+    // Borrow as JObject without DeleteLocalRef / AutoLocal ownership.
     let ctx = unsafe { JObject::from_raw(context) };
     if let Ok(cl_v) = env.call_method(&ctx, "getClassLoader", "()Ljava/lang/ClassLoader;", &[]) {
         if let Ok(cl) = cl_v.l() {
@@ -123,12 +125,18 @@ pub fn open_url(url: &str, mime: Option<&str>) -> Result<(), String> {
     match env.call_static_method(
         cls,
         "openUrl",
-        "(Ljava/lang/String;Ljava/lang/String;)V",
+        "(Ljava/lang/String;Ljava/lang/String;)Z",
         &[JValue::Object(&url_j), JValue::Object(&mime_j)],
     ) {
-        Ok(_) => {
-            info!("openUrl ok");
-            Ok(())
+        Ok(v) => {
+            let ok = v.z().unwrap_or(false);
+            if ok {
+                info!("openUrl ok");
+                Ok(())
+            } else {
+                warn!("Install VLC / a video player if no handler is registered");
+                Err("Aucun lecteur système pour cette URL".into())
+            }
         }
         Err(e) => {
             clear_ex(&mut env);
@@ -140,7 +148,24 @@ pub fn open_url(url: &str, mime: Option<&str>) -> Result<(), String> {
 }
 
 /// Launch the platform player / chooser for a stream URL (`video/*`).
+///
+/// ACTION_VIEW cannot attach UA/Referer — pass `headers_required=true` to refuse
+/// gated IPTV rather than open a bare URL that will 403.
 pub fn open_stream_url(url: &str) -> Result<(), String> {
+    open_stream_url_ex(url, false)
+}
+
+/// Like [`open_stream_url`], but refuses when the portal needs HTTP headers.
+pub fn open_stream_url_ex(url: &str, headers_required: bool) -> Result<(), String> {
+    if headers_required {
+        warn!(
+            host = %url_host(url),
+            "ACTION_VIEW refused — stream needs HTTP headers (use libmpv)"
+        );
+        return Err(
+            "Lecteur système ignore les en-têtes HTTP — utilisez libmpv".into(),
+        );
+    }
     open_url(url, Some("video/*"))
 }
 

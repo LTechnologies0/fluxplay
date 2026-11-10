@@ -3,6 +3,8 @@ name = "fluxplay"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+authors.workspace = true
+repository.workspace = true
 description = "FluxPlay — cross-platform IPTV media player (Material Expressive)"
 
 [lib]
@@ -81,3 +83,6 @@ ndk-context = "0.1"
 
 [dev-dependencies]
 proptest = { workspace = true }
+
+[lints]
+workspace = true

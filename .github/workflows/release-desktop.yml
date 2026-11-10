@@ -88,7 +88,13 @@ jobs:
           FLUXPLAY_REQUIRE_LIBMPV: ${{ matrix.require_libmpv }}
           # Embedded FFmpeg is Linux-desktop only (see fluxplay-player/build.rs).
           FLUXPLAY_REQUIRE_FFMPEG: ${{ runner.os == 'Linux' && '1' || '0' }}
-        run: cargo build -p fluxplay --release --target ${{ matrix.target }}
+          # Per-target CPU/linker from `.cargo/config.toml` (x86-64-v3 / apple-a14 / …).
+          # Downgrade shipping floor: FLUXPLAY_CPU=v2 source scripts/rustc-flags.sh
+        run: |
+          chmod +x scripts/rustc-flags.sh
+          FLUXPLAY_TARGET="${{ matrix.target }}" FLUXPLAY_CPU=v3 \
+            bash scripts/rustc-flags.sh --print "${{ matrix.target }}" || true
+          cargo build -p fluxplay --release --locked --target ${{ matrix.target }}
 
       - name: Bundle libmpv (Unix shared)
         if: runner.os != 'Windows' && matrix.require_libmpv == '1'

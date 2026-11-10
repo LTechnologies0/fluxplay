@@ -10,7 +10,7 @@ use crate::storage::downloads_dir;
 use crate::wg_proxy::parse_profile;
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(200))]
+    #![proptest_config(ProptestConfig::with_cases(512))]
 
     /// File stems must never re-introduce path separators or Windows reserved chars.
     #[test]
@@ -26,6 +26,11 @@ proptest! {
         prop_assert!(s.len() <= 240, "utf-8 byte length {}", s.len());
         // No `..` alone as the whole name after collapse.
         prop_assert!(s != ".." && s != ".");
+        // Windows reserved device names must not survive as the path leaf.
+        let upper = s.to_ascii_uppercase();
+        for bad in ["CON", "PRN", "AUX", "NUL", "COM1", "LPT1"] {
+            prop_assert_ne!(&upper, bad);
+        }
     }
 
     #[test]

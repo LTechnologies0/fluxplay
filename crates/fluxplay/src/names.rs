@@ -323,7 +323,7 @@ fn desuperscript(c: char) -> Option<char> {
 fn clean_decorations(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut in_sup = false;
-    for c in s.chars() {
+    for c in scrub_controls(s).chars() {
         if let Some(plain) = desuperscript(c) {
             if !in_sup && !out.ends_with([' ', '/']) && !out.is_empty() {
                 out.push(' ');
@@ -342,8 +342,18 @@ fn clean_decorations(s: &str) -> String {
     collapse_ws(&out)
 }
 
+/// Drop C0 controls (NUL, etc.) that break iced text / FFI while keeping tabs/spaces.
+fn scrub_controls(s: &str) -> String {
+    s.chars()
+        .filter(|c| *c == '\t' || *c == '\n' || !c.is_control())
+        .collect()
+}
+
 fn collapse_ws(s: &str) -> String {
-    s.split_whitespace().collect::<Vec<_>>().join(" ")
+    scrub_controls(s)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn fold_upper(word: &str) -> String {
@@ -1154,8 +1164,9 @@ fn peel_tail(t: &mut String, lang: &mut LangInfo, year: &mut Option<String>) {
 
 /// Dashes unified, superscript badges spelled out, `Hannah*s` → `Hannah's`.
 fn normalize_item_chars(s: &str) -> String {
-    let chars: Vec<char> = s.chars().collect();
-    let mut out = String::with_capacity(s.len());
+    let scrubbed = scrub_controls(s);
+    let chars: Vec<char> = scrubbed.chars().collect();
+    let mut out = String::with_capacity(scrubbed.len());
     for (i, &c) in chars.iter().enumerate() {
         match c {
             '\u{2013}' | '\u{2014}' => out.push('-'),

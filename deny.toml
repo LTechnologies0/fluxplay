@@ -1,0 +1,92 @@
+# Supply-chain policy for FluxPlay (cargo-deny).
+# Run: `scripts/supply-chain.sh` or `cargo deny check --all-features`
+
+[graph]
+all-features = true
+# Tier-1 + Android ABIs we actually ship / CI-build.
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-unknown-linux-musl",
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+    "x86_64-pc-windows-msvc",
+    "aarch64-linux-android",
+    "x86_64-linux-android",
+    "armv7-linux-androideabi",
+]
+
+[advisories]
+db-urls = ["https://github.com/RustSec/advisory-db"]
+yanked = "deny"
+unmaintained = "workspace"
+# Ignore list: document reason + ticket; prefer fixing over ignoring.
+ignore = [
+    # boringtun 0.6 → x25519-dalek rc → curve25519-dalek 4.0.0-rc.3 (no stable bump yet).
+    { id = "RUSTSEC-2024-0344", reason = "boringtun/tokio-wireguard pins curve25519-dalek 4.0.0-rc.3; timing side-channel only under secret Scalar ops we do not expose" },
+    # hickory 0.25: NSEC3 unbounded loop — no safe upgrade on 0.25 line; 0.26 API rewrite deferred.
+    { id = "RUSTSEC-2026-0118", reason = "no fixed 0.25.x; FluxPlay only uses stub A/AAAA lookups (not NSEC3 validation path in normal IPTV DNS)" },
+    # CPU exhaustion on message encoding — fixed in ≥0.26.1; same API deferral.
+    { id = "RUSTSEC-2026-0119", reason = "requires hickory 0.26+; deferred with 0118 until resolver API migration" },
+    # ring 0.16 QUIC header mask panic under overflow-checks — we do not use QUIC;
+    # release profile has overflow-checks=false; ring ≥0.17.12 still pulled as 0.16 by old deps.
+    { id = "RUSTSEC-2025-0009", reason = "QUIC-only API; FluxPlay TLS is rustls without QUIC; release disables overflow-checks" },
+]
+
+[licenses]
+confidence-threshold = 0.93
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "OpenSSL",
+    "CC0-1.0",
+    "BSL-1.0",
+    "MPL-2.0",
+    "0BSD",
+    # webpki-roots / trust-stores (CDLA)
+    "CDLA-Permissive-2.0",
+]
+exceptions = []
+private = { ignore = true }
+
+# ring 0.16 (pulled transitively) omits license= in Cargo.toml.
+[[licenses.clarify]]
+crate = "ring"
+expression = "MIT AND ISC AND OpenSSL"
+license-files = [{ path = "LICENSE", hash = 0xbd0eed23 }]
+
+[bans]
+multiple-versions = "warn"
+# Workspace path deps use version="*" — crates.io treats published=true via repository URL.
+wildcards = "warn"
+allow-wildcard-paths = true
+highlight = "simplest-path"
+workspace-default-features = "allow"
+external-default-features = "allow"
+# Prefer rustls / ring — ban OpenSSL stacks when they appear as optional pulls.
+deny = [
+    { crate = "openssl", use-instead = "rustls" },
+    { crate = "openssl-sys", use-instead = "rustls / rustls-native-certs" },
+    { crate = "libssh2-sys", reason = "native SSH stack; not used by FluxPlay" },
+    { crate = "cmake", use-instead = "cc", reason = "avoid build-time CMake when possible" },
+]
+skip = []
+skip-tree = [
+    # windows-sys bumps often across the iced/winit/wgpu graph
+    { crate = "windows-sys", reason = "foundational; version fan-out expected" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+# crates.io only; path patches live under vendor/ (not git).
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
+required-git-spec = "rev"

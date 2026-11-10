@@ -1,18 +1,136 @@
-# Host-local overrides (not required for CI / cross builds).
-# Uncomment for native CPU codegen on your machine only:
-# [build]
-# rustflags = ["-C", "target-cpu=native"]
+# FluxPlay cargo / rustc defaults.
+#
+# CPU policy:
+#   - Per-target `target-cpu` below = portable *shipping* floor (max SIMD that
+#     still matches our release hardware matrix — not host `native`).
+#   - Local max: `source scripts/rustc-flags.sh` (FLUXPLAY_CPU=native) before
+#     `scripts/build-native.sh` — overrides with `-C target-cpu=native` (last wins).
+#   - Downgrade: FLUXPLAY_CPU=v2|baseline source scripts/rustc-flags.sh
+#
+# Supply chain: see `deny.toml` + `scripts/supply-chain.sh`. Prefer
+# `cargo build --locked` / CI `--locked` so Cargo.lock is the source of truth.
+#
+# curve25519-dalek: serial backend — `stdsimd` gate is gone on current rustc.
 
-# boringtun → curve25519-dalek 4.0.0-rc.3 still gates SIMD on nightly feature
-# `stdsimd`, removed in current rustc. Force the serial backend (same as
-# tokio-wireguard docs.rs) so `cargo run -p fluxplay` builds on nightly.
 [build]
+# Leave ≥ half the cores free on a 8–12 core laptop (verify/fuzz).
+# Override: CARGO_BUILD_JOBS / FLUXPLAY_JOBS.
+jobs = 4
 rustflags = ['--cfg', 'curve25519_dalek_backend="serial"']
 
+[net]
+# Sparse index is the crates.io default; keep git fetches via system git
+# (better proxy / credential / CA handling than libgit2).
+git-fetch-with-cli = true
+
+[term]
+quiet = false
+verbose = false
+color = "auto"
+
+# Never silently rewrite registry → custom source (supply-chain footgun).
+# Path patches for iced / tokio-wireguard live in root Cargo.toml [patch].
+
+# ── x86_64 desktop (Linux / Windows / macOS Intel) ──────────────────────────
+# x86-64-v3: AVX2+BMI2+FMA (~Haswell / Zen1+, Steam Deck). Last -C target-cpu wins.
+[target.x86_64-unknown-linux-gnu]
+rustflags = [
+    '--cfg', 'curve25519_dalek_backend="serial"',
+    '-C', 'target-cpu=x86-64-v3',
+    '-C', 'force-frame-pointers=no',
+    '-C', 'link-arg=-Wl,-O1',
+    '-C', 'link-arg=-Wl,--as-needed',
+    '-C', 'link-arg=-Wl,-z,relro,-z,now',
+    '-C', 'link-arg=-Wl,--gc-sections',
+]
+
+[target.x86_64-unknown-linux-musl]
+rustflags = [
+    '--cfg', 'curve25519_dalek_backend="serial"',
+    '-C', 'target-cpu=x86-64-v3',
+    '-C', 'target-feature=+crt-static',
+    '-C', 'force-frame-pointers=no',
+    '-C', 'link-arg=-Wl,-O1',
+    '-C', 'link-arg=-Wl,--gc-sections',
+]
+
+[target.x86_64-pc-windows-msvc]
+rustflags = [
+    '--cfg', 'curve25519_dalek_backend="serial"',
+    '-C', 'target-cpu=x86-64-v3',
+    '-C', 'force-frame-pointers=no',
+    '-C', 'control-flow-guard=yes',
+    '-C', 'link-arg=/OPT:REF',
+    '-C', 'link-arg=/OPT:ICF',
+]
+
+[target.x86_64-apple-darwin]
+rustflags = [
+    '--cfg', 'curve25519_dalek_backend="serial"',
+    '-C', 'target-cpu=x86-64-v3',
+    '-C', 'force-frame-pointers=no',
+    '-C', 'link-arg=-Wl,-dead_strip',
+]
+
+# ── aarch64 desktop / server ────────────────────────────────────────────────
+[target.aarch64-unknown-linux-gnu]
+rustflags = [
+    '--cfg', 'curve25519_dalek_backend="serial"',
+    '-C', 'target-cpu=neoverse-n1',
+    '-C', 'force-frame-pointers=no',
+    '-C', 'link-arg=-Wl,-O1',
+    '-C', 'link-arg=-Wl,--as-needed',
+    '-C', 'link-arg=-Wl,-z,relro,-z,now',
+    '-C', 'link-arg=-Wl,--gc-sections',
+]
+
+[target.aarch64-apple-darwin]
+rustflags = [
+    '--cfg', 'curve25519_dalek_backend="serial"',
+    # apple-a14 ≡ M1 / A14 (rustc has no apple-m1 name)
+    '-C', 'target-cpu=apple-a14',
+    '-C', 'force-frame-pointers=no',
+    '-C', 'link-arg=-Wl,-dead_strip',
+]
+
+# ── Android (Phone / TV) ────────────────────────────────────────────────────
+# cortex-a76 ≈ 2019+ big cores (SD 855 / Xclipse / Tensor class). Fat arm64-v8a.
+[target.aarch64-linux-android]
+rustflags = [
+    '--cfg', 'curve25519_dalek_backend="serial"',
+    '-C', 'target-cpu=cortex-a76',
+    '-C', 'force-frame-pointers=no',
+    '-C', 'link-arg=-Wl,-O1',
+    '-C', 'link-arg=-Wl,--as-needed',
+    '-C', 'link-arg=-Wl,--gc-sections',
+]
+
+[target.armv7-linux-androideabi]
+rustflags = [
+    '--cfg', 'curve25519_dalek_backend="serial"',
+    '-C', 'target-feature=+neon,+vfp4',
+    '-C', 'force-frame-pointers=no',
+    '-C', 'link-arg=-Wl,-O1',
+    '-C', 'link-arg=-Wl,--gc-sections',
+]
+
+[target.x86_64-linux-android]
+rustflags = [
+    '--cfg', 'curve25519_dalek_backend="serial"',
+    '-C', 'target-cpu=x86-64-v3',
+    '-C', 'force-frame-pointers=no',
+    '-C', 'link-arg=-Wl,-O1',
+    '-C', 'link-arg=-Wl,--gc-sections',
+]
+
 [alias]
-# Production binary (fat LTO + strip + panic=abort)
-rel = "build -p fluxplay --release"
+# Production binary (fat LTO + strip + panic=abort) — uses per-target CPU above
+rel = "build -p fluxplay --release --locked"
+# Host-max: same profile + scripts/rustc-flags.sh native (see build-native.sh)
+rel-native = "build -p fluxplay --release --locked"
 # Size-optimized binary
-rel-size = "build -p fluxplay --profile release-size"
+rel-size = "build -p fluxplay --profile release-size --locked"
 # Faster CI-ish release
-rel-ci = "build -p fluxplay --profile release-ci"
+rel-ci = "build -p fluxplay --profile release-ci --locked"
+# Property suite (lib crates) — quick local check without fuzz
+test-props = "test -p fluxplay-core -p fluxplay-providers -p fluxplay-player -p fluxplay --lib --locked"

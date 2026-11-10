@@ -140,9 +140,28 @@ pub fn libmpv_available() -> bool {
         #[link(name = "kernel32")]
         extern "system" {
             fn LoadLibraryW(name: *const u16) -> *mut c_void;
+            fn GetModuleFileNameW(module: *mut c_void, buf: *mut u16, size: u32) -> u32;
         }
-        let name: Vec<u16> = "libmpv-2.dll\0".encode_utf16().collect();
-        let ok = !unsafe { LoadLibraryW(name.as_ptr()) }.is_null();
+        fn load(path: &str) -> bool {
+            let wide: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
+            !unsafe { LoadLibraryW(wide.as_ptr()) }.is_null()
+        }
+        // Prefer exe-dir absolute path (flat packaging); fall back to bare name.
+        let mut ok = false;
+        let mut buf = [0u16; 520];
+        let n = unsafe { GetModuleFileNameW(std::ptr::null_mut(), buf.as_mut_ptr(), buf.len() as u32) };
+        if n > 0 && (n as usize) < buf.len() {
+            let exe = String::from_utf16_lossy(&buf[..n as usize]);
+            if let Some(dir) = std::path::Path::new(&exe).parent() {
+                let cand = dir.join("libmpv-2.dll");
+                if let Some(s) = cand.to_str() {
+                    ok = load(s);
+                }
+            }
+        }
+        if !ok {
+            ok = load("libmpv-2.dll");
+        }
         if ok {
             info!("libmpv-2.dll loaded");
         } else {
@@ -248,7 +267,12 @@ pub struct LibMpv {
     force_render: bool,
 }
 
-// Client API: one thread at a time per handle; UI/player tick owns it.
+// Client API: one thread at a time per handle — serialize via `Arc<Mutex<LibMpv>>`
+// (SoftPump + UI). Intentionally **not** Sync: callers must not share bare &LibMpv
+// across threads. Poisoned mutexes recover with `into_inner` (backend / SoftPump).
+// SAFETY: libmpv client API is not Sync — one thread at a time per handle.
+// Callers wrap `LibMpv` in `Arc<Mutex<_>>` (UI tick / SoftPump). `Send` only so
+// the mutex can move across threads; never share without that mutex.
 unsafe impl Send for LibMpv {}
 
 /// Serialize Android create vs async `mpv_terminate_destroy` so a zap cannot
@@ -711,7 +735,7 @@ impl LibMpv {
             if !ctx.is_null() {
                 // Pass as usize so the destroy thread is Send (raw *mut isn't).
                 let ctx_addr = ctx as usize;
-                let _ = std::thread::Builder::new()
+                match std::thread::Builder::new()
                     .name("flux-mpv-destroy".into())
                     .spawn(move || {
                         let _life = android_mpv_life()
@@ -719,13 +743,23 @@ impl LibMpv {
                             .unwrap_or_else(|e| e.into_inner());
                         debug!("LibMpv terminate_destroy (async)");
                         unsafe { mpv_terminate_destroy(ctx_addr as *mut mpv_handle) };
-                    });
+                    }) {
+                    Ok(_) => {}
+                    Err(e) => {
+                        // Spawn fail would leak demux/VO forever — terminate sync.
+                        error!(error = %e, "mpv destroy spawn failed — sync terminate");
+                        let _life = android_mpv_life()
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner());
+                        unsafe { mpv_terminate_destroy(ctx_addr as *mut mpv_handle) };
+                    }
+                }
             }
             return;
         }
         #[cfg(not(target_os = "android"))]
         {
-            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(300);
+            let deadline = std::time::Instant::now() + Duration::from_millis(300);
             while std::time::Instant::now() < deadline {
                 let ev = unsafe { mpv_wait_event(self.ctx, 0.05) };
                 if ev.is_null() {

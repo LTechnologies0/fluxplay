@@ -20,14 +20,29 @@ pub use crate::http_client::{
 
 /// Max simultaneous portal HTTP calls (auth + catalog + EPG share this).
 /// 2 unlocks real overlap for `tokio::join!` dumps while staying panel-friendly.
-const PORTAL_CONCURRENCY: usize = 2;
+const PORTAL_CONCURRENCY_DEFAULT: usize = 2;
 
+static PORTAL_SLOTS: OnceLock<usize> = OnceLock::new();
+static PORTAL_TTL_SCALE: OnceLock<f32> = OnceLock::new();
 static PORTAL_SEM: OnceLock<Semaphore> = OnceLock::new();
+
+/// Soft knobs from the app [`PolicyPack`] (safe to call before first portal request).
+pub fn configure_runtime_policy(portal_concurrency: usize, ttl_scale: f32) {
+    let slots = portal_concurrency.clamp(1, 4);
+    let scale = ttl_scale.clamp(0.25, 4.0);
+    let _ = PORTAL_SLOTS.set(slots);
+    let _ = PORTAL_TTL_SCALE.set(scale);
+    debug!(slots, ttl_scale = scale, "portal runtime policy");
+}
 
 fn portal_sem() -> &'static Semaphore {
     PORTAL_SEM.get_or_init(|| {
-        debug!(slots = PORTAL_CONCURRENCY, "portal semaphore created");
-        Semaphore::new(PORTAL_CONCURRENCY)
+        let slots = PORTAL_SLOTS
+            .get()
+            .copied()
+            .unwrap_or(PORTAL_CONCURRENCY_DEFAULT);
+        debug!(slots, "portal semaphore created");
+        Semaphore::new(slots)
     })
 }
 
@@ -83,7 +98,7 @@ pub fn key(portal: &str, user: &str, action: &str, extras: &[&str]) -> String {
 }
 
 pub fn ttl_for_action(action: Option<&str>) -> Duration {
-    match action {
+    let base = match action {
         None => Duration::from_secs(2 * 3600), // auth
         Some("get_live_categories")
         | Some("get_vod_categories")
@@ -93,7 +108,13 @@ pub fn ttl_for_action(action: Option<&str>) -> Duration {
         Some("get_series_info") | Some("get_vod_info") => Duration::from_secs(24 * 3600),
         Some("get_short_epg") | Some("get_simple_data_table") => Duration::from_secs(45 * 60),
         _ => Duration::from_secs(6 * 3600),
+    };
+    let scale = PORTAL_TTL_SCALE.get().copied().unwrap_or(1.0);
+    if (scale - 1.0).abs() < f32::EPSILON {
+        return base;
     }
+    let millis = (base.as_millis() as f32 * scale).round().max(1.0) as u64;
+    Duration::from_millis(millis)
 }
 
 fn path_for(key: &str) -> PathBuf {
@@ -145,24 +166,121 @@ fn read_entry(key: &str) -> Option<(Value, u64)> {
     Some((value, age))
 }
 
+/// Skip caching blobs larger than this (still usable in-memory once).
+const MAX_ENTRY_BYTES: usize = 16 * 1024 * 1024;
+/// Soft budget for the whole xtream-api cache directory.
+const MAX_CACHE_DIR_BYTES: u64 = 256 * 1024 * 1024;
+
+fn dir_usage_bytes(root: &std::path::Path) -> u64 {
+    let Ok(rd) = std::fs::read_dir(root) else {
+        return 0;
+    };
+    rd.filter_map(|e| e.ok())
+        .filter_map(|e| e.metadata().ok())
+        .filter(|m| m.is_file())
+        .map(|m| m.len())
+        .sum()
+}
+
+/// Drop oldest `.json`/`.meta` pairs until under budget (mtime LRU).
+fn enforce_cache_budget(root: &std::path::Path) {
+    let mut usage = dir_usage_bytes(root);
+    if usage <= MAX_CACHE_DIR_BYTES {
+        return;
+    }
+    let Ok(rd) = std::fs::read_dir(root) else {
+        return;
+    };
+    let mut entries: Vec<(SystemTime, PathBuf, u64)> = rd
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            e.path()
+                .extension()
+                .and_then(|x| x.to_str())
+                .is_some_and(|x| x == "json")
+        })
+        .filter_map(|e| {
+            let meta = e.metadata().ok()?;
+            let mtime = meta.modified().ok()?;
+            Some((mtime, e.path(), meta.len()))
+        })
+        .collect();
+    entries.sort_by_key(|(mtime, _, _)| *mtime);
+    for (_mtime, path, len) in entries {
+        if usage <= MAX_CACHE_DIR_BYTES {
+            break;
+        }
+        let meta = path.with_extension("meta");
+        let meta_len = std::fs::metadata(&meta).map(|m| m.len()).unwrap_or(0);
+        if std::fs::remove_file(&path).is_ok() {
+            usage = usage.saturating_sub(len);
+        }
+        if std::fs::remove_file(&meta).is_ok() {
+            usage = usage.saturating_sub(meta_len);
+        }
+        warn!(?path, "xtream cache LRU eviction");
+    }
+}
+
 pub fn put(key: &str, value: &Value) {
     let root = cache_root();
     if let Err(e) = std::fs::create_dir_all(&root) {
         warn!(error = %e, "xtream cache mkdir failed");
         return;
     }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700));
+    }
     let path = path_for(key);
     let meta = meta_path(key);
     match serde_json::to_vec(value) {
         Ok(bytes) => {
-            if let Err(e) = std::fs::write(&path, bytes) {
+            if bytes.len() > MAX_ENTRY_BYTES {
+                warn!(
+                    %key,
+                    bytes = bytes.len(),
+                    cap = MAX_ENTRY_BYTES,
+                    "xtream cache skip oversize entry"
+                );
+                return;
+            }
+            if let Err(e) = std::fs::write(&path, &bytes) {
                 warn!(error = %e, "xtream cache write failed");
                 return;
             }
             let _ = std::fs::write(&meta, now_secs().to_string());
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+                let _ = std::fs::set_permissions(&meta, std::fs::Permissions::from_mode(0o600));
+            }
+            enforce_cache_budget(&root);
             trace!(%key, "xtream cache put");
         }
         Err(e) => warn!(error = %e, "xtream cache serialize failed"),
+    }
+}
+
+/// Drop a cached portal answer so the next call hits the network (e.g. empty seasons).
+pub fn forget(key: &str) {
+    let _ = std::fs::remove_file(path_for(key));
+    let _ = std::fs::remove_file(meta_path(key));
+    debug!(%key, "xtream cache forgotten");
+}
+
+/// True when `get_series_info` JSON carries at least one episode entry.
+pub fn series_info_has_episodes(value: &Value) -> bool {
+    match value.get("episodes") {
+        Some(Value::Object(map)) => map.values().any(|eps| match eps {
+            Value::Array(a) => !a.is_empty(),
+            Value::Object(o) => !o.is_empty(),
+            _ => false,
+        }),
+        Some(Value::Array(arr)) => !arr.is_empty(),
+        _ => false,
     }
 }
 

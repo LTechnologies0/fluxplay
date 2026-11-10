@@ -65,15 +65,17 @@ pub struct StreamSession {
     elapsed_label_cache: std::cell::RefCell<(i64, String)>,
     /// Last tracks read while the player lock was free. The view must not
     /// query mpv itself: a busy lock used to blank the options card every frame.
-    audio_tracks_cache: Vec<crate::MediaTrack>,
-    subtitle_tracks_cache: Vec<crate::MediaTrack>,
+    audio_tracks_cache: Vec<MediaTrack>,
+    subtitle_tracks_cache: Vec<MediaTrack>,
     /// New streams start with subtitles off. Cleared when the viewer picks a track.
     subs_hold_off: bool,
     /// Auto-skip already jumped this opening, so a later seek back into it stays put.
     intro_skipped: bool,
     credits_skipped: bool,
-    /// Opening credits, once we know where they start and where to land after them.
+    /// Opening / recap window (chapters, picture scan, or Open Skip Database).
     opening: Option<OpeningSpan>,
+    /// End credits / outro start (seconds). Seek lands near duration − 1s.
+    credits: Option<CreditsSpan>,
     opening_watch: OpeningWatch,
     /// OS language (`fr`, `en`…). Empty means leave the demuxer's default track.
     preferred_audio_lang: String,
@@ -81,6 +83,9 @@ pub struct StreamSession {
     audio_lang_applied: bool,
     /// Polls spent waiting for a matching track to show up.
     audio_lang_wait: u8,
+    /// `wake_output` already full-rebuilt libffmpeg/ffplay AO this sleep cycle.
+    /// `wake_audio` must not restart again (drops VOD position).
+    ao_rebuilt_this_wake: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -336,15 +341,32 @@ impl Default for StreamSession {
             intro_skipped: false,
             credits_skipped: false,
             opening: None,
+            credits: None,
             opening_watch: OpeningWatch::new(),
             preferred_audio_lang: String::new(),
             audio_lang_applied: false,
             audio_lang_wait: 0,
+            ao_rebuilt_this_wake: false,
         }
     }
 }
 
-fn track_is_lang(track: &crate::MediaTrack, lang: &str) -> bool {
+/// Soft / FFmpeg backends reject mpv-only props; that is expected, not a warn.
+fn warn_mpv_or_skip(op: &str, err: &impl std::fmt::Display) {
+    let msg = err.to_string();
+    let soft = msg.contains("pas de libmpv")
+        || msg.contains("non supporté")
+        || msg.contains("unsupported")
+        || msg.contains("libav intégré")
+        || msg.contains("Unsupported");
+    if soft {
+        debug!(error = %err, op, "skipped (non-mpv)");
+    } else {
+        warn!(error = %err, op, "player control failed");
+    }
+}
+
+fn track_is_lang(track: &MediaTrack, lang: &str) -> bool {
     let want = lang.split(['-', '_']).next().unwrap_or(lang).trim();
     if want.is_empty() {
         return false;
@@ -434,6 +456,10 @@ impl StreamSession {
         self.native.set_present_hz(hz);
     }
 
+    pub fn set_panel_hz(&mut self, hz: u32) {
+        self.native.set_panel_hz(hz);
+    }
+
     pub fn pull_video_frame(&mut self, w: u32, h: u32) -> Option<(u32, u32, Vec<u8>)> {
         self.native.pull_video_frame(w, h)
     }
@@ -457,6 +483,11 @@ impl StreamSession {
 
     pub fn has_embedded_video(&self) -> bool {
         self.native.has_embedded_video()
+    }
+
+    /// Soft RGBA *or* Android Surface / native window — see [`NativePlayer::has_in_process_video`].
+    pub fn has_in_process_video(&self) -> bool {
+        self.native.has_in_process_video()
     }
 
     pub fn caps(&self) -> crate::BackendCaps {
@@ -510,9 +541,11 @@ impl StreamSession {
         self.intro_skipped = false;
         self.credits_skipped = false;
         self.opening = None;
+        self.credits = None;
         self.opening_watch = OpeningWatch::new();
         self.audio_lang_applied = false;
         self.audio_lang_wait = 0;
+        self.ao_rebuilt_this_wake = false;
         let url = self
             .playback_url
             .clone()
@@ -521,7 +554,12 @@ impl StreamSession {
         match route(&url) {
             Ok(routed) => {
                 self.routed = Some(routed);
-                self.native.options_mut().media_title = Some(channel.name.trim().to_string());
+                {
+                    let opts = self.native.options_mut();
+                    opts.media_title = Some(channel.name.trim().to_string());
+                    opts.muted = self.muted;
+                    opts.volume = self.volume;
+                }
                 match self.native.play(&url) {
                     Ok(backend) => {
                         self.backend = Some(backend);
@@ -693,6 +731,29 @@ impl StreamSession {
             return;
         }
         info!(paused, "StreamSession::wake_output");
+        // libffmpeg/ffplay PCM sinks die across sleep — ao-reload does not exist;
+        // rebuild via restart, then seek VOD back to the pre-sleep position
+        // (NativePlayer::play opens at t≈0; demuxer does not restore).
+        if self.native.needs_full_ao_rebuild() {
+            let pos = self.position_secs;
+            let restore = !self.is_live() && pos > 1.0;
+            {
+                let opts = self.native.options_mut();
+                opts.muted = self.muted;
+                opts.volume = self.volume;
+            }
+            self.restart();
+            if restore {
+                self.seek_absolute(pos);
+            }
+            if paused {
+                self.pause();
+            }
+            self.ao_rebuilt_this_wake = true;
+            self.refresh_times();
+            return;
+        }
+        self.ao_rebuilt_this_wake = false;
         if let Err(e) = self.native.wake_after_sleep(paused) {
             warn!(error = %e, "wake output failed");
         }
@@ -701,6 +762,15 @@ impl StreamSession {
 
     pub fn wake_audio(&mut self) {
         if self.channel.is_none() {
+            return;
+        }
+        // libffmpeg/ffplay: AO rebuild is owned by wake_output. A second
+        // restart here (delayed WakeAudio / stall kick1) drops VOD position.
+        if self.native.needs_full_ao_rebuild() {
+            if self.ao_rebuilt_this_wake {
+                self.ao_rebuilt_this_wake = false;
+                debug!("wake_audio: skip second ffmpeg/ffplay AO rebuild");
+            }
             return;
         }
         if let Err(e) = self.native.wake_audio() {
@@ -723,12 +793,13 @@ impl StreamSession {
                 self.intro_skipped = false;
                 self.credits_skipped = false;
                 self.opening = None;
+                self.credits = None;
                 self.opening_watch = OpeningWatch::new();
                 self.audio_lang_applied = false;
                 self.audio_lang_wait = 0;
                 self.started_at = Some(Utc::now());
                 self.backend = self.native.active_backend();
-                // The engine was rebuilt at `opts.volume`: re-apply the user's mute.
+                // Defense in depth: open already honors opts.muted; re-apply mute.
                 if self.muted {
                     if let Err(e) = self.native.set_mute(true) {
                         warn!(error = %e, "mute after restart failed");
@@ -893,7 +964,7 @@ impl StreamSession {
         let next = speed.clamp(0.25, 3.0);
         match self.native.set_speed(next) {
             Ok(()) => self.speed = next,
-            Err(e) => warn!(error = %e, speed = next, "set_speed unsupported"),
+            Err(e) => warn_mpv_or_skip("set_speed", &e),
         }
     }
 
@@ -912,7 +983,7 @@ impl StreamSession {
         let next = !self.loop_file;
         match self.native.set_loop_file(next) {
             Ok(()) => self.loop_file = next,
-            Err(e) => warn!(error = %e, "toggle_loop unsupported"),
+            Err(e) => warn_mpv_or_skip("toggle_loop", &e),
         }
     }
 
@@ -925,7 +996,7 @@ impl StreamSession {
                 true
             }
             Err(e) => {
-                warn!(error = %e, "mark_ab_a unsupported");
+                warn_mpv_or_skip("mark_ab_a", &e);
                 false
             }
         }
@@ -940,7 +1011,7 @@ impl StreamSession {
                 true
             }
             Err(e) => {
-                warn!(error = %e, "mark_ab_b unsupported");
+                warn_mpv_or_skip("mark_ab_b", &e);
                 false
             }
         }
@@ -954,7 +1025,7 @@ impl StreamSession {
                 true
             }
             Err(e) => {
-                warn!(error = %e, "clear_ab_loop unsupported");
+                warn_mpv_or_skip("clear_ab_loop", &e);
                 false
             }
         }
@@ -968,20 +1039,31 @@ impl StreamSession {
         self.refresh_times();
     }
 
-    /// « Passer le générique » during a detected opening, or for a series
-    /// during the first 90s. Animated openings have no title card, so the
-    /// picture scan never armed a button and nothing was drawn.
+    /// « Passer le générique » during a detected opening / recap, end credits,
+    /// or a series cold-open guess in the first 90s.
     pub fn skip_prompt(&self) -> Option<&'static str> {
-        if self.intro_skipped || self.is_live() {
+        if self.is_live() {
             return None;
         }
-        if let Some(span) = &self.opening {
-            if span.contains(self.position_secs) {
+        if !self.intro_skipped {
+            if let Some(span) = &self.opening {
+                if span.contains(self.position_secs) {
+                    return Some(match span.kind {
+                        SkipKind::Recap => "Passer le résumé",
+                        _ => "Passer le générique",
+                    });
+                }
+            }
+            if self.series_opening_guess() {
                 return Some("Passer le générique");
             }
         }
-        if self.series_opening_guess() {
-            return Some("Passer le générique");
+        if !self.credits_skipped {
+            if let Some(c) = &self.credits {
+                if c.contains(self.position_secs, self.duration_secs) {
+                    return Some("Passer le générique de fin");
+                }
+            }
         }
         None
     }
@@ -1022,19 +1104,34 @@ impl StreamSession {
         if self.intro_skipped || self.is_live() || !self.playing_vod() {
             return;
         }
-        if self.opening.as_ref().is_some_and(|s| s.from_chapter) || self.opening_watch.gave_up {
+        if self
+            .opening
+            .as_ref()
+            .is_some_and(|s| s.from_chapter || s.from_remote)
+            || self.opening_watch.gave_up
+        {
             return;
         }
         if !self.opening_watch.chapters_read && self.position_secs >= 0.3 {
             match self.native.chapter_markers() {
                 Some(chapters) => {
                     self.opening_watch.chapters_read = true;
-                    if let Some(span) = opening_from_chapters(
-                        &chapters,
-                        self.channel.as_ref().map(|c| c.kind) == Some(ContentKind::Series),
-                    ) {
-                        tracing::info!(start = span.start, end = span.end, "opening from chapters");
+                    let series =
+                        self.channel.as_ref().map(|c| c.kind) == Some(ContentKind::Series);
+                    if let Some(span) = opening_from_chapters(&chapters, series) {
+                        tracing::info!(
+                            start = span.start,
+                            end = span.end,
+                            ?span.kind,
+                            "opening from chapters"
+                        );
                         self.opening = Some(span);
+                    }
+                    if self.credits.is_none() {
+                        if let Some(c) = credits_from_chapters(&chapters, self.duration_secs) {
+                            tracing::info!(start = c.start, "credits from chapters");
+                            self.credits = Some(c);
+                        }
                     }
                 }
                 None if self.position_secs > 8.0 => self.opening_watch.chapters_read = true,
@@ -1049,7 +1146,10 @@ impl StreamSession {
         if self.intro_skipped
             || self.is_live()
             || !self.playing_vod()
-            || self.opening.as_ref().is_some_and(|s| s.from_chapter)
+            || self
+                .opening
+                .as_ref()
+                .is_some_and(|s| s.from_chapter || s.from_remote)
             || self.opening_watch.gave_up
         {
             return;
@@ -1105,7 +1205,9 @@ impl StreamSession {
                 let span = OpeningSpan {
                     start,
                     end,
+                    kind: SkipKind::Intro,
                     from_chapter: false,
+                    from_remote: false,
                 };
                 if span.end > span.start + 3.0 {
                     tracing::info!(start = span.start, end = span.end, "opening from picture");
@@ -1131,34 +1233,65 @@ impl StreamSession {
         }
     }
 
-    /// Seek past the opening. Same percent command as the progress bar — an
-    /// absolute second seek is ignored on a lot of these series streams, which
-    /// made the button look dead. The button stays if the seek did not land.
+    /// Seek past the active intro / recap / end-credits window.
+    /// Same percent command as the progress bar — absolute second seeks are
+    /// ignored on a lot of series streams, which made the button look dead.
     pub fn skip_generic(&mut self) -> bool {
-        if self.intro_skipped || self.is_live() {
+        if self.is_live() {
             return false;
         }
-        let target = if let Some(span) = self.opening.clone() {
-            let in_span =
-                self.position_secs + 1.5 >= span.start && self.position_secs <= span.end + 2.0;
-            if in_span {
-                span.end.max(self.position_secs + 2.0)
+        let (target, mark_intro, mark_credits) = if !self.intro_skipped {
+            if let Some(span) = self.opening.clone() {
+                let in_span =
+                    self.position_secs + 1.5 >= span.start && self.position_secs <= span.end + 2.0;
+                if in_span {
+                    (span.end.max(self.position_secs + 2.0), true, false)
+                } else if self.series_opening_guess() {
+                    (90.0, true, false)
+                } else {
+                    return self.skip_credits_inner();
+                }
             } else if self.series_opening_guess() {
-                90.0
+                (90.0, true, false)
             } else {
-                return false;
+                return self.skip_credits_inner();
             }
-        } else if self.series_opening_guess() {
-            90.0
         } else {
+            return self.skip_credits_inner();
+        };
+        self.seek_skip_target(target, mark_intro, mark_credits)
+    }
+
+    fn skip_credits_inner(&mut self) -> bool {
+        if self.credits_skipped {
+            return false;
+        }
+        let Some(c) = self.credits.clone() else {
             return false;
         };
-        let delta = target - self.position_secs;
-        if delta < 1.5 {
+        if !c.contains(self.position_secs, self.duration_secs) {
             return false;
         }
+        let target = if self.duration_secs > c.start + 5.0 {
+            (self.duration_secs - 1.0).max(c.start + 1.0)
+        } else {
+            c.start + 1.0
+        };
+        self.seek_skip_target(target, false, true)
+    }
+
+    fn seek_skip_target(&mut self, target: f64, mark_intro: bool, mark_credits: bool) -> bool {
+        let delta = target - self.position_secs;
+        if delta < 1.5 && !mark_credits {
+            return false;
+        }
+        // End credits: allow a short jump near EOF.
+        if mark_credits && delta.abs() < 0.4 {
+            self.credits_skipped = true;
+            return true;
+        }
         let result = if self.duration_secs > 1.0 {
-            let pct = (target / self.duration_secs * 100.0).clamp(0.0, 99.0);
+            let pct = (target / self.duration_secs * 100.0).clamp(0.0, 99.5);
             match self.native.seek_percent(pct) {
                 Ok(()) => Ok(()),
                 Err(e) => {
@@ -1171,30 +1304,93 @@ impl StreamSession {
         };
         match result {
             Ok(()) => {
-                self.intro_skipped = true;
-                self.credits_skipped = true;
+                if mark_intro {
+                    self.intro_skipped = true;
+                }
+                if mark_credits {
+                    self.credits_skipped = true;
+                }
                 self.refresh_times();
                 true
             }
             Err(e) => {
-                warn!(error = %e, target, "skip opening failed");
+                warn!(error = %e, target, "skip seek failed");
                 false
             }
         }
     }
 
-    /// Once per play, when the automatic option is on, as soon as the opening starts.
+    /// Once per play, when the automatic option is on, as soon as a span starts.
     pub fn auto_skip_generic(&mut self) -> bool {
-        if self.intro_skipped {
-            return false;
+        if !self.intro_skipped {
+            if let Some(span) = self.opening.clone() {
+                if self.position_secs + 0.15 >= span.start && self.position_secs < span.end - 0.4 {
+                    return self.skip_generic();
+                }
+            }
         }
-        let Some(span) = self.opening.clone() else {
-            return false;
-        };
-        if self.position_secs + 0.15 < span.start || self.position_secs >= span.end - 0.4 {
-            return false;
+        if !self.credits_skipped {
+            if let Some(c) = &self.credits {
+                if c.contains(self.position_secs, self.duration_secs) {
+                    return self.skip_generic();
+                }
+            }
         }
-        self.skip_generic()
+        false
+    }
+
+    /// Apply community timings from The Open Skip Database (TMDB-keyed).
+    /// Remote data wins over picture guesses; chapters already applied stay if
+    /// they look more precise (same window ±2s) — otherwise remote replaces them.
+    pub fn apply_open_skip_db(
+        &mut self,
+        intro: Option<(f64, f64)>,
+        outro_start: Option<f64>,
+    ) {
+        if let Some((start, end)) = intro {
+            if end > start + 2.0 {
+                let replace = match &self.opening {
+                    None => true,
+                    Some(s) if s.from_remote => true,
+                    Some(s) if s.from_chapter => {
+                        // Prefer remote when chapter end was a wild guess (>2 min).
+                        (s.end - s.start) > 120.0
+                            || (s.start - start).abs() > 8.0
+                            || (s.end - end).abs() > 12.0
+                    }
+                    Some(_) => true, // picture guess yields to community data
+                };
+                if replace {
+                    tracing::info!(start, end, "opening from Open Skip Database");
+                    self.opening = Some(OpeningSpan {
+                        start,
+                        end,
+                        kind: SkipKind::Intro,
+                        from_chapter: false,
+                        from_remote: true,
+                    });
+                    self.opening_watch.gave_up = true;
+                }
+            }
+        }
+        if let Some(start) = outro_start {
+            if start > 30.0 {
+                let replace = match &self.credits {
+                    None => true,
+                    Some(c) if c.from_remote => true,
+                    Some(c) if c.from_chapter => (c.start - start).abs() > 15.0,
+                    Some(_) => true,
+                };
+                if replace {
+                    tracing::info!(start, "credits from Open Skip Database");
+                    self.credits = Some(CreditsSpan {
+                        start,
+                        from_chapter: false,
+                        from_remote: true,
+                    });
+                }
+            }
+        }
     }
 
     pub fn add_bookmark(&mut self) {
@@ -1222,7 +1418,7 @@ impl StreamSession {
         let next = (self.sub_delay + delta).clamp(-10.0, 10.0);
         match self.native.set_sub_delay(next) {
             Ok(()) => self.sub_delay = next,
-            Err(e) => warn!(error = %e, "sub_delay unsupported"),
+            Err(e) => warn_mpv_or_skip("sub_delay", &e),
         }
     }
 
@@ -1230,7 +1426,7 @@ impl StreamSession {
         let next = (self.audio_delay + delta).clamp(-10.0, 10.0);
         match self.native.set_audio_delay(next) {
             Ok(()) => self.audio_delay = next,
-            Err(e) => warn!(error = %e, "audio_delay unsupported"),
+            Err(e) => warn_mpv_or_skip("audio_delay", &e),
         }
     }
 
@@ -1238,7 +1434,7 @@ impl StreamSession {
         let next = self.audio_mode.cycle();
         match self.native.set_audio_channels(next.mpv_value()) {
             Ok(()) => self.audio_mode = next,
-            Err(e) => warn!(error = %e, "audio_mode unsupported"),
+            Err(e) => warn_mpv_or_skip("audio_mode", &e),
         }
     }
 
@@ -1270,7 +1466,7 @@ impl StreamSession {
         match self.native.set_af(&af) {
             Ok(()) => Ok(()),
             Err(e) => {
-                warn!(error = %e, "set_af unsupported");
+                warn_mpv_or_skip("set_af", &e);
                 Err(())
             }
         }
@@ -1278,27 +1474,27 @@ impl StreamSession {
 
     pub fn toggle_deinterlace(&mut self) {
         if self.native.android_surface_present() {
-            warn!("deinterlace skipped on MediaCodec Surface (would black video)");
+            debug!("deinterlace skipped on MediaCodec Surface (would black video)");
             return;
         }
         let next = self.deinterlace.cycle();
         info!(mode = next.label(), "StreamSession::deinterlace");
         match self.native.set_deinterlace_mode(next.mpv_value()) {
             Ok(()) => self.deinterlace = next,
-            Err(e) => warn!(error = %e, "deinterlace failed"),
+            Err(e) => warn_mpv_or_skip("deinterlace", &e),
         }
     }
 
     pub fn cycle_upscale(&mut self) {
         if self.native.android_surface_present() {
-            warn!("upscale/scale skipped on MediaCodec Surface (would black video)");
+            debug!("upscale/scale skipped on MediaCodec Surface (would black video)");
             return;
         }
         let next = self.upscale.cycle();
         info!(mode = next.label(), "StreamSession::upscale");
         match self.native.set_scale(next.mpv_scale()) {
             Ok(()) => self.upscale = next,
-            Err(e) => warn!(error = %e, "upscale/scale failed"),
+            Err(e) => warn_mpv_or_skip("upscale/scale", &e),
         }
     }
 
@@ -1312,7 +1508,7 @@ impl StreamSession {
         info!(deg = next, "StreamSession::rotate");
         match self.native.set_video_rotate(next) {
             Ok(()) => self.rotate_deg = next,
-            Err(e) => warn!(error = %e, "rotate failed"),
+            Err(e) => warn_mpv_or_skip("rotate", &e),
         }
     }
 
@@ -1321,7 +1517,7 @@ impl StreamSession {
         info!(zoom = next, "StreamSession::zoom");
         match self.native.set_video_zoom(next) {
             Ok(()) => self.zoom = next,
-            Err(e) => warn!(error = %e, "zoom failed"),
+            Err(e) => warn_mpv_or_skip("zoom", &e),
         }
     }
 
@@ -1334,7 +1530,7 @@ impl StreamSession {
                 true
             }
             Err(e) => {
-                warn!(error = %e, "aspect failed");
+                warn_mpv_or_skip("aspect", &e);
                 false
             }
         }
@@ -1345,7 +1541,7 @@ impl StreamSession {
         info!(ontop = next, "StreamSession::ontop (mpv prop; iced window handled by UI)");
         match self.native.set_ontop(next) {
             Ok(()) => self.ontop = next,
-            Err(e) => warn!(error = %e, "ontop unsupported"),
+            Err(e) => warn_mpv_or_skip("ontop", &e),
         }
     }
 
@@ -1443,7 +1639,13 @@ impl StreamSession {
         match self.native.set_vf(&vf) {
             Ok(()) => Ok(()),
             Err(e) => {
-                warn!(error = %e, vf = %vf, "set_vf failed");
+                let msg = e.to_string();
+                // Non-mpv backends return a coded "pas de libmpv" — not a real filter failure.
+                if msg.contains("pas de libmpv") || msg.contains("non supporté") {
+                    debug!(error = %e, vf = %vf, "set_vf skipped (non-mpv)");
+                } else {
+                    warn!(error = %e, vf = %vf, "set_vf failed");
+                }
                 Err(())
             }
         }
@@ -1564,16 +1766,41 @@ impl StreamSession {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SkipKind {
+    Intro,
+    Recap,
+}
+
 #[derive(Clone, Copy)]
 struct OpeningSpan {
     start: f64,
     end: f64,
+    kind: SkipKind,
     from_chapter: bool,
+    from_remote: bool,
 }
 
 impl OpeningSpan {
     fn contains(self, pos: f64) -> bool {
         pos + 0.15 >= self.start && pos < self.end - 0.25
+    }
+}
+
+#[derive(Clone, Copy)]
+struct CreditsSpan {
+    start: f64,
+    from_chapter: bool,
+    from_remote: bool,
+}
+
+impl CreditsSpan {
+    fn contains(self, pos: f64, duration: f64) -> bool {
+        if duration > 1.0 && self.start >= duration - 2.0 {
+            return false;
+        }
+        // Arm a few seconds before the marker so the pill is usable.
+        pos + 0.2 >= self.start - 1.5 && (duration <= 1.0 || pos < duration - 0.5)
     }
 }
 
@@ -1602,64 +1829,27 @@ impl OpeningWatch {
 }
 
 fn opening_from_chapters(chapters: &[(f64, String)], series: bool) -> Option<OpeningSpan> {
-    let guess = if series { 90.0 } else { 25.0 };
-    for (i, (start, title)) in chapters.iter().enumerate() {
-        if !looks_like_opening(title) {
-            continue;
-        }
-        let next = chapters.get(i + 1).map(|(t, _)| *t);
-        let end = next.unwrap_or(start + guess).min(start + 150.0);
-        if end > start + 3.0 {
-            return Some(OpeningSpan {
-                start: *start,
-                end,
-                from_chapter: true,
-            });
-        }
-    }
-    None
+    let (start, end, class) = crate::chapter_classify::opening_from_chapters(chapters, series)?;
+    let kind = match class {
+        crate::ChapterClass::Intro => SkipKind::Intro,
+        crate::ChapterClass::Recap => SkipKind::Recap,
+        _ => return None,
+    };
+    Some(OpeningSpan {
+        start,
+        end,
+        kind,
+        from_chapter: true,
+        from_remote: false,
+    })
 }
 
-fn looks_like_opening(title: &str) -> bool {
-    let mut folded = String::new();
-    for c in title.chars() {
-        let c = match c {
-            'é' | 'è' | 'ê' | 'ë' => 'e',
-            'à' | 'â' | 'ä' => 'a',
-            'ù' | 'û' | 'ü' => 'u',
-            'î' | 'ï' => 'i',
-            'ô' | 'ö' => 'o',
-            'ç' => 'c',
-            other => other.to_ascii_lowercase(),
-        };
-        folded.push(c);
-    }
-    let t = format!(" {folded} ");
-    const BLOCK: &[&str] = &[
-        "ending",
-        "outro",
-        "preview",
-        "end credit",
-        "credits de fin",
-        "credit de fin",
-        "generique de fin",
-    ];
-    if BLOCK.iter().any(|k| t.contains(k)) {
-        return false;
-    }
-    const OPEN: &[&str] = &[
-        " intro",
-        "intro ",
-        "opening",
-        "generique",
-        " op ",
-        "o.p",
-        "theme",
-        "logo",
-        "studio",
-        "cold open",
-    ];
-    OPEN.iter().any(|k| t.contains(k)) || t.trim() == "op"
+fn credits_from_chapters(chapters: &[(f64, String)], duration: f64) -> Option<CreditsSpan> {
+    crate::chapter_classify::credits_from_chapters(chapters, duration).map(|start| CreditsSpan {
+        start,
+        from_chapter: true,
+        from_remote: false,
+    })
 }
 
 fn sample_luma_grid(w: u32, h: u32, pitch: u32, rgba: &[u8]) -> Vec<f32> {
@@ -1724,5 +1914,32 @@ fn format_hms(secs: f64) -> String {
         format!("{h}:{m:02}:{sec:02}")
     } else {
         format!("{m:02}:{sec:02}")
+    }
+}
+
+#[cfg(test)]
+mod skip_chapter_tests {
+    use super::*;
+
+    #[test]
+    fn opening_prefers_intro_over_recap() {
+        let chapters = vec![
+            (5.0, "Previously on".into()),
+            (90.0, "Opening".into()),
+            (180.0, "Act 1".into()),
+        ];
+        let span = opening_from_chapters(&chapters, true).unwrap();
+        assert_eq!(span.kind, SkipKind::Intro);
+        assert!((span.start - 90.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn credits_from_late_chapter() {
+        let chapters = vec![
+            (10.0, "Intro".into()),
+            (2400.0, "End Credits".into()),
+        ];
+        let c = credits_from_chapters(&chapters, 2600.0).unwrap();
+        assert!((c.start - 2400.0).abs() < 0.01);
     }
 }

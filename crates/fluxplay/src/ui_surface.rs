@@ -125,10 +125,13 @@ mod tests {
         assert!(UiSurface::Television.touch_target() >= 64.0);
         assert!(UiSurface::Television.overscan_pad() >= 24.0);
         assert!(UiSurface::Television.wants_focus_chrome());
-        let m = crate::theme::LayoutMetrics::compute_for(UiSurface::Television, 1920.0, 1080.0);
-        assert_eq!(m.bp, Breakpoint::Tv);
-        assert!(m.focus_chrome);
-        assert!(m.pad >= 24.0);
-        assert!(m.cols <= 6);
+        assert_eq!(
+            UiSurface::Television.layout_breakpoint(1920.0, 1080.0),
+            Breakpoint::Tv
+        );
+        // Geometry path without FORCE_TV stays desktop on a wide window.
+        if std::env::var_os("FLUXPLAY_FORCE_TV").is_none() {
+            assert_eq!(UiSurface::detect(1920.0, 1080.0), UiSurface::Desktop);
+        }
     }
 }

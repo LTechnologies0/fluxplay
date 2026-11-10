@@ -143,7 +143,11 @@ pub fn import_profile(archive: &Path) -> Result<MediaSource, String> {
     let mut unpacked = 0u64;
     for i in 0..zip.len() {
         let mut entry = zip.by_index(i).map_err(|e| format!("zip entry: {e}"))?;
-        let name = entry.name().to_string();
+        // zip 9: `name()` validates UTF-8 / returns Result (symlink-safe extract CVEs).
+        let name = entry
+            .name()
+            .map_err(|e| format!("zip name: {e}"))?
+            .into_owned();
         if name == "manifest.json" || name == "source.json" {
             continue;
         }
@@ -152,7 +156,7 @@ pub fn import_profile(archive: &Path) -> Result<MediaSource, String> {
         } else if name == "favorites.json" {
             dest_dir.join("favorites.json")
         } else if let Some(rest) = name.strip_prefix("images/") {
-            let rel = std::path::Path::new(rest);
+            let rel = Path::new(rest);
             let plain = rel
                 .components()
                 .all(|c| matches!(c, std::path::Component::Normal(_)));

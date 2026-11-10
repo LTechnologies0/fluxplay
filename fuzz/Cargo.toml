@@ -13,7 +13,10 @@ cargo-fuzz = true
 # or dalek 4.0.0-rc.3 dies on removed nightly `stdsimd`.
 [dependencies]
 libfuzzer-sys = "0.4"
+url = "2"
 fluxplay-core = { path = "../crates/fluxplay-core" }
+fluxplay-providers = { path = "../crates/fluxplay-providers" }
+fluxplay-player = { path = "../crates/fluxplay-player", default-features = false, features = ["fuzzing"] }
 fluxplay = { path = "../crates/fluxplay", default-features = false, features = ["fuzzing"] }
 
 [[bin]]
@@ -61,6 +64,104 @@ bench = false
 [[bin]]
 name = "fuzz_sanitize"
 path = "fuzz_targets/fuzz_sanitize.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_virtual_slice"
+path = "fuzz_targets/fuzz_virtual_slice.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_soft_present"
+path = "fuzz_targets/fuzz_soft_present.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_downloads"
+path = "fuzz_targets/fuzz_downloads.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_image_url"
+path = "fuzz_targets/fuzz_image_url.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_xtream_url"
+path = "fuzz_targets/fuzz_xtream_url.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_metadata"
+path = "fuzz_targets/fuzz_metadata.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_redact"
+path = "fuzz_targets/fuzz_redact.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_ui_surface"
+path = "fuzz_targets/fuzz_ui_surface.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_route"
+path = "fuzz_targets/fuzz_route.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_hls_body"
+path = "fuzz_targets/fuzz_hls_body.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_chapters"
+path = "fuzz_targets/fuzz_chapters.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_persist"
+path = "fuzz_targets/fuzz_persist.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_video_frame"
+path = "fuzz_targets/fuzz_video_frame.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_android_quality"
+path = "fuzz_targets/fuzz_android_quality.rs"
 test = false
 doc = false
 bench = false

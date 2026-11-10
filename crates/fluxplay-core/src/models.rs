@@ -152,6 +152,12 @@ pub struct Channel {
     /// Catch-up / archive (M3U Plus / IPTVnator).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub catchup: Option<CatchupInfo>,
+    /// Per-entry HTTP User-Agent from `#EXTVLCOPT` / EXTINF (else source-level).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub http_user_agent: Option<String>,
+    /// Per-entry HTTP Referer from `#EXTVLCOPT` / EXTINF (else source-level).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub http_referer: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -196,6 +202,9 @@ pub struct VodItem {
     pub genre: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub imdb_id: Option<String>,
+    /// The Open Skip Database / TMDB identity for intro·outro lookups.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tmdb_id: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub actors: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -238,6 +247,9 @@ pub struct SeriesItem {
     pub genre: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub imdb_id: Option<String>,
+    /// The Open Skip Database / TMDB identity for intro·outro lookups.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tmdb_id: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub actors: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

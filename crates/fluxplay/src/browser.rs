@@ -36,9 +36,6 @@ pub const CAT_PAGE: usize = 2000;
 /// Higher = less sensitive scrollbar on huge catalogs, but iced hates
 /// multi‑million‑px layouts — keep a hard ceiling.
 pub const MAX_VIRTUAL_CONTENT_PX: f32 = 480_000.0;
-/// Target scroll travel per virtual row (px) before hitting the cap.
-/// With the height ceiling this stays smooth up to ~1M mosaic rows.
-const VIRTUAL_ROW_TRAVEL_PX: f32 = 8.0;
 /// Rows rendered above/below the viewport (fast flings need deeper lead-in).
 /// Tile geometry only — keep tiny so posters stay on-screen (RAM).
 pub const VIRTUAL_OVERSCAN: usize = 4;
@@ -256,9 +253,7 @@ pub fn virtual_slice(
     // Compressed mode: keep layout height == content_h always
     // (spacers must absorb the difference vs real item_h — otherwise scroll
     // offset desyncs and fast flings show blank / jumpy mosaics).
-    let content_h = (total as f32 * VIRTUAL_ROW_TRAVEL_PX)
-        .clamp(view_h * 4.0, MAX_VIRTUAL_CONTENT_PX)
-        .max(view_h + item_h);
+    let content_h = MAX_VIRTUAL_CONTENT_PX.max(view_h + item_h);
     let max_scroll = (content_h - view_h).max(1.0);
     let scroll_y = scroll_y.clamp(0.0, max_scroll);
     let t = (scroll_y / max_scroll).clamp(0.0, 1.0);
@@ -314,9 +309,7 @@ mod virtual_scroll_tests {
             let s = virtual_slice(y, view_h, item_h, total, 10);
             let mid = (s.end - s.start) as f32 * item_h;
             let layout = s.top_spacer + mid + s.bottom_spacer;
-            let content_h = (total as f32 * VIRTUAL_ROW_TRAVEL_PX)
-                .clamp(view_h * 4.0, MAX_VIRTUAL_CONTENT_PX)
-                .max(view_h + item_h);
+            let content_h = MAX_VIRTUAL_CONTENT_PX.max(view_h + item_h);
             assert!(
                 (layout - content_h).abs() < 1.0,
                 "y={y} layout={layout} content_h={content_h} slice={s:?}"
@@ -333,9 +326,7 @@ mod virtual_scroll_tests {
         let total = 8_766usize;
         let item_h = 250.0;
         let view_h = 900.0;
-        let content_h = (total as f32 * VIRTUAL_ROW_TRAVEL_PX)
-            .clamp(view_h * 4.0, MAX_VIRTUAL_CONTENT_PX)
-            .max(view_h + item_h);
+        let content_h = MAX_VIRTUAL_CONTENT_PX.max(view_h + item_h);
         let max_scroll = (content_h - view_h).max(1.0);
         for overscan in [6usize, 14, 28] {
             for i in 0..200 {
@@ -562,9 +553,10 @@ pub fn virtual_content_height(total: usize, view_h: f32, item_h: f32) -> f32 {
     if natural <= MAX_VIRTUAL_CONTENT_PX {
         natural
     } else {
-        (total as f32 * VIRTUAL_ROW_TRAVEL_PX)
-            .clamp(view_h * 4.0, MAX_VIRTUAL_CONTENT_PX)
-            .max(view_h + item_h)
+        // Stay at the soft ceiling once natural overflows — a travel×total floor
+        // used to *shrink* the scroll surface right at the threshold (e.g. 478k →
+        // 28k), which jumps the scrollbar and desyncs virtual_slice mapping.
+        MAX_VIRTUAL_CONTENT_PX.max(view_h + item_h)
     }
 }
 
@@ -1144,7 +1136,13 @@ pub fn category_sidebar<'a>(
 
     let total = entries.len();
     let row_h = cat_row_height();
-    let slice = virtual_slice(scroll_y, view_h, row_h, total, VIRTUAL_OVERSCAN);
+    let slice = virtual_slice(
+        scroll_y,
+        view_h,
+        row_h,
+        total,
+        crate::policy::virtual_overscan(),
+    );
     let mut rows: Vec<Element<'a, Message>> = Vec::with_capacity(slice.end.saturating_sub(slice.start));
     if total == 0 {
         rows.push(text("Aucune catégorie").size(12).color(ui.ink_muted()).into());
@@ -1537,8 +1535,11 @@ pub fn media_row<'a>(
     thumb_size: f32,
     // Outer row width in px (Fill under mouse_area collapses on GLES).
     row_w: f32,
+    // Minimum interactive hit (from LayoutMetrics::hit).
+    hit: f32,
 ) -> Element<'a, Message> {
     use crate::theme::TOUCH_TARGET;
+    let hit = hit.max(40.0);
     #[cfg(target_os = "android")]
     let title = sanitize_android_ui_text(&title);
     #[cfg(target_os = "android")]
@@ -1618,7 +1619,7 @@ pub fn media_row<'a>(
             },
             ..Default::default()
         };
-        let play_w = TOUCH_TARGET;
+        let play_w = hit.max(TOUCH_TARGET);
         let play_el = mouse_area(
             container(crate::icons::icon(
                 crate::icons::Icon::Play,
@@ -1626,13 +1627,13 @@ pub fn media_row<'a>(
                 ui.primary(),
             ))
             .width(Length::Fixed(play_w))
-            .height(Length::Fixed(row_h))
+            .height(Length::Fixed(row_h.max(play_w)))
             .center_x(Fill)
             .center_y(Fill),
         )
         .on_press(on_open.clone());
         if let Some((is_fav, fav_msg)) = on_fav {
-            let fav_w = TOUCH_TARGET;
+            let fav_w = hit.max(TOUCH_TARGET);
             let title_w = (row_w - ts - fav_w - play_w - 12.0).max(64.0);
             let fav_icon = favorite_mark(ui, is_fav, 22.0);
             return row![
@@ -1683,8 +1684,8 @@ pub fn media_row<'a>(
 
     #[cfg(not(target_os = "android"))]
     {
-    let ts = thumb_size.clamp(32.0, 72.0).max(TOUCH_TARGET - 8.0);
-    let fav_w = if on_fav.is_some() { 36.0 } else { 0.0 };
+    let ts = thumb_size.clamp(32.0, 72.0).max(hit.min(TOUCH_TARGET));
+    let fav_w = if on_fav.is_some() { hit } else { 0.0 };
     let label_w = (row_w - ts - fav_w - 40.0).max(64.0);
     let use_raster_thumb = thumb.is_some();
 
@@ -1748,8 +1749,8 @@ pub fn media_row<'a>(
             Space::new().width(SPACE_SM),
             mouse_area(
                 container(favorite_mark(ui, is_fav, 22.0))
-                    .width(Length::Fixed(TOUCH_TARGET - 8.0))
-                    .height(Length::Fixed(TOUCH_TARGET - 8.0))
+                    .width(Length::Fixed(hit))
+                    .height(Length::Fixed(hit))
                     .center_x(Fill)
                     .center_y(Fill),
             )
@@ -2005,8 +2006,12 @@ pub fn mosaic_tile<'a>(
     tile_w: f32,
     thumb: Option<&'a Handle>,
     pressed: bool,
+    focused: bool,
+    hit: f32,
 ) -> Element<'a, Message> {
-    mosaic_tile_marked(title, meta_line, id, on_open, ui, tile_w, thumb, pressed, None)
+    mosaic_tile_marked(
+        title, meta_line, id, on_open, ui, tile_w, thumb, pressed, None, focused, hit,
+    )
 }
 
 // UI tile builder: each arg maps to a distinct visual slot; a builder struct adds noise.
@@ -2021,11 +2026,14 @@ pub fn mosaic_tile_marked<'a>(
     thumb: Option<&'a Handle>,
     pressed: bool,
     mark: Option<TileMark>,
+    focused: bool,
+    hit: f32,
 ) -> Element<'a, Message> {
     let w = tile_w.max(96.0);
     // Classic poster aspect ~2:3
     let h = (w * 1.5).round();
     let press_alpha = if pressed { 0.85_f32 } else { 1.0 };
+    let hit = hit.max(40.0);
 
     let poster: Element<'a, Message> = {
         // Android: show poster art by default; skip only if FLUXPLAY_ANDROID_ART=0/off.
@@ -2057,45 +2065,58 @@ pub fn mosaic_tile_marked<'a>(
     };
     let poster = match mark {
         Some(mark) => {
-            let (icon_el, msg) = match mark {
-                TileMark::Favorite { on, toggle } => (favorite_mark(ui, on, 16.0), toggle),
-                TileMark::Remove(msg) => (
-                    crate::icons::icon(crate::icons::Icon::Close, 14.0, ui.on_surface()),
-                    msg,
-                ),
-            };
-            let badge = mouse_area(
-                container(icon_el)
-                    .width(Length::Fixed(32.0))
-                    .height(Length::Fixed(32.0))
-                    .align_x(Alignment::Center)
-                    .align_y(Alignment::Center)
-                    .style(move |_t: &Theme| {
-                        let mut bg = ui.surface_container_highest();
-                        bg.a = 0.92;
-                        container::Style {
-                            background: Some(Background::Color(bg)),
-                            border: Border {
-                                radius: RADIUS_FULL.into(),
-                                color: ui.outline_variant(),
-                                width: 1.0,
-                            },
-                            ..Default::default()
-                        }
-                    }),
-            )
-            .on_press(msg)
-            .on_release(Message::ShelfHold);
-            stack![
-                poster,
-                container(badge)
-                    .width(Length::Fixed(w))
-                    .height(Length::Fixed(h))
-                    .align_x(Alignment::End)
-                    .align_y(Alignment::Start)
-                    .padding(8),
-            ]
-            .into()
+            // Desktop: defer badge chrome until focus/press (or fav already on) —
+            // every marked tile used to mount a mouse_area stack (atlas pressure).
+            // Android/TV: always show (leanback has no hover).
+            let fav_on = matches!(&mark, TileMark::Favorite { on: true, .. });
+            #[cfg(target_os = "android")]
+            let show_badge = true;
+            #[cfg(not(target_os = "android"))]
+            let show_badge = focused || pressed || fav_on;
+            if !show_badge {
+                poster
+            } else {
+                let (icon_el, msg) = match mark {
+                    TileMark::Favorite { on, toggle } => (favorite_mark(ui, on, 16.0), toggle),
+                    TileMark::Remove(msg) => (
+                        crate::icons::icon(crate::icons::Icon::Close, 14.0, ui.on_surface()),
+                        msg,
+                    ),
+                };
+                let badge_hit = hit;
+                let badge = mouse_area(
+                    container(icon_el)
+                        .width(Length::Fixed(badge_hit))
+                        .height(Length::Fixed(badge_hit))
+                        .align_x(Alignment::Center)
+                        .align_y(Alignment::Center)
+                        .style(move |_t: &Theme| {
+                            let mut bg = ui.surface_container_highest();
+                            bg.a = 0.92;
+                            container::Style {
+                                background: Some(Background::Color(bg)),
+                                border: Border {
+                                    radius: RADIUS_FULL.into(),
+                                    color: ui.outline_variant(),
+                                    width: 1.0,
+                                },
+                                ..Default::default()
+                            }
+                        }),
+                )
+                .on_press(msg)
+                .on_release(Message::ShelfHold);
+                stack![
+                    poster,
+                    container(badge)
+                        .width(Length::Fixed(w))
+                        .height(Length::Fixed(h))
+                        .align_x(Alignment::End)
+                        .align_y(Alignment::Start)
+                        .padding(SPACE_SM),
+                ]
+                .into()
+            }
         }
         None => poster,
     };
@@ -2144,8 +2165,20 @@ pub fn mosaic_tile_marked<'a>(
             let mut c = ui.surface_container_high();
             c.a *= press_alpha;
             Some(Background::Color(c))
+        } else if focused {
+            Some(Background::Color(ui.surface_container_low()))
         } else {
             None
+        },
+        // Ten-foot / D-pad focus ring (M3 target boundary — primary, ≥2px).
+        border: Border {
+            color: if focused {
+                ui.primary()
+            } else {
+                Color::TRANSPARENT
+            },
+            width: if focused { 2.0 } else { 0.0 },
+            radius: RADIUS_LG.into(),
         },
         ..Default::default()
     });
@@ -2169,7 +2202,9 @@ pub fn channel_tile<'a>(
     thumb: Option<&'a Handle>,
     pressed: bool,
     selected: bool,
+    hit: f32,
 ) -> Element<'a, Message> {
+    let hit = hit.max(40.0);
     let w = tile_w.max(112.0);
     let logo_side = if w < 190.0 { 40.0 } else { 64.0 };
     let poster: Element<'a, Message> = if let Some(handle) = thumb {
@@ -2234,9 +2269,15 @@ pub fn channel_tile<'a>(
     .on_press(Message::MosaicPress(id))
     .on_release(on_open);
     let heart: Element<'a, Message> = if let Some((is_fav, fav_msg)) = on_fav {
-        mouse_area(container(favorite_mark(ui, is_fav, 18.0)))
-            .on_press(fav_msg)
-            .into()
+        mouse_area(
+            container(favorite_mark(ui, is_fav, 18.0))
+                .width(Length::Fixed(hit))
+                .height(Length::Fixed(hit))
+                .center_x(Fill)
+                .center_y(Fill),
+        )
+        .on_press(fav_msg)
+        .into()
     } else {
         Space::new().width(0).into()
     };
@@ -2249,7 +2290,7 @@ pub fn channel_tile<'a>(
             .height(Fill),
     )
     .width(Length::Fixed(w))
-    .height(Length::Fixed(CHANNEL_CARD_H))
+    .height(Length::Fixed(CHANNEL_CARD_H.max(hit + 16.0)))
     .clip(true)
     .style(move |_t: &Theme| container::Style {
         background: Some(Background::Color(if pressed {
@@ -2259,11 +2300,12 @@ pub fn channel_tile<'a>(
         })),
         border: Border {
             color: if selected {
-                ui.accent()
+                ui.primary()
             } else {
                 ui.outline_variant()
             },
-            width: if selected { 1.5 } else { 1.0 },
+            // Selected / D-pad focus: ≥2px primary boundary (not outline_variant alone).
+            width: if selected { 2.0 } else { 1.0 },
             radius: RADIUS_LG.into(),
         },
         ..Default::default()
@@ -2962,7 +3004,7 @@ pub fn load_more_row<'a>(ui: UiTheme, left: usize) -> Element<'a, Message> {
         )
         .on_press(Message::LoadMore),
     )
-    .width(Length::Fill)
+    .width(Fill)
     .align_x(Alignment::Center)
     .padding(Padding {
         top: 12.0,
@@ -3614,7 +3656,7 @@ pub fn media_detail_page<'a>(
         .into()
     };
 
-    pane(ui, Length::Fill, page)
+    pane(ui, Fill, page)
 }
 
 fn section_heading<'a>(heading: &str) -> Element<'a, Message> {
@@ -3764,6 +3806,8 @@ pub fn actor_page<'a>(
                 tile_w,
                 thumb,
                 false,
+                false,
+                crate::theme::TOUCH_TARGET,
             ));
         }
         body = body.push(
@@ -3792,7 +3836,7 @@ pub fn actor_page<'a>(
 
     pane(
         ui,
-        Length::Fill,
+        Fill,
         column![back, soft_scroll(ui, body.width(Fill))]
             .spacing(SPACE_MD)
             .width(Fill)

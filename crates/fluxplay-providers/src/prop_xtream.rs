@@ -4,10 +4,26 @@
 
 use proptest::prelude::*;
 
+use crate::redact_urls;
 use crate::xtream_url::{http_status_hint, parse_xtream_get_php, path_segment, status_error};
 
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(128))]
+
+    /// Credential-bearing URLs in error text must vanish (ASCII case-insensitive).
+    #[test]
+    fn redact_urls_kills_http_schemes(prefix in "\\PC{0,40}", suffix in "\\PC{0,40}") {
+        const TOKEN: &str = "s3cr3tTok9Xz";
+        let mixed = format!("{prefix}HTTP://user:{TOKEN}@host.example/x{suffix}");
+        let out = redact_urls(&mixed);
+        let lower = out.to_ascii_lowercase();
+        prop_assert!(!lower.contains("http://"));
+        prop_assert!(!lower.contains("https://"));
+        // Only fail if the token came from the URL (suffix may randomly match).
+        if !suffix.contains(TOKEN) && !prefix.contains(TOKEN) {
+            prop_assert!(!out.contains(TOKEN), "credential leaked: {out:?}");
+        }
+    }
 
     #[test]
     fn path_segment_encodes_slash_and_space(raw in "\\PC{0,80}") {

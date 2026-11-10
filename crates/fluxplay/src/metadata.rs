@@ -24,6 +24,8 @@ pub struct MetaPatch {
     pub poster: Option<String>,
     pub rating: Option<String>,
     pub imdb_id: Option<String>,
+    /// TMDB numeric id — used by The Open Skip Database for intro/outro.
+    pub tmdb_id: Option<u32>,
     pub actors: Option<String>,
     pub director: Option<String>,
     pub writer: Option<String>,
@@ -88,7 +90,12 @@ impl TitleQuery {
 /// - suffixes `_sub` `-fr` `_eng` `--it` `-DE`
 /// - tags `4K` `4KL` `[Multi-Sub]` `NF -`
 pub fn parse_title_query(raw: &str) -> TitleQuery {
-    let mut s = raw.trim().to_string();
+    // Drop C0 controls early — iced labels / OMDB queries choke on embedded NUL.
+    let mut s: String = raw
+        .trim()
+        .chars()
+        .filter(|c| *c == '\t' || !c.is_control())
+        .collect();
     // Normalize separators before suffix stripping
     s = s.replace(['\u{2013}', '\u{2014}'], "-");
 
@@ -140,7 +147,7 @@ pub fn parse_title_query(raw: &str) -> TitleQuery {
     let cleaned = words.join(" ");
 
     let title = if cleaned.is_empty() {
-        raw.trim().to_string()
+        s
     } else {
         cleaned
     };
@@ -421,6 +428,7 @@ impl MetaPatch {
         fill!(poster);
         // First match wins: a later title search must not swap in another film's id.
         fill!(imdb_id);
+        fill!(tmdb_id);
         fill!(rating);
         fill!(actors);
         fill!(director);
@@ -449,6 +457,7 @@ impl MetaPatch {
             && self.poster.is_none()
             && self.rating.is_none()
             && self.imdb_id.is_none()
+            && self.tmdb_id.is_none()
             && self.actors.is_none()
             && self.director.is_none()
             && self.writer.is_none()
@@ -480,6 +489,7 @@ impl MetaPatch {
         }
         set!(rating);
         set!(imdb_id);
+        set!(tmdb_id);
         set!(actors);
         set!(director);
         set!(writer);
@@ -510,6 +520,7 @@ impl MetaPatch {
         }
         set!(rating);
         set!(imdb_id);
+        set!(tmdb_id);
         set!(actors);
         set!(director);
         set!(writer);
@@ -523,13 +534,7 @@ impl MetaPatch {
 
 fn http() -> reqwest::Client {
     fluxplay_providers::app_http("FluxPlay/0.2 (+metadata; public APIs only)", 14).unwrap_or_else(
-        |_| {
-            reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(14))
-                .user_agent("FluxPlay/0.2 (+metadata; public APIs only)")
-                .build()
-                .expect("metadata HTTP client")
-        },
+        |_| fluxplay_providers::emergency_http("FluxPlay/0.2 (+metadata; public APIs only)", 14),
     )
 }
 
@@ -600,22 +605,22 @@ impl ApiGate {
 
 fn tvmaze_gate() -> &'static ApiGate {
     static G: OnceLock<ApiGate> = OnceLock::new();
-    G.get_or_init(|| ApiGate::new("tvmaze", 750))
+    G.get_or_init(|| ApiGate::new("tvmaze", crate::policy::get().meta.gate_tvmaze_ms))
 }
 
 fn omdb_gate() -> &'static ApiGate {
     static G: OnceLock<ApiGate> = OnceLock::new();
-    G.get_or_init(|| ApiGate::new("omdb", 280))
+    G.get_or_init(|| ApiGate::new("omdb", crate::policy::get().meta.gate_omdb_ms))
 }
 
 fn tmdb_gate() -> &'static ApiGate {
     static G: OnceLock<ApiGate> = OnceLock::new();
-    G.get_or_init(|| ApiGate::new("tmdb", 250))
+    G.get_or_init(|| ApiGate::new("tmdb", crate::policy::get().meta.gate_tmdb_ms))
 }
 
 fn itunes_gate() -> &'static ApiGate {
     static G: OnceLock<ApiGate> = OnceLock::new();
-    G.get_or_init(|| ApiGate::new("itunes", 200))
+    G.get_or_init(|| ApiGate::new("itunes", crate::policy::get().meta.gate_itunes_ms))
 }
 
 
@@ -784,7 +789,7 @@ async fn wikidata_portrait(qid: &str) -> Option<String> {
 
 fn anilist_gate() -> &'static ApiGate {
     static G: OnceLock<ApiGate> = OnceLock::new();
-    G.get_or_init(|| ApiGate::new("anilist", 700))
+    G.get_or_init(|| ApiGate::new("anilist", crate::policy::get().meta.gate_anilist_ms))
 }
 
 /// AniList staff portrait. The search hit is kept only when the name matches.
@@ -1498,13 +1503,12 @@ pub async fn enrich_vod(name: &str) -> Option<MetaPatch> {
     enrich_title_full(name, "movie", None).await
 }
 
-/// Full IMDb-via-OMDb detail for the media page (synopsis + cast). Prefer `i=tt…`.
+/// Full media-page detail (synopsis + cast). Prefer `i=tt…` when known.
 ///
-/// Strategy:
-/// 1. OMDb `i=` / `t=` / `s=` (rate-gated)
-/// 2. iTunes Search (poster/year)
-/// 3. TVMaze (series cast/plot)
-/// 4. Wikipedia summary (plot)
+/// Strategy (keyless first — works with zero API keys):
+/// 1. TVMaze (series) / iTunes / Wikipedia / Wikidata / Kitsu
+/// 2. TMDB when a user token is configured
+/// 3. OMDb when a user key is configured
 pub async fn enrich_title_full(
     name: &str,
     kind: &str,
@@ -1514,31 +1518,64 @@ pub async fn enrich_title_full(
     debug!(%name, title = %q.title, year = ?q.year, %kind, "enrich_title_full");
     let mut patch = MetaPatch::default();
 
-    if let Some(p) = tmdb_fiche(name, kind, imdb_id).await {
-        patch.merge(p);
+    // --- Keyless public APIs (no signup) ---------------------------------
+    if kind == "series" {
+        if let Some(p) = tvmaze_show(&q.title).await {
+            patch.merge(p);
+        }
     }
-    let tmdb_hit = patch.imdb_id.is_some() || patch.actors.is_some() || patch.rated.is_some();
+    if patch.poster.is_none() || patch.year.is_none() {
+        if let Some(p) = itunes_lookup(&q, kind == "series").await {
+            patch.merge(p);
+        }
+    }
+    if patch.plot.as_ref().map(|p| p.len() < 40).unwrap_or(true) {
+        if let Some(p) = wikipedia_summary(&q, kind == "series").await {
+            patch.merge(p);
+        }
+    }
+    if patch.rated.is_none() {
+        if let Some(code) =
+            wikidata_rating(&q.title, q.year.as_deref(), kind == "series").await
+        {
+            patch.rated = Some(code);
+        }
+    }
+    if patch.rated.is_none() && kind == "series" {
+        if let Some(code) = kitsu_age(&rating_query_title(&q.title)).await {
+            patch.rated = Some(code);
+        }
+    }
+    if patch.year.is_none() {
+        patch.year = q.year.clone();
+    }
 
-    if !tmdb_hit {
+    // --- Optional keyed providers (user-owned keys only) -----------------
+    if tmdb_configured() {
+        if let Some(p) = tmdb_fiche(name, kind, imdb_id).await {
+            patch.merge(p);
+        }
+    }
+
+    if omdb_configured()
+        && (needs_full_credits(patch.actors.as_deref(), patch.plot.as_deref())
+            || patch.imdb_id.is_none())
+    {
         if let Some(id) = imdb_id.filter(|s| s.starts_with("tt")) {
             if let Some(p) = omdb_by_id(id).await {
                 patch.merge(p);
             }
         }
-
         if needs_full_credits(patch.actors.as_deref(), patch.plot.as_deref()) {
             if let Some(p) = omdb_lookup(&q, kind).await {
                 patch.merge(p);
             }
         }
-
-        // Untyped title pass (some OMDb rows omit type=movie).
         if needs_full_credits(patch.actors.as_deref(), patch.plot.as_deref()) && !kind.is_empty() {
             if let Some(p) = omdb_lookup(&q, "").await {
                 patch.merge(p);
             }
         }
-
         if needs_full_credits(patch.actors.as_deref(), patch.plot.as_deref())
             || patch.imdb_id.is_none()
         {
@@ -1556,42 +1593,6 @@ pub async fn enrich_title_full(
         }
     }
 
-    // Series cast fallback when OMDb has no Actors field.
-    if kind == "series" && needs_full_credits(patch.actors.as_deref(), patch.plot.as_deref()) {
-        if let Some(p) = tvmaze_show(&q.title).await {
-            patch.merge(p);
-        }
-    }
-
-    if patch.poster.is_none() || patch.year.is_none() {
-        if let Some(p) = itunes_lookup(&q, kind == "series").await {
-            patch.merge(p);
-        }
-    }
-
-    if patch.plot.as_ref().map(|p| p.len() < 40).unwrap_or(true) {
-        if let Some(p) = wikipedia_summary(&q, kind == "series").await {
-            patch.merge(p);
-        }
-    }
-
-    if patch.year.is_none() {
-        patch.year = q.year.clone();
-    }
-    if patch.rated.is_none() {
-        if let Some(code) =
-            wikidata_rating(&q.title, q.year.as_deref(), kind == "series").await
-        {
-            patch.rated = Some(code);
-        }
-    }
-    // Portals often have no certification. Kitsu publishes one for animation.
-    // Its wording is not an age, so it stays off once a TMDB token is set.
-    if patch.rated.is_none() && kind == "series" && !tmdb_configured() {
-        if let Some(code) = kitsu_age(&rating_query_title(&q.title)).await {
-            patch.rated = Some(code);
-        }
-    }
     if patch.is_empty() {
         None
     } else {
@@ -1600,7 +1601,7 @@ pub async fn enrich_title_full(
 }
 
 /// Fill episode plot/airdate/still from TVMaze when seasons are loaded.
-pub async fn enrich_series_episodes(series_name: &str, item: &mut fluxplay_core::models::SeriesItem) {
+pub async fn enrich_series_episodes(series_name: &str, item: &mut SeriesItem) {
     let q = parse_title_query(series_name);
     let Some(eps) = tvmaze_episodes(&q.title).await else {
         return;
@@ -2044,6 +2045,7 @@ pub async fn tmdb_fiche(name: &str, kind: &str, imdb_id: Option<&str>) -> Option
         poster: tmdb_poster(&body),
         rating: tmdb_vote(&body),
         imdb_id: tmdb_imdb(&body).or_else(|| imdb_id.filter(|s| s.starts_with("tt")).map(str::to_string)),
+        tmdb_id: u32::try_from(id).ok(),
         actors,
         director,
         writer,
@@ -2059,6 +2061,12 @@ pub async fn tmdb_fiche(name: &str, kind: &str, imdb_id: Option<&str>) -> Option
         ..Default::default()
     };
     if patch.is_empty() { None } else { Some(patch) }
+}
+
+/// Public TMDB id resolver for The Open Skip Database lookups.
+pub async fn tmdb_id_for_imdb(imdb_id: &str, series: bool) -> Option<u32> {
+    let id = tmdb_find_id(imdb_id, series).await?;
+    u32::try_from(id).ok()
 }
 
 async fn tmdb_json(path: &str) -> Option<serde_json::Value> {
@@ -2421,6 +2429,7 @@ async fn omdb_get(url: &str, label: &str) -> Option<MetaPatch> {
         poster: na(body.poster),
         rating: na(body.imdb_rating),
         imdb_id: na(body.imdb_id),
+        tmdb_id: None,
         actors: na(body.actors),
         director: na(body.director),
         writer: na(body.writer),
@@ -2532,7 +2541,7 @@ fn pref_lang() -> Option<String> {
 
 fn wiki_gate() -> &'static ApiGate {
     static G: OnceLock<ApiGate> = OnceLock::new();
-    G.get_or_init(|| ApiGate::new("wikipedia", 150))
+    G.get_or_init(|| ApiGate::new("wikipedia", crate::policy::get().meta.gate_wikipedia_ms))
 }
 
 /// Disambiguated page titles per wiki (`Title (2016 film)`, `Titre (série télévisée)`).
@@ -2742,6 +2751,9 @@ pub fn clean_text(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len());
     let mut chars = raw.char_indices().peekable();
     while let Some((i, c)) = chars.next() {
+        if c.is_control() && c != '\n' && c != '\t' {
+            continue;
+        }
         if c == '<' {
             if let Some(j) = raw[i..].find('>') {
                 let tag = raw[i + 1..i + j].trim().to_ascii_lowercase();
@@ -3017,8 +3029,8 @@ pub async fn lookup_series_age(name: &str) -> Option<String> {
     kitsu_age(&rating_query_title(&q.title)).await
 }
 
-/// Age for one poster. The portal already supplies the category. OMDb fills
-/// the age when a key is set. Series ask Kitsu when no age comes back.
+/// Age / year for one poster. Portal supplies the genre shelf; optional keys
+/// and keyless public APIs fill the rest.
 pub struct PosterFacts {
     pub year: Option<String>,
     pub rated: Option<String>,
@@ -3041,7 +3053,22 @@ pub async fn lookup_poster_facts(name: &str, series: bool) -> PosterFacts {
         let kind = if series { "series" } else { "movie" };
         if let Some(patch) = omdb_lookup(&q, kind).await {
             facts.rated = patch.rated.as_deref().and_then(advisory_code);
+            if facts.year.is_none() {
+                facts.year = patch.year;
+            }
         }
+    }
+    // Keyless: iTunes year + Wikidata certificate (films and series).
+    if facts.year.is_none() {
+        if let Some(p) = itunes_lookup(&q, series).await {
+            facts.year = p.year;
+        }
+    }
+    if facts.year.is_none() {
+        facts.year = q.year.clone();
+    }
+    if facts.rated.is_none() {
+        facts.rated = wikidata_rating(&q.title, q.year.as_deref(), series).await;
     }
     // Kitsu answers with prose ("Teens 13 or older") that was shown as the age
     // when TMDB already had a certificate. Only use it without a TMDB token.
@@ -3070,8 +3097,12 @@ pub fn display_genres(raw: &str) -> Vec<String> {
 }
 
 fn genre_chunks(raw: &str) -> Vec<String> {
+    let scrubbed: String = raw
+        .chars()
+        .filter(|c| *c == '\t' || !c.is_control())
+        .collect();
     let mut out = Vec::new();
-    for piece in raw.split([',', '/', '|', ';', '&']) {
+    for piece in scrubbed.split([',', '/', '|', ';', '&']) {
         let piece = piece.trim();
         if piece.is_empty() {
             continue;

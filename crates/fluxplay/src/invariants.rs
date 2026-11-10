@@ -15,6 +15,18 @@ pub const SOFT_PRESENT_MAX_H: u32 = 720;
 /// Poster decode longest-edge hard cap (display_caps).
 pub const DECODE_EDGE_HARD_CAP: u32 = 300;
 
+/// iced soft Allocation hold depth — matches `iced_wgpu` worker video atlases[5].
+/// Host RGBA is reclaimed when a hold is expelled (W4-01); do not shrink without
+/// blink measurement against atlas_binds.
+pub const SOFT_HOLD_DEPTH: usize = 5;
+
+/// SoftPump recycle pool slots (upload + pending + mpv scratch headroom).
+pub const SOFT_RGBA_RECYCLE_POOL: usize = 3;
+
+/// Max host soft RGBA retained by holds at Auto ceiling (bytes, exclusive of pool).
+pub const SOFT_HOLD_HOST_BYTES_MAX: usize =
+    SOFT_HOLD_DEPTH * (SOFT_PRESENT_MAX_W as usize) * (SOFT_PRESENT_MAX_H as usize) * 4;
+
 // ── rustc-time budget locks (plan RAM ~100 Mo) ──────────────────────────────
 const _: () = assert!(BROWSE_TILE_FETCH_LIMIT > 0);
 const _: () = assert!(BROWSE_TILE_FETCH_LIMIT <= 512);
@@ -26,6 +38,9 @@ const _: () = assert!(SOFT_PRESENT_MAX_W * SOFT_PRESENT_MAX_H <= 1280 * 720);
 const _: () = assert!(DECODE_EDGE_HARD_CAP <= 300);
 const _: () = assert!(MOSAIC_PAGE_ITEMS > 0 && MOSAIC_PAGE_ITEMS <= MAX_RAM_HANDLES);
 const _: () = assert!(VIRTUAL_OVERSCAN <= 8);
+const _: () = assert!(SOFT_HOLD_DEPTH == 5);
+const _: () = assert!(SOFT_RGBA_RECYCLE_POOL == 3);
+const _: () = assert!(SOFT_HOLD_HOST_BYTES_MAX <= 5 * 1280 * 720 * 4);
 
 /// Validate a browse window health report — used by fill paths + property tests.
 #[cfg(any(test, feature = "fuzzing"))]

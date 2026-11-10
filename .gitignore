@@ -26,11 +26,13 @@ fluxplay-state.json
 # proptest failure corpora (reproducers committed only when intentional)
 **/proptest-regressions/
 
-# Fuzz: keep harness, ignore generated corpus/artifacts
+# Fuzz: keep harness + curated seeds/dicts; ignore generated corpus/artifacts
 fuzz/corpus/
 fuzz/artifacts/
 fuzz/target/
 fuzz/Cargo.lock
+!fuzz/seeds/
+!fuzz/dictionaries/
 
 # Local screenshots
 tmp_fp_*.png

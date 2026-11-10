@@ -248,10 +248,10 @@ impl UiTheme {
         }
     }
 
-    /// Favorite star (`tertiary`).
+    /// Favorite star (`tertiary`). Day gold darkened for ≥3:1 on surface.
     pub fn favorite(self) -> Color {
         if self.day {
-            Color::from_rgb8(0xC9, 0x8A, 0x00)
+            Color::from_rgb8(0x9A, 0x6A, 0x00)
         } else {
             Color::from_rgb8(0xF5, 0xC5, 0x42)
         }
@@ -297,7 +297,11 @@ impl UiTheme {
 
     pub fn ink(self) -> Color {
         if let Some([r, g, b]) = self.ink_rgb {
-            return Color::from_rgb8(r, g, b);
+            let c = Color::from_rgb8(r, g, b);
+            // Custom ink must keep AA body contrast on surface (≥4.5:1).
+            if contrast_ratio(c, self.surface()) >= 4.5 {
+                return c;
+            }
         }
         if self.day {
             Color::from_rgb8(0x0F, 0x17, 0x22)
@@ -308,10 +312,15 @@ impl UiTheme {
 
     pub fn ink_muted(self) -> Color {
         if let Some([r, g, b]) = self.ink_rgb {
-            return Color::from_rgba8(r, g, b, 0.62);
+            let solid = Color::from_rgb8(r, g, b);
+            if contrast_ratio(solid, self.surface()) >= 4.5 {
+                // α 0.70 keeps muted role while solid ink already clears AA.
+                return Color::from_rgba8(r, g, b, 0.70);
+            }
         }
         if self.day {
-            Color::from_rgba8(0x0F, 0x17, 0x22, 0.58)
+            // ≥4.5:1 on surface for small caption/body_s text (was 0.58 ≈ 4.35:1).
+            Color::from_rgba8(0x0F, 0x17, 0x22, 0.70)
         } else {
             Color::from_rgba8(0xD0, 0xD7, 0xE0, 0.62)
         }
@@ -796,7 +805,8 @@ pub const RADIUS_FULL: f32 = 999.0;
 // Legacy aliases used across browser / player / app.
 pub const RADIUS_XS: f32 = RADIUS_EXTRA_SMALL;
 pub const RADIUS_SM: f32 = RADIUS_SMALL;
-pub const RADIUS_MD: f32 = RADIUS_LARGE;
+/// Material medium radius (12). Was aliased to LARGE (16) — mosaic/cards looked oversized.
+pub const RADIUS_MD: f32 = RADIUS_MEDIUM;
 pub const RADIUS_LG: f32 = RADIUS_LARGE_INCREASED;
 pub const RADIUS_XL: f32 = RADIUS_EXTRA_LARGE;
 pub const RADIUS_XXL: f32 = RADIUS_EXTRA_LARGE_INCREASED;
@@ -951,6 +961,25 @@ pub fn type_style(role: TypeRole, emphasized: bool) -> (f32, Font) {
     (type_size(role), type_font(emphasized))
 }
 
+/// Relative luminance (WCAG) for sRGB `Color` channels in 0..=1.
+fn relative_luminance(c: Color) -> f32 {
+    fn lin(u: f32) -> f32 {
+        if u <= 0.04045 {
+            u / 12.92
+        } else {
+            ((u + 0.055) / 1.055).powf(2.4)
+        }
+    }
+    0.2126 * lin(c.r) + 0.7152 * lin(c.g) + 0.0722 * lin(c.b)
+}
+
+/// WCAG contrast ratio between two opaque colors (≥1).
+pub fn contrast_ratio(a: Color, b: Color) -> f32 {
+    let (l1, l2) = (relative_luminance(a), relative_luminance(b));
+    let (hi, lo) = if l1 >= l2 { (l1, l2) } else { (l2, l1) };
+    (hi + 0.05) / (lo + 0.05)
+}
+
 /// Component measurement tokens (M3 Expressive).
 pub const TOOLBAR_H: f32 = 48.0;
 pub const TOOLBAR_OUTER_PAD: f32 = 12.0;
@@ -1001,7 +1030,8 @@ pub const PLAYER_PAD: f32 = SPACE_LG;
 
 /// Minimum mosaic tile width (logical px) before dropping a column.
 pub const MOSAIC_TILE_MIN: f32 = 120.0;
-pub const MOSAIC_GAP: f32 = 10.0;
+/// Mosaic gutter — Material `SPACE_MD` (was ad-hoc 10).
+pub const MOSAIC_GAP: f32 = SPACE_MD;
 
 /// Screen class from window width — M3 window size classes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1059,10 +1089,24 @@ pub struct LayoutMetrics {
     pub short: bool,
     /// Phone landscape: single-row tab strip instead of 2-col grid.
     pub nav_strip: bool,
+    /// Minimum interactive hit target (from [`crate::ui_surface::UiSurface`]).
+    pub hit: f32,
 }
 
 impl LayoutMetrics {
     pub fn compute(width: f32, height: f32) -> Self {
+        Self::compute_with(width, height, None, 1.0, 48.0)
+    }
+
+    /// `force_bp` / `type_scale` / `hit` come from [`crate::ui_surface::UiSurface`]
+    /// (passed as primitives to avoid a theme ↔ ui_surface import cycle).
+    pub fn compute_with(
+        width: f32,
+        height: f32,
+        force_bp: Option<Breakpoint>,
+        type_scale: f32,
+        hit: f32,
+    ) -> Self {
         let w = width.max(280.0);
         let h = height.max(200.0);
         // Phone landscape is often ≥600 wide but ~360 tall — width-only breakpoints
@@ -1070,11 +1114,15 @@ impl LayoutMetrics {
         let short = h < 520.0;
         let landscape = w > h * 1.05;
         let compact = w.min(h) < 520.0 || h < 480.0 || (landscape && h < 560.0);
-        let bp = if compact {
-            Breakpoint::Phone
-        } else {
-            Breakpoint::from_width(w)
-        };
+        let bp = force_bp.unwrap_or_else(|| {
+            if compact {
+                Breakpoint::Phone
+            } else {
+                Breakpoint::from_width(w)
+            }
+        });
+        // Television forces Tv breakpoint even on compact 720p panels.
+        let compact = compact && !matches!(bp, Breakpoint::Tv);
 
         #[cfg(target_os = "android")]
         let pad = if short { 6.0_f32 } else { 8.0_f32 };
@@ -1134,19 +1182,40 @@ impl LayoutMetrics {
         };
 
         // Type ladder: Phone / Tablet / Desktop / Tv (Laptop shares Desktop).
+        let scale = type_scale.clamp(1.0, 1.5);
         let (title_size, body_size, rail_size, thumb, player_chrome_h) = match bp {
             Breakpoint::Phone => (
-                TYPE_TITLE_L,
-                TYPE_BODY_M,
-                TYPE_LABEL_M,
+                TYPE_TITLE_L * scale,
+                TYPE_BODY_M * scale,
+                TYPE_LABEL_M * scale,
                 if short { 36.0 } else { 40.0 },
                 if short { 96.0 } else { 108.0 },
             ),
-            Breakpoint::Tablet => (TYPE_HEADLINE_S, TYPE_BODY_M, TYPE_LABEL_L, 44.0, 112.0),
-            Breakpoint::Laptop | Breakpoint::Desktop => {
-                (TYPE_HEADLINE_M, TYPE_BODY_L, TYPE_TITLE_M, if matches!(bp, Breakpoint::Desktop) { 52.0 } else { 48.0 }, 116.0)
-            }
-            Breakpoint::Tv => (TYPE_DISPLAY_S, TYPE_BODY_L, TYPE_LABEL_L, 64.0, 128.0),
+            Breakpoint::Tablet => (
+                TYPE_HEADLINE_S * scale,
+                TYPE_BODY_M * scale,
+                TYPE_LABEL_L * scale,
+                44.0,
+                112.0,
+            ),
+            Breakpoint::Laptop | Breakpoint::Desktop => (
+                TYPE_HEADLINE_M * scale,
+                TYPE_BODY_L * scale,
+                TYPE_TITLE_M * scale,
+                if matches!(bp, Breakpoint::Desktop) {
+                    52.0
+                } else {
+                    48.0
+                },
+                116.0,
+            ),
+            Breakpoint::Tv => (
+                TYPE_DISPLAY_S * scale,
+                TYPE_BODY_L * scale,
+                TYPE_LABEL_L * scale,
+                64.0_f32.max(hit),
+                128.0,
+            ),
         };
 
         Self {
@@ -1174,6 +1243,7 @@ impl LayoutMetrics {
             top_nav,
             short,
             nav_strip: top_nav && short && landscape,
+            hit: hit.max(40.0),
         }
     }
 }
@@ -1193,7 +1263,8 @@ fn mosaic_scroll_rail() -> f32 {
 /// How many mosaic columns fit in `content_width`.
 pub fn mosaic_cols(content_width: f32) -> usize {
     let w = (content_width - mosaic_scroll_rail()).max(80.0);
-    let cols = ((w + MOSAIC_GAP) / (MOSAIC_TILE_MIN + MOSAIC_GAP)).floor() as usize;
+    let tile_min = crate::policy::get().browse.mosaic_tile_min;
+    let cols = ((w + MOSAIC_GAP) / (tile_min + MOSAIC_GAP)).floor() as usize;
     cols.clamp(1, 14)
 }
 
@@ -1203,4 +1274,41 @@ pub fn mosaic_tile_width(content_width: f32, cols: usize) -> f32 {
     let usable = (content_width - mosaic_scroll_rail()).max(80.0);
     // Slack so button padding cannot overflow the row.
     ((usable - gaps) / cols - 4.0).clamp(96.0, 320.0)
+}
+
+#[cfg(test)]
+mod contrast_tests {
+    use super::*;
+
+    #[test]
+    fn day_muted_and_favorite_meet_aa() {
+        let ui = UiTheme::new(true, AccentPreset::default());
+        // Blend muted over surface (α compositing) before measuring.
+        let muted = ui.ink_muted();
+        let surf = ui.surface();
+        let a = muted.a;
+        let blended = Color {
+            r: muted.r * a + surf.r * (1.0 - a),
+            g: muted.g * a + surf.g * (1.0 - a),
+            b: muted.b * a + surf.b * (1.0 - a),
+            a: 1.0,
+        };
+        assert!(
+            contrast_ratio(blended, surf) >= 4.5,
+            "day ink_muted on surface {:.2}",
+            contrast_ratio(blended, surf)
+        );
+        assert!(
+            contrast_ratio(ui.favorite(), surf) >= 3.0,
+            "day favorite on surface {:.2}",
+            contrast_ratio(ui.favorite(), surf)
+        );
+    }
+
+    #[test]
+    fn weak_custom_ink_falls_back() {
+        // Near-white ink on day surface fails AA → default dark ink.
+        let ui = UiTheme::new(true, AccentPreset::default()).with_ink(Some([0xF0, 0xF2, 0xF5]));
+        assert!(contrast_ratio(ui.ink(), ui.surface()) >= 4.5);
+    }
 }

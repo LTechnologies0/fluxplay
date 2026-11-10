@@ -17,6 +17,9 @@ mod images;
 mod metadata;
 mod names;
 mod network;
+mod api_assist;
+mod policy;
+mod skip_db;
 mod translate;
 mod wg_proxy;
 mod wg_tunnel;
@@ -39,6 +42,10 @@ mod prop_security;
 mod prop_browser;
 #[cfg(test)]
 mod prop_metadata;
+#[cfg(test)]
+mod prop_persist;
+#[cfg(test)]
+mod prop_skip;
 
 /// Stable surface for libFuzzer / AFL harnesses (`--features fuzzing`).
 #[cfg(feature = "fuzzing")]
@@ -47,15 +54,31 @@ pub mod fuzz_api {
         BrowseTile, BrowseTileCache, BrowseViewportHealth, BROWSE_TILE_CACHE_CAP,
         BROWSE_TILE_FETCH_LIMIT,
     };
+    pub use crate::browser::{
+        list_row_height, mosaic_row_height, virtual_content_height, virtual_slice, VirtualSlice,
+        MAX_VIRTUAL_CONTENT_PX, VIRTUAL_OVERSCAN,
+    };
+    pub use crate::downloads::{
+        episode_title, extension_for, human_size, progress_text, sanitize_file_name, url_key,
+    };
+    pub use crate::images::is_fetchable_image_url;
     pub use crate::invariants::{
         assert_viewport_sane, soft_present_within_budget, DECODE_EDGE_HARD_CAP,
         SOFT_PRESENT_MAX_H, SOFT_PRESENT_MAX_W,
     };
-    pub use crate::downloads::sanitize_file_name;
+    pub use crate::metadata::{
+        age_rank, age_rating, clean_text, clean_title, display_genres, fmt_airdate, fmt_genre,
+        fmt_people, fmt_plot, fmt_rated, fmt_rating, fmt_runtime, fmt_year, parse_title_query,
+    };
     pub use crate::names::{
         category_label, display_channel, display_title, parse_category, parse_channel,
         parse_item_title,
     };
+    pub use crate::skip_db::{parse_movie_json, parse_series_json, SkipHit};
+    pub use crate::storage::{
+        downloads_dir, parse_persisted_state, validate_downloads_dir, PersistedState,
+    };
+    pub use crate::ui_surface::UiSurface;
     pub use crate::wg_proxy::parse_profile as parse_wg_profile;
 }
 #[cfg(not(target_os = "android"))]
@@ -73,6 +96,8 @@ use tracing_subscriber::EnvFilter;
 /// Desktop / Linux entry used by the `fluxplay` binary.
 pub fn run() -> iced::Result {
     init_tracing();
+    let _ = policy::init();
+    policy::ensure_default_file();
     tracing::info!("FluxPlay starting (desktop)");
     if fluxplay_core::profiling_enabled() {
         tracing::info!(
@@ -89,6 +114,8 @@ pub fn run() -> iced::Result {
 #[cfg(target_os = "android")]
 pub fn run_android(android_app: android_activity::AndroidApp) -> iced::Result {
     init_tracing_android();
+    let _ = policy::init();
+    policy::ensure_default_file();
     tracing::info!(target: "fluxplay::boot", "FluxPlay starting (android iced)");
     if fluxplay_core::profiling_enabled() {
         tracing::info!(

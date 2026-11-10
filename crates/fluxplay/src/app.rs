@@ -1,6 +1,7 @@
 use chrono::Local;
 #[cfg(target_os = "android")]
 use fluxplay_core::models::AndroidPresentPref;
+use fluxplay_core::ensure_status;
 use fluxplay_core::models::{
     AccentPreset, AppSettings, AspectPref, Channel, ContentKind,
     DeinterlacePref, FpsCapPref, MediaSource, NetworkSettings, PlaylistBundle, PlayerBackendPref,
@@ -25,7 +26,7 @@ use iced::{
 };
 use uuid::Uuid;
 
-use crate::browser::{BrowseIndex, CAT_PAGE, LIST_PAGE, LIVE_PAGE};
+use crate::browser::{BrowseIndex, CAT_PAGE};
 use crate::player_ui::PlayerPanel;
 use crate::theme::{
     type_style, LayoutMetrics, TypeRole, UiTheme, MOTION_COAST_FRICTION, RADIUS_LARGE, RADIUS_LARGE_INCREASED, RADIUS_MD, SPACE_SM,
@@ -42,9 +43,12 @@ use std::sync::Mutex;
 static PENDING_CATALOG_BOOT: Mutex<Option<crate::catalog_db::CatalogDb>> = Mutex::new(None);
 
 pub(crate) fn run_daemon() -> iced::Result {
-    // Adapter pick happens before FluxPlay::new. Export the saved GPU first.
-    let saved = crate::storage::load();
-    export_gpu_env(&saved.settings.gpu_choice);
+    // Adapter pick happens before FluxPlay::new. Export the *display* GPU for
+    // iced present — a saved discrete gpu_choice must not pin FLUXPLAY_GPU to a
+    // non-panel adapter (PRIME/Optimus black UI). Decode uses FLUXPLAY_DECODE_GPU
+    // only (apply must never overwrite FLUXPLAY_GPU — new() runs before window).
+    let _saved = storage::load();
+    export_present_gpu_env();
     iced::daemon(FluxPlay::new, FluxPlay::update, FluxPlay::view)
         .title(FluxPlay::title)
         .theme(FluxPlay::theme_for)
@@ -149,6 +153,7 @@ impl Tab {
     fn all() -> &'static [Tab] {
         &[
             Tab::Live,
+            Tab::Favorites,
             Tab::Vod,
             Tab::Series,
             Tab::Epg,
@@ -339,6 +344,11 @@ struct FluxPlay {
     form_tmdb_key: String,
     /// The API assistant is open. Not saved: it does not come back on the next launch.
     api_guide: bool,
+    /// Provider whose key page is open — clipboard is polled for a paste.
+    api_assist: Option<crate::api_assist::ApiProvider>,
+    api_assist_last_clip: String,
+    /// Wall clock when the clipboard poll started — auto-stop after a few minutes.
+    api_assist_started: Option<std::time::Instant>,
     /// Settings draft for `settings.download_dir` (empty = default folder).
     form_download_dir: String,
     form_dns_servers: String,
@@ -356,7 +366,8 @@ struct FluxPlay {
     autoplay_done: bool,
     main_id: Option<window::Id>,
     player_id: Option<window::Id>,
-    /// Browser window is hidden and its grid is not built while a film or series plays.
+    /// Browser stays mapped but paints a cheap shell while a film/series plays
+    /// (CPU/network park — mosaic tiles are not rebuilt).
     browse_parked: bool,
     /// On Android, player UI is shown inside the main window (no multi-window).
     #[cfg(target_os = "android")]
@@ -365,6 +376,16 @@ struct FluxPlay {
     main_size: Size,
     /// Cached layout metrics for `main_size` (invalidate on resize).
     layout_cache: Option<(Size, LayoutMetrics)>,
+    /// Cached iced `Theme` — `Theme::custom` every style pass was pure overhead.
+    iced_theme_cache: Theme,
+    /// Watch progress dirty → async `persist` (avoid sync JSON on PlayerTick).
+    persist_watch_pending: bool,
+    /// Settle sleep already armed for the current fling window.
+    browse_settle_armed: bool,
+    /// Throttle download status bar rebuilds (Progress events are 500 ms).
+    download_status_at: Option<std::time::Instant>,
+    /// Throttle `refresh_display_caps` on chrome/player ticks.
+    caps_refresh_at: Option<std::time::Instant>,
     /// Cached `detect_backends()` — probing PATH every Settings paint is expensive.
     backends_cache: Option<Vec<fluxplay_player::BackendInfo>>,
     /// System players (OS default first), refreshed with `backends_cache`.
@@ -374,6 +395,9 @@ struct FluxPlay {
     /// Last logical client size of the player window.
     #[cfg_attr(target_os = "android", allow(dead_code))]
     player_logical_size: Size,
+    /// Last window scale factor used for NativeGpu overlay chrome inset.
+    #[cfg_attr(target_os = "android", allow(dead_code))]
+    player_layout_scale: f32,
     /// Source display size the floating player was already fitted to.
     #[cfg_attr(target_os = "android", allow(dead_code))]
     player_fitted_wh: Option<(u32, u32)>,
@@ -390,6 +414,8 @@ struct FluxPlay {
     video_frame_wh: (u32, u32),
     /// One in-flight `image::allocate` — drop intermediate soft frames.
     video_upload_busy: bool,
+    /// When `video_upload_busy` flipped on — recover if allocate never returns.
+    video_upload_busy_at: Option<std::time::Instant>,
     /// Bumped on Stop/close so late `VideoFrameAllocated` cannot resurrect a cleared stage.
     video_upload_gen: u64,
     /// Latest soft frame waiting while GPU upload is in flight (at most one).
@@ -430,6 +456,10 @@ struct FluxPlay {
     /// Soft started because Surface bind missed — promote when Surface becomes ready.
     #[cfg(target_os = "android")]
     android_want_surface_upgrade: bool,
+    /// Last content fps we snapped + `sync_android_video_timing` for Surface.
+    /// `None` until demuxer reports fps — forces one retune after cold open / rebind.
+    #[cfg(target_os = "android")]
+    android_synced_content_fps: Option<f32>,
     /// Bumped on Play / manual close so deferred Stop→close cannot kill a new session.
     player_close_gen: u64,
     player_panel: PlayerPanel,
@@ -451,6 +481,10 @@ struct FluxPlay {
     /// Position and the moment it last moved, so a frozen episode can be nudged.
     play_stall_at: Option<(f64, std::time::Instant)>,
     play_stall_kicks: u8,
+    /// When the current VOD/series open started (cold-start watchdog).
+    play_open_at: Option<std::time::Instant>,
+    /// Cold-open reconnect attempts before giving up (no decoded picture yet).
+    play_cold_kicks: u8,
     /// Floating notices on the left of the screen.
     notices: Vec<Notice>,
     notice_seq: u64,
@@ -529,6 +563,8 @@ struct FluxPlay {
     /// Image URLs skipped because the inflight cap was full (cast photos).
     art_wait: Vec<String>,
     image_flush_armed: bool,
+    /// Last disk image-cache eviction (never on the iced hot path).
+    art_cache_evict_at: Option<std::time::Instant>,
     /// Scroll velocity (px/s) for art lookahead / fling LOD.
     browse_scroll_vy: f32,
     browse_scroll_at: Option<std::time::Instant>,
@@ -546,6 +582,12 @@ struct FluxPlay {
     art_warm_active: bool,
     /// Debounce search → index rebuild (generation discards stale timers).
     search_debounce_gen: u64,
+    /// Debounce browse settle sleeps — coast/fling used to stack dozens of timers.
+    browse_settle_gen: u64,
+    /// Throttle mosaic art prefetch during wheel/coast (ms wall clock).
+    art_scroll_prefetch_at: Option<std::time::Instant>,
+    /// Throttle `dark_light::detect` / Android night-mode probes on chrome ticks.
+    system_dark_at: Option<std::time::Instant>,
     /// Atomic job meters (ingest / index / images) + browse generation.
     jobs: crate::async_jobs::JobMeters,
     /// True when we paused playback because Android Suspended (resume on foreground).
@@ -571,9 +613,6 @@ struct FluxPlay {
     browse_coast_vy: f32,
     /// Mosaic tile currently pressed (press feedback).
     pressed_mosaic: Option<String>,
-    /// The category column just collapsed under the pointer. The release that
-    /// follows must not open the tile that slid underneath.
-    swallow_tile_release: bool,
     /// « Voir plus » rebuilds the grid on press. The release then lands on the
     /// poster that replaced the button. Ignore that open briefly.
     suppress_open_until: Option<std::time::Instant>,
@@ -640,7 +679,7 @@ pub(crate) enum PasteTarget {
 }
 
 /// Poster/art fetch result: (key, source uuid, bytes) or (key, error).
-type ImageLoadResult = Result<(String, Option<uuid::Uuid>, Vec<u8>), (String, String)>;
+type ImageLoadResult = Result<(String, Option<Uuid>, Vec<u8>), (String, String)>;
 
 /// Year, recommended age and genres learned for one poster.
 #[derive(Debug, Clone)]
@@ -736,6 +775,12 @@ pub(crate) enum Message {
     SkipGeneric,
     /// Seek past a studio card or a series opening. Not shown on the picture.
     SkipIntro,
+    /// Community intro/outro timings from The Open Skip Database.
+    OpenSkipDbReady {
+        play_url: String,
+        intro: Option<(f64, f64)>,
+        outro_start: Option<f64>,
+    },
     /// Finish entering fullscreen once the window is no longer maximized.
     PlayerFullscreenCommit(window::Id, u64),
     /// The player window moved, possibly onto another monitor.
@@ -748,8 +793,6 @@ pub(crate) enum Message {
     SetHideAgeUnder(Option<u8>),
     /// Hide ratings at or above this age. `None` shows them.
     SetHideAgeOver(Option<u8>),
-    /// Ages found for the series currently on screen.
-    AgesLoaded(Vec<(String, Option<Uuid>, Option<String>)>),
     /// Year, age and genres for the posters on screen.
     CaptionLoaded(Vec<PosterCaption>),
     SetSpeed(f64),
@@ -786,11 +829,10 @@ pub(crate) enum Message {
     /// Android system Back while browsing (close detail → ignore Activity finish).
     #[cfg(target_os = "android")]
     NavBack,
-    /// TV / D-pad browse focus step (when player not open).
-    #[cfg(target_os = "android")]
-    BrowseFocusDelta(i32),
+    /// TV / D-pad browse focus step (when player not open). `dx`/`dy` are
+    /// grid steps; columns come from the active browse layout.
+    BrowseFocusStep { dx: i32, dy: i32 },
     /// TV / D-pad activate focused browse row.
-    #[cfg(target_os = "android")]
     BrowseActivate,
     /// Poll SAF inbox (document picker / create).
     #[cfg(target_os = "android")]
@@ -852,6 +894,13 @@ pub(crate) enum Message {
     /// Show or hide the API assistant. It stays off until this is pressed.
     ApiGuideToggle,
     OpenWeb(String),
+    /// Open provider signup/API page and start clipboard watch for the key.
+    StartApiAssist(crate::api_assist::ApiProvider),
+    /// Ask iced for the clipboard contents (API assistant).
+    ApiAssistPoll,
+    /// Raw clipboard sample while the API assistant is open.
+    ApiAssistClipboard(Option<String>),
+    ApiAssistDismiss,
     /// Viewer language (ISO 639-1); empty = none.
     SetPrefLang(String),
     ToggleOnlyPrefLang,
@@ -957,6 +1006,8 @@ pub(crate) enum Message {
     },
     /// Films enriched from the portal. `skipped` failed for a reason other than
     /// a rate limit. `throttled` means the portal answered 429: stop asking.
+    /// Idle for now: background batches starve series/play; fiche loads on open.
+    #[allow(dead_code)]
     VodInfoBatch {
         items: Vec<VodItem>,
         skipped: Vec<String>,
@@ -976,7 +1027,12 @@ pub(crate) enum Message {
     /// Virtualized browse scroll: absolute Y + viewport height.
     BrowseScrolled(f32, f32),
     /// Deferred check after scrolling: wheel/trackpad sends no "stopped" event.
-    BrowseSettle,
+    /// Generation discards settle sleeps stacked during coast/fling.
+    BrowseSettle(u64),
+    /// Disk image_cache touch batch finished (off UI thread).
+    ArtMetaTouched,
+    /// Async settings/watch persist finished (no UI work).
+    PersistFlushed,
     /// Wheel / trackpad on mosaic overlay → scroll the stable spacer surface.
     BrowseScrollBy(f32),
     BrowseDragStart,
@@ -991,6 +1047,8 @@ pub(crate) enum Message {
     ImageLoaded(ImageLoadResult),
     /// Apply coalesced poster bytes to the RAM cache (one view rebuild).
     FlushPendingImages,
+    /// Background image_cache trim finished (no UI work).
+    ArtCacheEvicted,
     /// SQLite ingest finished off the UI thread.
     CatalogIngestDone(crate::catalog_db::IngestBatchReport),
     CatalogIngestOneDone {
@@ -1004,8 +1062,8 @@ pub(crate) enum Message {
         episode_flat: Vec<EpisodeFlat>,
     },
     MetaEnriched {
-        series: Vec<(String, Option<uuid::Uuid>, crate::metadata::MetaPatch)>,
-        vod: Vec<(String, Option<uuid::Uuid>, crate::metadata::MetaPatch)>,
+        series: Vec<(String, Option<Uuid>, crate::metadata::MetaPatch)>,
+        vod: Vec<(String, Option<Uuid>, crate::metadata::MetaPatch)>,
     },
     OpenImdb(String),
     /// Actor chip on a film / series page.
@@ -1130,6 +1188,15 @@ impl FluxPlay {
                 matches!(dark_light::detect(), Ok(dark_light::Mode::Dark))
             }
         };
+        let boot_day = match settings.theme {
+            ThemeMode::Day => true,
+            ThemeMode::Night => false,
+            ThemeMode::System => !system_dark,
+        };
+        let iced_theme_cache = UiTheme::new(boot_day, settings.accent)
+            .with_custom(settings.custom_accent)
+            .with_ink(settings.custom_ink)
+            .iced_theme();
 
         #[cfg(target_os = "android")]
         {
@@ -1248,6 +1315,9 @@ impl FluxPlay {
             form_omdb_key: String::new(), // filled below from settings
             form_tmdb_key: String::new(),
             api_guide: false,
+            api_assist: None,
+            api_assist_last_clip: String::new(),
+            api_assist_started: None,
             form_download_dir: String::new(),
             form_dns_servers: String::new(),
             form_doh_url: String::new(),
@@ -1256,7 +1326,7 @@ impl FluxPlay {
             network_probe: String::new(),
             system_dark,
             cat_filter: String::new(),
-            list_limit: LIST_PAGE,
+            list_limit: crate::policy::list_page(),
             images: crate::images::ImageCache::default(),
             catalog_db,
             autoplay_done: false,
@@ -1270,10 +1340,16 @@ impl FluxPlay {
             #[cfg(not(target_os = "android"))]
             main_size: Size::new(1920.0, 1080.0),
             layout_cache: None,
+            iced_theme_cache,
+            persist_watch_pending: false,
+            browse_settle_armed: false,
+            download_status_at: None,
+            caps_refresh_at: None,
             backends_cache: None,
             external_players: Vec::new(),
             player_pos: None,
             player_logical_size: Size::new(1280.0, 720.0),
+            player_layout_scale: 1.0,
             player_fitted_wh: None,
             video_frame: None,
             video_allocation: None,
@@ -1283,6 +1359,7 @@ impl FluxPlay {
             video_allocation_hold4: None,
             video_frame_wh: (0, 0),
             video_upload_busy: false,
+            video_upload_busy_at: None,
             video_upload_gen: 0,
             video_pending: None,
             stage_picture: false,
@@ -1290,7 +1367,7 @@ impl FluxPlay {
             download_queue: std::collections::VecDeque::new(),
             download_partials: std::collections::HashMap::new(), // filled below from settings
             download_library: crate::downloads::Library::load(
-                crate::storage::data_dir().join("downloads.index"),
+                storage::data_dir().join("downloads.index"),
             ),
             playback_ended_since: None,
             playback_clock_poll: None,
@@ -1308,6 +1385,8 @@ impl FluxPlay {
             android_force_soft: false,
             #[cfg(target_os = "android")]
             android_want_surface_upgrade: false,
+            #[cfg(target_os = "android")]
+            android_synced_content_fps: None,
             player_close_gen: 0,
             player_panel: PlayerPanel::None,
             player_exit_ask: false,
@@ -1322,6 +1401,8 @@ impl FluxPlay {
             player_pointer_at: None,
             play_stall_at: None,
             play_stall_kicks: 0,
+            play_open_at: None,
+            play_cold_kicks: 0,
             notices: Vec::new(),
             notice_seq: 0,
             alert_checked: std::collections::HashSet::new(),
@@ -1374,6 +1455,7 @@ impl FluxPlay {
             pending_images: Vec::new(),
             art_wait: Vec::new(),
             image_flush_armed: false,
+            art_cache_evict_at: None,
             browse_scroll_vy: 0.0,
             browse_scroll_at: None,
             browse_was_flinging: false,
@@ -1384,6 +1466,9 @@ impl FluxPlay {
             art_warm_cursor: 0,
             art_warm_active: false,
             search_debounce_gen: 0,
+            browse_settle_gen: 0,
+            art_scroll_prefetch_at: None,
+            system_dark_at: None,
             jobs: crate::async_jobs::JobMeters::new(),
             #[cfg(target_os = "android")]
             lifecycle_paused: false,
@@ -1399,7 +1484,6 @@ impl FluxPlay {
             browse_drag_last_dy: 0.0,
             browse_coast_vy: 0.0,
             pressed_mosaic: None,
-            swallow_tile_release: false,
             suppress_open_until: None,
             #[cfg(target_os = "android")]
             saf_kind: None,
@@ -1529,6 +1613,8 @@ impl FluxPlay {
                     source_id: None,
                     kind: Default::default(),
                     catchup: None,
+                http_user_agent: None,
+                http_referer: None,
                 };
                 boot.push(Task::done(Message::PlayChannel(ch)));
             }
@@ -1540,6 +1626,7 @@ impl FluxPlay {
             Task::perform(async { tokio::fs::remove_dir_all(prefetch_dir()).await.ok() }, |_| ())
                 .discard(),
         );
+        app.refresh_layout_cache();
         let task = Task::batch(boot);
         tracing::info!(
             sources = app.sources.len(),
@@ -1624,6 +1711,7 @@ impl FluxPlay {
         };
         if dark != self.system_dark {
             self.system_dark = dark;
+            self.rebuild_iced_theme();
         }
     }
 
@@ -1649,18 +1737,56 @@ impl FluxPlay {
         self.chrome_vel = v;
     }
 
-    /// Apply one coast friction step; returns BrowseScrollBy task when moving.
+    /// Apply one coast friction step without the BrowseScrollBy art/settle storm.
+    /// Coast used to enqueue prefetch + settle every ~16 ms → iced Task flood.
     fn apply_browse_coast_step(&mut self) -> Task<Message> {
         let vy = self.browse_coast_vy;
         if vy.abs() < 2.0 {
             self.browse_coast_vy = 0.0;
-            return Task::none();
+            self.browse_scroll_vy = 0.0;
+            self.browse_was_flinging = false;
+            // One settle after coast ends — loads the posters under the cursor.
+            return self.browse_settle_task();
         }
         self.browse_coast_vy *= MOTION_COAST_FRICTION;
         if self.browse_coast_vy.abs() < 2.0 {
             self.browse_coast_vy = 0.0;
         }
-        Task::done(Message::BrowseScrollBy(vy))
+        let content_h = self.browse_virtual_content_h();
+        let max_scroll = (content_h - self.browse_view_h).max(1.0);
+        self.browse_scroll_y = (self.browse_scroll_y + vy).clamp(0.0, max_scroll);
+        self.browse_slice =
+            self.content_virtual_slice(self.browse_scroll_y, self.browse_view_h);
+        self.browse_scroll_at = Some(std::time::Instant::now());
+        self.browse_was_flinging = true;
+        // Throttled art only — never stack settle timers mid-coast.
+        let art = self.maybe_scroll_prefetch_art();
+        Task::batch([
+            iced::widget::operation::scroll_by(
+                iced::widget::Id::from(self.browse_scroll_widget_id()),
+                AbsoluteOffset { x: 0.0, y: vy },
+            ),
+            art,
+        ])
+    }
+
+    /// Prefetch mosaic posters at most every 120 ms during wheel/coast.
+    fn maybe_scroll_prefetch_art(&mut self) -> Task<Message> {
+        if !(matches!(self.tab, Tab::Vod | Tab::Series)
+            && self.vod_detail.is_none()
+            && self.series_detail.is_none())
+        {
+            return Task::none();
+        }
+        let now = std::time::Instant::now();
+        if self
+            .art_scroll_prefetch_at
+            .is_some_and(|t| now.duration_since(t) < std::time::Duration::from_millis(120))
+        {
+            return Task::none();
+        }
+        self.art_scroll_prefetch_at = Some(now);
+        self.prefetch_visible_art()
     }
 
     /// One-shot: after a mosaic fling, the next tile `on_release` must not open.
@@ -1680,10 +1806,25 @@ impl FluxPlay {
             .with_ink(self.settings.custom_ink)
     }
 
+    /// Caps refresh at most every 2s unless forced (resize / quality change).
+    fn maybe_refresh_display_caps(&mut self) {
+        let due = self.caps_refresh_at.is_none_or(|t| {
+            t.elapsed() >= std::time::Duration::from_secs(2)
+        });
+        if !due {
+            return;
+        }
+        self.caps_refresh_at = Some(std::time::Instant::now());
+        self.refresh_display_caps(false);
+    }
+
     fn refresh_display_caps(&mut self, force_probe: bool) {
         if force_probe || self.display_probe_at.elapsed() >= display_caps::probe_stale_after() {
             self.display_probe = display_caps::boot_probe();
             self.display_probe_at = std::time::Instant::now();
+        }
+        if force_probe {
+            self.caps_refresh_at = Some(std::time::Instant::now());
         }
         // Soft budget must use soft RGBA pixels (≤1080p unless UHD), NOT raw window
         // size — a 4K stage with 1080p soft present was wrongly forced to 30 fps.
@@ -1709,23 +1850,17 @@ impl FluxPlay {
                 self.display_caps.video_hz = prev_video_hz;
             }
         }
+        self.sync_player_hz();
         self.apply_host_tuning();
+        // Mid-play SoftBudget: thermal / stage cliffs change WH — re-stick soft vf
+        // (open/bind alone used to leave a hot SoC on a cold 720p scale).
+        self.maybe_reapply_soft_budget_vf();
         #[cfg(target_os = "android")]
         {
             // Only snap display mode while a Surface session is live. Soft present
             // was calling this every caps refresh → 30↔60 preferredDisplayMode thrash.
             if self.session.native.android_surface_present() {
-                let panel = self.display_caps.probe.monitor_hz as f32;
-                let content = self.session.content_fps().unwrap_or(0.0) as f32;
-                let modes = crate::android_bridge::poll_android_device_caps()
-                    .map(|c| c.refresh_modes)
-                    .unwrap_or_default();
-                let hz = fluxplay_player::AndroidDeviceCaps::snap_present_hz_with_modes(
-                    content, panel, &modes,
-                );
-                crate::android_bridge::set_video_frame_rate(hz);
-                // Content fps is known now — re-tune Surface A/V offset (fix judder).
-                self.session.native.sync_android_video_timing();
+                self.apply_android_surface_timing(None);
                 // Push buffer + display geometry — Java cover-fits the Surface
                 // buffer to the screen via SurfaceControl transform (exact ratio).
                 let disp = self.session.native.video_wh();
@@ -1737,19 +1872,96 @@ impl FluxPlay {
         }
     }
 
+    /// Snap Surface frame rate + (TV) preferredDisplayMode + A/V timing.
+    /// Phone: `setFrameRate` hint only. TV: also `preferredDisplayModeId` when content known.
+    #[cfg(target_os = "android")]
+    fn apply_android_surface_timing(&mut self, content_hint: Option<f32>) {
+        if !self.session.native.android_surface_present() {
+            return;
+        }
+        let caps = crate::android_bridge::poll_android_device_caps();
+        let panel = caps
+            .as_ref()
+            .map(|c| c.refresh_hz as f32)
+            .filter(|&h| h >= 24.0)
+            .unwrap_or(self.display_caps.probe.monitor_hz as f32);
+        let content = content_hint
+            .or_else(|| self.session.content_fps().map(|f| f as f32))
+            .unwrap_or(0.0);
+        let modes = caps
+            .as_ref()
+            .map(|c| c.refresh_modes.as_slice())
+            .unwrap_or(&[]);
+        let hz = fluxplay_player::AndroidDeviceCaps::snap_present_hz_with_modes(
+            content, panel, modes,
+        );
+        // Always a soft scheduler hint (API≥30). Not a Display.Mode switch.
+        crate::android_bridge::set_video_frame_rate(hz);
+        if content >= 1.0 {
+            if crate::android_bridge::is_television() {
+                // Heavy HDMI mode switch — TV/leanback only (debounced in Java).
+                crate::android_bridge::set_preferred_display_mode_hz(hz);
+            }
+            self.session.native.sync_android_video_timing();
+            self.android_synced_content_fps = Some(content);
+        }
+    }
+
     /// Push host-derived ceilings into image cache / knobs that live outside DisplayCaps.
     fn apply_host_tuning(&mut self) {
         let t = self.display_caps.tuning;
-        self.images.max_inflight = t.image_inflight;
+        let pol = crate::policy::get();
+        // Host probe proposes; policy.json / FLUXPLAY_* caps the ceiling.
+        let mut inflight = t.image_inflight.min(pol.images.max_inflight).max(4);
+        // SoftPump + mosaic decode compete for RAM/CPU — clamp while soft plays.
+        if self.soft_playback_active() {
+            inflight = inflight.min(8);
+        }
+        self.images.max_inflight = inflight;
         self.images.decode_edge_px = t.decode_edge_px;
     }
 
+    /// Soft RGBA path is live (not MediaCodec Surface / idle browser).
+    fn soft_playback_active(&self) -> bool {
+        self.session.channel.is_some()
+            && !self.session.native.android_surface_present()
+            && matches!(
+                self.session.state,
+                PlaybackState::Playing | PlaybackState::Buffering | PlaybackState::Paused
+            )
+    }
+
+    /// Re-apply SoftBudget `vf` when thermal/stage budget drifts mid-play.
+    fn maybe_reapply_soft_budget_vf(&mut self) {
+        if !self.soft_playback_active() {
+            return;
+        }
+        let vf = self.soft_present_vf_scale();
+        let changed = self.session.soft_vf_prefix.as_deref() != Some(vf.as_str());
+        if !changed {
+            return;
+        }
+        tracing::debug!(%vf, "soft budget vf re-applied mid-play");
+        self.session.native.options_mut().android_soft_vf = Some(vf.clone());
+        self.session.soft_vf_prefix = Some(vf);
+        let _ = self.session.refresh_soft_filters();
+    }
+
     fn virtual_overscan(&self) -> usize {
-        self.display_caps.tuning.virtual_overscan
+        // display_caps proposes 10–18+; policy.json / FLUXPLAY_VIRTUAL_OVERSCAN (≤8) wins.
+        self.display_caps
+            .tuning
+            .virtual_overscan
+            .min(crate::policy::virtual_overscan())
+            .min(8)
     }
 
     fn theme(&self) -> Theme {
-        self.ui_theme().iced_theme()
+        self.iced_theme_cache.clone()
+    }
+
+    fn rebuild_iced_theme(&mut self) {
+        self.iced_theme_cache = self.ui_theme().iced_theme();
     }
 
     /// Responsive chrome metrics from the current main window size.
@@ -1759,19 +1971,8 @@ impl FluxPlay {
         self.resync_player_options();
         self.persist();
         if self.session.channel.is_some() {
-            #[cfg(target_os = "android")]
-            {
-                let (rw, rh) = self.soft_present_wh();
-                self.session.native.options_mut().android_soft_vf = Some(
-                    fluxplay_player::SoftBudget {
-                        max_w: rw,
-                        max_h: rh,
-                        video_hz: 30,
-                        gui_hz: 60,
-                    }
-                    .vf_scale(),
-                );
-            }
+            self.session.native.options_mut().android_soft_vf =
+                Some(self.soft_present_vf_scale());
             self.apply_saved_video_defaults_for_current_play();
         }
         self.status = format!("Qualité d'affichage : {}", quality.short_label());
@@ -1784,7 +1985,14 @@ impl FluxPlay {
                 return m;
             }
         }
-        LayoutMetrics::compute(iw, ih)
+        let surf = crate::ui_surface::UiSurface::detect(iw, ih);
+        LayoutMetrics::compute_with(
+            iw,
+            ih,
+            Some(surf.layout_breakpoint(iw, ih)),
+            surf.type_scale(),
+            surf.touch_target(),
+        )
     }
 
     fn layout_content_size(&self) -> (f32, f32) {
@@ -1804,8 +2012,56 @@ impl FluxPlay {
 
     fn refresh_layout_cache(&mut self) {
         let (iw, ih) = self.layout_content_size();
-        let m = LayoutMetrics::compute(iw, ih);
+        let surf = crate::ui_surface::UiSurface::detect(iw, ih);
+        let m = LayoutMetrics::compute_with(
+            iw,
+            ih,
+            Some(surf.layout_breakpoint(iw, ih)),
+            surf.type_scale(),
+            surf.touch_target(),
+        );
         self.layout_cache = Some((Size::new(iw, ih), m));
+    }
+
+    /// Ten-foot / FORCE_TV leanback: show D-pad focus chrome + accept browse keys.
+    fn browse_focus_chrome_active(&self) -> bool {
+        let (iw, ih) = self.layout_content_size();
+        crate::ui_surface::UiSurface::detect(iw, ih).is_television()
+    }
+
+    /// Columns for D-pad vertical steps on the active browse grid.
+    fn browse_focus_cols(&self) -> usize {
+        match self.tab {
+            Tab::Live | Tab::Epg => self.live_grid().0,
+            Tab::Vod | Tab::Series => self.poster_grid().0,
+            // Favorites list tab is single-column rows.
+            Tab::Favorites => 1,
+            _ => 1,
+        }
+    }
+
+    /// Keep the focused tile inside the virtual viewport.
+    fn ensure_browse_focus_visible(&mut self) {
+        let cols = self.browse_focus_cols().max(1);
+        let row = self.browse_focus / cols;
+        let row_h = match self.tab {
+            Tab::Live | Tab::Epg => browser::channel_row_height(),
+            Tab::Vod | Tab::Series => {
+                let (_, tile_w) = self.poster_grid();
+                browser::mosaic_row_height(tile_w)
+            }
+            Tab::Favorites => browser::list_row_height(0.0),
+            _ => browser::list_row_height(0.0),
+        };
+        let view_h = self.browse_view_h.max(row_h);
+        let y = row as f32 * row_h;
+        if y < self.browse_scroll_y {
+            self.browse_scroll_y = y;
+        } else if y + row_h > self.browse_scroll_y + view_h {
+            self.browse_scroll_y = (y + row_h - view_h).max(0.0);
+        }
+        let max_scroll = (self.browse_virtual_content_h() - view_h).max(0.0);
+        self.browse_scroll_y = self.browse_scroll_y.clamp(0.0, max_scroll);
     }
 
     /// Category sidebar or phone chips + content pane.
@@ -1872,25 +2128,23 @@ impl FluxPlay {
             window::Event::Moved(_) => Some(Message::PlayerScreenChanged(id)),
             _ => None,
         });
+        let surface_video = {
+            #[cfg(target_os = "android")]
+            {
+                self.session.native.android_surface_present()
+            }
+            #[cfg(not(target_os = "android"))]
+            {
+                false
+            }
+        };
+        let soft_video = self.session.has_embedded_video()
+            && !surface_video
+            && matches!(
+                self.session.state,
+                PlaybackState::Playing | PlaybackState::Buffering | PlaybackState::Paused
+            );
         let tick = {
-            let surface_video = {
-                #[cfg(target_os = "android")]
-                {
-                    self.session.native.android_surface_present()
-                }
-                #[cfg(not(target_os = "android"))]
-                {
-                    false
-                }
-            };
-            let soft_video = self.session.has_embedded_video()
-                && !surface_video
-                && matches!(
-                    self.session.state,
-                    PlaybackState::Playing
-                        | PlaybackState::Buffering
-                        | PlaybackState::Paused
-                );
             let playing_like = matches!(
                 self.session.state,
                 PlaybackState::Playing | PlaybackState::Paused | PlaybackState::Buffering
@@ -1905,11 +2159,11 @@ impl FluxPlay {
                     self.player_id.is_some()
                 }
             };
-            // Soft-render: poll at display_caps.video_hz; Surface path: light time/chrome only.
+            // Soft-render: poll at soft_present_hz (≤60); Surface: light time/chrome only.
             let period_ms = if soft_video {
-                // Sample every monitor refresh. A content-fps tick phase-drifts
-                // against the snapped 3-2 cadence and shows up as micro-stutter.
-                crate::display_caps::period_ms(self.display_probe.monitor_hz.max(24))
+                // Never tick at raw panel Hz (120/144): SoftPump + iced upload at
+                // that rate starves the AO and the sound crackles / rushes.
+                display_caps::soft_period_ms(self.soft_present_hz())
             } else if self.sleep_until.is_some() {
                 1000
             } else if playing_like && player_open {
@@ -1925,8 +2179,9 @@ impl FluxPlay {
                 Subscription::none()
             }
         };
-        // Chrome autohide + alpha lerp + caps refresh. Keep alive during soft video even
-        // when chrome is fully hidden — otherwise video_hz/content_fps never update mid-play.
+        // Chrome autohide + alpha lerp only while the overlay is moving.
+        // Caps / episode prefetch run from PlayerTick (throttled) — a second
+        // timer during soft video doubled iced wakeups for no visible work.
         let chrome_tick = {
             let player_open = {
                 #[cfg(target_os = "android")]
@@ -1938,37 +2193,18 @@ impl FluxPlay {
                     self.player_id.is_some()
                 }
             };
-            let soft_video = {
-                let surface_video = {
-                    #[cfg(target_os = "android")]
-                    {
-                        self.session.native.android_surface_present()
-                    }
-                    #[cfg(not(target_os = "android"))]
-                    {
-                        false
-                    }
-                };
-                self.session.has_embedded_video()
-                    && !surface_video
-                    && matches!(
-                        self.session.state,
-                        PlaybackState::Playing
-                            | PlaybackState::Buffering
-                            | PlaybackState::Paused
-                    )
-            };
-            let animating =
-                self.player_chrome_visible || self.chrome_alpha > 0.05 || self.player_panel != PlayerPanel::None;
-            if player_open && (animating || soft_video) {
-                let ms = if soft_video && !animating {
-                    // Caps / prefetch only — don't spin at full GUI Hz on a black overlay.
-                    self.display_caps.gui_period_ms().max(250)
-                } else {
-                    self.display_caps.gui_period_ms().max(100)
-                };
-                iced::time::every(std::time::Duration::from_millis(ms))
-                    .map(|_| Message::PlayerChromeTick)
+            // Tick only while alpha is moving or a panel is open — idle-visible
+            // chrome used to wake iced every gui period for no lerp work.
+            let show = self.player_chrome_visible || self.player_panel != PlayerPanel::None;
+            let target = if show { 1.0_f32 } else { 0.0_f32 };
+            let animating = self.chrome_vel.abs() > 0.02
+                || (self.chrome_alpha - target).abs() > 0.05
+                || self.player_panel != PlayerPanel::None;
+            if player_open && animating {
+                iced::time::every(std::time::Duration::from_millis(
+                    self.display_caps.gui_period_ms().max(100),
+                ))
+                .map(|_| Message::PlayerChromeTick)
             } else {
                 Subscription::none()
             }
@@ -1996,7 +2232,12 @@ impl FluxPlay {
                 }
                 #[cfg(not(target_os = "android"))]
                 {
-                    Subscription::none()
+                    // Desktop couch / CI: FLUXPLAY_FORCE_TV → Television D-pad browse.
+                    if self.browse_focus_chrome_active() {
+                        event::listen_with(map_browse_focus_keys)
+                    } else {
+                        Subscription::none()
+                    }
                 }
             }
         };
@@ -2012,16 +2253,43 @@ impl FluxPlay {
         } else {
             Subscription::none()
         };
-        let catalog_sync = iced::time::every(std::time::Duration::from_secs(60))
-            .map(|_| Message::CatalogFreshnessCheck);
+        // Idle browse must not wake iced every minute for a SQLite stale check.
+        let catalog_sync = if self.browse_parked {
+            Subscription::none()
+        } else {
+            iced::time::every(std::time::Duration::from_secs(60))
+                .map(|_| Message::CatalogFreshnessCheck)
+        };
         let notices = if self.notices.is_empty() {
             Subscription::none()
         } else {
             iced::time::every(std::time::Duration::from_secs(1)).map(|_| Message::NoticeTick)
         };
-        let wake = iced::time::every(std::time::Duration::from_secs(2)).map(|_| Message::WakeProbe);
-        let party = iced::time::every(std::time::Duration::from_millis(200))
-            .map(|_| Message::PartyPoll);
+        // Sleep recovery only matters while something is playing (or a sleep timer).
+        let wake = if self.session.channel.is_some() || self.sleep_until.is_some() {
+            iced::time::every(std::time::Duration::from_secs(2)).map(|_| Message::WakeProbe)
+        } else {
+            Subscription::none()
+        };
+        // Party used to tick at 200 ms forever → 5 iced update/redraws per second
+        // while browsing idle. Poll fast only when a room/remote is live; bootstrap
+        // host Info at 500 ms until the listener binds, then stop.
+        // Soft play / parked: coalesce ≥500 ms so iced isn't woken for SoftPump.
+        let party = if self.party.paired.is_some()
+            || self.party.broadcasting
+            || !self.party.room_code.is_empty()
+        {
+            let ms = if soft_video || self.browse_parked {
+                500
+            } else {
+                200
+            };
+            iced::time::every(std::time::Duration::from_millis(ms)).map(|_| Message::PartyPoll)
+        } else if self.party.info.is_none() {
+            iced::time::every(std::time::Duration::from_millis(500)).map(|_| Message::PartyPoll)
+        } else {
+            Subscription::none()
+        };
         Subscription::batch([
             closes, close_req, opens, moves, tick, chrome_tick, coast_tick, keys, pointer, saf,
             catalog_sync, wake, party, notices,
@@ -2086,19 +2354,65 @@ impl FluxPlay {
         })
     }
 
+    /// NativeGpu / CLI overlay: chrome inset + macOS screen height for geometry.
+    /// Soft RGBA keeps full-stage `video_rect` (chrome is an iced overlay).
+    fn sync_native_overlay_chrome(&mut self, scale: f32) {
+        #[cfg(target_os = "android")]
+        {
+            let _ = scale;
+            return;
+        }
+        #[cfg(not(target_os = "android"))]
+        {
+            let mh = self.display_probe.monitor_h;
+            self.session.native.set_geometry_screen_h(if mh >= 64 {
+                Some(mh)
+            } else {
+                None
+            });
+            let needs_inset = self.session.native.android_present_mode().uses_native_window()
+                || self.session.native.os_video_present();
+            let chrome_px = if needs_inset && self.player_chrome_visible && !self.pip_mode {
+                ((self.layout_metrics().player_chrome_h + crate::theme::TOOLBAR_OUTER_PAD) * scale)
+                    .round() as u32
+            } else {
+                0
+            };
+            self.session.native.set_overlay_chrome_inset(chrome_px);
+        }
+    }
+
     fn apply_player_layout(&mut self, position: Option<Point>, size: Size, scale: f32) {
         let scale = if scale > 0.05 { scale } else { 1.0 };
         if let Some(p) = position {
             self.player_pos = Some(p);
         }
         self.player_logical_size = size;
+        self.player_layout_scale = scale;
         // Soft-render uses the full window — chrome is an overlay and must NOT shrink the
         // stage (shrinking caused size oscillation / flicker when chrome toggled).
         let w = ((size.width).max(160.0) * scale).round() as u32;
         let h = ((size.height).max(120.0) * scale).round() as u32;
         let w = (w & !1).max(2);
         let h = (h & !1).max(2);
-        let rect = VideoRect::detached(w, h);
+        // Wayland cannot place absolute overlays — size-only detached window.
+        // X11 / Windows / macOS: pin NativeGpu VO over the iced stage.
+        let wayland = cfg!(all(
+            unix,
+            not(target_os = "android"),
+            not(target_os = "macos"),
+            not(target_os = "ios")
+        )) && std::env::var_os("WAYLAND_DISPLAY")
+            .is_some_and(|v| !v.is_empty());
+        let rect = if wayland {
+            VideoRect::detached(w, h)
+        } else if let Some(p) = position.or(self.player_pos) {
+            let x = (p.x * scale).round() as i32;
+            let y = (p.y * scale).round() as i32;
+            VideoRect::overlay(x, y, w, h)
+        } else {
+            VideoRect::detached(w, h)
+        };
         // Detect portrait↔landscape even during fullscreen settle freeze.
         let mut orient_flip = false;
         if let Some(prev) = self.session.native.video_rect() {
@@ -2126,22 +2440,29 @@ impl FluxPlay {
         // Hysteresis: must match soft-pull hysteresis (±16px / 8%) or video_rect drifts
         // while pull stays sticky → FFmpeg want_w mismatch discards frames (black flashes).
         // Bypass when aspect ratio diverges (FS/PiP shrink) — Fill would non-uniform stretch.
+        // NativeGpu/CLI overlay: also bypass when the window *moved* (size-only skip left
+        // the OS VO parked at old screen coords — W3-02 F1).
         if !orient_flip {
             if let Some(prev) = self.session.native.video_rect() {
+                let moved = rect.anchored
+                    && ((prev.x as i32 - rect.x).unsigned_abs() > 8
+                        || (prev.y as i32 - rect.y).unsigned_abs() > 8);
                 let aspect_delta = {
                     let pa = prev.w.max(1) as f32 / prev.h.max(1) as f32;
                     let na = w.max(1) as f32 / h.max(1) as f32;
                     ((pa - na) / pa).abs() > 0.05
                 };
-                if !aspect_delta {
+                if !moved && !aspect_delta {
                     let dw = (prev.w as i32 - w as i32).unsigned_abs();
                     let dh = (prev.h as i32 - h as i32).unsigned_abs();
                     if dw <= 16 && dh <= 16 {
+                        self.sync_native_overlay_chrome(scale);
                         return;
                     }
                     let pw = prev.w.max(1) as f32;
                     let ph = prev.h.max(1) as f32;
                     if (w as f32 - pw).abs() / pw < 0.08 && (h as f32 - ph).abs() / ph < 0.08 {
+                        self.sync_native_overlay_chrome(scale);
                         return;
                     }
                 }
@@ -2149,6 +2470,7 @@ impl FluxPlay {
         }
         tracing::debug!(?rect, %scale, "player embed stage size");
         self.session.set_video_rect(rect);
+        self.sync_native_overlay_chrome(scale);
         #[cfg(target_os = "android")]
         if self.session.native.android_surface_present() {
             let chrome = if self.player_chrome_visible && !self.pip_mode {
@@ -2165,7 +2487,6 @@ impl FluxPlay {
             self.invalidate_soft_stage(true);
         }
         // Keep soft vf ceiling aligned with live stage (portrait rotate used to keep landscape scale=).
-        #[cfg(target_os = "android")]
         if !self.session.native.android_surface_present()
             && self.session.channel.is_some()
             && matches!(
@@ -2173,14 +2494,7 @@ impl FluxPlay {
                 PlaybackState::Playing | PlaybackState::Buffering | PlaybackState::Paused
             )
         {
-            let (rw, rh) = self.soft_present_wh();
-            let vf = fluxplay_player::SoftBudget {
-                max_w: rw,
-                max_h: rh,
-                video_hz: 30,
-                gui_hz: 60,
-            }
-            .vf_scale();
+            let vf = self.soft_present_vf_scale();
             self.session.native.options_mut().android_soft_vf = Some(vf.clone());
             self.session.soft_vf_prefix = Some(vf);
             let _ = self.session.refresh_soft_filters();
@@ -2188,6 +2502,22 @@ impl FluxPlay {
     }
 
     /// Sticky soft RGBA request size (window-scaled, capped, hysteresis vs last frame).
+    /// Soft present / mpv `display-fps-override` rate — content-budgeted, ≤60.
+    /// Using `monitor_hz` here made high-refresh panels rush the audio clock.
+    fn soft_present_hz(&self) -> u32 {
+        self.display_caps.video_hz.clamp(24, 60)
+    }
+
+    /// Real panel refresh for native GPU VO (`display-resample`). Soft path ignores it.
+    fn panel_present_hz(&self) -> u32 {
+        self.display_caps.probe.monitor_hz.clamp(24, 240)
+    }
+
+    fn sync_player_hz(&mut self) {
+        self.session.set_present_hz(self.soft_present_hz());
+        self.session.set_panel_hz(self.panel_present_hz());
+    }
+
     fn soft_present_wh(&self) -> (u32, u32) {
         let frozen = self
             .player_layout_freeze_until
@@ -2276,27 +2606,91 @@ impl FluxPlay {
         (rw, rh)
     }
 
+    /// Soft `vf` string for the live stage size (all soft-RGBA platforms).
+    /// Desktop mirrors Android SoftBudget so Auto quality never feeds SoftPump 4K.
+    fn soft_present_vf_scale(&self) -> String {
+        let (rw, rh) = self.soft_present_wh();
+        #[cfg(target_os = "android")]
+        let (video_hz, gui_hz) = crate::android_bridge::poll_android_device_caps()
+            .map(|c| {
+                let b = c.soft_budget_with_quality(self.settings.video_quality.max_wh());
+                (b.video_hz, b.gui_hz)
+            })
+            .unwrap_or((30, 60));
+        #[cfg(not(target_os = "android"))]
+        let (video_hz, gui_hz) = (self.soft_present_hz(), self.panel_present_hz().min(60));
+        fluxplay_player::SoftBudget {
+            max_w: rw,
+            max_h: rh,
+            video_hz,
+            gui_hz,
+        }
+        .vf_scale()
+    }
+
     fn clear_video_pending(&mut self) {
         if let Some((_, _, rgba, _)) = self.video_pending.take() {
             self.session.recycle_soft_rgba(rgba);
         }
     }
 
+    /// Reclaim host RGBA from a released iced soft Allocation into SoftPump's
+    /// recycle pool when we uniquely own the backing `Bytes` (W3-01 F1/F4).
+    /// Depth-5 holds stay (iced worker atlases); host pixels return when expelled.
+    fn recycle_soft_allocation(&mut self, alloc: Option<ImageAllocation>) {
+        let Some(alloc) = alloc else {
+            return;
+        };
+        let handle = alloc.handle().clone();
+        drop(alloc);
+        if let ImageHandle::Rgba { pixels, .. } = handle {
+            if let Ok(bm) = pixels.try_into_mut() {
+                let buf: Vec<u8> = bm.into();
+                if !buf.is_empty() {
+                    self.session.recycle_soft_rgba(buf);
+                }
+            }
+        }
+    }
+
+    /// Drop soft iced atlas pins and reclaim unique host RGBA (Stop / stage handoff).
+    fn clear_soft_allocation_holds(&mut self) {
+        // Take all first — overlapping `&mut self` + field `.take()` fails borrowck.
+        let a0 = self.video_allocation.take();
+        let a1 = self.video_allocation_hold.take();
+        let a2 = self.video_allocation_hold2.take();
+        let a3 = self.video_allocation_hold3.take();
+        let a4 = self.video_allocation_hold4.take();
+        self.recycle_soft_allocation(a0);
+        self.recycle_soft_allocation(a1);
+        self.recycle_soft_allocation(a2);
+        self.recycle_soft_allocation(a3);
+        self.recycle_soft_allocation(a4);
+    }
+
+    /// Rotate 5-deep hold chain; reclaim expelled host RGBA into SoftPump pool.
+    fn push_soft_allocation_hold(&mut self, allocation: ImageAllocation) {
+        let expelled = self.video_allocation_hold4.take();
+        self.video_allocation_hold4 = self.video_allocation_hold3.take();
+        self.video_allocation_hold3 = self.video_allocation_hold2.take();
+        self.video_allocation_hold2 = self.video_allocation_hold.take();
+        self.video_allocation_hold = self.video_allocation.take();
+        self.video_allocation = Some(allocation);
+        self.recycle_soft_allocation(expelled);
+    }
+
     /// Invalidate soft present pipeline (Stop / close / channel switch).
     /// Bumps gen so in-flight `iced_image::allocate` cannot resurrect a stale frame.
     fn invalidate_soft_stage(&mut self, clear_displayed: bool) {
         self.video_upload_busy = false;
+        self.video_upload_busy_at = None;
         self.video_upload_gen = self.video_upload_gen.wrapping_add(1);
         self.clear_video_pending();
         self.playback_ended_since = None;
         if clear_displayed {
             self.player_fitted_wh = None;
             self.video_frame = None;
-            self.video_allocation = None;
-            self.video_allocation_hold = None;
-            self.video_allocation_hold2 = None;
-            self.video_allocation_hold3 = None;
-            self.video_allocation_hold4 = None;
+            self.clear_soft_allocation_holds();
             self.video_frame_wh = (0, 0);
             self.clear_stage_picture();
             // Soft RGBA used the shared GPU image cache — bump poster handles (new iced
@@ -2327,12 +2721,12 @@ impl FluxPlay {
     /// Pull one soft frame and start GPU allocate. Caller must ensure `!video_upload_busy`.
     fn enqueue_soft_video_frame(&mut self) -> Option<Task<Message>> {
         let (rw, rh) = self.soft_present_wh();
-        let hz = self.display_probe.monitor_hz.max(self.display_caps.video_hz);
-        self.session.set_present_hz(hz);
+        self.sync_player_hz();
         let (w, h, rgba) = self.session.pull_video_frame(rw, rh)?;
         // Keep sticky pull size; only commit WH to layout/caps after GPU Ok.
         let gen = self.video_upload_gen;
         self.video_upload_busy = true;
+        self.video_upload_busy_at = Some(std::time::Instant::now());
         let handle = ImageHandle::from_rgba(w, h, rgba);
         Some(iced_image::allocate(handle).map(move |result| Message::VideoFrameAllocated {
             gen,
@@ -2359,8 +2753,7 @@ impl FluxPlay {
             return;
         }
         let (rw, rh) = self.soft_present_wh();
-        let hz = self.display_probe.monitor_hz.max(self.display_caps.video_hz);
-        self.session.set_present_hz(hz);
+        self.sync_player_hz();
         crate::video_stage::set_aspect(self.session.aspect.ratio());
         let Some(frame) = self.session.pull_frame(rw, rh) else {
             return;
@@ -2381,21 +2774,24 @@ impl FluxPlay {
             // The image path is done for this playback: free its atlas pixels.
             self.video_upload_gen = self.video_upload_gen.wrapping_add(1);
             self.video_upload_busy = false;
+            self.video_upload_busy_at = None;
             self.clear_video_pending();
             self.video_frame = None;
-            self.video_allocation = None;
-            self.video_allocation_hold = None;
-            self.video_allocation_hold2 = None;
-            self.video_allocation_hold3 = None;
-            self.video_allocation_hold4 = None;
+            self.clear_soft_allocation_holds();
         }
     }
 
     fn clear_stage_picture(&mut self) {
         self.stage_picture = false;
         #[cfg(not(target_os = "android"))]
-        if let Some(frame) = crate::video_stage::clear() {
-            self.session.recycle_video_frame(frame);
+        {
+            let (pending, spent) = crate::video_stage::clear();
+            if let Some(frame) = pending {
+                self.session.recycle_video_frame(frame);
+            }
+            for frame in spent {
+                self.session.recycle_video_frame(frame);
+            }
         }
     }
 
@@ -2454,8 +2850,13 @@ impl FluxPlay {
             )
     }
 
-    /// Hide the browser and drop poster RAM. Catalog data stays, so coming back is immediate.
-    /// Live TV is left on screen. Android keeps a single window, so this is a no-op there.
+    /// Pause catalog art work once a VOD/series picture is on screen.
+    /// Live TV keeps the mosaic hot. Android is a single window (no-op).
+    ///
+    /// We used to `Mode::Hidden` the browser + paint an empty shell. On several
+    /// Linux compositors that left a solid black catalog window and could stall
+    /// the shared iced/wgpu surface used by the player (frozen picture / audio).
+    /// Park is now CPU/network only — the mosaic stays painted and mapped.
     fn park_browser_for_library(&mut self) -> Task<Message> {
         #[cfg(target_os = "android")]
         {
@@ -2466,24 +2867,95 @@ impl FluxPlay {
             if self.browse_parked || !self.library_playback() {
                 return Task::none();
             }
-            let Some(main) = self.main_id else {
+            if !self.saw_playback_picture() {
                 return Task::none();
-            };
-            let Some(player) = self.player_id else {
-                return Task::none();
-            };
+            }
             self.browse_parked = true;
             self.browse_coast_vy = 0.0;
             self.art_warm_active = false;
             self.pending_images.clear();
-            // Keep decoded posters. Dropping them made the grid and the episode
-            // stills come back blank; the restore path only repaints new handles.
-            window::set_mode::<Message>(main, window::Mode::Hidden)
-                .chain(window::gain_focus(player))
+            self.art_wait.clear();
+            self.image_flush_armed = false;
+            // Abort in-flight HTTP so ImageLoaded cannot keep waking iced during
+            // playback; decoded handles stay for a blank-free restore.
+            self.images.inflight_clear();
+            Task::none()
         }
     }
 
-    /// Show the browser again the moment the player window is gone.
+    /// Soft RGBA stage OR OS-owned VO (NativeGpu / Android Surface) with progress.
+    fn saw_playback_picture(&self) -> bool {
+        if self.video_frame.is_some() || self.stage_picture {
+            return true;
+        }
+        // NativeGpu / Surface never fill iced `video_frame` / `stage_picture`.
+        if self.session.native.os_video_present() {
+            return self.session.position_secs > 0.25
+                || self
+                    .session
+                    .buffer
+                    .as_ref()
+                    .is_some_and(|b| b.buffered_secs > 0.5);
+        }
+        false
+    }
+
+    /// Mark a fresh library open so a silent stream can be restarted / aborted.
+    fn arm_cold_open_watch(&mut self) {
+        self.play_open_at = Some(std::time::Instant::now());
+        self.play_cold_kicks = 0;
+    }
+
+    fn clear_cold_open_watch(&mut self) {
+        self.play_open_at = None;
+        self.play_cold_kicks = 0;
+    }
+
+    /// No decoded picture after open: reconnect once, then restore the browser.
+    fn watch_cold_open(&mut self) -> Option<Task<Message>> {
+        let library = self.library_playback();
+        let saw = self.saw_playback_picture();
+        if saw {
+            self.clear_cold_open_watch();
+            if library && !self.browse_parked {
+                return Some(self.park_browser_for_library());
+            }
+            return None;
+        }
+        if !library {
+            self.clear_cold_open_watch();
+            return None;
+        }
+        let Some(opened) = self.play_open_at else {
+            return None;
+        };
+        // Portals can take a few seconds; don't abort a healthy buffer too early.
+        if opened.elapsed() < std::time::Duration::from_secs(12) {
+            return None;
+        }
+        if self.play_cold_kicks == 0 {
+            self.play_cold_kicks = 1;
+            self.play_open_at = Some(std::time::Instant::now());
+            tracing::warn!("cold open — no picture after 12s, restarting stream");
+            self.session.restart();
+            self.status = ensure_status("Toujours rien — reconnexion…");
+            self.player_chrome_visible = true;
+            self.chrome_alpha = 1.0;
+            return None;
+        }
+        tracing::warn!("cold open — giving up, restoring browser");
+        self.clear_cold_open_watch();
+        self.store_watch_progress(true);
+        self.session.stop();
+        self.invalidate_soft_stage(false);
+        self.status = ensure_status("Échec lecture — flux inaccessible");
+        self.push_notice(self.status.clone());
+        self.player_chrome_visible = true;
+        self.chrome_alpha = 1.0;
+        Some(self.restore_browser())
+    }
+
+    /// Resume catalog art the moment the player window is gone.
     fn restore_browser(&mut self) -> Task<Message> {
         #[cfg(target_os = "android")]
         {
@@ -2496,6 +2968,8 @@ impl FluxPlay {
             }
             self.browse_parked = false;
             let warm = self.warm_after_restore();
+            // Best-effort: older builds used Mode::Hidden — force Windowed so a
+            // leftover black hole catalog comes back with the mosaic.
             let Some(main) = self.main_id else {
                 return warm;
             };
@@ -2536,11 +3010,44 @@ impl FluxPlay {
         ])
     }
 
-    /// Nothing to paint while the browser is parked. Keeps player ticks off the mosaic.
+    /// Cheap parked shell — mapped Windowed, no mosaic tiles / image widgets.
+    /// Soft PlayerTick must not rebuild the full catalog while SoftPump runs.
     fn view_parked_browser(&self) -> Element<'_, Message> {
-        container(Space::new())
+        let ui = self.ui_theme();
+        let (title_sz, title_font) = type_style(TypeRole::TitleM, true);
+        let (body_sz, body_font) = type_style(TypeRole::BodyM, false);
+        let (cap_sz, cap_font) = type_style(TypeRole::BodyS, false);
+        let title = self
+            .session
+            .channel
+            .as_ref()
+            .map(|c| c.name.as_str())
+            .unwrap_or("Lecture");
+        let body = column![
+            text(title)
+                .size(title_sz)
+                .font(title_font)
+                .color(ui.ink()),
+            text("Lecture en cours — catalogue en pause")
+                .size(body_sz)
+                .font(body_font)
+                .color(ui.ink_muted()),
+            text(self.status.as_str())
+                .size(cap_sz)
+                .font(cap_font)
+                .color(ui.ink_muted()),
+        ]
+        .spacing(SPACE_SM)
+        .padding(Padding::from([24, 28]));
+        container(body)
             .width(Fill)
             .height(Fill)
+            .align_x(Alignment::Center)
+            .align_y(Alignment::Center)
+            .style(move |_t: &Theme| container::Style {
+                background: Some(Background::Color(browser::shell_background(ui))),
+                ..Default::default()
+            })
             .into()
     }
 
@@ -2552,6 +3059,7 @@ impl FluxPlay {
         {
             self.android_force_soft = false;
             self.android_want_surface_upgrade = false;
+            self.android_synced_content_fps = None;
             crate::android_bridge::set_immersive_mode(false);
             crate::android_bridge::set_keep_screen_on(false);
             crate::android_bridge::set_force_landscape(false);
@@ -2621,24 +3129,6 @@ impl FluxPlay {
             ) {
                 self.pressed_mosaic = None;
                 return Task::none();
-            }
-        }
-        if self.swallow_tile_release {
-            // Image loads and player ticks arrive between the category press and
-            // the release that lands on the poster underneath. Those must not
-            // spend the one-shot, or the poster still opens.
-            if !swallow_noise(&message) {
-                self.swallow_tile_release = false;
-                if matches!(
-                    message,
-                    Message::OpenSeries(_)
-                        | Message::OpenVodDetail(_)
-                        | Message::PlayChannelId(..)
-                        | Message::PlayChannel(_)
-                ) {
-                    self.pressed_mosaic = None;
-                    return Task::none();
-                }
             }
         }
         match message {
@@ -2831,16 +3321,13 @@ impl FluxPlay {
                     }
                     self.player_pos = None;
                     self.video_frame = None;
-                    self.video_allocation = None;
-                    self.video_allocation_hold = None;
-                    self.video_allocation_hold2 = None;
-                    self.video_allocation_hold3 = None;
-                    self.video_allocation_hold4 = None;
+                    self.clear_soft_allocation_holds();
                     self.video_frame_wh = (0, 0);
                     self.invalidate_soft_stage(true);
                     self.player_fullscreen = false;
                     self.player_chrome_visible = true;
                     self.player_panel = PlayerPanel::None;
+                    self.clear_cold_open_watch();
                     self.session.stop();
                     self.status = "Lecteur fermé".into();
                     return self.restore_browser();
@@ -3007,7 +3494,7 @@ impl FluxPlay {
                     Err(e) => {
                         self.party.broadcasting = false;
                         self.session.playback_url = None;
-                        self.party.status = e.to_string();
+                        self.party.status = ensure_status(e);
                     }
                 }
             }
@@ -3161,7 +3648,7 @@ impl FluxPlay {
                             self.party.status = body.chars().take(160).collect();
                         }
                     }
-                    Err(e) => self.party.status = e,
+                    Err(e) => self.party.status = ensure_status(e),
                 }
             }
             Message::Tab(tab) => {
@@ -3188,6 +3675,8 @@ impl FluxPlay {
                 self.series_detail = None;
                 self.vod_detail = None;
                 self.detail_meta_loading = false;
+                self.images.clear_handles();
+                crate::images::trim_global_aux_caches();
                 if tab == Tab::Settings && self.backends_cache.is_none() {
                     self.backends_cache = Some(detect_backends());
                     self.external_players = fluxplay_player::detect_external_players();
@@ -3287,7 +3776,7 @@ impl FluxPlay {
                 let slice = self.content_virtual_slice(y, view_h);
                 if slice == self.browse_slice {
                     if flinging {
-                        return Self::browse_settle_task();
+                        return self.browse_settle_task();
                     }
                     if settled {
                         return Task::batch([
@@ -3302,18 +3791,9 @@ impl FluxPlay {
                 // Velocity only decays on new scroll events, so schedule a settle check:
                 // without it the last fast wheel turn left art loading off for good.
                 if flinging {
-                    // Still fetch the posters now under the cursor. Waiting for
-                    // the wheel to stop left films and series blank.
-                    let art = if matches!(self.tab, Tab::Vod | Tab::Series)
-                        && self.vod_detail.is_none()
-                        && self.series_detail.is_none()
-                    {
-                        self.art_wait.clear();
-                        self.prefetch_visible_art()
-                    } else {
-                        Task::none()
-                    };
-                    return Task::batch([Self::browse_settle_task(), art]);
+                    // Throttled fetch under the cursor — full refresh happens on settle.
+                    let art = self.maybe_scroll_prefetch_art();
+                    return Task::batch([self.browse_settle_task(), art]);
                 }
                 let mut tasks = vec![self.flush_pending_images(), self.refresh_browse_art()];
                 if matches!(self.tab, Tab::Live | Tab::Epg) {
@@ -3322,7 +3802,11 @@ impl FluxPlay {
                 }
                 return Task::batch(tasks);
             }
-            Message::BrowseSettle => {
+            Message::BrowseSettle(gen) => {
+                if gen != self.browse_settle_gen {
+                    return Task::none();
+                }
+                self.browse_settle_armed = false;
                 tracing::debug!(
                     vy = self.browse_scroll_vy,
                     pending = self.pending_images.len(),
@@ -3334,7 +3818,7 @@ impl FluxPlay {
                 if !idle {
                     // The check that woke too early must arm the next one.
                     // Otherwise the last tick of a fling never loads posters.
-                    return Self::browse_settle_task();
+                    return self.browse_settle_task();
                 }
                 self.browse_scroll_vy = 0.0;
                 self.browse_was_flinging = false;
@@ -3359,23 +3843,15 @@ impl FluxPlay {
                     (self.browse_scroll_y + dy).clamp(0.0, max_scroll);
                 self.browse_slice =
                     self.content_virtual_slice(self.browse_scroll_y, self.browse_view_h);
-                // The wheel is handled here, not by the scrollable. Load the rows
-                // now; waiting for settle left the new posters blank.
+                // Wheel: throttle art; settle does the full visible refresh.
                 self.browse_scroll_at = Some(std::time::Instant::now());
-                let art = if matches!(self.tab, Tab::Vod | Tab::Series)
-                    && self.vod_detail.is_none()
-                    && self.series_detail.is_none()
-                {
-                    self.prefetch_visible_art()
-                } else {
-                    Task::none()
-                };
+                let art = self.maybe_scroll_prefetch_art();
                 return Task::batch([
                     iced::widget::operation::scroll_by(
                         iced::widget::Id::from(self.browse_scroll_widget_id()),
                         AbsoluteOffset { x: 0.0, y: dy },
                     ),
-                    Self::browse_settle_task(),
+                    self.browse_settle_task(),
                     art,
                 ]);
             }
@@ -3426,12 +3902,17 @@ impl FluxPlay {
             Message::BrowseDragEnd => {
                 self.browse_dragging = false;
                 self.browse_drag_last_y = None;
-                // Keep browse_drag_moved so the sibling mosaic on_release in this
-                // frame is suppressed; open handlers *consume* the flag (one-shot)
-                // so PlayVod / detail FABs are not stuck forever after a fling.
                 let coast = self.browse_drag_last_dy * 10.0;
                 self.browse_drag_last_dy = 0.0;
-                if self.browse_drag_moved && coast.abs() > 8.0 {
+                // Time-box the post-fling open suppress. A sticky browse_drag_moved
+                // after empty-space release ate the next poster click forever.
+                if self.browse_drag_moved {
+                    self.suppress_open_until = Some(
+                        std::time::Instant::now() + std::time::Duration::from_millis(120),
+                    );
+                    self.browse_drag_moved = false;
+                }
+                if coast.abs() > 8.0 {
                     self.pressed_mosaic = None;
                     self.browse_coast_vy = coast;
                     return self.apply_browse_coast_step();
@@ -3462,7 +3943,10 @@ impl FluxPlay {
             }
             Message::SelectBrowseCategory(id) => {
                 if self.cats_open {
-                    self.swallow_tile_release = true;
+                    // Deadline: the release after closing cats often hits the poster under.
+                    self.suppress_open_until = Some(
+                        std::time::Instant::now() + std::time::Duration::from_millis(400),
+                    );
                 }
                 self.cats_open = false;
                 self.list_limit = self.browse_page();
@@ -3503,6 +3987,7 @@ impl FluxPlay {
                         self.selected_vod_category = Some(id.clone());
                         self.vod_detail = None;
                         self.detail_meta_loading = false;
+                        self.begin_mosaic_category_switch();
                         let base = crate::names::category_shelf(&id).0.to_string();
                         let idx = self.rebuild_browse_index();
                         let follow = if id == "*"
@@ -3522,6 +4007,7 @@ impl FluxPlay {
                         self.selected_series_category = Some(id.clone());
                         self.series_detail = None;
                         self.detail_meta_loading = false;
+                        self.begin_mosaic_category_switch();
                         let base = crate::names::category_shelf(&id).0.to_string();
                         let idx = self.rebuild_browse_index();
                         let follow = if id == "*"
@@ -3539,11 +4025,9 @@ impl FluxPlay {
                     }
                     _ => self.rebuild_browse_index(),
                 };
-                return Task::batch([
-                    task,
-                    self.refresh_browse_art(),
-                    self.snap_browse_scroll_task(),
-                ]);
+                // `follow` already refreshes visible art — a second refresh_browse_art
+                // doubled the ImageLoaded storm and froze the mosaic.
+                return Task::batch([task, self.snap_browse_scroll_task()]);
             }
             Message::PlayChannelId(id, source_id) => {
                 if self.consume_browse_drag_suppress() {
@@ -3557,7 +4041,7 @@ impl FluxPlay {
                     .or_else(|| self.bundle.channels.iter().find(|c| c.id == id))
                     .cloned();
                 let Some(ch) = found else {
-                    self.status = "Chaîne introuvable".into();
+                    self.status = ensure_status("Chaîne introuvable");
                     return Task::none();
                 };
                 return Task::done(Message::PlayChannel(ch));
@@ -3672,7 +4156,7 @@ impl FluxPlay {
                         if let Some(dir) = p.parent() {
                             self.status = format!(
                                 "Téléchargement — {name} → {}",
-                                crate::storage::display_path(dir)
+                                storage::display_path(dir)
                             );
                         }
                         *part = Some(p);
@@ -3685,15 +4169,25 @@ impl FluxPlay {
                     } => {
                         *done = d;
                         *total = t;
-                        let links = match connections {
-                            0 if rate == 0 => " · en attente d'une connexion libre".to_string(),
-                            0 | 1 => String::new(),
-                            n => format!(" · {n} connexions"),
-                        };
-                        self.status = format!(
-                            "Téléchargement — {name} · {}{links}",
-                            crate::downloads::progress_detail(d, t, rate)
-                        );
+                        // Progress ticks every 500 ms — rebuilding status every
+                        // time forced a full iced redraw for every parallel job.
+                        let due = self.download_status_at.is_none_or(|at| {
+                            at.elapsed() >= std::time::Duration::from_secs(2)
+                        });
+                        if due {
+                            self.download_status_at = Some(std::time::Instant::now());
+                            let links = match connections {
+                                0 if rate == 0 => {
+                                    " · en attente d'une connexion libre".to_string()
+                                }
+                                0 | 1 => String::new(),
+                                n => format!(" · {n} connexions"),
+                            };
+                            self.status = format!(
+                                "Téléchargement — {name} · {}{links}",
+                                crate::downloads::progress_detail(d, t, rate)
+                            );
+                        }
                     }
                     DownloadEvent::Waiting => {
                         self.status = format!(
@@ -3718,7 +4212,8 @@ impl FluxPlay {
                         return self.pump_download_queue();
                     }
                     DownloadEvent::Finished(Err(error)) => {
-                        self.status = format!("Téléchargement échoué — {name} : {error}");
+                        self.status =
+                            ensure_status(format!("Téléchargement échoué — {name} : {error}"));
                         self.download_partials =
                             crate::downloads::scan_partials(&self.downloads_dir());
                         self.downloads.insert(url, DownloadState::Failed);
@@ -3738,14 +4233,14 @@ impl FluxPlay {
                     .unwrap_or_else(|| self.downloads_dir());
                 #[cfg(not(target_os = "android"))]
                 if let Err(e) = open::that(&dir) {
-                    self.status = format!("Impossible d'ouvrir {} : {e}", dir.display());
+                    self.status = ensure_status(format!("Impossible d'ouvrir {} : {e}", dir.display()));
                     return Task::none();
                 }
                 self.status = format!("Téléchargé — {}", path.display());
             }
             Message::FormDownloadDir(s) => self.form_download_dir = s,
             Message::SaveDownloadDir => {
-                match crate::storage::validate_downloads_dir(&self.form_download_dir) {
+                match storage::validate_downloads_dir(&self.form_download_dir) {
                     Ok(dir) => {
                         self.settings.download_dir = dir;
                         self.form_download_dir = self.settings.download_dir.clone();
@@ -3754,10 +4249,10 @@ impl FluxPlay {
                         self.persist();
                         self.status = format!(
                             "Téléchargements → {}",
-                            crate::storage::display_path(&self.downloads_dir())
+                            storage::display_path(&self.downloads_dir())
                         );
                     }
-                    Err(e) => self.status = e,
+                    Err(e) => self.status = ensure_status(e),
                 }
             }
             Message::PickDownloadDir => {
@@ -3790,12 +4285,12 @@ impl FluxPlay {
             Message::OpenDownloadsDir => {
                 let dir = self.downloads_dir();
                 if let Err(e) = std::fs::create_dir_all(&dir) {
-                    self.status = format!("Impossible de créer {} : {e}", dir.display());
+                    self.status = ensure_status(format!("Impossible de créer {} : {e}", dir.display()));
                     return Task::none();
                 }
                 #[cfg(not(target_os = "android"))]
                 if let Err(e) = open::that(&dir) {
-                    self.status = format!("Impossible d'ouvrir {} : {e}", dir.display());
+                    self.status = ensure_status(format!("Impossible d'ouvrir {} : {e}", dir.display()));
                     return Task::none();
                 }
                 self.status = format!("Téléchargements : {}", dir.display());
@@ -3840,7 +4335,8 @@ impl FluxPlay {
                         PlayerBackendPref::External
                     );
                     if prefer_external {
-                        match crate::android_intent::open_stream_url(&ch.stream_url) {
+                        let need_hdrs = self.stream_needs_http_headers(Some(&ch));
+                        match crate::android_intent::open_stream_url_ex(&ch.stream_url, need_hdrs) {
                             Ok(()) => {
                                 self.session.stop();
                                 self.invalidate_soft_stage(true);
@@ -3856,7 +4352,7 @@ impl FluxPlay {
                                 );
                             }
                             Err(e) => {
-                                self.status = format!("Intent: {e}");
+                                self.status = ensure_status(format!("Intent: {e}"));
                                 self.persist();
                                 return take_queue_task(
                                     vec![epg_task, art_task, self.open_or_focus_player()],
@@ -3884,14 +4380,23 @@ impl FluxPlay {
                     Ok(()) => {
                         self.arm_resume(&ch.stream_url, ch.kind);
                         self.apply_saved_video_defaults_for_current_play();
+                        if matches!(ch.kind, ContentKind::Vod | ContentKind::Series) {
+                            self.arm_cold_open_watch();
+                        } else {
+                            self.clear_cold_open_watch();
+                        }
                         self.status = self.session.status_line();
                         self.persist();
                         #[cfg(target_os = "android")]
                         {
-                            // Prefer in-process libmpv RGBA embed (desktop parity).
-                            // Only fall back to ACTION_VIEW when embed is unavailable.
-                            if !self.session.has_embedded_video() {
-                                match crate::android_intent::open_stream_url(&ch.stream_url) {
+                            // Prefer in-process present (soft RGBA *or* Surface/GpuEgl).
+                            // has_embedded_video is soft-only — Surface Ok must not Intent+stop.
+                            if !self.session.has_in_process_video() {
+                                let need_hdrs = self.stream_needs_http_headers(Some(&ch));
+                                match crate::android_intent::open_stream_url_ex(
+                                    &ch.stream_url,
+                                    need_hdrs,
+                                ) {
                                     Ok(()) => {
                                         self.session.stop();
                                         self.invalidate_soft_stage(true);
@@ -3902,13 +4407,14 @@ impl FluxPlay {
                                         self.status = format!("Lecteur système · {}", ch.name);
                                     }
                                     Err(e) => {
-                                        self.status = format!("Intent: {e}");
+                                        self.status = ensure_status(format!("Intent: {e}"));
                                     }
                                 }
                             }
                         }
+                        let skip_task = self.open_skip_db_task(&ch.stream_url, ch.kind);
                         return take_queue_task(
-                            vec![epg_task, art_task, self.open_or_focus_player()],
+                            vec![epg_task, art_task, self.open_or_focus_player(), skip_task],
                             &mut queue_task,
                         );
                     }
@@ -3916,8 +4422,12 @@ impl FluxPlay {
                         #[cfg(target_os = "android")]
                         {
                             let needs_intent = e.to_string().contains("EXTERNAL_NEEDS_INTENT");
-                            if needs_intent || !self.session.has_embedded_video() {
-                                match crate::android_intent::open_stream_url(&ch.stream_url) {
+                            if needs_intent || !self.session.has_in_process_video() {
+                                let need_hdrs = self.stream_needs_http_headers(Some(&ch));
+                                match crate::android_intent::open_stream_url_ex(
+                                    &ch.stream_url,
+                                    need_hdrs,
+                                ) {
                                     Ok(()) => {
                                         self.session.stop();
                                         self.invalidate_soft_stage(true);
@@ -3929,11 +4439,11 @@ impl FluxPlay {
                                             format!("Lecteur système · {}", ch.name);
                                     }
                                     Err(ie) => {
-                                        self.status = format!("{e} / Intent: {ie}");
+                                        self.status = ensure_status(format!("{e} / Intent: {ie}"));
                                     }
                                 }
                             } else {
-                                self.status = format!("{e}");
+                                self.status = ensure_status(format!("{e}"));
                             }
                             self.persist();
                             return take_queue_task(
@@ -3943,7 +4453,9 @@ impl FluxPlay {
                         }
                         #[cfg(not(target_os = "android"))]
                         {
-                            self.status = format!("{e} — essayez Externe ou installez mpv");
+                            self.status = ensure_status(format!(
+                                "{e} — essayez Externe ou installez mpv"
+                            ));
                             self.persist();
                             return take_queue_task(
                                 vec![epg_task, art_task, self.open_or_focus_player()],
@@ -3971,6 +4483,14 @@ impl FluxPlay {
                 self.status = format!("Ouverture — {name}…");
                 // Invalidate deferred Stop→close so a quick play cannot be killed.
                 self.player_close_gen = self.player_close_gen.wrapping_add(1);
+                let url = if url.trim().is_empty() {
+                    // Catalog row / fiche without a stream — rebuild from Xtream id
+                    // (also writes the URL back onto the open fiche for TOSD).
+                    self.repair_play_stream_url(kind, &name)
+                        .unwrap_or_default()
+                } else {
+                    url
+                };
                 if url.trim().is_empty() {
                     self.status = format!("URL vide — {name}");
                     return Task::none();
@@ -4023,6 +4543,8 @@ impl FluxPlay {
                     source_id: self.source_for_url(&stream_url).map(|s| s.id),
                     kind,
                     catchup: None,
+                    http_user_agent: None,
+                    http_referer: None,
                 };
                 self.apply_source_headers_for(&ch);
                 #[cfg(target_os = "android")]
@@ -4032,7 +4554,8 @@ impl FluxPlay {
                         PlayerBackendPref::External
                     );
                     if prefer_external {
-                        match crate::android_intent::open_stream_url(&stream_url) {
+                        let need_hdrs = self.stream_needs_http_headers(Some(&ch));
+                        match crate::android_intent::open_stream_url_ex(&stream_url, need_hdrs) {
                             Ok(()) => {
                                 self.session.stop();
                                 self.invalidate_soft_stage(true);
@@ -4047,7 +4570,7 @@ impl FluxPlay {
                                 );
                             }
                             Err(e) => {
-                                self.status = format!("Intent: {e}");
+                                self.status = ensure_status(format!("Intent: {e}"));
                                 return take_queue_task(
                                     vec![self.open_or_focus_player()],
                                     &mut queue_task,
@@ -4057,6 +4580,8 @@ impl FluxPlay {
                     }
                 }
                 self.remember_play(&ch, &stream_url);
+                #[cfg(target_os = "android")]
+                let need_hdrs = self.stream_needs_http_headers(Some(&ch));
                 let res = {
                     self.invalidate_soft_stage(false);
                     #[cfg(target_os = "android")]
@@ -4072,6 +4597,7 @@ impl FluxPlay {
                     Ok(()) => {
                         self.arm_resume(&stream_url, kind);
                         self.apply_saved_video_defaults_for_current_play();
+                        self.arm_cold_open_watch();
                         self.status = self.session.status_line();
                         self.persist();
                         let art = crate::images::pick_art(
@@ -4083,11 +4609,14 @@ impl FluxPlay {
                         let art_task = art
                             .map(|u| self.prefetch_urls(std::iter::once(u)))
                             .unwrap_or_else(Task::none);
+                        let skip_task = self.open_skip_db_task(&stream_url, kind);
+                        // Park only after the first frame (see watch_cold_open /
+                        // park_browser_for_library) so a stuck load keeps the mosaic.
                         return take_queue_task(
                             vec![
                                 art_task,
                                 self.open_or_focus_player(),
-                                self.park_browser_for_library(),
+                                skip_task,
                             ],
                             &mut queue_task,
                         );
@@ -4095,18 +4624,28 @@ impl FluxPlay {
                     Err(e) => {
                         #[cfg(target_os = "android")]
                         {
-                            match crate::android_intent::open_stream_url(&stream_url) {
-                                Ok(()) => {
-                                    self.session.stop();
-                                    self.invalidate_soft_stage(true);
-                                    crate::android_bridge::release_video_surface_wid();
-                                    self.session.backend = Some(BackendId::External);
-                                    self.session.state = PlaybackState::Playing;
-                                    self.status = format!("Lecteur système · {name}");
+                            // Same gate as Live Err — never Intent when Soft/Surface still owns video.
+                            let needs_intent = e.to_string().contains("EXTERNAL_NEEDS_INTENT");
+                            if needs_intent || !self.session.has_in_process_video() {
+                                match crate::android_intent::open_stream_url_ex(
+                                    &stream_url,
+                                    need_hdrs,
+                                ) {
+                                    Ok(()) => {
+                                        self.session.stop();
+                                        self.invalidate_soft_stage(true);
+                                        crate::android_bridge::release_video_surface_wid();
+                                        self.session.backend = Some(BackendId::External);
+                                        self.session.state = PlaybackState::Playing;
+                                        self.status = format!("Lecteur système · {name}");
+                                    }
+                                    Err(ie) => {
+                                        self.status =
+                                            ensure_status(format!("{e} / Intent: {ie}"));
+                                    }
                                 }
-                                Err(ie) => {
-                                    self.status = format!("{e} / Intent: {ie}");
-                                }
+                            } else {
+                                self.status = ensure_status(format!("{e}"));
                             }
                             return take_queue_task(
                                 vec![self.open_or_focus_player()],
@@ -4116,9 +4655,9 @@ impl FluxPlay {
                         #[cfg(not(target_os = "android"))]
                         {
                             let _ = stream_url;
-                            self.status = format!(
+                            self.status = ensure_status(format!(
                                 "{e} — 1 connexion max: Stop puis réessayez, ou Externe"
-                            );
+                            ));
                             return take_queue_task(
                                 vec![self.open_or_focus_player()],
                                 &mut queue_task,
@@ -4129,7 +4668,13 @@ impl FluxPlay {
             }
             #[cfg(target_os = "android")]
             Message::SafPoll => {
-                self.refresh_system_dark();
+                let dark_due = self.system_dark_at.is_none_or(|t| {
+                    t.elapsed() >= std::time::Duration::from_secs(2)
+                });
+                if dark_due {
+                    self.system_dark_at = Some(std::time::Instant::now());
+                    self.refresh_system_dark();
+                }
                 crate::android_bridge::refresh_system_insets();
                 let prev_insets = self.system_insets;
                 self.system_insets = crate::android_bridge::system_insets_dp();
@@ -4177,11 +4722,11 @@ impl FluxPlay {
                 err,
             } => {
                 if let Some(e) = err {
-                    self.status = e;
+                    self.status = ensure_status(e);
                     return Task::none();
                 }
                 let Some(path) = path else {
-                    self.status = "Fichier introuvable".into();
+                    self.status = ensure_status("Fichier introuvable");
                     return Task::none();
                 };
                 match kind {
@@ -4237,39 +4782,56 @@ impl FluxPlay {
                 crate::android_bridge::finish_activity();
                 return Task::none();
             }
-            #[cfg(target_os = "android")]
-            Message::BrowseFocusDelta(delta) => {
+            Message::BrowseFocusStep { dx, dy } => {
+                if !self.browse_focus_chrome_active() {
+                    return Task::none();
+                }
                 let len = self.browse_index.len();
                 if len == 0 {
                     return Task::none();
                 }
-                let next = if delta < 0 {
-                    self.browse_focus.saturating_sub((-delta) as usize)
-                } else {
-                    (self.browse_focus + delta as usize).min(len.saturating_sub(1))
-                };
+                let cols = self.browse_focus_cols().max(1) as i32;
+                let cur = self.browse_focus as i32;
+                let next = (cur + dy.saturating_mul(cols) + dx).clamp(0, len as i32 - 1) as usize;
                 self.browse_focus = next;
-                if matches!(self.tab, Tab::Live | Tab::Favorites) {
+                if matches!(self.tab, Tab::Live | Tab::Favorites | Tab::Epg) {
                     if let Some(bi) = self.browse_index.get(next) {
                         if let Some(ch) = self.bundle.channels.get(bi) {
                             self.selected_channel = Some(ch.id.clone());
                         }
                     }
                 }
-                return Task::none();
+                self.ensure_browse_focus_visible();
+                return self.snap_browse_scroll_task();
             }
-            #[cfg(target_os = "android")]
             Message::BrowseActivate => {
-                if !matches!(self.tab, Tab::Live | Tab::Favorites) {
+                if !self.browse_focus_chrome_active() {
                     return Task::none();
                 }
                 let Some(bi) = self.browse_index.get(self.browse_focus) else {
                     return Task::none();
                 };
-                let Some(ch) = self.bundle.channels.get(bi) else {
-                    return Task::none();
-                };
-                return Task::done(Message::PlayChannelId(ch.id.clone(), ch.source_id));
+                match self.tab {
+                    Tab::Live | Tab::Favorites | Tab::Epg => {
+                        let Some(ch) = self.bundle.channels.get(bi) else {
+                            return Task::none();
+                        };
+                        return Task::done(Message::PlayChannelId(ch.id.clone(), ch.source_id));
+                    }
+                    Tab::Vod => {
+                        let Some(v) = self.bundle.vod.get(bi) else {
+                            return Task::none();
+                        };
+                        return Task::done(Message::OpenVodDetail(v.id.clone()));
+                    }
+                    Tab::Series => {
+                        let Some(s) = self.bundle.series.get(bi) else {
+                            return Task::none();
+                        };
+                        return Task::done(Message::OpenSeries(s.id.clone()));
+                    }
+                    _ => return Task::none(),
+                }
             }
             #[cfg(target_os = "android")]
             Message::CatalogBootReady {
@@ -4299,6 +4861,7 @@ impl FluxPlay {
                 {
                     self.android_force_soft = false;
                     self.android_want_surface_upgrade = false;
+                    self.android_synced_content_fps = None;
                     crate::android_bridge::release_video_surface_wid();
                     crate::android_bridge::set_hdr_color_mode(false);
                 }
@@ -4449,6 +5012,13 @@ impl FluxPlay {
                     return Task::none();
                 }
                 let paused = matches!(self.session.state, PlaybackState::Paused);
+                // libffmpeg/ffplay: wake_output already full-rebuilt AO — a second
+                // restart here drops VOD position again. Seek restore lives in
+                // recover_after_sleep; skip the duplicate wake_audio restart.
+                if self.session.native.needs_full_ao_rebuild() {
+                    self.wake_pos = None;
+                    return Task::none();
+                }
                 self.session.wake_audio();
                 let stuck = self.wake_pos.take().is_some_and(|pos| {
                     !paused
@@ -4507,14 +5077,30 @@ impl FluxPlay {
                         + self.system_insets.3;
                     crate::android_bridge::layout_video_surface_chrome_inset_dp(chrome);
                 }
+                #[cfg(not(target_os = "android"))]
+                {
+                    // NativeGpu ontop: re-inset so iced chrome is clickable again.
+                    let scale = self.player_layout_scale;
+                    self.sync_native_overlay_chrome(scale);
+                }
             }
             Message::PlayerChromeTick => {
-                self.session.refresh_track_cache();
+                // Track list only when the panel is open — polling every chrome
+                // tick while chrome is hidden was pure UI overhead.
+                if self.player_panel != PlayerPanel::None {
+                    self.session.refresh_track_cache();
+                }
                 self.maybe_autohide_player_chrome();
                 self.lerp_chrome_alpha();
-                // Off the soft-video path — theme/caps at GUI rate only.
-                self.refresh_system_dark();
-                self.refresh_display_caps(false);
+                // Theme probe at most every 2s (dark_light::detect is not free).
+                let dark_due = self.system_dark_at.is_none_or(|t| {
+                    t.elapsed() >= std::time::Duration::from_secs(2)
+                });
+                if dark_due {
+                    self.system_dark_at = Some(std::time::Instant::now());
+                    self.refresh_system_dark();
+                }
+                self.maybe_refresh_display_caps();
                 if let Some(prefetch) = self.maybe_prefetch_next_episode() {
                     return prefetch;
                 }
@@ -4523,21 +5109,21 @@ impl FluxPlay {
                 self.status = if self.session.cycle_audio() {
                     "Piste audio suivante".into()
                 } else {
-                    "Piste audio non supportée".into()
+                    ensure_status("Piste audio non supportée")
                 };
             }
             Message::SelectAudio(id) => {
                 self.status = if self.session.set_audio_track(id) {
                     "Piste audio".into()
                 } else {
-                    "Piste audio non supportée".into()
+                    ensure_status("Piste audio non supportée")
                 };
             }
             Message::CycleSubtitles => {
                 self.status = if self.session.cycle_subtitles() {
                     "Sous-titres suivants".into()
                 } else {
-                    "Sous-titres non supportés".into()
+                    ensure_status("Sous-titres non supportés")
                 };
             }
             Message::SelectSubtitle(id) => {
@@ -4548,7 +5134,7 @@ impl FluxPlay {
                         "Sous-titres".into()
                     }
                 } else {
-                    "Sous-titres non supportés".into()
+                    ensure_status("Sous-titres non supportés")
                 };
             }
             Message::SkipGeneric => {
@@ -4564,6 +5150,54 @@ impl FluxPlay {
                 } else {
                     "Pas de générique à passer".into()
                 };
+            }
+            Message::OpenSkipDbReady {
+                play_url,
+                intro,
+                outro_start,
+            } => {
+                // Failover may swap the host; local `file:` play keeps catalog URL
+                // as the skip task identity.
+                let current = self
+                    .session
+                    .playback_url
+                    .as_deref()
+                    .or_else(|| self.session.channel.as_ref().map(|c| c.stream_url.as_str()));
+                let want = crate::downloads::url_key(&play_url);
+                let local_of_catalog = self
+                    .download_library
+                    .get(&play_url)
+                    .and_then(crate::downloads::local_play_url)
+                    .or_else(|| {
+                        self.prefetched.as_ref().and_then(|(u, path)| {
+                            (u == &play_url)
+                                .then(|| crate::downloads::local_play_url(path))
+                                .flatten()
+                        })
+                    })
+                    .or_else(|| {
+                        self.downloads.iter().find_map(|(saved, state)| {
+                            let crate::downloads::DownloadState::Done { path } = state else {
+                                return None;
+                            };
+                            if saved == &play_url || crate::downloads::url_key(saved) == want {
+                                crate::downloads::local_play_url(path)
+                            } else {
+                                None
+                            }
+                        })
+                    });
+                let same = current.is_some_and(|cur| {
+                    cur == play_url.as_str()
+                        || crate::downloads::url_key(cur) == want
+                        || local_of_catalog.as_deref() == Some(cur)
+                });
+                if same {
+                    self.session.apply_open_skip_db(intro, outro_start);
+                    if intro.is_some() || outro_start.is_some() {
+                        tracing::debug!(%play_url, ?intro, ?outro_start, "open skip db applied");
+                    }
+                }
             }
             Message::PlayerFullscreenCommit(id, gen) => {
                 if gen != self.player_fs_gen
@@ -4591,8 +5225,9 @@ impl FluxPlay {
                 return self.sync_player_layout_task(id);
             }
             Message::PlayerScreenChanged(id) => {
-                // A plain move does not change the stage. Re-running layout on
-                // every drag step stopped presents, so the picture stayed put.
+                // Soft RGBA: a plain move does not change the stage — skip.
+                // NativeGpu / CLI overlay: absolute geometry must track the iced window
+                // (W3-02 F1). Debounce like resize so drag does not spam mpv.
                 let settling = self
                     .player_layout_freeze_until
                     .is_some_and(|t| std::time::Instant::now() < t);
@@ -4604,6 +5239,21 @@ impl FluxPlay {
                     return self
                         .sync_player_layout_task(id)
                         .chain(self.commit_player_fullscreen(id, gen));
+                }
+                #[cfg(not(target_os = "android"))]
+                if self.player_id == Some(id)
+                    && (self.session.native.android_present_mode().uses_native_window()
+                        || self.session.native.os_video_present())
+                {
+                    self.player_resize_gen = self.player_resize_gen.wrapping_add(1);
+                    let gen = self.player_resize_gen;
+                    return Task::perform(
+                        async move {
+                            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                            (id, gen)
+                        },
+                        |(id, gen)| Message::PlayerResizeSettled { id, gen },
+                    );
                 }
                 return Task::none();
             }
@@ -4631,43 +5281,6 @@ impl FluxPlay {
                 if matches!(self.tab, Tab::Live | Tab::Epg | Tab::Vod | Tab::Series) {
                     return self.rebuild_browse_index();
                 }
-            }
-            Message::AgesLoaded(rows) => {
-                self.age_lookup_busy = false;
-                let mut changed = false;
-                for (id, source_id, rated) in rows {
-                    let Some(code) = rated.filter(|s| !s.trim().is_empty()) else {
-                        continue;
-                    };
-                    let Some(item) = self.bundle.series.iter_mut().find(|s| s.id == id) else {
-                        continue;
-                    };
-                    if crate::metadata::age_rating(item.rated.as_deref()).is_some() {
-                        continue;
-                    }
-                    item.rated = Some(code);
-                    changed = true;
-                    if let (Some(db), Some(sid)) = (&self.catalog_db, source_id.or(item.source_id))
-                    {
-                        let mut saved = item.clone();
-                        saved.source_id = Some(sid);
-                        let _ = db.persist_series(&saved);
-                    }
-                }
-                if let Some(detail) = &self.series_detail {
-                    if let Some(updated) = self.bundle.series.iter().find(|s| s.id == detail.id) {
-                        let mut d = updated.clone();
-                        if d.seasons.is_empty() {
-                            d.seasons = detail.seasons.clone();
-                        }
-                        self.series_detail = Some(d);
-                    }
-                }
-                let more = self.queue_visible_ages();
-                if changed && self.age_filter_on() {
-                    return Task::batch([self.rebuild_browse_index(), more]);
-                }
-                return more;
             }
             Message::CaptionLoaded(rows) => {
                 self.age_lookup_busy = false;
@@ -4733,6 +5346,18 @@ impl FluxPlay {
                         if urgent || self.android_maintain_tick % 5 == 0 {
                             self.maintain_android_surface_session(false);
                         }
+                        // First stable content_fps after cold open (content=0 snap) —
+                        // don't wait only on the 2s caps refresh for timing + TV mode.
+                        if let Some(cfps) = self.session.content_fps() {
+                            let cfps = cfps as f32;
+                            let need = self
+                                .android_synced_content_fps
+                                .map(|p| (p - cfps).abs() >= 1.0)
+                                .unwrap_or(true);
+                            if need {
+                                self.apply_android_surface_timing(Some(cfps));
+                            }
+                        }
                     } else if self.android_want_surface_upgrade
                         && !self.android_force_soft
                         && !matches!(
@@ -4744,41 +5369,46 @@ impl FluxPlay {
                             PlaybackState::Playing | PlaybackState::Buffering
                         )
                     {
-                        // Soft emergency: keep Surface warming under iced, promote when ready.
+                        // Soft emergency: poll for Surface readiness; never leave
+                        // SurfaceView VISIBLE covering iced soft RGBA between ticks.
                         self.android_maintain_tick =
                             self.android_maintain_tick.wrapping_add(1);
                         if self.android_maintain_tick % 5 == 0 {
                             crate::android_bridge::set_video_surface_z_on_top(false);
+                            // Brief visible pulse so SurfaceHolder can create; hide if
+                            // not ready so soft RGBA stays uncovered.
                             crate::android_bridge::set_video_surface_visible(true);
-                            if crate::android_bridge::is_video_surface_ready() {
-                                if let Some(ch) = self.session.channel.clone() {
-                                    tracing::info!(
-                                        "android Surface ready — promoting Soft → mediacodec_embed"
-                                    );
-                                    self.android_want_surface_upgrade = false;
-                                    self.player_close_gen =
-                                        self.player_close_gen.wrapping_add(1);
-                                    self.invalidate_soft_stage(false);
-                                    self.apply_source_headers_for(&ch);
-                                    crate::android_bridge::request_audio_focus();
-                                    if crate::android_bridge::poll_audio_focus_held()
-                                        == Some(true)
-                                    {
-                                        self.audio_focus_held = true;
+                            let ready = crate::android_bridge::is_video_surface_ready();
+                            if !ready {
+                                crate::android_bridge::set_video_surface_visible(false);
+                            } else if let Some(ch) = self.session.channel.clone() {
+                                tracing::info!(
+                                    "android Surface ready — promoting Soft → mediacodec_embed"
+                                );
+                                self.android_want_surface_upgrade = false;
+                                self.player_close_gen =
+                                    self.player_close_gen.wrapping_add(1);
+                                self.invalidate_soft_stage(false);
+                                self.apply_source_headers_for(&ch);
+                                crate::android_bridge::request_audio_focus();
+                                if crate::android_bridge::poll_audio_focus_held()
+                                    == Some(true)
+                                {
+                                    self.audio_focus_held = true;
+                                }
+                                match self.session.open_channel(ch) {
+                                    Ok(()) => {
+                                        self.apply_saved_video_defaults_for_current_play();
+                                        self.status = "Surface HQ — MediaCodec".into();
                                     }
-                                    match self.session.open_channel(ch) {
-                                        Ok(()) => {
-                                            self.apply_saved_video_defaults_for_current_play();
-                                            self.status =
-                                                "Surface HQ — MediaCodec".into();
-                                        }
-                                        Err(e) => {
-                                            self.android_want_surface_upgrade = true;
-                                            self.status =
-                                                format!("Promotion Surface: {e}");
-                                        }
+                                    Err(e) => {
+                                        self.android_want_surface_upgrade = true;
+                                        crate::android_bridge::set_video_surface_visible(false);
+                                        self.status = format!("Promotion Surface: {e}");
                                     }
                                 }
+                            } else {
+                                crate::android_bridge::set_video_surface_visible(false);
                             }
                         }
                     }
@@ -4810,10 +5440,12 @@ impl FluxPlay {
                                         | PlaybackState::Paused
                                 )
                             {
-                                if self.session.muted {
-                                    self.session.toggle_mute();
+                                // Re-apply user mute — never toggle (GAIN used to unmute
+                                // intentional mute after LOSS→GAIN).
+                                let _ = self.session.native.set_mute(self.session.muted);
+                                if !self.session.muted {
+                                    self.session.set_volume(self.settings.volume);
                                 }
-                                self.session.set_volume(self.settings.volume);
                             }
                             // LOSS→GAIN: resume only if we paused for focus (not user).
                             if self.pause_cause == PauseCause::AudioFocus
@@ -4868,14 +5500,11 @@ impl FluxPlay {
                         // wgpu surface was dropped on Suspend — drop iced GPU handle
                         // so next pull re-allocates (don't abandon audio focus).
                         self.video_upload_busy = false;
+                        self.video_upload_busy_at = None;
                         self.video_upload_gen = self.video_upload_gen.wrapping_add(1);
                         self.clear_video_pending();
                         self.video_frame = None;
-                        self.video_allocation = None;
-                        self.video_allocation_hold = None;
-                        self.video_allocation_hold2 = None;
-                        self.video_allocation_hold3 = None;
-                        self.video_allocation_hold4 = None;
+                        self.clear_soft_allocation_holds();
                         self.video_frame_wh = (0, 0);
                         crate::android_bridge::stabilize_android_session();
                         self.maintain_android_surface_session(true);
@@ -4940,6 +5569,9 @@ impl FluxPlay {
                     self.try_resume_seek();
                     self.store_watch_progress(false);
                 }
+                // Caps / next-episode prefetch used to ride a second chrome timer
+                // during soft video; fold them into PlayerTick at a low rate.
+                self.maybe_refresh_display_caps();
                 // External / Intent: no owned process — never treat as EOF.
                 let owned_playback = !matches!(self.session.backend, Some(BackendId::External));
                 if poll_player {
@@ -4950,21 +5582,20 @@ impl FluxPlay {
                             PlaybackState::Playing | PlaybackState::Paused | PlaybackState::Buffering
                         )
                     {
-                        let since = self
-                            .playback_ended_since
-                            .get_or_insert_with(std::time::Instant::now);
                         // Time-based debounce — independent of video_hz (12 ticks @120Hz was ~100ms).
                         // A stream that has not shown a picture yet can sit idle
                         // for a few seconds while the portal answers. Cutting it
                         // at 400 ms made every film and episode look dead.
                         let cold = self.session.position_secs < 0.5
-                            && self.video_frame.is_none()
-                            && !self.stage_picture;
+                            && !self.saw_playback_picture();
                         let wait = if cold {
                             std::time::Duration::from_secs(8)
                         } else {
                             std::time::Duration::from_millis(400)
                         };
+                        let since = self
+                            .playback_ended_since
+                            .get_or_insert_with(std::time::Instant::now);
                         if since.elapsed() >= wait {
                             // A finished episode starts the next one, including
                             // the first episode of the following season.
@@ -4973,7 +5604,7 @@ impl FluxPlay {
                                 self.store_watch_progress(true);
                                 let task = self.play_neighbor(1);
                                 let stuck = self.status == "Pas d'épisode suivant"
-                                    || self.status == "Impossible de charger les épisodes";
+                                    || self.status.contains("Impossible de charger les épisodes");
                                 if !stuck {
                                     return task;
                                 }
@@ -4981,18 +5612,29 @@ impl FluxPlay {
                             self.store_watch_progress(true);
                             self.session.stop();
                             self.invalidate_soft_stage(false);
+                            self.clear_cold_open_watch();
                             // Keep last GPU frame on stage (no black wipe).
-                            self.status = if self.video_frame.is_none() && !self.stage_picture {
-                                "Échec lecture — flux inaccessible".into()
+                            let failed = !self.saw_playback_picture();
+                            self.status = if failed {
+                                ensure_status("Échec lecture — flux inaccessible")
                             } else {
                                 "Lecture terminée".into()
                             };
+                            if failed {
+                                self.push_notice(self.status.clone());
+                                self.player_chrome_visible = true;
+                                self.chrome_alpha = 1.0;
+                                return self.restore_browser();
+                            }
                         }
                     } else {
                         self.playback_ended_since = None;
                     }
                 }
                 let mut tasks = Vec::new();
+                if let Some(cold) = self.watch_cold_open() {
+                    tasks.push(cold);
+                }
                 #[cfg(target_os = "android")]
                 if pip_layout_dirty {
                     if let Some(id) = self.player_id.or(self.main_id) {
@@ -5007,21 +5649,37 @@ impl FluxPlay {
                 if gpu_stage && allow_soft_present {
                     self.present_stage_frame();
                 }
+                // allocate() can hang after a compositor/GPU hiccup (e.g. old
+                // Mode::Hidden park) — without a reset the soft path never
+                // enqueues again and the picture freezes while audio runs.
+                if self.video_upload_busy
+                    && self.video_upload_busy_at.is_some_and(|t| {
+                        t.elapsed() >= std::time::Duration::from_millis(750)
+                    })
+                {
+                    // Bump gen so a late VideoFrameAllocated cannot dual-allocate
+                    // while SoftPump already holds the next pending slot.
+                    tracing::warn!("soft video upload stuck — resetting busy flag + gen");
+                    self.video_upload_gen = self.video_upload_gen.wrapping_add(1);
+                    self.video_upload_busy = false;
+                    self.video_upload_busy_at = None;
+                    self.clear_video_pending();
+                }
                 // While the GPU takes the current frame, keep only the newest
                 // pixels. The upload callback sends them without waiting a tick.
+                // One pending soft frame max while upload is busy — never re-pull
+                // RGBA every monitor tick (memcpy storm on the iced thread).
                 if allow_soft_present
                     && !gpu_stage
                     && self.video_upload_busy
+                    && self.video_pending.is_none()
+                    && !self.stage_picture
                     && self.session.has_embedded_video()
                     && self.session.frame_needs_redraw()
                 {
                     let (rw, rh) = self.soft_present_wh();
-                    let hz = self.display_probe.monitor_hz.max(self.display_caps.video_hz);
-                    self.session.set_present_hz(hz);
-                    if self.video_pending.is_some() {
-                        /* Keep the frame already waiting. Pulling again dropped it
-                         * and the picture jumped. */
-                    } else if let Some((w, h, rgba)) = self.session.pull_video_frame(rw, rh) {
+                    self.sync_player_hz();
+                    if let Some((w, h, rgba)) = self.session.pull_video_frame(rw, rh) {
                         let gen = self.video_upload_gen;
                         self.video_pending = Some((w, h, rgba, gen));
                     }
@@ -5056,6 +5714,14 @@ impl FluxPlay {
                         self.status = "Veille — lecture en pause".into();
                     }
                 }
+                if self.persist_watch_pending {
+                    tasks.push(self.take_persist_watch_task());
+                }
+                if poll_player {
+                    if let Some(prefetch) = self.maybe_prefetch_next_episode() {
+                        tasks.push(prefetch);
+                    }
+                }
                 let fit = self.fit_player_to_video();
                 if !tasks.is_empty() {
                     tasks.push(fit);
@@ -5069,17 +5735,17 @@ impl FluxPlay {
                     return Task::none();
                 }
                 self.video_upload_busy = false;
+                self.video_upload_busy_at = None;
                 match result {
                     Ok(allocation) => {
                         self.video_frame_wh = (w, h);
+                        // Update displayed handle before reclaiming expelled hold
+                        // so try_into_mut can uniquely own the oldest Bytes.
                         self.video_frame = Some(allocation.handle().clone());
                         // Keep prior GPU textures so a slow draw cannot sample a
                         // worker atlas that was already reset for a newer frame.
-                        self.video_allocation_hold4 = self.video_allocation_hold3.take();
-                        self.video_allocation_hold3 = self.video_allocation_hold2.take();
-                        self.video_allocation_hold2 = self.video_allocation_hold.take();
-                        self.video_allocation_hold = self.video_allocation.take();
-                        self.video_allocation = Some(allocation);
+                        // Expelling hold4 returns host RGBA to SoftPump (W3-01 F1/F4).
+                        self.push_soft_allocation_hold(allocation);
                     }
                     Err(e) => {
                         tracing::warn!(error = %e, "video frame GPU allocate failed");
@@ -5090,6 +5756,7 @@ impl FluxPlay {
                 if let Some((pw, ph, rgba, pgen)) = self.video_pending.take() {
                     if pgen == self.video_upload_gen {
                         self.video_upload_busy = true;
+                        self.video_upload_busy_at = Some(std::time::Instant::now());
                         let handle = ImageHandle::from_rgba(pw, ph, rgba);
                         let gen = self.video_upload_gen;
                         return iced_image::allocate(handle).map(move |result| {
@@ -5196,7 +5863,7 @@ impl FluxPlay {
                 self.status = if self.session.toggle_sub_visibility() {
                     "Visibilité sous-titres basculée".into()
                 } else {
-                    "Sous-titres non supportés".into()
+                    ensure_status("Sous-titres non supportés")
                 };
             }
             Message::CycleAspect => {
@@ -5326,7 +5993,7 @@ impl FluxPlay {
                 }
                 let Ok(item) = result else {
                     if self.series_neighbor_pending.take().is_some() {
-                        self.status = "Impossible de charger les épisodes".into();
+                        self.status = ensure_status("Impossible de charger les épisodes");
                     }
                     return Task::none();
                 };
@@ -5575,6 +6242,7 @@ impl FluxPlay {
             Message::CycleTheme => {
                 self.settings.theme = self.settings.theme.cycle();
                 tracing::debug!(theme = ?self.settings.theme, "cycle theme");
+                self.rebuild_iced_theme();
                 self.persist();
             }
             Message::SetAccent(preset) => {
@@ -5584,15 +6252,18 @@ impl FluxPlay {
                 self.accent_open = false;
                 self.accent_query.clear();
                 tracing::debug!(accent = ?preset, "set accent");
+                self.rebuild_iced_theme();
                 self.persist();
             }
             Message::ToggleCategories => {
                 // The tongue fires on release. If that release also hits the poster
-                // that slides under the cursor, the one-shot below drops it.
+                // that slides under the cursor, suppress opens briefly (time-boxed).
                 let closing = self.cats_open;
                 self.cats_open = !self.cats_open;
                 if closing {
-                    self.swallow_tile_release = true;
+                    self.suppress_open_until = Some(
+                        std::time::Instant::now() + std::time::Duration::from_millis(400),
+                    );
                 }
             }
             Message::ToggleCustomColor => {
@@ -5606,6 +6277,7 @@ impl FluxPlay {
                 if rgb.is_none() {
                     self.ink_open = false;
                 }
+                self.rebuild_iced_theme();
                 self.persist();
             }
             Message::ToggleInkPicker => {
@@ -5631,9 +6303,11 @@ impl FluxPlay {
                     }
                 } else if self.ink_open {
                     if self.settings.custom_ink.is_some() {
+                        self.rebuild_iced_theme();
                         self.persist();
                     }
                 } else if self.settings.custom_accent.is_some() {
+                    self.rebuild_iced_theme();
                     self.persist();
                 }
             }
@@ -5836,7 +6510,7 @@ impl FluxPlay {
                 {
                     match crate::android_intent::open_url(&url, None) {
                         Ok(()) => self.status = "Page ouverte".into(),
-                        Err(e) => self.status = format!("Navigateur: {e}"),
+                        Err(e) => self.status = ensure_status(format!("Navigateur: {e}")),
                     }
                 }
                 #[cfg(not(target_os = "android"))]
@@ -5844,6 +6518,102 @@ impl FluxPlay {
                     let _ = open::that(&url);
                     self.status = "Page ouverte dans le navigateur".into();
                 }
+            }
+            Message::StartApiAssist(provider) => {
+                self.api_guide = true;
+                self.api_assist = Some(provider);
+                self.api_assist_last_clip.clear();
+                self.api_assist_started = Some(std::time::Instant::now());
+                self.tab = Tab::Settings;
+                self.settings_open = Some(SettingsSection::Meta);
+                // System browser / WebView — user solves captcha legitimately there.
+                crate::api_assist::open_provider_page(provider, true);
+                self.status = format!(
+                    "Assistant {} — captcha dans le navigateur, puis copie la clé (auto-détectée)",
+                    provider.label()
+                );
+                return Task::perform(
+                    async {
+                        tokio::time::sleep(std::time::Duration::from_millis(900)).await;
+                        Message::ApiAssistPoll
+                    },
+                    |m| m,
+                );
+            }
+            Message::ApiAssistPoll => {
+                if self.api_assist.is_none() {
+                    return Task::none();
+                }
+                if self
+                    .api_assist_started
+                    .is_some_and(|t| t.elapsed() > std::time::Duration::from_secs(10 * 60))
+                {
+                    self.api_assist = None;
+                    self.api_assist_started = None;
+                    self.status = "Assistant API expiré — relance si besoin".into();
+                    return Task::none();
+                }
+                return iced::clipboard::read().map(Message::ApiAssistClipboard);
+            }
+            Message::ApiAssistClipboard(sample) => {
+                if self.api_assist.is_none() {
+                    return Task::none();
+                }
+                if self
+                    .api_assist_started
+                    .is_some_and(|t| t.elapsed() > std::time::Duration::from_secs(10 * 60))
+                {
+                    self.api_assist = None;
+                    self.api_assist_started = None;
+                    self.status = "Assistant API expiré — relance si besoin".into();
+                    return Task::none();
+                }
+                if let Some(text) = sample {
+                    if text != self.api_assist_last_clip {
+                        self.api_assist_last_clip = text.clone();
+                        if let Some((provider, cleaned)) = crate::api_assist::extract_key(&text) {
+                            match provider {
+                                crate::api_assist::ApiProvider::Tmdb => {
+                                    self.form_tmdb_key = cleaned.clone();
+                                    self.settings.tmdb_api_key = cleaned;
+                                    self.settings.tmdb_prompt_done = true;
+                                    crate::metadata::set_tmdb_token(Some(
+                                        self.settings.tmdb_api_key.clone(),
+                                    ));
+                                    self.status =
+                                        "Jeton TMDB détecté dans le presse-papiers — enregistré"
+                                            .into();
+                                }
+                                crate::api_assist::ApiProvider::Omdb => {
+                                    self.form_omdb_key = cleaned.clone();
+                                    self.settings.omdb_api_key = cleaned;
+                                    crate::metadata::set_omdb_api_key(Some(
+                                        self.settings.omdb_api_key.clone(),
+                                    ));
+                                    self.status =
+                                        "Clé OMDb détectée dans le presse-papiers — enregistrée"
+                                            .into();
+                                }
+                            }
+                            self.api_assist = None;
+                            self.api_assist_started = None;
+                            self.persist();
+                            return Task::none();
+                        }
+                    }
+                }
+                return Task::perform(
+                    async {
+                        tokio::time::sleep(std::time::Duration::from_millis(900)).await;
+                        Message::ApiAssistPoll
+                    },
+                    |m| m,
+                );
+            }
+            Message::ApiAssistDismiss => {
+                self.api_assist = None;
+                self.api_assist_started = None;
+                self.status = "Assistant API fermé".into();
             }
             Message::SetPrefLang(code) => {
                 if self.settings.pref_lang == code {
@@ -5981,7 +6751,7 @@ impl FluxPlay {
                         crate::network::apply_to_http(&self.settings.network);
                         *self.session.native.options_mut() = play_options_from(&self.settings);
                         self.persist();
-                        self.status = format!("Échec tunnel WireGuard: {e}");
+                        self.status = ensure_status(format!("Échec tunnel WireGuard: {e}"));
                         // Still reload so the app works without the tunnel.
                         if pending_sync {
                             return self.reload_all_task();
@@ -6027,7 +6797,7 @@ impl FluxPlay {
                             self.settings.network.wireguard_profile_name
                         );
                     }
-                    Err(e) => self.status = e,
+                    Err(e) => self.status = ensure_status(e),
                 }
             }
             Message::ImportWireGuardPaste => {
@@ -6044,7 +6814,7 @@ impl FluxPlay {
                         self.persist();
                         self.status = "Profil WireGuard collé et enregistré".into();
                     }
-                    Err(e) => self.status = e,
+                    Err(e) => self.status = ensure_status(e),
                 }
             }
             Message::ClearWireGuardProfile => {
@@ -6064,7 +6834,7 @@ impl FluxPlay {
                             self.settings.network.wireguard_bootstrap_dns
                         );
                     }
-                    Err(e) => self.status = e,
+                    Err(e) => self.status = ensure_status(e),
                 }
             }
             Message::AddPublicDemo { name, endpoint } => {
@@ -6081,7 +6851,7 @@ impl FluxPlay {
                     }
                 }
                 if let Some(s) = self.sources.iter().find(|s| s.id == id) {
-                    crate::storage::write_profile_source_json(s);
+                    storage::write_profile_source_json(s);
                 }
                 self.persist();
                 self.status = "Playlist publique ajoutée — sync…".to_string();
@@ -6089,26 +6859,28 @@ impl FluxPlay {
                 return self.reload_one_task(id);
             }
             Message::AddSource => {
-                let missing = if self.form_endpoint.trim().is_empty() {
+                use fluxplay_core::FpCode;
+                let missing: Option<(FpCode, &str)> = if self.form_endpoint.trim().is_empty() {
                     Some(match self.form_kind {
-                        SourceKind::Xtream => "Indiquez l’URL du serveur Xtream.",
-                        SourceKind::Stalker => "Indiquez l’URL du portail Stalker.",
-                        SourceKind::Xmltv => "Indiquez l’URL du guide XMLTV.",
-                        _ => "Indiquez l’URL ou le fichier de la playlist M3U.",
+                        SourceKind::Xtream => (FpCode::CatXtreamApi, "Indiquez l’URL du serveur Xtream."),
+                        SourceKind::Stalker => (FpCode::CatStalkerApi, "Indiquez l’URL du portail Stalker."),
+                        SourceKind::Xmltv => (FpCode::CatXmltvFetch, "Indiquez l’URL du guide XMLTV."),
+                        _ => (FpCode::CatM3uEmpty, "Indiquez l’URL ou le fichier de la playlist M3U."),
                     })
                 } else if matches!(self.form_kind, SourceKind::Xtream)
                     && (self.form_user.trim().is_empty() || self.form_pass.trim().is_empty())
                 {
-                    Some("Xtream : identifiant et mot de passe requis.")
+                    Some((FpCode::CatXtreamAuth, "Xtream : identifiant et mot de passe requis."))
                 } else if self.form_kind == SourceKind::Stalker && self.form_mac.trim().is_empty() {
-                    Some("Stalker : adresse MAC requise.")
+                    Some((FpCode::CatStalkerAuth, "Stalker : adresse MAC requise."))
                 } else {
                     None
                 };
-                if let Some(msg) = missing {
-                    tracing::warn!(%msg, "add source rejected");
-                    self.form_error = Some(msg.into());
-                    self.status = msg.into();
+                if let Some((code, msg)) = missing {
+                    tracing::warn!(%msg, code = %code, "add source rejected");
+                    let coded = code.ensure_coded(msg);
+                    self.form_error = Some(coded.clone());
+                    self.status = coded;
                     return Task::none();
                 }
                 self.form_error = None;
@@ -6158,7 +6930,7 @@ impl FluxPlay {
                             src.mac.clone(),
                             src.epg_url.clone(),
                         );
-                    crate::storage::write_profile_source_json(src);
+                    storage::write_profile_source_json(src);
                     self.clear_source_form();
                     self.persist();
                     if !changed {
@@ -6193,7 +6965,7 @@ impl FluxPlay {
                     }
                 }
                 if let Some(s) = self.sources.iter().find(|s| s.id == id) {
-                    crate::storage::write_profile_source_json(s);
+                    storage::write_profile_source_json(s);
                 }
                 self.clear_source_form();
                 self.persist();
@@ -6227,10 +6999,10 @@ impl FluxPlay {
             }
             Message::ExportProfile(id) => {
                 let Some(src) = self.sources.iter().find(|s| s.id == id).cloned() else {
-                    self.status = "Source introuvable".into();
+                    self.status = ensure_status("Source introuvable");
                     return Task::none();
                 };
-                crate::storage::write_profile_source_json(&src);
+                storage::write_profile_source_json(&src);
                 self.status = "Export profil…".into();
                 #[cfg(not(target_os = "android"))]
                 {
@@ -6334,11 +7106,11 @@ impl FluxPlay {
                 self.status = format!("Profil exporté · {path} (contient identifiants)");
             }
             Message::ProfileExportDone(Err(e)) => {
-                self.status = format!("Export: {e}");
+                self.status = ensure_status(format!("Export: {e}"));
             }
             Message::ProfileImportDone(Ok(src)) => {
                 let id = src.id;
-                let fav_path = crate::storage::profile_dir(id).join("favorites.json");
+                let fav_path = storage::profile_dir(id).join("favorites.json");
                 if let Ok(raw) = std::fs::read_to_string(&fav_path) {
                     if let Ok(favs) = serde_json::from_str::<Vec<String>>(&raw) {
                         for f in favs {
@@ -6362,7 +7134,7 @@ impl FluxPlay {
                 return self.rebuild_bundle_from_cache_task();
             }
             Message::ProfileImportDone(Err(e)) => {
-                self.status = format!("Import: {e}");
+                self.status = ensure_status(format!("Import: {e}"));
             }
             Message::BundleCacheReady { gen, parts, result } => {
                 if gen != self.catalog_load_gen {
@@ -6417,7 +7189,7 @@ impl FluxPlay {
                     Err(e) => {
                         // A transient SQLite error ("database is locked") must not empty the UI.
                         tracing::warn!(error = %e, "catalog reload failed — keeping the current catalog");
-                        self.status = format!("Échec lecture catalogue: {e}");
+                        self.status = ensure_status(format!("Échec lecture catalogue: {e}"));
                     }
                 }
             }
@@ -6464,15 +7236,21 @@ impl FluxPlay {
                 } else {
                     String::new()
                 };
-                self.status = format!(
-                    "Ingest OK · {ok} source(s){}{} — relecture SQLite…",
-                    if err > 0 {
-                        format!(" ({err} échec)")
-                    } else {
-                        String::new()
-                    },
-                    ck_owned,
-                );
+                self.status = if err > 0 && ok == 0 {
+                    ensure_status(format!(
+                        "Sync live impossible ({err} échec) — conservation du catalogue SQLite…"
+                    ))
+                } else {
+                    format!(
+                        "Ingest OK · {ok} source(s){}{} — relecture SQLite…",
+                        if err > 0 {
+                            format!(" ({err} échec)")
+                        } else {
+                            String::new()
+                        },
+                        ck_owned,
+                    )
+                };
                 return self.rebuild_bundle_from_cache_task();
             }
             Message::SourceLoaded { source_id, result } => {
@@ -6500,7 +7278,14 @@ impl FluxPlay {
                     }
                     Err(e) => {
                         self.loading = false;
-                        self.status = format!("Échec chargement: {e}");
+                        let has_cache = !self.bundle.channels.is_empty()
+                            || !self.bundle.vod.is_empty()
+                            || !self.bundle.series.is_empty();
+                        self.status = ensure_status(if has_cache {
+                            format!("Sync live impossible — catalogue local conservé · {e}")
+                        } else {
+                            format!("Échec chargement: {e}")
+                        });
                     }
                 }
             }
@@ -6529,7 +7314,12 @@ impl FluxPlay {
                         return self.rebuild_bundle_from_cache_task();
                     }
                     Err(e) => {
-                        self.status = format!("Échec ingest: {e}");
+                        let suffix = self.jobs.status_suffix_fr();
+                        self.status = ensure_status(if suffix.is_empty() {
+                            format!("Échec ingest: {e}")
+                        } else {
+                            format!("Échec ingest: {e} · {suffix}")
+                        });
                     }
                 }
             }
@@ -6539,6 +7329,14 @@ impl FluxPlay {
                 episode_flat,
             } => {
                 if gen != self.jobs.browse_gen() {
+                    return Task::none();
+                }
+                // A fiche is open: mosaic index updates wait for Close*. Applying
+                // them now can leave the wrong catalog under the detail page.
+                if self.series_detail.is_some() || self.vod_detail.is_some() {
+                    if self.series_detail.is_some() {
+                        self.rebuild_episode_flat();
+                    }
                     return Task::none();
                 }
                 self.browse_index = index;
@@ -6587,6 +7385,7 @@ impl FluxPlay {
                             d.seasons = detail.seasons.clone();
                         }
                         self.series_detail = Some(d);
+                        self.rebuild_episode_flat();
                     }
                 }
                 if let Some(detail) = &self.vod_detail {
@@ -6602,6 +7401,7 @@ impl FluxPlay {
                 throttled,
             } => {
                 self.age_lookup_busy = false;
+                let empty_batch = items.is_empty() && skipped.is_empty();
                 for id in skipped {
                     self.age_asked.insert(id);
                 }
@@ -6627,6 +7427,10 @@ impl FluxPlay {
                 }
                 if throttled {
                     self.status = "Portail saturé — nouvel essai des fiches dans un instant.".into();
+                    return self.prefetch_catalog_art();
+                }
+                // Empty keepalive must not re-arm ages → film-info → empty batch forever.
+                if empty_batch {
                     return self.prefetch_catalog_art();
                 }
                 return Task::batch([self.prefetch_catalog_art(), self.queue_visible_ages()]);
@@ -6709,7 +7513,7 @@ impl FluxPlay {
                 {
                     match crate::android_intent::open_url(&url, None) {
                         Ok(()) => self.status = format!("IMDb · {id_or_query}"),
-                        Err(e) => self.status = format!("IMDb: {e}"),
+                        Err(e) => self.status = ensure_status(format!("IMDb: {e}")),
                     }
                 }
                 #[cfg(not(target_os = "android"))]
@@ -6722,9 +7526,11 @@ impl FluxPlay {
                 if let Some(ch) = &self.session.channel {
                     #[cfg(target_os = "android")]
                     {
-                        match crate::android_intent::open_stream_url(&ch.stream_url) {
+                        let need_hdrs = self.stream_needs_http_headers(Some(ch));
+                        match crate::android_intent::open_stream_url_ex(&ch.stream_url, need_hdrs)
+                        {
                             Ok(()) => self.status = "Ouvert dans le lecteur système".into(),
-                            Err(e) => self.status = format!("Intent: {e}"),
+                            Err(e) => self.status = ensure_status(format!("Intent: {e}")),
                         }
                     }
                     #[cfg(not(target_os = "android"))]
@@ -6900,11 +7706,13 @@ impl FluxPlay {
                     let idx = devices.iter().position(|d| d.name == cur).unwrap_or(usize::MAX);
                     let next = &devices[(idx.wrapping_add(1)) % devices.len()];
                     self.settings.gpu_choice = next.name.clone();
-                    export_gpu_env(&self.settings.gpu_choice);
-                    self.resync_player_options();
+                    // Persist only — iced/wgpu binds the present adapter once at
+                    // boot (`WGPU_ADAPTER_NAME` / `FLUXPLAY_GPU`). Mid-session
+                    // export would desync decode vs present (black UI / stutter).
+                    // Decode still follows `gpu_choice` on next open via DECODE_GPU.
                     self.persist();
                     self.status = format!(
-                        "GPU : {}. Relance l'application pour que l'affichage change aussi.",
+                        "GPU décode : {}. Relance pour que l'affichage iced suive aussi (wgpu fixe l'adaptateur au démarrage).",
                         next.label()
                     );
                 }
@@ -7083,6 +7891,13 @@ impl FluxPlay {
                     crate::names::category_shelf(id).0 == category_id.as_str()
                 });
                 match result {
+                    Ok(items) if items.is_empty() => {
+                        // Empty success must not wipe a populated shelf (bad JSON
+                        // used to arrive as Ok([]) and delete every title).
+                        if current {
+                            self.status = "VOD catégorie · portail vide — catalogue conservé".into();
+                        }
+                    }
                     Ok(items) => {
                         self.bundle.vod.retain(|v| {
                             v.category_id.as_deref() != Some(&category_id)
@@ -7098,7 +7913,7 @@ impl FluxPlay {
                             ]);
                         }
                     }
-                    Err(e) if current => self.status = format!("VOD: {e}"),
+                    Err(e) if current => self.status = ensure_status(format!("VOD: {e}")),
                     Err(_) => {}
                 }
             }
@@ -7111,6 +7926,12 @@ impl FluxPlay {
                     crate::names::category_shelf(id).0 == category_id.as_str()
                 });
                 match result {
+                    Ok(items) if items.is_empty() => {
+                        if current {
+                            self.status =
+                                "Séries catégorie · portail vide — catalogue conservé".into();
+                        }
+                    }
                     Ok(items) => {
                         self.bundle.series.retain(|s| {
                             s.category_id.as_deref() != Some(&category_id)
@@ -7126,7 +7947,7 @@ impl FluxPlay {
                             ]);
                         }
                     }
-                    Err(e) if current => self.status = format!("Séries: {e}"),
+                    Err(e) if current => self.status = ensure_status(format!("Séries: {e}")),
                     Err(_) => {}
                 }
             }
@@ -7145,6 +7966,8 @@ impl FluxPlay {
                 self.resume_season_pending = true;
                 self.cast_photos.clear();
                 self.cast_photo_asked.clear();
+                // Drop stale mosaic index results while the series page is open.
+                let _ = self.jobs.bump_browse_gen();
                 if let Some(existing) = self.bundle.series.iter().find(|s| s.id == id) {
                     let mut detail = existing.clone();
                     if detail.seasons.is_empty() {
@@ -7230,11 +8053,18 @@ impl FluxPlay {
                             .iter()
                             .any(|a| a.series_id == item.id);
                     if !quiet {
-                        self.status = format!(
-                            "{} · {} saisons · {eps} épisodes",
-                            crate::names::display_title(&item.name),
-                            item.seasons.len()
-                        );
+                        self.status = if eps == 0 {
+                            format!(
+                                "{} — aucune saison/épisode renvoyé par le portail",
+                                crate::names::display_title(&item.name),
+                            )
+                        } else {
+                            format!(
+                                "{} · {} saisons · {eps} épisodes",
+                                crate::names::display_title(&item.name),
+                                item.seasons.len()
+                            )
+                        };
                     }
                     if !item.seasons.is_empty() {
                         if let (Some(db), Some(sid)) = (&self.catalog_db, item.source_id) {
@@ -7243,25 +8073,18 @@ impl FluxPlay {
                             let _ = db.persist_series(&saved);
                         }
                     }
-                    let in_catalog =
-                        match self.bundle.series.iter_mut().find(|s| s.id == item.id) {
-                            Some(existing) => {
-                                merge_xtream_series_fields(existing, &item);
-                                true
-                            }
-                            None => false,
-                        };
+                    if let Some(existing) =
+                        self.bundle.series.iter_mut().find(|s| s.id == item.id)
+                    {
+                        merge_xtream_series_fields(existing, &item);
+                    }
                     // Late answer for a page the viewer already left (or closed): catalog only.
                     self.alert_checked.insert(item.id.clone());
                     self.consider_episode_alert(&item);
-                    let open = self.series_detail.as_ref().map(|d| d.id.as_str());
-                    if open.map(|id| id != item.id).unwrap_or(in_catalog) {
+                    let Some(detail) = self.series_detail.as_mut().filter(|d| d.id == item.id) else {
                         return Task::none();
-                    }
-                    match self.series_detail.as_mut() {
-                        Some(detail) => merge_xtream_series_fields(detail, &item),
-                        None => self.series_detail = Some(item),
-                    }
+                    };
+                    merge_xtream_series_fields(detail, &item);
                     self.browse_scroll_y = 0.0;
                     self.sync_selected_season();
                     self.focus_resume_season();
@@ -7336,19 +8159,32 @@ impl FluxPlay {
             }
             Message::SeriesEpisodesEnriched(item) => {
                 if let Some(existing) = self.bundle.series.iter_mut().find(|s| s.id == item.id) {
-                    existing.seasons = item.seasons.clone();
+                    merge_series_episode_enrichment(existing, &item);
                 }
                 let open = self.series_detail.as_ref().map(|d| d.id.as_str()) == Some(item.id.as_str());
                 if open {
                     if let Some(detail) = &mut self.series_detail {
-                        detail.seasons = item.seasons.clone();
+                        merge_series_episode_enrichment(detail, &item);
                     }
                     self.rebuild_episode_flat();
                     self.focus_resume_season();
                     self.rebuild_episode_flat();
                 }
                 if let (Some(db), Some(sid)) = (&self.catalog_db, item.source_id) {
-                    let mut saved = item;
+                    let base = self
+                        .series_detail
+                        .as_ref()
+                        .filter(|d| d.id == item.id)
+                        .cloned()
+                        .or_else(|| {
+                            self.bundle
+                                .series
+                                .iter()
+                                .find(|s| s.id == item.id)
+                                .cloned()
+                        })
+                        .unwrap_or(item);
+                    let mut saved = base;
                     saved.source_id = Some(sid);
                     let _ = db.persist_series(&saved);
                 }
@@ -7389,8 +8225,9 @@ impl FluxPlay {
                 self.cast_photo_asked.clear();
                 self.browse_scroll_y = 0.0;
                 self.browse_view_h = 0.0;
+                let _ = self.jobs.bump_browse_gen();
                 let Some(item) = self.bundle.vod.iter().find(|v| v.id == id).cloned() else {
-                    self.status = "Film introuvable".into();
+                    self.status = ensure_status("Film introuvable");
                     return Task::none();
                 };
                 self.detail_meta_loading = true;
@@ -7563,30 +8400,47 @@ impl FluxPlay {
                     }
                     return Task::none();
                 };
-                if let Some(db) = &self.catalog_db {
-                    let name = if is_series {
-                        self.series_detail
-                            .as_ref()
-                            .filter(|d| d.id == id)
-                            .map(|d| d.name.clone())
-                    } else {
-                        self.vod_detail
-                            .as_ref()
-                            .filter(|d| d.id == id)
-                            .map(|d| d.name.clone())
-                    };
-                    if let Some(name) = name {
-                        let kind = if is_series { "series" } else { "movie" };
-                        let q = crate::metadata::parse_title_query(&name);
-                        db.meta_cache_put(&q.cache_key(kind), kind, &q, Some(&patch));
+                // Incomplete patches still paint the UI, but must not stick in the
+                // meta cache as hits — otherwise a thin answer blocks a full enrich.
+                let fiche_complete = fiche_ready(&patch.plot, &patch.actors)
+                    && cache_patch_enough(&patch, true, patch.rated.is_none());
+                if fiche_complete {
+                    if let Some(db) = &self.catalog_db {
+                        let name = if is_series {
+                            self.series_detail
+                                .as_ref()
+                                .filter(|d| d.id == id)
+                                .map(|d| d.name.clone())
+                        } else {
+                            self.vod_detail
+                                .as_ref()
+                                .filter(|d| d.id == id)
+                                .map(|d| d.name.clone())
+                        };
+                        if let Some(name) = name {
+                            let kind = if is_series { "series" } else { "movie" };
+                            let q = crate::metadata::parse_title_query(&name);
+                            db.meta_cache_put(&q.cache_key(kind), kind, &q, Some(&patch));
+                        }
                     }
                 }
+                let fiche_tag = if fiche_complete {
+                    "fiche"
+                } else {
+                    "fiche partielle"
+                };
                 if is_series {
                     if let Some(item) = self.bundle.series.iter_mut().find(|s| s.id == id) {
                         patch.apply_series(item);
                         if let (Some(db), Some(sid)) = (&self.catalog_db, item.source_id) {
                             let mut saved = item.clone();
                             saved.source_id = Some(sid);
+                            // Prefer seasons already on the open page.
+                            if saved.seasons.is_empty() {
+                                if let Some(d) = self.series_detail.as_ref().filter(|d| d.id == id) {
+                                    saved.seasons = d.seasons.clone();
+                                }
+                            }
                             let _ = db.persist_series(&saved);
                         }
                     }
@@ -7597,8 +8451,10 @@ impl FluxPlay {
                             if detail.seasons.is_empty() {
                                 detail.seasons = seasons;
                             }
-                            self.status =
-                                format!("{} · fiche IMDb", crate::names::display_title(&detail.name));
+                            self.status = format!(
+                                "{} · {fiche_tag}",
+                                crate::names::display_title(&detail.name)
+                            );
                         }
                     }
                 } else {
@@ -7613,8 +8469,10 @@ impl FluxPlay {
                     if let Some(detail) = &mut self.vod_detail {
                         if detail.id == id {
                             patch.apply_vod(detail);
-                            self.status =
-                                format!("{} · fiche IMDb", crate::names::display_title(&detail.name));
+                            self.status = format!(
+                                "{} · {fiche_tag}",
+                                crate::names::display_title(&detail.name)
+                            );
                         }
                     }
                 }
@@ -7626,11 +8484,11 @@ impl FluxPlay {
             }
             Message::ImageLoaded(Ok((url, source_id, bytes))) => {
                 if self.browse_parked {
-                    // The browser is hidden, but the bytes have to be here when it
-                    // comes back. Dropping them left the tiles empty.
+                    // Park already aborted inflight + keeps existing handles.
+                    // Dropping late completions avoids iced/wgpu uploads mid-play;
+                    // restore re-prefetches any still-missing tiles.
                     self.jobs.images.tick();
-                    let _ = source_id;
-                    self.images.insert_ui_bytes(url, bytes);
+                    let _ = (url, source_id, bytes);
                     return Task::none();
                 }
                 self.jobs.images.tick();
@@ -7638,24 +8496,25 @@ impl FluxPlay {
                 // Keep fetching the rows on screen. A hard fling used to stop the
                 // queue after the first batch, so posters stayed blank until settle.
                 if self.browse_flinging() {
-                    let more = self.prefetch_visible_art();
-                    if self.pending_images.len() >= 6 {
+                    // Throttle — every ImageLoaded used to spawn a full prefetch wave.
+                    let more = self.maybe_scroll_prefetch_art();
+                    if self.pending_images.len() >= 4 {
                         return Task::batch([self.flush_pending_images(), more]);
                     }
                     return more;
                 }
-                if self.pending_images.len() >= 10 {
+                // Smaller batches → fewer iced/wgpu texture uploads per frame.
+                if self.pending_images.len() >= 4 {
                     return Task::batch([
                         self.flush_pending_images(),
                         self.prefetch_visible_art(),
-                        self.continue_art_warm(),
                     ]);
                 }
                 if !self.image_flush_armed {
                     self.image_flush_armed = true;
                     return Task::perform(
                         async {
-                            tokio::time::sleep(std::time::Duration::from_millis(18)).await;
+                            tokio::time::sleep(std::time::Duration::from_millis(32)).await;
                         },
                         |_| Message::FlushPendingImages,
                     );
@@ -7690,20 +8549,43 @@ impl FluxPlay {
                     // Keep buffering; settle path will flush.
                     return Task::none();
                 }
-                return Task::batch([
-                    self.flush_pending_images(),
-                    self.prefetch_visible_art(),
-                    self.continue_art_warm(),
-                ]);
+                // Visible first; warm only when the screen is already covered so
+                // category switches don't freeze the mosaic under a fetch storm.
+                let mut tasks = vec![self.flush_pending_images(), self.prefetch_visible_art()];
+                if self.mosaic_visible_art_ready() {
+                    tasks.push(self.continue_art_warm());
+                }
+                return Task::batch(tasks);
             }
+            Message::ArtCacheEvicted => {}
+            Message::ArtMetaTouched => {}
+            Message::PersistFlushed => {}
         }
         Task::none()
     }
 
     fn enrich_episodes_task(&self) -> Task<Message> {
-        // Episode text stays the portal copy. TVMaze summaries are English and
-        // were then machine-translated.
-        Task::none()
+        let Some(detail) = &self.series_detail else {
+            return Task::none();
+        };
+        // Only fill empty episode plots / air dates — never overwrite portal text.
+        let needs = detail.seasons.iter().any(|s| {
+            s.episodes
+                .iter()
+                .any(|e| e.plot.as_ref().map(|p| p.len() < 20).unwrap_or(true))
+        });
+        if !needs {
+            return Task::none();
+        }
+        let mut item = detail.clone();
+        let name = detail.name.clone();
+        Task::perform(
+            async move {
+                crate::metadata::enrich_series_episodes(&name, &mut item).await;
+                Message::SeriesEpisodesEnriched(item)
+            },
+            |m| m,
+        )
     }
 
     fn translation_on(&self) -> bool {
@@ -7736,9 +8618,29 @@ impl FluxPlay {
             .map(|_| true)
     }
 
-    /// Synopsis / genre / episode plots stay in the language the portal sent.
+    /// Translate open detail plot / genres into the preferred language (MyMemory / Google free).
     fn translate_open_detail_task(&mut self) -> Task<Message> {
-        Task::none()
+        if !self.translation_on() {
+            return Task::none();
+        }
+        let mut texts = Vec::new();
+        if let Some(v) = &self.vod_detail {
+            if let Some(p) = v.plot.as_ref() {
+                texts.push(p.clone());
+            }
+            if let Some(g) = v.genre.as_ref() {
+                texts.push(g.clone());
+            }
+        }
+        if let Some(s) = &self.series_detail {
+            if let Some(p) = s.plot.as_ref() {
+                texts.push(p.clone());
+            }
+            if let Some(g) = s.genre.as_ref() {
+                texts.push(g.clone());
+            }
+        }
+        self.request_translations(texts)
     }
 
     fn request_translations(&mut self, texts: Vec<String>) -> Task<Message> {
@@ -7858,9 +8760,6 @@ impl FluxPlay {
     }
 
     fn enrich_open_detail_task(&mut self, is_series: bool) -> Task<Message> {
-        if !crate::metadata::tmdb_configured() {
-            return Task::none();
-        }
         let (id, name, imdb) = if is_series {
             let Some(detail) = &self.series_detail else {
                 return Task::none();
@@ -7875,7 +8774,8 @@ impl FluxPlay {
         let kind = if is_series { "series" } else { "movie" };
         Task::perform(
             async move {
-                let patch = crate::metadata::tmdb_fiche(&name, kind, imdb.as_deref()).await;
+                // Keyless providers first; TMDB/OMDb only if the user configured keys.
+                let patch = crate::metadata::enrich_title_full(&name, kind, imdb.as_deref()).await;
                 Message::DetailMetaLoaded {
                     is_series,
                     id,
@@ -7886,13 +8786,13 @@ impl FluxPlay {
         )
     }
 
-    /// After catalog load/reload: visible art only. English metadata lookups
-    /// used to rewrite synopses that the portal had already sent.
+    /// After catalog load/reload: art + keyless/optional keyed metadata enrich.
     fn after_catalog_ready_tasks(&mut self) -> Task<Message> {
         self.xtream_vod_enrich_started = false;
         Task::batch([
             self.prefetch_catalog_art(),
             self.fetch_epg_for_visible_task(),
+            self.enrich_metadata_task(),
         ])
     }
 
@@ -7904,7 +8804,7 @@ impl FluxPlay {
             .series
             .iter()
             .filter(|s| crate::metadata::needs_series_enrich(s))
-            .take(12)
+            .take(crate::policy::get().meta.enrich_series_take)
         {
             let q = crate::metadata::parse_title_query(&s.name);
             let key = q.cache_key("series");
@@ -7925,7 +8825,7 @@ impl FluxPlay {
             .vod
             .iter()
             .filter(|v| crate::metadata::needs_vod_enrich(v))
-            .take(24)
+            .take(crate::policy::get().meta.enrich_vod_take)
         {
             let q = crate::metadata::parse_title_query(&v.name);
             let key = q.cache_key("movie");
@@ -7950,7 +8850,12 @@ impl FluxPlay {
             });
         }
 
-        let meta_parallel = self.display_caps.tuning.meta_parallel;
+        let meta_parallel = self
+            .display_caps
+            .tuning
+            .meta_parallel
+            .min(crate::policy::get().meta.enrich_join_parallel_max)
+            .max(1);
         Task::perform(
             async move {
                 let mut series_out = series_cached;
@@ -8007,10 +8912,13 @@ impl FluxPlay {
         )
     }
 
+    /// Portal `get_vod_info` batch — kept for re-enable; mosaic ages use
+    /// [`Self::queue_visible_ages`] (keyless CaptionLoaded) instead.
+    #[allow(dead_code)]
     fn queue_visible_film_info(&mut self) -> Task<Message> {
-        // One film fiche at a time, when the viewer opens it. A background
-        // batch of get_vod_info was tripping the portal limit and leaving
-        // the open page empty.
+        // Background get_vod_info batches trip portal limits; fiche loads on open only.
+        // An empty VodInfoBatch keepalive re-armed queue_visible_ages forever and
+        // starved SeriesDetailLoaded / PlayVod.
         Task::none()
     }
 
@@ -8307,9 +9215,8 @@ impl FluxPlay {
         {
             return Task::none();
         }
-        if self.tab == Tab::Vod {
-            return self.queue_visible_film_info();
-        }
+        // Portal get_vod_info batches stay off (`queue_visible_film_info`);
+        // ages/year still come from keyless/OMDb/TMDB CaptionLoaded below.
         let series = self.tab == Tab::Series;
         let shown = self.shown_count(self.browse_index.len());
         let mut jobs = Vec::new();
@@ -8357,13 +9264,9 @@ impl FluxPlay {
                     &name,
                 )
                 .is_none();
-            // The portal category is the genre line. Only the age is missing
-            // from the list, and a film has no age source without an OMDb key.
-            if !missing_age
-                || (!series
-                    && !crate::metadata::omdb_configured()
-                    && !crate::metadata::tmdb_configured())
-            {
+            // Portal category is the genre line; ages/year come from
+            // keyless iTunes/Wikidata/Kitsu plus optional OMDb/TMDB.
+            if !missing_age {
                 continue;
             }
             if self.age_asked.contains(&id) {
@@ -8392,7 +9295,10 @@ impl FluxPlay {
                         let (id, sid, name, series) = jobs[i].clone();
                         i += 1;
                         set.spawn(async move {
-                            let facts = crate::metadata::lookup_poster_facts(&name, series).await;
+                            let mut facts = crate::metadata::lookup_poster_facts(&name, series).await;
+                            if series && facts.rated.is_none() {
+                                facts.rated = crate::metadata::lookup_series_age(&name).await;
+                            }
                             PosterCaption {
                                 id,
                                 source_id: sid,
@@ -8416,8 +9322,8 @@ impl FluxPlay {
     /// Films and series stay on a short page. Chaînes and the guide load a taller block.
     fn browse_page(&self) -> usize {
         match self.tab {
-            Tab::Live | Tab::Epg => LIVE_PAGE,
-            _ => LIST_PAGE,
+            Tab::Live | Tab::Epg => crate::policy::live_page(),
+            _ => crate::policy::list_page(),
         }
     }
 
@@ -8445,12 +9351,16 @@ impl FluxPlay {
         self.rebuild_cat_entries();
 
         if matches!(self.tab, Tab::Series) && self.series_detail.is_some() {
+            // Invalidate in-flight mosaic BrowseIndexReady so it cannot clobber
+            // the open series page after a late gen match.
+            let _ = self.jobs.bump_browse_gen();
             self.episode_flat.clear();
             self.rebuild_episode_flat();
             self.finish_browse_index_rebuild();
             return self.snap_browse_scroll_task();
         }
         if matches!(self.tab, Tab::Favorites) {
+            let _ = self.jobs.bump_browse_gen();
             self.browse_index = BrowseIndex::mapped(
                 self.bundle
                     .channels
@@ -8464,12 +9374,14 @@ impl FluxPlay {
             return self.snap_browse_scroll_task();
         }
         if !matches!(self.tab, Tab::Live | Tab::Epg | Tab::Vod | Tab::Series) {
+            let _ = self.jobs.bump_browse_gen();
             self.browse_index.clear();
             self.episode_flat.clear();
             self.finish_browse_index_rebuild();
             return Task::none();
         }
         if matches!(self.tab, Tab::Vod) && self.vod_detail.is_some() {
+            let _ = self.jobs.bump_browse_gen();
             self.finish_browse_index_rebuild();
             return Task::none();
         }
@@ -8482,6 +9394,8 @@ impl FluxPlay {
                 Tab::Vod
                     if matches!(self.selected_vod_category.as_deref(), None | Some("*")) =>
                 {
+                    // Invalidate in-flight filtered rebuilds (same gap as other early exits).
+                    let _ = self.jobs.bump_browse_gen();
                     self.browse_index = BrowseIndex::identity(self.bundle.vod.len());
                     self.finish_browse_index_rebuild();
                     return Task::batch([
@@ -8492,6 +9406,7 @@ impl FluxPlay {
                 Tab::Series
                     if matches!(self.selected_series_category.as_deref(), None | Some("*")) =>
                 {
+                    let _ = self.jobs.bump_browse_gen();
                     self.browse_index = BrowseIndex::identity(self.bundle.series.len());
                     self.finish_browse_index_rebuild();
                     return Task::batch([
@@ -8502,6 +9417,7 @@ impl FluxPlay {
                 Tab::Live | Tab::Epg
                     if matches!(self.selected_group.as_deref(), None | Some("Tous") | Some("*")) =>
                 {
+                    let _ = self.jobs.bump_browse_gen();
                     // Live-only contiguous catalog → identity; mixed → cheap index of Live kinds.
                     let all_live = self
                         .bundle
@@ -8696,6 +9612,7 @@ impl FluxPlay {
         let Some(detail) = &self.series_detail else {
             return;
         };
+        let n_seasons = detail.seasons.len();
         for (si, season) in detail.seasons.iter().enumerate() {
             self.episode_flat
                 .push(EpisodeFlat::Header(season.season_number));
@@ -8706,6 +9623,11 @@ impl FluxPlay {
                 });
             }
         }
+        // Validate indices (also keeps the enum fields live for rustc).
+        debug_assert!(self.episode_flat.iter().all(|row| match row {
+            EpisodeFlat::Header(n) => *n < 10_000,
+            EpisodeFlat::Ep { season_idx, ep_idx } => *season_idx < n_seasons && *ep_idx < 10_000,
+        }));
     }
 
     fn section_kind(&self) -> Option<ContentKind> {
@@ -9140,10 +10062,17 @@ impl FluxPlay {
         }
     }
 
-    fn browse_settle_task() -> Task<Message> {
+    fn browse_settle_task(&mut self) -> Task<Message> {
+        // One sleep per fling window — coast/wheel used to stack dozens of timers.
+        if self.browse_settle_armed {
+            return Task::none();
+        }
+        self.browse_settle_armed = true;
+        self.browse_settle_gen = self.browse_settle_gen.wrapping_add(1);
+        let gen = self.browse_settle_gen;
         Task::perform(
             async { tokio::time::sleep(BROWSE_SETTLE_AFTER).await },
-            |_| Message::BrowseSettle,
+            move |_| Message::BrowseSettle(gen),
         )
     }
 
@@ -9368,27 +10297,127 @@ impl FluxPlay {
         // first so LRU eviction drops off-screen posters, not the ones being shown
         // (they were never re-requested and stayed as letter placeholders).
         self.promote_visible_art();
+        let mut touches: Vec<(Uuid, String, std::path::PathBuf, usize)> = Vec::new();
         for (url, source_id, bytes) in batch {
             let n = bytes.len();
-            self.images.insert_ui_bytes(url.clone(), bytes);
-            if let (Some(db), Some(sid), Some(path)) = (
-                &self.catalog_db,
+            if let (Some(sid), Some(path)) = (
                 source_id,
                 crate::images::disk_path_for_url(&url, source_id),
             ) {
-                db.touch_image(sid, &url, &path, n);
+                touches.push((sid, url.clone(), path, n));
             }
+            self.images.insert_ui_bytes(url, bytes);
         }
-        if let Some(db) = &self.catalog_db {
-            db.evict_old_images(4_000);
-            db.evict_old_meta(30 * 24 * 60 * 60);
+        // Disk eviction used to run here on every flush (SQLite + unlink) and
+        // froze the mosaic while a category filled. Defer to idle.
+        let mut tasks = Vec::new();
+        // touch_image was synchronous SQLite on the iced thread — category fills
+        // stuttered. Batch off-thread; handles are already in RAM.
+        if !touches.is_empty() {
+            let source_ids: Vec<Uuid> = {
+                let mut ids: Vec<Uuid> = touches.iter().map(|(s, _, _, _)| *s).collect();
+                ids.sort_unstable();
+                ids.dedup();
+                ids
+            };
+            tasks.push(Task::perform(
+                async move {
+                    let _ = tokio::task::spawn_blocking(move || {
+                        let Some(db) = crate::catalog_db::CatalogDb::open(&source_ids) else {
+                            return;
+                        };
+                        for (sid, url, path, n) in touches {
+                            db.touch_image(sid, &url, &path, n);
+                        }
+                    })
+                    .await;
+                },
+                |_| Message::ArtMetaTouched,
+            ));
+        }
+        if let Some(evict) = self.maybe_evict_art_cache_task() {
+            tasks.push(evict);
         }
         let waiting = std::mem::take(&mut self.art_wait);
-        if waiting.is_empty() {
+        if !waiting.is_empty() {
+            tasks.push(self.prefetch_urls(waiting));
+        }
+        if tasks.is_empty() {
             Task::none()
         } else {
-            self.prefetch_urls(waiting)
+            Task::batch(tasks)
         }
+    }
+
+    /// Reset warm/pending state when the user opens another VOD/series shelf.
+    fn begin_mosaic_category_switch(&mut self) {
+        self.pending_images.clear();
+        self.art_wait.clear();
+        self.image_flush_armed = false;
+        self.art_warm_cursor = 0;
+        self.art_warm_active = true;
+        self.browse_scroll_vy = 0.0;
+        self.browse_was_flinging = false;
+        // Keep handles that still match the new shelf (overlap / « Tous »);
+        // abort only in-flight fetches so they cannot clobber with stale bytes.
+        self.images.inflight_clear();
+    }
+
+    /// True when every on-screen mosaic tile already has a handle (or none to fetch).
+    fn mosaic_visible_art_ready(&self) -> bool {
+        if !matches!(self.tab, Tab::Vod | Tab::Series)
+            || self.vod_detail.is_some()
+            || self.series_detail.is_some()
+        {
+            return true;
+        }
+        let (cols, tile_w) = self.poster_grid();
+        let screen = self.onscreen_browse_range(cols, tile_w);
+        if screen.is_empty() {
+            return true;
+        }
+        let mut missing = 0usize;
+        for pos in screen {
+            let Some(url) = self.art_url_for_browse_pos(pos) else {
+                continue;
+            };
+            if self.images.get(&url).is_none() {
+                missing += 1;
+                if missing >= 2 {
+                    return false;
+                }
+            }
+        }
+        missing == 0
+    }
+
+    /// Rare background image_cache trim — never on the iced update path.
+    fn maybe_evict_art_cache_task(&mut self) -> Option<Task<Message>> {
+        let now = std::time::Instant::now();
+        if self
+            .art_cache_evict_at
+            .is_some_and(|t| now.duration_since(t) < std::time::Duration::from_secs(120))
+        {
+            return None;
+        }
+        self.art_cache_evict_at = Some(now);
+        let ids: Vec<Uuid> = self.sources.iter().map(|s| s.id).collect();
+        if ids.is_empty() {
+            return None;
+        }
+        Some(Task::perform(
+            async move {
+                let _ = tokio::task::spawn_blocking(move || {
+                    let Some(db) = crate::catalog_db::CatalogDb::open(&ids) else {
+                        return;
+                    };
+                    db.evict_old_images(4_000);
+                    db.evict_old_meta(30 * 24 * 60 * 60);
+                })
+                .await;
+            },
+            |_| Message::ArtCacheEvicted,
+        ))
     }
 
     fn defer_art(&mut self, url: String) {
@@ -9435,13 +10464,13 @@ impl FluxPlay {
     /// `source_id` hits the profile disk cache. `None` misses it and re-downloads.
     fn prefetch_art(
         &mut self,
-        urls: Vec<(String, Option<uuid::Uuid>)>,
+        urls: Vec<(String, Option<Uuid>)>,
         max: usize,
     ) -> Task<Message> {
         let mut tasks = Vec::new();
         // The rows on screen go first. The wait queue used to spend every free
         // slot on posters from the top of the catalogue.
-        let urls: Vec<(String, Option<uuid::Uuid>)> = urls
+        let urls: Vec<(String, Option<Uuid>)> = urls
             .into_iter()
             .chain(
                 std::mem::take(&mut self.art_wait)
@@ -9505,19 +10534,18 @@ impl FluxPlay {
             return Task::none();
         }
         self.art_warm_cursor = 0;
-        self.art_warm_active = false;
-        self.refresh_browse_art()
+        self.art_warm_active = true;
+        Task::batch([self.refresh_browse_art(), self.continue_art_warm()])
     }
 
     /// Visible window + background warm of the current filter.
     fn refresh_browse_art(&mut self) -> Task<Message> {
-        self.art_warm_active = false;
+        self.art_warm_active = true;
         self.prefetch_visible_art()
     }
 
     fn continue_art_warm(&mut self) -> Task<Message> {
-        let _ = self;
-        Task::none()
+        self.pump_art_warm()
     }
 
     /// How many browse_index entries to warm after load (~8–12 mosaic screens).
@@ -9569,6 +10597,10 @@ impl FluxPlay {
 
     /// After soft video, shared atlas UVs may point at stale pixels — new Handle ids force re-upload.
     fn refresh_browse_poster_gpu_textures(&mut self) {
+        // Parked browser is not painted — defer the texture storm until restore.
+        if self.browse_parked {
+            return;
+        }
         let range = match self.tab {
             Tab::Vod | Tab::Series => {
                 let (cols, tile_w) = self.poster_grid();
@@ -9674,6 +10706,17 @@ impl FluxPlay {
         if !self.art_warm_active {
             return Task::none();
         }
+        // Soft RAM guard: if mosaic handles explode, keep only warm band URLs.
+        if self.images.handle_count() > crate::images::MAX_RAM_HANDLES {
+            let mut keep = Vec::new();
+            let end = self.art_warm_cursor.max(self.mounted_limit()).min(self.browse_index.len());
+            for pos in 0..end {
+                if let Some(url) = self.art_url_for_browse_pos(pos) {
+                    keep.push(url);
+                }
+            }
+            self.images.retain_urls(keep);
+        }
         // Films and series: stay on the rows in front of the user. Warming the
         // catalog from the top filled every slot, so scrolled posters never started.
         let posters = matches!(self.tab, Tab::Vod | Tab::Series)
@@ -9701,9 +10744,13 @@ impl FluxPlay {
             return Task::none();
         }
         let mut tasks = Vec::new();
-        let room = self.images.max_inflight
+        // Mosaic: small warm waves so category fills don't monopolize the UI.
+        let warm_cap = if posters { 4 } else { 10 };
+        let room = self
+            .images
+            .max_inflight
             .saturating_sub(self.images.inflight_len())
-            .min(18);
+            .min(warm_cap);
         if room == 0 {
             return Task::none();
         }
@@ -9783,10 +10830,12 @@ impl FluxPlay {
                 }
             }
             let cap = if matches!(self.tab, Tab::Vod | Tab::Series) {
+                // One screen + one row — never open max_inflight (24) at once on
+                // a category switch (that flooded iced with texture uploads).
                 screen
                     .len()
                     .saturating_add(grid_cols)
-                    .clamp(20, self.images.max_inflight)
+                    .clamp(8, 14.min(self.images.max_inflight))
             } else {
                 self.display_caps
                     .tuning
@@ -9900,31 +10949,7 @@ impl FluxPlay {
         let soft_vf = if surface {
             None
         } else {
-            #[cfg(target_os = "android")]
-            {
-                let (rw, rh) = self.soft_present_wh();
-                Some(
-                    fluxplay_player::SoftBudget {
-                        max_w: rw,
-                        max_h: rh,
-                        video_hz: 30,
-                        gui_hz: 60,
-                    }
-                    .vf_scale(),
-                )
-            }
-            #[cfg(not(target_os = "android"))]
-            {
-                self.settings.video_quality.max_wh().map(|(w, h)| {
-                    let w = w.max(2) & !1;
-                    let h = h.max(2) & !1;
-                    if w >= h {
-                        format!("scale={w}:-2:flags=fast_bilinear,format=yuv420p")
-                    } else {
-                        format!("scale=-2:{h}:flags=fast_bilinear,format=yuv420p")
-                    }
-                })
-            }
+            Some(self.soft_present_vf_scale())
         };
         self.session.apply_saved_video_prefs(
             match self.settings.aspect {
@@ -9952,6 +10977,38 @@ impl FluxPlay {
         );
     }
 
+    /// True when portal or per-channel EXTVLCOPT headers need embedding (ACTION_VIEW cannot).
+    #[cfg(target_os = "android")]
+    fn stream_needs_http_headers(&self, ch: Option<&Channel>) -> bool {
+        let Some(ch) = ch else {
+            return false;
+        };
+        if ch
+            .http_referer
+            .as_ref()
+            .is_some_and(|r| !r.trim().is_empty())
+            || ch
+                .http_user_agent
+                .as_ref()
+                .is_some_and(|u| !u.trim().is_empty())
+        {
+            return true;
+        }
+        let Some(sid) = ch.source_id else {
+            return false;
+        };
+        let Some(src) = self.sources.iter().find(|s| s.id == sid) else {
+            return false;
+        };
+        src.http_referer
+            .as_ref()
+            .is_some_and(|r| !r.trim().is_empty())
+            || src
+                .user_agent
+                .as_ref()
+                .is_some_and(|u| !u.trim().is_empty() && u != "IPTVSmartersPlayer")
+    }
+
     fn apply_source_headers_for(&mut self, ch: &Channel) {
         {
             let force_soft = {
@@ -9967,8 +11024,11 @@ impl FluxPlay {
                 }
             };
             let soft_wh = self.soft_present_wh();
+            let soft_vf = self.soft_present_vf_scale();
             let opts = self.session.native.options_mut();
             *opts = play_options_from(&self.settings);
+            // Desktop soft always gets a SoftBudget vf (Auto quality used to skip).
+            opts.android_soft_vf = Some(soft_vf);
             let want_upgrade =
                 bind_android_surface_for_play(opts, &self.settings, force_soft, soft_wh);
             #[cfg(target_os = "android")]
@@ -9979,6 +11039,7 @@ impl FluxPlay {
             {
                 let _ = want_upgrade;
             }
+            // Source-level headers first; per-channel EXTVLCOPT overrides.
             if let Some(sid) = ch.source_id {
                 if let Some(src) = self.sources.iter().find(|s| s.id == sid) {
                     if let Some(ua) = &src.user_agent {
@@ -9989,11 +11050,18 @@ impl FluxPlay {
                     }
                 }
             }
+            if let Some(ua) = ch.http_user_agent.as_ref().filter(|u| !u.trim().is_empty()) {
+                opts.user_agent = Some(ua.clone());
+            }
+            if let Some(r) = ch.http_referer.as_ref().filter(|r| !r.trim().is_empty()) {
+                opts.referer = Some(r.clone());
+            }
         }
         #[cfg(target_os = "android")]
         {
             self.android_surface_gen = crate::android_bridge::poll_surface_state().gen;
             self.android_surface_misses = 0;
+            self.android_synced_content_fps = None;
         }
     }
 
@@ -10022,6 +11090,8 @@ impl FluxPlay {
             if self.android_surface_misses >= 60 {
                 if let Some((wid, wh)) = crate::android_bridge::prepare_surface_present() {
                     if self.session.native.rebind_android_surface(wid, Some(wh)) {
+                        // Safe to Drop previous GlobalRef only after mpv holds the new wid.
+                        crate::android_bridge::drop_stale_video_surface_ref();
                         self.android_surface_gen =
                             crate::android_bridge::poll_surface_state().gen;
                         self.android_surface_misses = 0;
@@ -10088,24 +11158,14 @@ impl FluxPlay {
         if let Some(wid) = crate::android_bridge::acquire_video_surface_wid() {
             let wh = (st.w >= 64 && st.h >= 64).then_some((st.w, st.h));
             if self.session.native.rebind_android_surface(wid, wh) {
+                // Safe to Drop previous GlobalRef only after mpv holds the new wid.
+                crate::android_bridge::drop_stale_video_surface_ref();
                 self.android_surface_gen = st.gen;
             }
         }
-        let caps = crate::android_bridge::poll_android_device_caps();
-        let panel = caps
-            .as_ref()
-            .map(|c| c.refresh_hz as f32)
-            .filter(|&h| h >= 24.0)
-            .unwrap_or(self.display_caps.probe.monitor_hz as f32);
-        let content = self.session.content_fps().unwrap_or(0.0) as f32;
-        let modes = caps
-            .as_ref()
-            .map(|c| c.refresh_modes.as_slice())
-            .unwrap_or(&[]);
-        let hz = fluxplay_player::AndroidDeviceCaps::snap_present_hz_with_modes(
-            content, panel, modes,
-        );
-        crate::android_bridge::set_video_frame_rate(hz);
+        // Rebind / gen bump: re-snap + sync_android_video_timing (not setFrameRate alone).
+        self.android_synced_content_fps = None;
+        self.apply_android_surface_timing(None);
     }
 
     fn fetch_epg_for_visible_task(&self) -> Task<Message> {
@@ -10268,7 +11328,7 @@ impl FluxPlay {
     fn epg_slot<'a>(
         &'a self,
         map: &'a std::collections::HashMap<String, String>,
-        ch: &fluxplay_core::models::Channel,
+        ch: &Channel,
     ) -> Option<&'a str> {
         ch.epg_channel_id
             .as_deref()
@@ -10278,11 +11338,11 @@ impl FluxPlay {
             .map(String::as_str)
     }
 
-    fn epg_now_title<'a>(&'a self, ch: &fluxplay_core::models::Channel) -> Option<&'a str> {
+    fn epg_now_title<'a>(&'a self, ch: &Channel) -> Option<&'a str> {
         self.epg_slot(&self.epg_now, ch)
     }
 
-    fn epg_next_title<'a>(&'a self, ch: &fluxplay_core::models::Channel) -> Option<&'a str> {
+    fn epg_next_title<'a>(&'a self, ch: &Channel) -> Option<&'a str> {
         self.epg_slot(&self.epg_next, ch)
     }
 
@@ -10327,6 +11387,85 @@ impl FluxPlay {
 
     /// Profile a stream URL belongs to: Xtream credentials in the path, then
     /// the catalog entry, then a server host of the profile.
+    /// Rebuild a missing film/episode URL from the open fiche + Xtream source.
+    /// Writes the repaired episode URL back so TOSD / queue can resolve it.
+    fn repair_play_stream_url(&mut self, kind: ContentKind, play_name: &str) -> Option<String> {
+        let xtream_src = |source_id: Option<Uuid>| {
+            self.sources
+                .iter()
+                .find(|s| s.enabled && source_id.map(|id| id == s.id).unwrap_or(false))
+                .or_else(|| {
+                    self.sources.iter().find(|s| {
+                        s.enabled
+                            && (s.kind == SourceKind::Xtream
+                                || fluxplay_providers::parse_xtream_get_php(&s.endpoint).is_some())
+                    })
+                })
+                .cloned()
+        };
+        match kind {
+            ContentKind::Vod => {
+                let detail = self.vod_detail.as_ref()?;
+                if !detail.stream_url.trim().is_empty() {
+                    return Some(detail.stream_url.clone());
+                }
+                let id = detail.id.clone();
+                let sid = detail.source_id;
+                let src = xtream_src(sid)?;
+                let url = fluxplay_providers::guess_xtream_vod_url(&src, &id)?;
+                if let Some(detail) = self.vod_detail.as_mut() {
+                    detail.stream_url = url.clone();
+                }
+                if let Some(existing) = self.bundle.vod.iter_mut().find(|v| v.id == id) {
+                    if existing.stream_url.trim().is_empty() {
+                        existing.stream_url = url.clone();
+                    }
+                }
+                Some(url)
+            }
+            ContentKind::Series => {
+                let detail = self.series_detail.as_ref()?;
+                let ep_title = play_name
+                    .rsplit_once(" — ")
+                    .map(|(_, t)| t.trim())
+                    .filter(|t| !t.is_empty())?
+                    .to_string();
+                let sid = detail.source_id;
+                let series_id = detail.id.clone();
+                let (ep_id, existing_url) = detail.seasons.iter().find_map(|s| {
+                    s.episodes.iter().find(|ep| ep.title == ep_title).map(|ep| {
+                        (ep.id.clone(), ep.stream_url.clone())
+                    })
+                })?;
+                if !existing_url.trim().is_empty() {
+                    return Some(existing_url);
+                }
+                let src = xtream_src(sid)?;
+                let url = fluxplay_providers::guess_xtream_series_url(&src, &ep_id)?;
+                if let Some(detail) = self.series_detail.as_mut() {
+                    for season in &mut detail.seasons {
+                        if let Some(ep) = season.episodes.iter_mut().find(|e| e.id == ep_id) {
+                            ep.stream_url = url.clone();
+                        }
+                    }
+                }
+                if let Some(existing) =
+                    self.bundle.series.iter_mut().find(|s| s.id == series_id)
+                {
+                    for season in &mut existing.seasons {
+                        if let Some(ep) = season.episodes.iter_mut().find(|e| e.id == ep_id) {
+                            if ep.stream_url.trim().is_empty() {
+                                ep.stream_url = url.clone();
+                            }
+                        }
+                    }
+                }
+                Some(url)
+            }
+            _ => None,
+        }
+    }
+
     fn source_for_url(&self, url: &str) -> Option<MediaSource> {
         let enabled = || self.sources.iter().filter(|s| s.enabled);
         let by_creds = enabled().find(|s| {
@@ -10357,6 +11496,22 @@ impl FluxPlay {
                     .iter()
                     .find(|c| c.stream_url == url)
                     .and_then(|c| c.source_id)
+            })
+            .or_else(|| {
+                self.series_detail.as_ref().and_then(|d| {
+                    d.seasons
+                        .iter()
+                        .flat_map(|s| s.episodes.iter())
+                        .any(|e| e.stream_url == url)
+                        .then_some(d.source_id)
+                        .flatten()
+                })
+            })
+            .or_else(|| {
+                self.vod_detail
+                    .as_ref()
+                    .filter(|v| v.stream_url == url)
+                    .and_then(|v| v.source_id)
             });
         if let Some(s) = catalog_id.and_then(|id| enabled().find(|s| s.id == id)) {
             return Some(s.clone());
@@ -10459,6 +11614,8 @@ impl FluxPlay {
             source_id: None,
             kind: ContentKind::Live,
             catchup: None,
+            http_user_agent: None,
+            http_referer: None,
         };
         self.update(Message::PlayChannel(ch))
     }
@@ -10466,6 +11623,8 @@ impl FluxPlay {
     /// Open `ch` on the fastest server of its profile; when that server
     /// refuses, the next one (profiles with mirrors only).
     fn open_with_failover(&mut self, mut ch: Channel) -> fluxplay_player::Result<()> {
+        // Soft ≤60 + panel Hz for native VO before libmpv options are locked in.
+        self.sync_player_hz();
         if ch.stream_url.starts_with("file:") {
             self.session.playback_url = None;
             return self.session.open_channel(ch);
@@ -10768,7 +11927,8 @@ impl FluxPlay {
         };
         Task::perform(
             async move {
-                let r = fluxplay_providers::servers::rank(&src).await;
+                // Prefer cache — boot + load_source used to probe twice in the same second.
+                let r = fluxplay_providers::servers::rank_if_stale(&src).await;
                 (r.up.len(), r.up.len() + r.down.len())
             },
             move |(up, total)| Message::ServersRanked(id, up, total),
@@ -10905,6 +12065,14 @@ impl FluxPlay {
             self.play_stall_kicks = 0;
             return;
         }
+        // After sleep wake, AO is reloading — seek nudge reintroduces crackle.
+        let now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        if self.wake_unix > 0 && now_unix.saturating_sub(self.wake_unix) < 3 {
+            return;
+        }
         let pos = self.session.position_secs;
         match self.play_stall_at {
             Some((prev, at)) if (pos - prev).abs() < 0.35 => {
@@ -10913,12 +12081,17 @@ impl FluxPlay {
                     self.play_stall_kicks = self.play_stall_kicks.saturating_add(1);
                     self.play_stall_at = Some((pos, std::time::Instant::now()));
                     tracing::info!(pos, kicks = self.play_stall_kicks, "playback frozen, nudging");
-                    if self.play_stall_kicks >= 2 {
+                    if self.play_stall_kicks >= 2
+                        || self.session.native.needs_full_ao_rebuild()
+                    {
+                        // ffmpeg/ffplay: wake_audio is a no-op — restart on kick1
+                        // so we do not wait a second 18s stall for kick2.
                         self.session.restart();
                         self.session.seek_absolute(pos);
+                        self.play_stall_kicks = 2;
                     } else {
+                        // Prefer ao-reload / unpause before seek (WASAPI/PW crackle class).
                         self.session.wake_audio();
-                        self.session.seek_absolute((pos + 0.4).max(0.0));
                     }
                     self.status = "Image figée — reprise".into();
                 }
@@ -11082,8 +12255,18 @@ impl FluxPlay {
         // yet, and replacing the file freezes the picture on the last frame.
         let paused = matches!(self.session.state, PlaybackState::Paused);
         if self.session.channel.is_some() {
-            self.wake_pos = Some(self.session.position_secs);
+            let pos = self.session.position_secs;
+            self.wake_pos = Some(pos);
+            // wake_output rebuilds ffmpeg/ffplay AO and seeks VOD to `pos`.
             self.session.wake_output(paused);
+            // Defense in depth if session path could not restore (mpv no-op).
+            if !self.session.is_live()
+                && self.session.native.needs_full_ao_rebuild()
+                && pos > 1.0
+                && (self.session.position_secs - pos).abs() > 1.5
+            {
+                self.session.seek_absolute(pos);
+            }
             self.status = if paused {
                 "En pause".into()
             } else {
@@ -11274,7 +12457,31 @@ impl FluxPlay {
         }
         self.settings.note_watch(&key, pos, dur);
         self.watch_saved_at = Some(std::time::Instant::now());
-        self.persist();
+        // Periodic saves must not pretty-print JSON on the iced thread (PlayerTick).
+        // Stop/close still sync-flush so the last position is never lost.
+        if force {
+            self.persist_watch_pending = false;
+            self.persist();
+        } else {
+            self.persist_watch_pending = true;
+        }
+    }
+
+    fn take_persist_watch_task(&mut self) -> Task<Message> {
+        if !self.persist_watch_pending {
+            return Task::none();
+        }
+        self.persist_watch_pending = false;
+        let state = storage::PersistedState {
+            settings: self.settings.clone(),
+            sources: self.sources.clone(),
+        };
+        Task::perform(
+            async move {
+                let _ = tokio::task::spawn_blocking(move || storage::save(&state)).await;
+            },
+            |_| Message::PersistFlushed,
+        )
     }
 
     fn arm_resume(&mut self, catalog_url: &str, kind: ContentKind) {
@@ -11433,6 +12640,8 @@ impl FluxPlay {
                 source_id: None,
                 kind,
                 catchup: None,
+                http_user_agent: None,
+                http_referer: None,
             })
         };
         (title, meta, open, art)
@@ -11455,6 +12664,90 @@ impl FluxPlay {
             self.selected_season = Some(n);
             self.season_menu_open = false;
         }
+    }
+
+    /// Ask The Open Skip Database for intro/outro once a VOD/series URL is live.
+    fn open_skip_db_task(&self, play_url: &str, kind: ContentKind) -> Task<Message> {
+        if matches!(kind, ContentKind::Live) || play_url.trim().is_empty() {
+            return Task::none();
+        }
+        let play_url = play_url.to_string();
+        let series = kind == ContentKind::Series;
+        let (tmdb_id, imdb_id, season, episode, title) = if series {
+            let detail = self.series_detail.as_ref();
+            let want = crate::downloads::url_key(&play_url);
+            let ep = detail.and_then(|d| {
+                d.seasons.iter().find_map(|s| {
+                    s.episodes.iter().find_map(|e| {
+                        let hit = e.stream_url == play_url
+                            || (!e.stream_url.is_empty()
+                                && crate::downloads::url_key(&e.stream_url) == want);
+                        hit.then_some((s.season_number, e.episode_num))
+                    })
+                })
+            });
+            (
+                detail.and_then(|d| d.tmdb_id),
+                detail.and_then(|d| d.imdb_id.clone()),
+                ep.map(|(s, _)| s),
+                ep.map(|(_, e)| e),
+                detail.map(|d| d.name.clone()),
+            )
+        } else {
+            let detail = self.vod_detail.as_ref();
+            (
+                detail.and_then(|d| d.tmdb_id),
+                detail.and_then(|d| d.imdb_id.clone()),
+                None,
+                None,
+                detail.map(|d| d.name.clone()),
+            )
+        };
+        Task::perform(
+            async move {
+                let mut tmdb = tmdb_id;
+                if tmdb.is_none() {
+                    if let Some(tt) = imdb_id.as_deref() {
+                        tmdb = crate::skip_db::tmdb_id_from_imdb(tt, series).await;
+                    }
+                }
+                if tmdb.is_none() {
+                    if let Some(name) = title.as_deref() {
+                        if let Some(patch) =
+                            crate::metadata::tmdb_fiche(name, if series { "series" } else { "movie" }, imdb_id.as_deref())
+                                .await
+                        {
+                            tmdb = patch.tmdb_id;
+                        }
+                    }
+                }
+                let Some(tmdb) = tmdb else {
+                    return Message::OpenSkipDbReady {
+                        play_url,
+                        intro: None,
+                        outro_start: None,
+                    };
+                };
+                let hit = if series {
+                    let (Some(season), Some(episode)) = (season, episode) else {
+                        return Message::OpenSkipDbReady {
+                            play_url,
+                            intro: None,
+                            outro_start: None,
+                        };
+                    };
+                    crate::skip_db::lookup_series(tmdb, season, episode).await
+                } else {
+                    crate::skip_db::lookup_movie(tmdb).await
+                };
+                Message::OpenSkipDbReady {
+                    play_url,
+                    intro: hit.and_then(|h| h.intro),
+                    outro_start: hit.and_then(|h| h.outro_start),
+                }
+            },
+            |m| m,
+        )
     }
 
     fn clear_series_queue(&mut self) {
@@ -11658,6 +12951,7 @@ impl FluxPlay {
             user_agent: ua,
             dir,
             background: true,
+            playback_busy: true,
         };
         let key = next.clone();
         let (task, handle) = Task::run(crate::downloads::run(req), move |event| {
@@ -11704,6 +12998,8 @@ impl FluxPlay {
             if self.player_id == Some(id) {
                 return self.view_player_window();
             }
+            // Park keeps the window mapped (no Mode::Hidden black hole) but
+            // skips mosaic rebuild so SoftPump/AO are not starved on soft tick.
             if self.browse_parked {
                 return self.view_parked_browser();
             }
@@ -11987,34 +13283,40 @@ impl FluxPlay {
         };
 
         // Android: dynamic WindowInsets (gesture nav may report 0 — do not invent 48dp).
+        // TV / leanback: UiSurface::overscan_pad for safe area.
+        let overscan = crate::ui_surface::UiSurface::detect(m.width, m.height).overscan_pad();
         #[cfg(target_os = "android")]
         let (top_inset, bottom_inset) = (self.system_insets.1, self.system_insets.3);
         #[cfg(not(target_os = "android"))]
         let (top_inset, bottom_inset) = (0.0_f32, 0.0_f32);
         let page = container(main_col)
             .padding(Padding {
-                top: m.pad + top_inset,
-                right: m.pad + {
-                    #[cfg(target_os = "android")]
-                    {
-                        self.system_insets.2
-                    }
-                    #[cfg(not(target_os = "android"))]
-                    {
-                        0.0
-                    }
-                },
-                bottom: m.pad + bottom_inset,
-                left: m.pad + {
-                    #[cfg(target_os = "android")]
-                    {
-                        self.system_insets.0
-                    }
-                    #[cfg(not(target_os = "android"))]
-                    {
-                        0.0
-                    }
-                },
+                top: m.pad + top_inset + overscan,
+                right: m.pad
+                    + overscan
+                    + {
+                        #[cfg(target_os = "android")]
+                        {
+                            self.system_insets.2
+                        }
+                        #[cfg(not(target_os = "android"))]
+                        {
+                            0.0
+                        }
+                    },
+                bottom: m.pad + bottom_inset + overscan,
+                left: m.pad
+                    + overscan
+                    + {
+                        #[cfg(target_os = "android")]
+                        {
+                            self.system_insets.0
+                        }
+                        #[cfg(not(target_os = "android"))]
+                        {
+                            0.0
+                        }
+                    },
             })
             .width(Fill)
             .height(Fill)
@@ -12083,6 +13385,7 @@ impl FluxPlay {
             sleep_mins: self.sleep_mins,
             pip: self.pip_mode,
             chrome_h: self.layout_metrics().player_chrome_h,
+            hit: self.layout_metrics().hit,
             chrome_visible: self.player_chrome_visible,
             chrome_alpha: self.chrome_alpha,
             fullscreen: self.player_fullscreen,
@@ -12162,6 +13465,12 @@ impl FluxPlay {
             if self.session.native.android_surface_present() {
                 // Expand SurfaceView to full bleed when chrome hides (was inset).
                 crate::android_bridge::layout_video_surface_chrome_inset_dp(0.0);
+            }
+            #[cfg(not(target_os = "android"))]
+            {
+                // NativeGpu ontop: expand VO to full-bleed when chrome autohides.
+                let scale = self.player_layout_scale;
+                self.sync_native_overlay_chrome(scale);
             }
         }
     }
@@ -12285,7 +13594,7 @@ impl FluxPlay {
     }
 
     /// Language filter context for the browse index (`None` = show everything).
-    fn lang_ctx(&self) -> Option<std::sync::Arc<LangCtx>> {
+    fn lang_ctx(&self) -> Option<Arc<LangCtx>> {
         if !self.lang_filter_on() {
             return None;
         }
@@ -12310,7 +13619,7 @@ impl FluxPlay {
                 (key, crate::names::parse_category(&c.name).lang)
             })
             .collect();
-        Some(std::sync::Arc::new(LangCtx { pref, cats }))
+        Some(Arc::new(LangCtx { pref, cats }))
     }
 
     fn view_channel_grid(&self, ui: UiTheme, guide: bool) -> Element<'_, Message> {
@@ -12376,6 +13685,8 @@ impl FluxPlay {
                     } else {
                         None
                     };
+                    let focused = self.browse_focus_chrome_active()
+                        && self.browse_focus == idx;
                     r = r.push(browser::channel_tile(
                         crate::names::display_channel(&ch.name),
                         now,
@@ -12390,7 +13701,8 @@ impl FluxPlay {
                         tile_w,
                         thumb,
                         self.pressed_mosaic.as_deref() == Some(ch.id.as_str()),
-                        self.selected_channel.as_deref() == Some(ch.id.as_str()),
+                        focused || self.selected_channel.as_deref() == Some(ch.id.as_str()),
+                        m.hit,
                     ));
                 }
                 r = r.push(Space::new().width(Fill));
@@ -12456,7 +13768,7 @@ impl FluxPlay {
         };
         let content = browser::pane(
             ui,
-            Length::Fill,
+            Fill,
             self.with_shelf_pills(false, header, scroller, m.gap),
         );
 
@@ -12530,6 +13842,8 @@ impl FluxPlay {
                     );
                     let thumb = crate::images::vod_poster_url(v)
                         .and_then(|u| self.images.get(&u));
+                    let focused = self.browse_focus_chrome_active()
+                        && self.browse_focus == idx;
                     r = r.push(browser::mosaic_tile(
                         ti.title,
                         meta,
@@ -12539,6 +13853,8 @@ impl FluxPlay {
                         tile_w,
                         thumb,
                         self.pressed_mosaic.as_deref() == Some(v.id.as_str()),
+                        focused,
+                        m.hit,
                     ));
                 }
                 r = r.push(Space::new().width(Fill));
@@ -12594,7 +13910,7 @@ impl FluxPlay {
         };
         let content = browser::pane(
             ui,
-            Length::Fill,
+            Fill,
             self.with_shelf_pills(false, header, scroller, m.gap),
         );
         self.with_categories(ui, m, "Films / VOD", &self.cat_entries, content)
@@ -12602,7 +13918,7 @@ impl FluxPlay {
 
     /// Current download root (settings or platform default).
     fn downloads_dir(&self) -> std::path::PathBuf {
-        crate::storage::downloads_dir(&self.settings.download_dir)
+        storage::downloads_dir(&self.settings.download_dir)
     }
 
     /// Where `url` is written. Always inside [`Self::downloads_dir`]:
@@ -12670,7 +13986,33 @@ impl FluxPlay {
             .count()
     }
 
+    /// True when playback likely holds the only panel stream for this URL's account.
+    fn playback_holds_only_slot(&self, url: &str) -> bool {
+        let playing = self.session.channel.is_some()
+            && matches!(
+                self.session.state,
+                PlaybackState::Opening
+                    | PlaybackState::Playing
+                    | PlaybackState::Buffering
+                    | PlaybackState::Paused
+            );
+        if !playing {
+            return false;
+        }
+        let Some(src) = self.source_for_url(url) else {
+            return false;
+        };
+        fluxplay_providers::servers::max_connections(src.id) == Some(1)
+    }
+
     fn start_download(&mut self, name: String, url: String) -> Task<Message> {
+        if self.playback_holds_only_slot(&url) {
+            self.status = format!("Lecture en cours — {name} en file (1 connexion)");
+            self.downloads
+                .insert(url.clone(), crate::downloads::DownloadState::Queued { name });
+            self.download_queue.push_back(url);
+            return Task::none();
+        }
         self.status = if crate::downloads::partial_for(&self.download_partials, &url).is_some() {
             format!("Reprise du téléchargement — {name}…")
         } else {
@@ -12680,6 +14022,14 @@ impl FluxPlay {
             .user_agent
             .unwrap_or_else(|| "IPTVSmartersPlayer".into());
         let key = url.clone();
+        let playback_busy = self.session.channel.is_some()
+            && matches!(
+                self.session.state,
+                PlaybackState::Opening
+                    | PlaybackState::Playing
+                    | PlaybackState::Buffering
+                    | PlaybackState::Paused
+            );
         let req = crate::downloads::DownloadRequest {
             name: name.clone(),
             url: url.clone(),
@@ -12687,6 +14037,7 @@ impl FluxPlay {
             user_agent: ua,
             dir: self.download_destination(&url),
             background: false,
+            playback_busy,
         };
         let (task, handle) = Task::run(
             crate::downloads::run(req),
@@ -12716,6 +14067,11 @@ impl FluxPlay {
             let Some(url) = self.download_queue.pop_front() else {
                 break;
             };
+            if self.playback_holds_only_slot(&url) {
+                // Keep waiting until playback releases the single panel slot.
+                self.download_queue.push_front(url);
+                break;
+            }
             if let Some(crate::downloads::DownloadState::Queued { name }) =
                 self.downloads.remove(&url)
             {
@@ -12850,11 +14206,11 @@ impl FluxPlay {
         let hint = match self.download_library.get(url) {
             Some(path) => format!(
                 "Téléchargé — « Lire » ouvre le fichier : {}",
-                crate::storage::display_path(path)
+                storage::display_path(path)
             ),
             None => format!(
                 "Enregistré dans {} — modifiable dans Réglages › Téléchargements",
-                crate::storage::display_path(&self.download_destination(url))
+                storage::display_path(&self.download_destination(url))
             ),
         };
         (label, msg, hint)
@@ -13017,7 +14373,7 @@ impl FluxPlay {
     fn view_vod_detail(
         &self,
         ui: UiTheme,
-        m: crate::theme::LayoutMetrics,
+        m: LayoutMetrics,
         detail: &VodItem,
     ) -> Element<'_, Message> {
         if self.actor_sheet.is_some() {
@@ -13165,7 +14521,10 @@ impl FluxPlay {
             }
             tasks.push(Task::perform(
                 async move {
-                    let url = crate::metadata::person_headshot_fast(&name).await;
+                    let url = match crate::metadata::person_headshot_fast(&name).await {
+                        Some(u) => Some(u),
+                        None => crate::metadata::person_headshot(&name).await,
+                    };
                     Message::CastPhoto { name, url }
                 },
                 |m| m,
@@ -13250,7 +14609,7 @@ impl FluxPlay {
     fn view_series_detail(
         &self,
         ui: UiTheme,
-        m: crate::theme::LayoutMetrics,
+        m: LayoutMetrics,
         detail: &SeriesItem,
     ) -> Element<'_, Message> {
         if self.actor_sheet.is_some() {
@@ -13272,8 +14631,8 @@ impl FluxPlay {
                 .flat_map(|s| s.episodes.iter().map(move |ep| (s.season_number, ep)))
         };
         let first_play = episodes_of(true)
-            .next()
-            .or_else(|| episodes_of(false).next())
+            .chain(episodes_of(false))
+            .find(|(_, ep)| !ep.stream_url.trim().is_empty())
             .map(|(season_num, ep)| {
                 (
                     {
@@ -13296,7 +14655,7 @@ impl FluxPlay {
                         let (label, msg) = self.season_download_action(detail, None, false);
                         let hint = format!(
                             "Épisodes enregistrés dans {} ({} à la fois) — un épisode téléchargé se lit depuis le disque",
-                            crate::storage::display_path(&crate::downloads::series_title_dir(
+                            storage::display_path(&crate::downloads::series_title_dir(
                                 &self.downloads_dir(),
                                 &detail.name
                             )),
@@ -13388,7 +14747,7 @@ impl FluxPlay {
                     ));
                 }
             }
-            let mut col = Column::new().spacing(crate::theme::SPACE_SM).width(Fill);
+            let mut col = Column::new().spacing(SPACE_SM).width(Fill);
             if let Some(season) = season {
                 let fallback = detail.cover.clone().or(detail.banner.clone());
                 for ep in &season.episodes {
@@ -13572,6 +14931,8 @@ impl FluxPlay {
                     );
                     let thumb = crate::images::series_cover_url(s)
                         .and_then(|u| self.images.get(&u));
+                    let focused = self.browse_focus_chrome_active()
+                        && self.browse_focus == idx;
                     r = r.push(browser::mosaic_tile(
                         ti.title,
                         meta,
@@ -13581,6 +14942,8 @@ impl FluxPlay {
                         tile_w,
                         thumb,
                         self.pressed_mosaic.as_deref() == Some(s.id.as_str()),
+                        focused,
+                        m.hit,
                     ));
                 }
                 r = r.push(Space::new().width(Fill));
@@ -13635,7 +14998,7 @@ impl FluxPlay {
         };
         let content = browser::pane(
             ui,
-            Length::Fill,
+            Fill,
             self.with_shelf_pills(false, header, scroller, m.gap),
         );
         self.with_categories(ui, m, "Séries", &self.cat_entries, content)
@@ -13858,6 +15221,8 @@ impl FluxPlay {
                         )
                         .and_then(|k| self.images.get(&k));
                         let now = self.epg_now_title(ch).unwrap_or("En direct").to_string();
+                        let focused = self.browse_focus_chrome_active()
+                            && self.browse_focus == idx;
                         r = r.push(browser::channel_tile(
                             crate::names::display_channel(&ch.name),
                             now,
@@ -13869,10 +15234,13 @@ impl FluxPlay {
                             tile_w,
                             thumb,
                             self.pressed_mosaic.as_deref() == Some(ch.id.as_str()),
-                            self.selected_channel.as_deref() == Some(ch.id.as_str()),
+                            focused || self.selected_channel.as_deref() == Some(ch.id.as_str()),
+                            m.hit,
                         ));
                     } else if let Some(card) = cards.get(idx) {
                         let thumb = card.art.as_deref().and_then(|u| self.images.get(u));
+                        let focused = self.browse_focus_chrome_active()
+                            && self.browse_focus == idx;
                         r = r.push(browser::mosaic_tile_marked(
                             card.title.clone(),
                             card.meta.clone(),
@@ -13883,6 +15251,8 @@ impl FluxPlay {
                             thumb,
                             self.pressed_mosaic.as_deref() == Some(card.id.as_str()),
                             Some(card.mark.clone()),
+                            focused,
+                            m.hit,
                         ));
                     }
                 }
@@ -13942,7 +15312,7 @@ impl FluxPlay {
         };
         let content = browser::pane(
             ui,
-            Length::Fill,
+            Fill,
             self.with_shelf_pills(false, header, scroller, m.gap),
         );
         content
@@ -13950,6 +15320,7 @@ impl FluxPlay {
 
     /// Last played films and series. Live channels are not listed.
     fn history_block(&self, ui: UiTheme, row_w: f32) -> Element<'_, Message> {
+        let hit = self.layout_metrics().hit;
         let media: Vec<_> = self
             .settings
             .recent
@@ -13997,6 +15368,7 @@ impl FluxPlay {
                 thumb,
                 40.0,
                 row_w,
+                hit,
             ));
         }
         Column::with_children(rows).spacing(4).width(Fill).into()
@@ -14046,6 +15418,7 @@ impl FluxPlay {
                     thumb,
                     40.0,
                     m.content_w.max(120.0),
+                    m.hit,
                 ));
             }
         }
@@ -14093,7 +15466,7 @@ impl FluxPlay {
         };
         browser::pane(
             ui,
-            Length::Fill,
+            Fill,
             column![
                 browser::content_header(
                     ui,
@@ -14922,7 +16295,7 @@ impl FluxPlay {
         .width(Fill);
         browser::pane(
             ui,
-            Length::Fill,
+            Fill,
             browser::soft_scroll(ui, body),
         )
     }
@@ -14978,7 +16351,7 @@ impl FluxPlay {
                 Some(err) => Element::from(
                     container(text(err.clone()).size(13).color(ui.error()))
                         .padding([8, 12])
-                        .width(Length::Fill)
+                        .width(Fill)
                         .style(move |_| container::Style {
                             background: Some(Background::Color(ui.error_container())),
                             border: Border {
@@ -15368,8 +16741,8 @@ fn build_browse_index_blocking(
     live_rows: Vec<(usize, String, Option<String>)>,
     vod_rows: Vec<(usize, String, String, Option<String>)>,
     series_rows: Vec<(usize, String, String, Option<String>)>,
-    lang: Option<std::sync::Arc<LangCtx>>,
-    progress: std::sync::Arc<crate::async_jobs::JobProgress>,
+    lang: Option<Arc<LangCtx>>,
+    progress: Arc<crate::async_jobs::JobProgress>,
 ) -> (BrowseIndex, Vec<EpisodeFlat>) {
     use crate::async_jobs::DEFAULT_CHUNK;
     let q_lc = if q.is_empty() {
@@ -15651,6 +17024,7 @@ fn play_options_from(settings: &AppSettings) -> PlayOptions {
         cache_ms: settings.cache_ms,
         demux_secs: settings.demux_secs,
         volume: settings.volume,
+        muted: false,
         low_latency: settings.low_latency,
         preferred,
         // Enabled but not up yet: a refused proxy, never the clearnet.
@@ -15664,6 +17038,7 @@ fn play_options_from(settings: &AppSettings) -> PlayOptions {
         android_surface_wh: None,
         android_soft_vf: None,
         vaapi_device: None,
+        d3d11_adapter: None,
         hwdec_force_copy: false,
         tonemap_hdr: settings.tonemap_hdr,
         video_max_wh: settings.video_quality.max_wh(),
@@ -15678,55 +17053,132 @@ fn play_options_from(settings: &AppSettings) -> PlayOptions {
     opts
 }
 
-fn export_gpu_env(gpu_choice: &str) {
+/// iced/wgpu present adapter — always the panel/display GPU (W4-08).
+fn export_present_gpu_env() {
     #[cfg(not(target_os = "android"))]
     {
-        let dc = crate::display_caps::resolve_caps(
-            fluxplay_core::models::FpsCapPref::Auto,
-            fluxplay_core::models::FpsCapPref::Auto,
+        let dc = display_caps::resolve_caps(
+            FpsCapPref::Auto,
+            FpsCapPref::Auto,
             None,
             None,
             None,
         );
-        let topo = &dc.probe.gpu_topology;
-        let dev = topo
-            .devices
-            .iter()
-            .find(|d| d.name == gpu_choice)
-            .unwrap_or(&topo.display);
-        std::env::set_var("FLUXPLAY_GPU", &dev.name);
-        match &dev.render_node {
-            Some(node) => std::env::set_var("FLUXPLAY_GPU_NODE", node),
-            None => std::env::remove_var("FLUXPLAY_GPU_NODE"),
-        }
-    }
-    #[cfg(target_os = "android")]
-    {
-        let _ = gpu_choice;
+        let display = &dc.probe.gpu_topology.display;
+        // Win: full DXGI description in render_node; Linux DRM path is not an iced name.
+        let present = match &display.render_node {
+            Some(n) if !n.starts_with('/') && !n.is_empty() => n.as_str(),
+            _ => display.name.as_str(),
+        };
+        std::env::set_var("FLUXPLAY_GPU", present);
+        // wgpu reads WGPU_ADAPTER_NAME at adapter pick (boot only). Soft/decode
+        // never retarget iced mid-session — CycleGpu persists + asks for relaunch.
+        std::env::set_var("WGPU_ADAPTER_NAME", present);
+        // Decode apply owns FLUXPLAY_GPU_NODE / FLUXPLAY_DECODE_GPU.
+        std::env::remove_var("FLUXPLAY_GPU_NODE");
     }
 }
 
-/// Decode and display stay on the GPU the user picked (default: the panel GPU).
+/// Decode GPU follows the user pick (or StrongDecodeCopy discrete). Zero-copy is
+/// only safe when decode == display; otherwise force `*-copy` / soft.
 fn apply_gpu_topology_opts(opts: &mut PlayOptions, gpu_choice: &str) {
     #[cfg(not(target_os = "android"))]
     {
-        let dc = crate::display_caps::resolve_caps(
-            fluxplay_core::models::FpsCapPref::Auto,
-            fluxplay_core::models::FpsCapPref::Auto,
+        use crate::gpu_topology::GpuDecodePolicy;
+        let dc = display_caps::resolve_caps(
+            FpsCapPref::Auto,
+            FpsCapPref::Auto,
             None,
             None,
             None,
         );
         let topo = &dc.probe.gpu_topology;
-        let dev = topo
-            .devices
-            .iter()
-            .find(|d| d.name == gpu_choice)
-            .unwrap_or(&topo.display);
-        opts.hwdec_force_copy = false;
-        opts.vaapi_device = dev.render_node.clone();
-        export_gpu_env(&dev.name);
-        tracing::info!(gpu = %dev.label(), "single GPU for decode and display");
+        let chosen = topo.devices.iter().find(|d| d.name == gpu_choice);
+        let decode = match chosen {
+            Some(dev) => dev,
+            None if topo.policy == GpuDecodePolicy::StrongDecodeCopy => &topo.decode,
+            None => &topo.display,
+        };
+        let cross = topo.requires_copy_path()
+            || decode.name != topo.display.name
+            || decode.render_node != topo.display.render_node;
+        opts.hwdec_force_copy = cross;
+        // NVIDIA decode is CUDA/NVDEC — never point mpv `vaapi-device` at its renderD*.
+        let lower = decode.name.to_ascii_lowercase();
+        let nvidia = lower.contains("nvidia") || lower.contains("geforce");
+        let vaapi_ok = !nvidia
+            && (lower.contains("intel")
+                || lower.contains("amd")
+                || lower.contains("radeon")
+                || lower.contains("rembrandt")
+                || lower.contains("mesa")
+                || lower.contains("iris")
+                || lower.contains("uhd")
+                || lower.contains("arc")
+                || lower.contains("xe "));
+        // `render_node` is a DRM path on Linux and a DXGI description on Windows.
+        // Only feed DRM paths into `vaapi-device` / FLUXPLAY_GPU_NODE.
+        let drm_node = decode.render_node.as_deref().filter(|n| n.starts_with("/dev/dri/"));
+        opts.vaapi_device = if vaapi_ok {
+            drm_node.map(str::to_owned)
+        } else {
+            None
+        };
+        // Win twin of vaapi-device: pin D3D11VA via full adapter description.
+        #[cfg(target_os = "windows")]
+        {
+            opts.d3d11_adapter = crate::gpu_topology::d3d11_adapter_from_device(decode);
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            opts.d3d11_adapter = None;
+        }
+        // Present/decode split (W3-07 F5 / W4-08/11): keep iced `FLUXPLAY_GPU` on
+        // the display adapter from boot. Decode steers mpv/ffmpeg via DECODE_GPU
+        // + DRM NODE. Never re-export discrete into FLUXPLAY_GPU (new() used to).
+        // Full Win DXGI desc when present in render_node; else UI name (Linux DRM ignored).
+        let decode_label = crate::gpu_topology::d3d11_adapter_from_device(decode)
+            .unwrap_or_else(|| decode.name.clone());
+        std::env::set_var("FLUXPLAY_DECODE_GPU", &decode_label);
+        // NVIDIA renderD* is not libva (W3-07 F4). Windows DXGI desc ≠ DRM path.
+        if nvidia || cfg!(target_os = "windows") {
+            std::env::remove_var("FLUXPLAY_GPU_NODE");
+        } else if let Some(node) = drm_node {
+            std::env::set_var("FLUXPLAY_GPU_NODE", node);
+        } else {
+            std::env::remove_var("FLUXPLAY_GPU_NODE");
+        }
+        // Log once per distinct (choice, force_copy) — play/open used to spam this.
+        use std::sync::Mutex;
+        static LAST: Mutex<Option<(String, bool)>> = Mutex::new(None);
+        let key = (gpu_choice.to_string(), opts.hwdec_force_copy);
+        let changed = LAST
+            .lock()
+            .map(|mut g| {
+                let ch = g.as_ref() != Some(&key);
+                if ch {
+                    *g = Some(key.clone());
+                }
+                ch
+            })
+            .unwrap_or(true);
+        if changed {
+            tracing::info!(
+                gpu = %decode.label(),
+                display = %topo.display.label(),
+                choice = %gpu_choice,
+                force_copy = opts.hwdec_force_copy,
+                vaapi = ?opts.vaapi_device.as_deref(),
+                d3d11 = ?opts.d3d11_adapter.as_deref(),
+                "GPU topology applied for decode"
+            );
+        } else {
+            tracing::debug!(
+                gpu = %decode.label(),
+                choice = %gpu_choice,
+                "GPU topology applied for decode (unchanged)"
+            );
+        }
     }
     #[cfg(target_os = "android")]
     {
@@ -15835,17 +17287,19 @@ fn bind_android_surface_for_play(
             if !mode.uses_surface() {
                 opts.android_surface_wid = None;
                 opts.android_surface_wh = None;
-                // Soft after a failed Surface attempt — warm under iced and promote later.
+                // Soft after a failed Surface attempt — keep SurfaceView hidden under
+                // iced soft RGBA (visible empty Surface punches a black hole). Promote
+                // tick shows Surface only when MediaCodec open is about to run.
                 if missed_surface
                     && !matches!(settings.android_present, AndroidPresentPref::Soft)
                 {
                     crate::android_bridge::release_video_surface_wid();
                     crate::android_bridge::set_video_surface_z_on_top(false);
-                    crate::android_bridge::set_video_surface_visible(true);
+                    crate::android_bridge::set_video_surface_visible(false);
                     tracing::info!(
                         present = mode.label(),
                         soft_vf = ?opts.android_soft_vf,
-                        "android soft present after Surface miss — warming for upgrade"
+                        "android soft present after Surface miss — Surface hidden (promote later)"
                     );
                     return true;
                 }
@@ -15865,14 +17319,16 @@ fn bind_android_surface_for_play(
             crate::android_bridge::set_video_surface_z_on_top(true);
             crate::android_bridge::set_video_surface_visible(true);
             crate::android_bridge::stabilize_android_session();
+            // Cap UI-thread wait (~2–3 frames). Longer sleeps ANR FocusEvent;
+            // Soft warm + PlayerTick promote covers slow SurfaceHolder create.
             let mut last_wh = (0u32, 0u32);
             let mut stable = 0u32;
-            for _ in 0..150 {
+            for _ in 0..6 {
                 if crate::android_bridge::is_video_surface_ready() {
                     if let Some(wh) = crate::android_bridge::video_surface_size() {
                         if wh == last_wh && wh.0 >= 64 && wh.1 >= 64 {
                             stable = stable.saturating_add(1);
-                            if stable >= 4 {
+                            if stable >= 2 {
                                 break;
                             }
                         } else {
@@ -15930,13 +17386,16 @@ fn bind_android_surface_for_play(
             opts.android_surface_wid = None;
             opts.android_surface_wh = None;
             crate::android_bridge::release_video_surface_wid();
-            // Warm Surface under iced (z below) so Soft paints and we can promote soon.
+            // Soft paints iced RGBA — keep SurfaceView hidden until promote tick.
+            // Leaving it VISIBLE under translucent iced reads as a black hole.
             if missed_surface
                 && !matches!(settings.android_present, AndroidPresentPref::Soft)
             {
                 crate::android_bridge::set_video_surface_z_on_top(false);
-                crate::android_bridge::set_video_surface_visible(true);
-                tracing::info!("android soft fallback — warming Surface under iced for upgrade");
+                crate::android_bridge::set_video_surface_visible(false);
+                tracing::info!(
+                    "android soft fallback — Surface hidden under iced (promote later)"
+                );
                 return true;
             }
             crate::android_bridge::set_video_surface_visible(false);
@@ -15964,7 +17423,7 @@ async fn load_one(src: MediaSource) -> Result<PlaylistBundle, String> {
 /// Warm next episode bytes to disk (cap ~48 MiB) so resume is non-blocking.
 /// Next-episode preloads (one at a time, wiped at start-up).
 fn prefetch_dir() -> std::path::PathBuf {
-    crate::storage::data_dir().join("prefetch")
+    storage::data_dir().join("prefetch")
 }
 
 /// Viewer language + per-category language (Live: keyed by group name, VOD/series: by id).
@@ -16166,6 +17625,9 @@ fn fiche_ready(plot: &Option<String>, actors: &Option<String>) -> bool {
 }
 
 fn merge_xtream_vod_fields(existing: &mut VodItem, item: &VodItem) {
+    if existing.stream_url.trim().is_empty() && !item.stream_url.trim().is_empty() {
+        existing.stream_url = item.stream_url.clone();
+    }
     take_plot(&mut existing.plot, &item.plot);
     take_text(&mut existing.actors, &item.actors);
     take_text(&mut existing.director, &item.director);
@@ -16184,8 +17646,15 @@ fn merge_xtream_vod_fields(existing: &mut VodItem, item: &VodItem) {
     take_text(&mut existing.awards, &item.awards);
 }
 
+fn series_episode_count(item: &SeriesItem) -> usize {
+    item.seasons.iter().map(|s| s.episodes.len()).sum()
+}
+
 fn merge_xtream_series_fields(existing: &mut SeriesItem, item: &SeriesItem) {
-    if !item.seasons.is_empty() {
+    // Never let a sparse portal/alert answer wipe a richer season tree.
+    if !item.seasons.is_empty()
+        && series_episode_count(item) >= series_episode_count(existing)
+    {
         existing.seasons = item.seasons.clone();
     }
     take_plot(&mut existing.plot, &item.plot);
@@ -16200,6 +17669,33 @@ fn merge_xtream_series_fields(existing: &mut SeriesItem, item: &SeriesItem) {
     take_text(&mut existing.country, &item.country);
     take_text(&mut existing.runtime, &item.runtime);
     take_text(&mut existing.rated, &item.rated);
+}
+
+/// TVMaze enrich fills empty plot/airdate/still — never replace season trees
+/// or stream URLs (a late enrich must not clobber a newer portal answer).
+fn merge_series_episode_enrichment(dst: &mut SeriesItem, src: &SeriesItem) {
+    for src_season in &src.seasons {
+        let Some(dst_season) = dst
+            .seasons
+            .iter_mut()
+            .find(|s| s.season_number == src_season.season_number)
+        else {
+            continue;
+        };
+        for src_ep in &src_season.episodes {
+            let Some(dst_ep) = dst_season.episodes.iter_mut().find(|e| {
+                (!src_ep.id.is_empty() && e.id == src_ep.id) || e.episode_num == src_ep.episode_num
+            }) else {
+                continue;
+            };
+            take_plot(&mut dst_ep.plot, &src_ep.plot);
+            take_text(&mut dst_ep.airdate, &src_ep.airdate);
+            take_text(&mut dst_ep.still, &src_ep.still);
+            take_text(&mut dst_ep.rating, &src_ep.rating);
+            take_text(&mut dst_ep.runtime, &src_ep.runtime);
+            take_text(&mut dst_ep.rated, &src_ep.rated);
+        }
+    }
 }
 
 /// Sync-fallback helpers for [`FluxPlay::ingest_source_bundle`] (batch path uses SQLite progressive ingest).
@@ -16275,6 +17771,9 @@ fn merge_part_with_existing(
             if v.imdb_id.is_none() {
                 v.imdb_id = old.imdb_id.clone();
             }
+            if v.tmdb_id.is_none() {
+                v.tmdb_id = old.tmdb_id;
+            }
             if v.rating.is_none() {
                 v.rating = old.rating.clone();
             }
@@ -16305,6 +17804,9 @@ fn merge_part_with_existing(
             }
             if s.imdb_id.is_none() {
                 s.imdb_id = old.imdb_id.clone();
+            }
+            if s.tmdb_id.is_none() {
+                s.tmdb_id = old.tmdb_id;
             }
             if s.rating.is_none() {
                 s.rating = old.rating.clone();
@@ -16576,7 +18078,9 @@ fn profile_message_label(message: &Message) -> &'static str {
         #[cfg(not(target_os = "android"))]
         Message::PlaylistFilePicked(_) => "async.file_pick",
         Message::BrowseScrolled(_, _) => "scroll.browse",
-        Message::BrowseSettle => "scroll.browse_settle",
+        Message::BrowseSettle(_) => "scroll.browse_settle",
+        Message::ArtMetaTouched => "async.image_meta",
+        Message::PersistFlushed => "async.persist",
         Message::BrowseScrollBy(_) => "scroll.browse_by",
         Message::BrowseDragStart | Message::BrowseDragAt(_) | Message::BrowseDragEnd => {
             "scroll.browse_drag"
@@ -16585,43 +18089,11 @@ fn profile_message_label(message: &Message) -> &'static str {
         Message::MosaicPress(_) => "input.mosaic_press",
         Message::CatScrolled(_, _) => "scroll.cats",
         Message::FlushPendingImages => "async.image_flush",
+        Message::ArtCacheEvicted => "async.image_evict",
         Message::SearchApply(_) => "nav.filtre_apply",
+        Message::OpenSkipDbReady { .. } => "lecteur.skip_db",
         other => ui_action_label(other).unwrap_or("ui.autre"),
     }
-}
-
-/// Background work that must not consume the “ignore the next poster click” flag.
-fn swallow_noise(message: &Message) -> bool {
-    matches!(
-        message,
-        Message::PlayerTick
-            | Message::CatalogFreshnessCheck
-            | Message::WakeProbe
-            | Message::WakeAudio
-            | Message::PlayerStageClick
-            | Message::PlayerStageClickFire(_)
-            | Message::PlayerChromeTick
-            | Message::ImageLoaded(_)
-            | Message::FlushPendingImages
-            | Message::BrowseCoastTick
-            | Message::BrowseScrolled(_, _)
-            | Message::BrowseSettle
-            | Message::CatScrolled(_, _)
-            | Message::VideoFrameAllocated { .. }
-            | Message::PlayerLayout { .. }
-            | Message::PlayerLayoutDirty(_)
-            | Message::MetaEnriched { .. }
-            | Message::DetailMetaLoaded { .. }
-            | Message::CastPhoto { .. }
-            | Message::PrefetchEvent { .. }
-            | Message::EpgFetched(..)
-            | Message::VodInfoBatch { .. }
-            | Message::AgesLoaded(_)
-            | Message::CaptionLoaded(_)
-            | Message::SeriesEpisodesEnriched(_)
-            | Message::SeriesQueueReady { .. }
-            | Message::SearchApply(_)
-    )
 }
 
 fn ui_action_label(message: &Message) -> Option<&'static str> {
@@ -16631,8 +18103,12 @@ fn ui_action_label(message: &Message) -> Option<&'static str> {
         | Message::VideoFrameAllocated { .. }
         | Message::ImageLoaded(_)
         | Message::FlushPendingImages
+        | Message::ArtCacheEvicted
+        | Message::ArtMetaTouched
+        | Message::PersistFlushed
         | Message::BrowseScrolled(_, _)
         | Message::BrowseScrollBy(_)
+        | Message::BrowseSettle(_)
         | Message::BrowseDragStart
         | Message::BrowseDragAt(_)
         | Message::BrowseDragEnd
@@ -16653,9 +18129,7 @@ fn ui_action_label(message: &Message) -> Option<&'static str> {
         Message::CatFilterChanged(_) => "nav.filtre",
         #[cfg(target_os = "android")]
         Message::NavBack => "nav.retour",
-        #[cfg(target_os = "android")]
-        Message::BrowseFocusDelta(_) => "nav.browse_focus",
-        #[cfg(target_os = "android")]
+        Message::BrowseFocusStep { .. } => "nav.browse_focus",
         Message::BrowseActivate => "nav.browse_activate",
         Message::PlayChannel(_) | Message::PlayChannelId(..) => "lecteur.play_chaine",
         Message::PlayVod { .. } => "lecteur.play_vod",
@@ -16686,11 +18160,12 @@ fn ui_action_label(message: &Message) -> Option<&'static str> {
         Message::SkipGeneric | Message::SkipIntro | Message::ToggleSkipCredits => {
             "lecteur.generique"
         }
+        Message::OpenSkipDbReady { .. } => "lecteur.skip_db",
         Message::PlayerFullscreenCommit(..) | Message::PlayerScreenChanged(_) => {
             "lecteur.plein_ecran"
         }
         Message::SetHideAgeUnder(_) | Message::SetHideAgeOver(_) => "reglages.age",
-        Message::AgesLoaded(_) | Message::CaptionLoaded(_) => return None,
+        Message::CaptionLoaded(_) => return None,
         Message::PlayerPanel(_) => "lecteur.panneau",
         Message::CycleSpeed | Message::SetSpeed(_) => "lecteur.vitesse",
         Message::ToggleLoop => "lecteur.boucle",
@@ -16737,6 +18212,10 @@ fn ui_action_label(message: &Message) -> Option<&'static str> {
         Message::ApiPromptSetup => "reglages.api_avec",
         Message::ApiPromptHold => "reglages.api_prompt",
         Message::ApiGuideToggle => "reglages.api_assistant",
+        Message::StartApiAssist(_) => "reglages.api_assist_start",
+        Message::ApiAssistPoll => "reglages.api_assist_poll",
+        Message::ApiAssistClipboard(_) => "reglages.api_assist_clip",
+        Message::ApiAssistDismiss => "reglages.api_assist_stop",
         Message::OpenWeb(_) => "reglages.api_lien",
         Message::SetPrefLang(_) => "reglages.langue",
         Message::ToggleOnlyPrefLang => "reglages.filtre_langue",
@@ -16872,44 +18351,61 @@ fn api_guide(ui: UiTheme, open: bool) -> Element<'static, Message> {
         return Space::new().height(0).into();
     }
     column![
-        text("Compte gratuit, environ 10 minutes. La clé reste la tienne : FluxPlay ne la partage pas.")
+        text("Sans clé : TVMaze, iTunes, Wikipedia et Wikidata enrichissent déjà le catalogue. TMDB/OMDb restent optionnels (meilleure fiche FR + âge).")
             .size(13)
             .color(ui.on_surface()),
+        text("Compte gratuit, ~10 min. La clé reste la tienne — FluxPlay ne la partage pas. Le captcha se passe dans ton navigateur (légitime), puis tu copies la clé : on la détecte automatiquement.")
+            .size(13)
+            .color(ui.ink_muted()),
+        row![
+            pill_button_primary(
+                text("Assistant TMDB (navigateur + captcha)"),
+                Message::StartApiAssist(crate::api_assist::ApiProvider::Tmdb),
+                ui,
+            ),
+            pill_button(
+                text("Assistant OMDb"),
+                Message::StartApiAssist(crate::api_assist::ApiProvider::Omdb),
+                ui,
+                false,
+            ),
+            pill_button(text("Stop auto-détection"), Message::ApiAssistDismiss, ui, false),
+        ]
+        .spacing(8)
+        .wrap(),
+        row![
+            pill_button(
+                text("Page API TMDB"),
+                Message::OpenWeb("https://www.themoviedb.org/settings/api".into()),
+                ui,
+                false,
+            ),
+            pill_button(
+                text("Page clé OMDb"),
+                Message::OpenWeb("https://www.omdbapi.com/apikey.aspx".into()),
+                ui,
+                false,
+            ),
+        ]
+        .spacing(8)
+        .wrap(),
         guide_step(
             ui,
             "1",
             "Créer le compte",
-            "Ouvre l'inscription. Un email, un mot de passe. Ouvre ensuite le mail et confirme le compte. Sans cette confirmation, la page API reste vide.",
-        ),
-        pill_button(
-            text("Ouvrir l'inscription"),
-            Message::OpenWeb("https://www.themoviedb.org/signup".into()),
-            ui,
-            false,
+            "Inscription → confirme l'email. Sans confirmation, la page API reste vide.",
         ),
         guide_step(
             ui,
             "2",
             "Demander la clé",
-            "Une fois connecté, ouvre la page API sur un ordinateur : elle n'est pas faite pour un téléphone. Clique sur demander une clé. Type : Personnel. Nom : FluxPlay. Adresse : https://www.themoviedb.org (une adresse est obligatoire, une page perso convient aussi). Résumé : lecteur personnel, fiches en français, la base n'est pas redistribuée. Accepte les conditions et envoie.",
-        ),
-        pill_button(
-            text("Ouvrir la page API"),
-            Message::OpenWeb("https://www.themoviedb.org/settings/api".into()),
-            ui,
-            false,
+            "TMDB : type Personnel, nom FluxPlay, URL https://www.themoviedb.org, résumé lecteur personnel. OMDb : formulaire email sur omdbapi.com.",
         ),
         guide_step(
             ui,
             "3",
-            "Copier le jeton de lecture",
-            "La page affiche deux secrets. Copie « API Read Access Token », le jeton d'accès en lecture. C'est la longue chaîne qui commence par eyJ. La clé courte de 32 caractères marche aussi. Ne l'envoie à personne.",
-        ),
-        guide_step(
-            ui,
-            "4",
-            "Le coller ici",
-            "Colle le jeton dans le champ juste en dessous, puis Enregistrer le jeton. Le statut passe à TMDB actif. Rouvre un film : synopsis, acteurs et âge, quand TMDB a une classification.",
+            "Copier le secret",
+            "TMDB : « API Read Access Token » (eyJ…) ou clé v3 32 caractères. OMDb : la clé reçue par mail. Copie-la — FluxPlay la détecte dans le presse-papiers.",
         ),
     ]
     .spacing(8)
@@ -17268,10 +18764,33 @@ fn map_android_back(
         Key::Named(Named::GoBack) | Key::Named(Named::BrowserBack) | Key::Named(Named::Escape) => {
             Some(Message::NavBack)
         }
-        Key::Named(Named::ArrowUp) => Some(Message::BrowseFocusDelta(-1)),
-        Key::Named(Named::ArrowDown) => Some(Message::BrowseFocusDelta(1)),
-        Key::Named(Named::ArrowLeft) => Some(Message::BrowseFocusDelta(-1)),
-        Key::Named(Named::ArrowRight) => Some(Message::BrowseFocusDelta(1)),
+        Key::Named(Named::ArrowUp) => Some(Message::BrowseFocusStep { dx: 0, dy: -1 }),
+        Key::Named(Named::ArrowDown) => Some(Message::BrowseFocusStep { dx: 0, dy: 1 }),
+        Key::Named(Named::ArrowLeft) => Some(Message::BrowseFocusStep { dx: -1, dy: 0 }),
+        Key::Named(Named::ArrowRight) => Some(Message::BrowseFocusStep { dx: 1, dy: 0 }),
+        Key::Named(Named::Enter) => Some(Message::BrowseActivate),
+        _ => None,
+    }
+}
+
+/// Desktop Television (`FLUXPLAY_FORCE_TV`) browse D-pad — no Android Back.
+#[cfg(not(target_os = "android"))]
+fn map_browse_focus_keys(
+    event: Event,
+    status: event::Status,
+    _id: window::Id,
+) -> Option<Message> {
+    if status == event::Status::Captured {
+        return None;
+    }
+    let Event::Keyboard(keyboard::Event::KeyPressed { key, .. }) = event else {
+        return None;
+    };
+    match key {
+        Key::Named(Named::ArrowUp) => Some(Message::BrowseFocusStep { dx: 0, dy: -1 }),
+        Key::Named(Named::ArrowDown) => Some(Message::BrowseFocusStep { dx: 0, dy: 1 }),
+        Key::Named(Named::ArrowLeft) => Some(Message::BrowseFocusStep { dx: -1, dy: 0 }),
+        Key::Named(Named::ArrowRight) => Some(Message::BrowseFocusStep { dx: 1, dy: 0 }),
         Key::Named(Named::Enter) => Some(Message::BrowseActivate),
         _ => None,
     }

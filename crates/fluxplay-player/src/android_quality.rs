@@ -133,12 +133,28 @@ pub struct AndroidDeviceCaps {
     pub surface_w: u32,
     #[serde(default)]
     pub surface_h: u32,
+    /// `PowerManager.getCurrentThermalStatus` (0=NONE … 6=SHUTDOWN). 0 if unknown / pre-Q.
+    #[serde(default)]
+    pub thermal_status: u8,
 }
 
 impl AndroidDeviceCaps {
     /// Name-based flagship hint (secondary to [`Self::compat_tier`]).
     pub fn is_flagship(&self) -> bool {
         self.compat_tier() >= CompatTier::High
+    }
+
+    /// Soft-path thermal demotion (PowerManager codes). Surface/MediaCodec stays preferred —
+    /// HW decode runs cooler than Soft SW; only the SoftBudget WH/Hz is cut under heat.
+    ///
+    /// - `≥2` MODERATE → Mid-like soft (≤960×540, video_hz≤30)
+    /// - `≥3` SEVERE+ → Low-like soft (≤854×480, video_hz≤24)
+    pub fn thermal_soft_ceiling(&self) -> Option<(u32, u32, u32)> {
+        match self.thermal_status {
+            0 | 1 => None,
+            2 => Some((960, 540, 30)),
+            _ => Some((854, 480, 24)),
+        }
     }
 
     pub fn compat_tier(&self) -> CompatTier {
@@ -184,6 +200,7 @@ impl AndroidDeviceCaps {
 
     /// Soft RGBA max size — **fallback only** (Surface is HQ path). Cap ≤720p by
     /// default so demotion stays smooth; `FLUXPLAY_SOFT_UHD` raises to 1080p.
+    /// Thermal status further caps WH (see [`Self::thermal_soft_ceiling`]).
     pub fn max_soft_wh(&self) -> (u32, u32) {
         let uhd = std::env::var_os("FLUXPLAY_SOFT_UHD").is_some();
         let (mut w, mut h) = match self.compat_tier() {
@@ -197,6 +214,13 @@ impl AndroidDeviceCaps {
             CompatTier::Mid => (960, 540),
             CompatTier::Low => (854, 480),
         };
+        if let Some((tw, th, _)) = self.thermal_soft_ceiling() {
+            let sx = tw as f32 / w as f32;
+            let sy = th as f32 / h as f32;
+            let s = sx.min(sy).min(1.0);
+            w = ((w as f32 * s).round() as u32).max(2);
+            h = ((h as f32 * s).round() as u32).max(2);
+        }
         // Never request soft present larger than HW can decode (when known).
         // Fit uniformly into the MediaCodec max box (don't squash aspect).
         if self.mediacodec_max_w >= 64 && self.mediacodec_max_h >= 64 {
@@ -268,25 +292,33 @@ impl AndroidDeviceCaps {
         let panel = self.refresh_hz.max(24);
         // Soft SW render + iced upload. The atlas-reuse patch (no per-frame texture
         // create + no blocking GPU wait) lets Ultra/High track 60 fps content.
-        let base = match self.compat_tier() {
+        let mut base = match self.compat_tier() {
             CompatTier::Ultra => 60,
             CompatTier::High => 60,
             CompatTier::Mid => 30,
             CompatTier::Low => 24,
         };
+        if let Some((_, _, thz)) = self.thermal_soft_ceiling() {
+            base = base.min(thz);
+        }
         base.min(panel).clamp(20, 60)
     }
 
     pub fn soft_gui_hz_cap(&self) -> u32 {
         // Chrome / mosaic can track the panel (120Hz on Pixel 8); soft video is capped separately.
-        match self.compat_tier() {
+        let mut gui = match self.compat_tier() {
             CompatTier::Ultra => 120,
             CompatTier::High => 90,
             CompatTier::Mid => 60,
             CompatTier::Low => 30,
         }
         .min(self.refresh_hz.max(30))
-        .min(120)
+        .min(120);
+        // Under heat, also ease iced chrome so SoftPump + OpenSLES keep headroom.
+        if let Some((_, _, thz)) = self.thermal_soft_ceiling() {
+            gui = gui.min(thz.saturating_mul(2).max(30));
+        }
+        gui
     }
 
     /// Unified soft budget for vf + iced present + display_caps.
@@ -486,5 +518,51 @@ mod tests {
         assert!(forced.max_h <= auto.max_h);
         assert!(forced.max_w <= auto.max_w);
         assert!(forced.max_h <= auto.max_h);
+    }
+
+    #[test]
+    fn soft_budget_thermal_severe_demotes_ultra() {
+        let cold = AndroidDeviceCaps {
+            cores: 9,
+            mediacodec_4k: true,
+            mediacodec_video: true,
+            soc: "Tensor G3".into(),
+            refresh_hz: 120,
+            thermal_status: 0,
+            ..Default::default()
+        };
+        let hot = AndroidDeviceCaps {
+            thermal_status: 3, // THERMAL_STATUS_SEVERE
+            ..cold.clone()
+        };
+        let cold_b = cold.soft_budget();
+        let hot_b = hot.soft_budget();
+        assert!(cold.compat_tier() >= CompatTier::Ultra);
+        assert_eq!(cold_b.max_w, 1280);
+        assert!(hot_b.max_w <= 854);
+        assert!(hot_b.max_h <= 480);
+        assert!(hot_b.video_hz <= 24);
+        // Surface stays preferred under heat — SoftBudget demotion only.
+        assert_eq!(
+            hot.select_present_mode(),
+            AndroidPresentMode::SurfaceEmbed
+        );
+    }
+
+    #[test]
+    fn soft_budget_thermal_moderate_caps_mid() {
+        let caps = AndroidDeviceCaps {
+            cores: 9,
+            mediacodec_4k: true,
+            mediacodec_video: true,
+            soc: "Tensor G3".into(),
+            refresh_hz: 120,
+            thermal_status: 2, // MODERATE
+            ..Default::default()
+        };
+        let b = caps.soft_budget();
+        assert!(b.max_w <= 960);
+        assert!(b.max_h <= 540);
+        assert!(b.video_hz <= 30);
     }
 }

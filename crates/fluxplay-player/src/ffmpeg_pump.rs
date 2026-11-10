@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use crate::ffmpeg_ffi::LibFfmpeg;
 use crate::video_frame::{
@@ -43,7 +43,9 @@ pub struct FfmpegPump {
 }
 
 impl FfmpegPump {
-    pub fn start(ff: Arc<LibFfmpeg>) -> Self {
+    /// `None` when the worker thread cannot start — callers must not store a
+    /// dead pump (that would black the stage forever while audio plays).
+    pub fn start(ff: Arc<LibFfmpeg>) -> Option<Self> {
         let stop = Arc::new(AtomicBool::new(false));
         let want_w = Arc::new(AtomicU32::new(1280));
         let want_h = Arc::new(AtomicU32::new(720));
@@ -146,6 +148,8 @@ impl FfmpegPump {
                     } else {
                         let w = want_w_t.load(Ordering::Relaxed);
                         let h = want_h_t.load(Ordering::Relaxed);
+                        /* RGBA is already converted by embed sws (BT2020→SDR
+                         * matrix when needed). Tags are display-SDR intentional. */
                         ff.pull_rgba(w, h).map(|(fw, fh, pixels)| VideoFrame {
                             layout: PixelLayout::Rgba,
                             width: fw,
@@ -161,17 +165,22 @@ impl FfmpegPump {
                         Some(frame) => {
                             gen = gen.wrapping_add(1);
                             produced_t.store(gen, Ordering::Release);
-                            if let Ok(mut slot) = latest_t.lock() {
-                                slot.replace(Slot { frame, gen });
-                            }
+                            let mut slot = latest_t
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner());
+                            slot.replace(Slot { frame, gen });
                         }
                         None => thread::sleep(Duration::from_millis(1)),
                     }
                 }
             })
-            .ok();
+            .map_err(|e| {
+                error!(error = %e, "ffmpeg soft pump spawn failed");
+                e
+            })
+            .ok()?;
 
-        Self {
+        Some(Self {
             stop,
             want_w,
             want_h,
@@ -179,8 +188,8 @@ impl FfmpegPump {
             recycled,
             produced,
             consumed,
-            join,
-        }
+            join: Some(join),
+        })
     }
 
     pub fn set_target(&self, w: u32, h: u32) {

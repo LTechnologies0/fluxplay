@@ -120,7 +120,8 @@ impl CatalogDb {
                 }
             }
         }
-        info!(profiles = db.conns.len(), "catalog db open (per-profile)");
+        // Open is called per browse/tab/task — keep INFO quiet; use DEBUG for hot paths.
+        debug!(profiles = db.conns.len(), "catalog db open (per-profile)");
         Some(db)
     }
 
@@ -135,6 +136,12 @@ impl CatalogDb {
         }
         let _ = std::fs::create_dir_all(crate::storage::profile_images_dir(source_id));
         let conn = Connection::open(&path)?;
+        // Catalog payloads embed Xtream `/user/pass/` stream URLs — owner-only like state.json.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+        }
         // Small page cache, no mmap of the whole file. Rows are read by query, not mapped in.
         let _ = conn.pragma_update(None, "cache_size", -2048i64);
         let _ = conn.pragma_update(None, "mmap_size", 0i64);
@@ -1022,6 +1029,7 @@ impl CatalogDb {
             rating: None,
             genre: None,
             imdb_id: None,
+            tmdb_id: None,
             actors: None,
             director: None,
             writer: None,
@@ -1061,10 +1069,28 @@ impl CatalogDb {
             return Ok(());
         };
         let sid = source_id.to_string();
-        let payload = serde_json::to_string(item).unwrap_or_default();
         let Ok(conn) = self.conn(source_id) else {
             return Ok(());
         };
+        let mut item = item.clone();
+        // Caption enrich must not blank a working play URL already on disk.
+        if item.stream_url.trim().is_empty() {
+            if let Ok(raw) = conn.query_row(
+                "SELECT payload FROM vod WHERE source_id = ?1 AND id = ?2",
+                params![sid, item.id],
+                |row| row.get::<_, String>(0),
+            ) {
+                if let Ok(old) = serde_json::from_str::<VodItem>(&raw) {
+                    if !old.stream_url.trim().is_empty() {
+                        item.stream_url = old.stream_url;
+                    }
+                    prefer_longer(&mut item.plot, old.plot);
+                    prefer_if_empty(&mut item.actors, old.actors);
+                    prefer_if_empty(&mut item.director, old.director);
+                }
+            }
+        }
+        let payload = serde_json::to_string(&item).unwrap_or_default();
         conn.execute(
             "UPDATE vod SET payload = ?1, year = ?2, genre = ?3, meta_ok = 1
              WHERE source_id = ?4 AND id = ?5",
@@ -1110,6 +1136,7 @@ impl CatalogDb {
             rating: None,
             genre: None,
             imdb_id: None,
+            tmdb_id: None,
             actors: None,
             director: None,
             writer: None,
@@ -1145,15 +1172,28 @@ impl CatalogDb {
     }
 
     /// Write full series JSON payload (credits, seasons, IMDb id, …).
+    ///
+    /// Caption / list enrich often clones a RAM row with `seasons` cleared.
+    /// Never let that wipe a previously stored episode tree.
     pub fn persist_series(&self, item: &SeriesItem) -> rusqlite::Result<()> {
         let Some(source_id) = item.source_id else {
             return Ok(());
         };
         let sid = source_id.to_string();
-        let payload = serde_json::to_string(item).unwrap_or_default();
         let Ok(conn) = self.conn(source_id) else {
             return Ok(());
         };
+        let mut item = item.clone();
+        if let Ok(raw) = conn.query_row(
+            "SELECT payload FROM series WHERE source_id = ?1 AND id = ?2",
+            params![sid, item.id],
+            |row| row.get::<_, String>(0),
+        ) {
+            if let Ok(old) = serde_json::from_str::<SeriesItem>(&raw) {
+                merge_series_keep_meta(&mut item, &old);
+            }
+        }
+        let payload = serde_json::to_string(&item).unwrap_or_default();
         conn.execute(
             "UPDATE series SET payload = ?1, year = ?2, genre = ?3, meta_ok = 1
              WHERE source_id = ?4 AND id = ?5",
@@ -2057,7 +2097,10 @@ fn merge_series_keep_meta(portal: &mut SeriesItem, old: &SeriesItem) {
     prefer_if_empty(&mut portal.imdb_id, old.imdb_id.clone());
     prefer_if_empty(&mut portal.cover, old.cover.clone());
     prefer_if_empty(&mut portal.banner, old.banner.clone());
-    if portal.seasons.is_empty() && !old.seasons.is_empty() {
+    let portal_eps: usize = portal.seasons.iter().map(|s| s.episodes.len()).sum();
+    let old_eps: usize = old.seasons.iter().map(|s| s.episodes.len()).sum();
+    // Keep the richer tree (sparse portal/alert must not wipe SQLite seasons).
+    if !old.seasons.is_empty() && (portal.seasons.is_empty() || portal_eps < old_eps) {
         portal.seasons = old.seasons.clone();
     }
 }

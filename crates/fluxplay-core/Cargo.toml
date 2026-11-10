@@ -3,6 +3,8 @@ name = "fluxplay-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+authors.workspace = true
+repository.workspace = true
 description = "Core models, playlist parsers, and protocol URL types for FluxPlay"
 
 [dependencies]
@@ -21,3 +23,5 @@ libc = "0.2"
 
 [dev-dependencies]
 proptest = { workspace = true }
+[lints]
+workspace = true

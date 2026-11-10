@@ -8,6 +8,17 @@ use crate::models::{CatchupInfo, Channel, ContentKind, PlaylistBundle};
 use crate::protocol::StreamScheme;
 use crate::Stopwatch;
 
+/// Skip absurd lines (VLC historically froze on multi-MB lines).
+const MAX_LINE_BYTES: usize = 8 * 1024;
+/// Soft cap — partial playlist better than OOM.
+const MAX_CHANNELS: usize = 100_000;
+/// Cap individual labels / attrs after scrub (amplification within an accepted line).
+const MAX_FIELD_CHARS: usize = 2 * 1024;
+/// Stream URLs may be longer than labels but still bounded by the line budget.
+const MAX_URL_CHARS: usize = 8 * 1024;
+/// HTTP header values (UA / Referer) — keep injection surface small.
+const MAX_HEADER_CHARS: usize = 512;
+
 /// Parse an M3U / M3U Plus body into a [`PlaylistBundle`].
 pub fn parse_m3u(body: &str, source_id: Option<Uuid>) -> Result<PlaylistBundle> {
     let _prof = Stopwatch::start("parse_m3u");
@@ -34,8 +45,13 @@ pub fn parse_m3u(body: &str, source_id: Option<Uuid>) -> Result<PlaylistBundle> 
     let mut catchup: Option<String> = None;
     // HD/SD variants often share one tvg-id; each still needs its own channel id.
     let mut seen_ids: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut truncated = false;
 
     for raw_line in text.lines() {
+        if raw_line.len() > MAX_LINE_BYTES {
+            warn!(len = raw_line.len(), "parse_m3u skip overlong line");
+            continue;
+        }
         let line = raw_line.trim();
         if line.is_empty() {
             continue;
@@ -44,16 +60,34 @@ pub fn parse_m3u(body: &str, source_id: Option<Uuid>) -> Result<PlaylistBundle> 
             continue;
         }
         if line.starts_with("#EXTVLCOPT:") {
+            let opt = line.trim_start_matches("#EXTVLCOPT:").trim();
+            let meta = pending_meta.get_or_insert_with(ExtInf::default);
+            apply_extvlcopt(meta, opt);
             continue;
         }
         if line.starts_with("#EXTGRP:") {
             if let Some(meta) = pending_meta.as_mut() {
-                meta.group = Some(line.trim_start_matches("#EXTGRP:").trim().to_string());
+                meta.group = Some(scrub_iptv_field(
+                    line.trim_start_matches("#EXTGRP:").trim(),
+                ));
             }
             continue;
         }
         if line.starts_with("#EXTINF:") {
-            pending_meta = Some(parse_extinf(line));
+            // EXTVLCOPT may precede EXTINF; merge so headers are not wiped.
+            let mut parsed = parse_extinf(line);
+            if let Some(prev) = pending_meta.take() {
+                if parsed.http_user_agent.is_none() {
+                    parsed.http_user_agent = prev.http_user_agent;
+                }
+                if parsed.http_referer.is_none() {
+                    parsed.http_referer = prev.http_referer;
+                }
+                if parsed.group.is_none() {
+                    parsed.group = prev.group;
+                }
+            }
+            pending_meta = Some(parsed);
             continue;
         }
         if line.starts_with('#') {
@@ -64,10 +98,15 @@ pub fn parse_m3u(body: &str, source_id: Option<Uuid>) -> Result<PlaylistBundle> 
             continue;
         }
 
-        let url = line.to_string();
-        if !looks_like_url(&url) {
+        let url = scrub_iptv_url(line);
+        if url.is_empty() || !looks_like_url(&url) {
             trace!(%url, "parse_m3u skip non-url line");
             continue;
+        }
+
+        if channels.len() >= MAX_CHANNELS {
+            truncated = true;
+            break;
         }
 
         let meta = pending_meta.take().unwrap_or_default();
@@ -92,7 +131,9 @@ pub fn parse_m3u(body: &str, source_id: Option<Uuid>) -> Result<PlaylistBundle> 
 
         channels.push(Channel {
             id,
-            name: meta.name.unwrap_or_else(|| format!("Channel {}", channels.len() + 1)),
+            name: meta
+                .name
+                .unwrap_or_else(|| format!("Channel {}", channels.len() + 1)),
             stream_url: url,
             logo: meta.tvg_logo.clone().or(meta.logo),
             group: meta.group,
@@ -104,7 +145,16 @@ pub fn parse_m3u(body: &str, source_id: Option<Uuid>) -> Result<PlaylistBundle> 
             source_id,
             kind: ContentKind::Live,
             catchup: catchup_info,
+            http_user_agent: meta.http_user_agent,
+            http_referer: meta.http_referer,
         });
+    }
+    if truncated {
+        warn!(
+            channels = channels.len(),
+            cap = MAX_CHANNELS,
+            "parse_m3u truncated at channel cap"
+        );
     }
 
     if channels.is_empty() {
@@ -129,6 +179,61 @@ struct ExtInf {
     tvg_logo: Option<String>,
     catchup: Option<CatchupInfo>,
     catchup_days: Option<u32>,
+    http_user_agent: Option<String>,
+    http_referer: Option<String>,
+}
+
+fn apply_extvlcopt(meta: &mut ExtInf, opt: &str) {
+    let opt = scrub_iptv_text(opt);
+    let (key, val) = match opt.split_once('=') {
+        Some((k, v)) => (k.trim(), v.trim().trim_matches('"')),
+        None => return,
+    };
+    if val.is_empty() {
+        return;
+    }
+    let val = scrub_iptv_header(val);
+    if val.is_empty() {
+        return;
+    }
+    if key.eq_ignore_ascii_case("http-user-agent") || key.eq_ignore_ascii_case("user-agent") {
+        meta.http_user_agent = Some(val);
+    } else if key.eq_ignore_ascii_case("http-referrer")
+        || key.eq_ignore_ascii_case("http-referer")
+        || key.eq_ignore_ascii_case("referrer")
+        || key.eq_ignore_ascii_case("referer")
+    {
+        meta.http_referer = Some(val);
+    }
+}
+
+/// Strip embedded NUL / other C0 controls that break FFI players and UI labels.
+fn scrub_iptv_text(s: &str) -> String {
+    s.chars()
+        .filter(|c| *c == '\t' || !c.is_control())
+        .collect()
+}
+
+fn truncate_chars(s: String, max: usize) -> String {
+    if s.chars().count() <= max {
+        s
+    } else {
+        s.chars().take(max).collect()
+    }
+}
+
+fn scrub_iptv_field(s: &str) -> String {
+    truncate_chars(scrub_iptv_text(s), MAX_FIELD_CHARS)
+}
+
+fn scrub_iptv_url(s: &str) -> String {
+    truncate_chars(scrub_iptv_text(s), MAX_URL_CHARS)
+}
+
+fn scrub_iptv_header(s: &str) -> String {
+    // Drop anything after embedded CR/LF so values cannot smuggle extra headers.
+    let cut = s.split(['\r', '\n']).next().unwrap_or(s);
+    truncate_chars(scrub_iptv_text(cut), MAX_HEADER_CHARS)
 }
 
 fn parse_extinf(line: &str) -> ExtInf {
@@ -151,25 +256,53 @@ fn parse_extinf(line: &str) -> ExtInf {
         None => (after, ""),
     };
     if !name_part.is_empty() {
-        meta.name = Some(name_part.to_string());
+        meta.name = Some(scrub_iptv_field(name_part));
     }
     let mut catchup_mode: Option<String> = None;
     let mut catchup_source: Option<String> = None;
     for_each_quoted_attr(attrs_part, |key, val| {
-        let val = val.trim();
-        if val.is_empty() {
+        let raw = val.trim();
+        if raw.is_empty() {
             return;
         }
         match key {
-            k if k.eq_ignore_ascii_case("tvg-id") => meta.tvg_id = Some(val.to_string()),
-            k if k.eq_ignore_ascii_case("tvg-name") => meta.tvg_name = Some(val.to_string()),
-            k if k.eq_ignore_ascii_case("tvg-logo") => meta.tvg_logo = Some(val.to_string()),
-            k if k.eq_ignore_ascii_case("group-title") => meta.group = Some(val.to_string()),
-            k if k.eq_ignore_ascii_case("logo") => meta.logo = Some(val.to_string()),
-            k if k.eq_ignore_ascii_case("catchup") => catchup_mode = Some(val.to_string()),
-            k if k.eq_ignore_ascii_case("catchup-source") => catchup_source = Some(val.to_string()),
+            k if k.eq_ignore_ascii_case("tvg-id") => meta.tvg_id = Some(scrub_iptv_field(raw)),
+            k if k.eq_ignore_ascii_case("tvg-name") => {
+                meta.tvg_name = Some(scrub_iptv_field(raw))
+            }
+            k if k.eq_ignore_ascii_case("tvg-logo") => {
+                meta.tvg_logo = Some(scrub_iptv_url(raw))
+            }
+            k if k.eq_ignore_ascii_case("group-title") => {
+                meta.group = Some(scrub_iptv_field(raw))
+            }
+            k if k.eq_ignore_ascii_case("logo") => meta.logo = Some(scrub_iptv_url(raw)),
+            k if k.eq_ignore_ascii_case("catchup") => {
+                catchup_mode = Some(scrub_iptv_field(raw))
+            }
+            k if k.eq_ignore_ascii_case("catchup-source") => {
+                catchup_source = Some(scrub_iptv_url(raw))
+            }
             k if k.eq_ignore_ascii_case("catchup-days") || k.eq_ignore_ascii_case("timeshift") => {
-                meta.catchup_days = val.parse().ok()
+                meta.catchup_days = scrub_iptv_field(raw).parse().ok()
+            }
+            k if k.eq_ignore_ascii_case("user-agent")
+                || k.eq_ignore_ascii_case("http-user-agent") =>
+            {
+                let h = scrub_iptv_header(raw);
+                if !h.is_empty() {
+                    meta.http_user_agent = Some(h);
+                }
+            }
+            k if k.eq_ignore_ascii_case("referrer")
+                || k.eq_ignore_ascii_case("referer")
+                || k.eq_ignore_ascii_case("http-referrer")
+                || k.eq_ignore_ascii_case("http-referer") =>
+            {
+                let h = scrub_iptv_header(raw);
+                if !h.is_empty() {
+                    meta.http_referer = Some(h);
+                }
             }
             _ => {}
         }
@@ -239,26 +372,35 @@ fn looks_like_url(s: &str) -> bool {
 
 fn parse_bare_urls(text: &str, source_id: Option<Uuid>) -> PlaylistBundle {
     let mut channels = Vec::new();
-    for line in text.lines() {
-        let url = line.trim();
-        if !looks_like_url(url) {
+    for raw_line in text.lines() {
+        if raw_line.len() > MAX_LINE_BYTES {
+            warn!(len = raw_line.len(), "parse_m3u bare skip overlong line");
+            continue;
+        }
+        let url = scrub_iptv_url(raw_line.trim());
+        if url.is_empty() || !looks_like_url(&url) {
             continue;
         }
         let n = channels.len() + 1;
+        if channels.len() >= MAX_CHANNELS {
+            break;
+        }
         channels.push(Channel {
             id: format!("ch-{n}"),
             name: format!("Stream {n}"),
-            stream_url: url.to_string(),
+            stream_url: url.clone(),
             logo: None,
             group: None,
             tvg_id: None,
             tvg_name: None,
             tvg_logo: None,
             epg_channel_id: None,
-            scheme: Some(StreamScheme::parse(url)),
+            scheme: Some(StreamScheme::parse(&url)),
             source_id,
             kind: ContentKind::Live,
             catchup: None,
+            http_user_agent: None,
+            http_referer: None,
         });
     }
     PlaylistBundle {
@@ -288,6 +430,17 @@ http://cdn.example.com/bein.ts
     }
 
     #[test]
+    fn strips_embedded_nul_from_url_and_attrs() {
+        let body = "#EXTM3U\n#EXTINF:-1 group-title=\"News\\0FR\",Chan\0nel\nhttp://ex.test/li\\0ve.ts\n"
+            .replace("\\0", "\0");
+        let ch = parse_m3u(&body, None).unwrap().channels;
+        assert_eq!(ch.len(), 1);
+        assert!(!ch[0].stream_url.contains('\0'));
+        assert!(!ch[0].name.contains('\0'));
+        assert_eq!(ch[0].group.as_deref(), Some("NewsFR"));
+    }
+
+    #[test]
     fn titles_with_commas_and_shared_or_empty_ids() {
         let body = r#"#EXTM3U
 #EXTINF:-1 tvg-id="tf1.fr" group-title="News, FR",Movie, The
@@ -305,6 +458,60 @@ http://cdn.example/3.ts
         assert_eq!(ch[1].epg_channel_id.as_deref(), Some("tf1.fr"));
         assert_eq!(ch[2].tvg_id, None);
         assert_eq!(ch[2].id, "ch-3");
+    }
+
+    #[test]
+    fn extvlcopt_sets_http_user_agent_and_referer() {
+        let body = r#"#EXTM3U
+#EXTINF:-1 tvg-id="gated",Gated
+#EXTVLCOPT:http-user-agent=VLC/3.0
+#EXTVLCOPT:http-referrer=https://portal.example/
+https://cdn.example/gated.ts
+#EXTINF:-1 user-agent="AttrUA" http-referer="https://attr.example/",AttrHdr
+http://cdn.example/attr.ts
+"#;
+        let ch = parse_m3u(body, None).unwrap().channels;
+        assert_eq!(ch.len(), 2);
+        assert_eq!(ch[0].http_user_agent.as_deref(), Some("VLC/3.0"));
+        assert_eq!(
+            ch[0].http_referer.as_deref(),
+            Some("https://portal.example/")
+        );
+        assert_eq!(ch[1].http_user_agent.as_deref(), Some("AttrUA"));
+        assert_eq!(
+            ch[1].http_referer.as_deref(),
+            Some("https://attr.example/")
+        );
+    }
+
+    #[test]
+    fn extvlcopt_before_extinf_and_strips_header_controls() {
+        // EXTVLCOPT before EXTINF must merge; CR/LF must not survive (header injection).
+        let body = format!(
+            "#EXTM3U\n#EXTVLCOPT:user-agent=Safe{cr}Tail\n#EXTINF:-1,Ch\nhttp://ex.test/a.ts\n",
+            cr = "\r"
+        );
+        let ch = parse_m3u(&body, None).unwrap().channels;
+        assert_eq!(ch.len(), 1);
+        let ua = ch[0]
+            .http_user_agent
+            .as_deref()
+            .expect("UA from EXTVLCOPT before EXTINF");
+        assert!(!ua.contains('\r') && !ua.contains('\n'));
+        assert_eq!(ua, "SafeTail");
+    }
+
+    #[test]
+    fn skips_overlong_lines_and_truncates_fields() {
+        let long_name: String = "N".repeat(MAX_FIELD_CHARS + 64);
+        let long_line = format!("#{}", "X".repeat(MAX_LINE_BYTES + 8));
+        let body = format!(
+            "#EXTM3U\n{long_line}\n#EXTINF:-1 group-title=\"{long_name}\",{long_name}\nhttp://cdn.example/ok.ts\n"
+        );
+        let ch = parse_m3u(&body, None).unwrap().channels;
+        assert_eq!(ch.len(), 1);
+        assert_eq!(ch[0].name.chars().count(), MAX_FIELD_CHARS);
+        assert_eq!(ch[0].group.as_ref().unwrap().chars().count(), MAX_FIELD_CHARS);
     }
 
     proptest! {

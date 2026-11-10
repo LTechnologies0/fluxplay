@@ -38,8 +38,11 @@ int flux_ffmpeg_frame_size(FluxFfmpegPlayer *p, int *w, int *h);
 /* Hint decode thread to scale toward this size (next frames). */
 void flux_ffmpeg_set_output_size(FluxFfmpegPlayer *p, int w, int h);
 
-/* Monitor refresh. Decode thread drops frames above this; the UI does not block. */
+/* Soft present ceiling (clamped 24–60). present_thread uses this with content_fps. */
 void flux_ffmpeg_set_present_hz(FluxFfmpegPlayer *p, int hz);
+
+/* Container/stream fps once known (≥20), else 0. */
+double flux_ffmpeg_content_fps(FluxFfmpegPlayer *p);
 
 int flux_ffmpeg_is_alive(FluxFfmpegPlayer *p);
 int flux_ffmpeg_has_frame(FluxFfmpegPlayer *p);

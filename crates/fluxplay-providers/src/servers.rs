@@ -8,7 +8,7 @@
 //!
 //! A source without mirrors never probes and never rewrites anything.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -187,7 +187,18 @@ async fn rank_xtream(source: &MediaSource) -> Ranking {
                 ranking.up.push(route);
             }
             Err(e) => {
-                warn!(server = %api_base, error = %e, "server probe failed");
+                // Dead mirrors / WAF RST: warn once per host per process (rank can re-run).
+                static SEEN: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+                let first = SEEN
+                    .get_or_init(|| Mutex::new(HashSet::new()))
+                    .lock()
+                    .map(|mut g| g.insert(api_base.clone()))
+                    .unwrap_or(true);
+                if first {
+                    warn!(server = %api_base, error = %e, "server probe failed");
+                } else {
+                    tracing::debug!(server = %api_base, error = %e, "server probe failed (repeat)");
+                }
                 ranking.down.push(route);
             }
         }

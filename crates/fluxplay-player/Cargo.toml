@@ -3,6 +3,8 @@ name = "fluxplay-player"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+authors.workspace = true
+repository.workspace = true
 description = "Protocol router and stream session manager for FluxPlay"
 
 [features]
@@ -17,6 +19,8 @@ static-link = ["native-mpv"]
 bundle-rpath = ["native-mpv"]
 # Keep spawning system `mpv`/`ffplay` as fallback (emergency only when native FFmpeg missing).
 cli-player = []
+# Expose pure parse/route helpers for cargo-fuzz (no native decode required).
+fuzzing = []
 
 [dependencies]
 fluxplay-core.workspace = true
@@ -29,10 +33,13 @@ tokio.workspace = true
 reqwest = { workspace = true, features = ["blocking"] }
 tracing.workspace = true
 chrono.workspace = true
-open.workspace = true
 
 [dev-dependencies]
 tracing-subscriber.workspace = true
+proptest = { workspace = true }
 
 [build-dependencies]
 cc = "1"
+
+[lints]
+workspace = true

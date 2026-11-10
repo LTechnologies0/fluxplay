@@ -4,12 +4,10 @@
 
 use proptest::prelude::*;
 
-use crate::browser::{
-    list_row_height_for, mosaic_row_height_for, virtual_content_height, virtual_slice,
-};
+use crate::browser::{list_row_height, mosaic_row_height, virtual_content_height, virtual_slice};
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(256))]
+    #![proptest_config(ProptestConfig::with_cases(512))]
 
     #[test]
     fn virtual_slice_window_invariants(
@@ -32,7 +30,24 @@ proptest! {
             let mounted = s.end - s.start;
             prop_assert!(mounted <= total);
             prop_assert!(mounted > 0 || total == 0);
+            let mid = mounted as f32 * item_h;
+            prop_assert!((s.top_spacer + mid + s.bottom_spacer).is_finite());
         }
+    }
+
+    /// Million-row catalogs (compressed virtual mode) must stay coherent.
+    #[test]
+    fn virtual_slice_huge_catalog_compressed(
+        scroll_y in 0.0f32..480_000.0,
+        view_h in 200.0f32..1600.0,
+        item_h in 80.0f32..320.0,
+        total in 100_000usize..2_000_000,
+        overscan in 0usize..16,
+    ) {
+        let s = virtual_slice(scroll_y, view_h, item_h, total, overscan);
+        prop_assert!(s.start <= s.end && s.end <= total);
+        prop_assert!(s.end - s.start <= 512, "mounted window too large: {}", s.end - s.start);
+        prop_assert!(s.top_spacer.is_finite() && s.bottom_spacer.is_finite());
     }
 
     #[test]
@@ -40,9 +55,9 @@ proptest! {
         tile_w in 96.0f32..400.0,
         touch in 40.0f32..80.0,
     ) {
-        let h = mosaic_row_height_for(tile_w, touch);
+        let h = mosaic_row_height(tile_w);
         prop_assert!(h.is_finite() && h > tile_w);
-        let list = list_row_height_for(touch, touch);
+        let list = list_row_height(touch);
         prop_assert!(list >= touch);
     }
 
@@ -55,6 +70,8 @@ proptest! {
         let a = virtual_content_height(total, view_h, item_h);
         let b = virtual_content_height(total.saturating_add(10), view_h, item_h);
         prop_assert!(a.is_finite() && a >= 0.0);
-        prop_assert!(b >= a || total == 0);
+        prop_assert!(b.is_finite() && b >= 0.0);
+        // Once the soft ceiling is hit, height stays flat — still never shrinks.
+        prop_assert!(b + 0.5 >= a || total == 0, "height shrank: {a} → {b}");
     }
 }

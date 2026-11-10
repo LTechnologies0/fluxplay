@@ -19,7 +19,7 @@ impl std::fmt::Debug for XtreamCredentials {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("XtreamCredentials")
             .field("base", &self.base)
-            .field("username", &self.username)
+            .field("username", &"***")
             .field("password", &"***")
             .finish()
     }
@@ -54,13 +54,64 @@ pub fn parse_xtream_get_php(endpoint: &str) -> Option<XtreamCredentials> {
         username,
         password,
     };
-    // Never log password — only base + username.
-    debug!(
-        base = %creds.base,
-        user = %creds.username,
-        "parsed get.php Xtream credentials"
-    );
+    // Never log username/password — portal base only.
+    debug!(base = %creds.base, "parsed get.php Xtream credentials");
     Some(creds)
+}
+
+/// Scrub embedded Xtream path credentials (`/live|movie|series/{user}/{pass}/…`).
+pub fn redact_media_url(url: &str) -> String {
+    let Ok(mut u) = Url::parse(url) else {
+        return crate::redact_urls(url);
+    };
+    let _ = u.set_username("");
+    let _ = u.set_password(None);
+    let segs: Vec<String> = u
+        .path_segments()
+        .map(|s| s.map(str::to_string).collect())
+        .unwrap_or_default();
+    if segs.len() >= 4 {
+        let kind = segs[0].to_ascii_lowercase();
+        if matches!(kind.as_str(), "live" | "movie" | "series") {
+            let mut rebuilt = u.clone();
+            rebuilt.set_query(None);
+            rebuilt.set_fragment(None);
+            if let Ok(mut path) = rebuilt.path_segments_mut() {
+                path.clear();
+                path.push(&segs[0]);
+                path.push("***");
+                path.push("***");
+                for rest in &segs[3..] {
+                    path.push(rest);
+                }
+            }
+            return rebuilt.to_string();
+        }
+    }
+    // Query-style creds (get.php / player_api).
+    let pairs: Vec<(String, String)> = u
+        .query_pairs()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+    if !pairs.is_empty() {
+        u.set_query(None);
+        {
+            let mut q = u.query_pairs_mut();
+            for (k, v) in pairs {
+                if k.eq_ignore_ascii_case("password")
+                    || k.eq_ignore_ascii_case("pass")
+                    || k.eq_ignore_ascii_case("token")
+                    || k.eq_ignore_ascii_case("username")
+                    || k.eq_ignore_ascii_case("user")
+                {
+                    q.append_pair(&k, "***");
+                } else {
+                    q.append_pair(&k, &v);
+                }
+            }
+        }
+    }
+    u.to_string()
 }
 
 /// Keep `/c` / `/iptv` path prefixes; strip trailing `get.php` / `player_api.php`.
@@ -170,5 +221,27 @@ mod tests {
         let portal = Url::parse(&c.base).unwrap();
         let api = join_portal_script(&portal, "player_api.php");
         assert_eq!(api.path(), "/c/player_api.php");
+    }
+
+    #[test]
+    fn redact_media_url_scrubs_path_creds() {
+        let raw = "http://cdn.example/live/alice/s3cret/42.m3u8";
+        let out = redact_media_url(raw);
+        assert!(out.contains("/live/***/***/42.m3u8"), "{out}");
+        assert!(!out.contains("alice"));
+        assert!(!out.contains("s3cret"));
+    }
+
+    #[test]
+    fn credentials_debug_hides_username() {
+        let c = XtreamCredentials {
+            base: "http://panel.example".into(),
+            username: "alice".into(),
+            password: "s3cret".into(),
+        };
+        let dbg = format!("{c:?}");
+        assert!(!dbg.contains("alice"));
+        assert!(!dbg.contains("s3cret"));
+        assert!(dbg.contains("***"));
     }
 }

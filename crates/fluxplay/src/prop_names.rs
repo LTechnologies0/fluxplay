@@ -9,7 +9,7 @@ use crate::names::{
 };
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(128))]
+    #![proptest_config(ProptestConfig::with_cases(384))]
 
     /// Parsers must never panic and must return owned UTF-8 strings.
     #[test]

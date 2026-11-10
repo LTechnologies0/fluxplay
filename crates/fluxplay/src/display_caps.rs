@@ -30,7 +30,8 @@ const DEFAULT_HZ: u32 = 60;
 const MIN_HZ: u32 = 24;
 const MAX_HZ: u32 = 240;
 /// Soft-present never needs to exceed this even on 360 Hz panels.
-const SOFT_PRESENT_MAX: u32 = 240;
+/// Matches `app.soft_present_hz` / `NativePlayer::set_present_hz` (AO-safe ≤60).
+const SOFT_PRESENT_MAX: u32 = 60;
 const GUI_CAP_MAX: u32 = 240;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -151,9 +152,18 @@ impl DisplayCaps {
     }
 }
 
+/// Tick period for a refresh rate (GUI / panel polls).
+/// Soft present must use [`soft_period_ms`] — AO-safe ≤60 with a 16 ms floor.
 pub fn period_ms(hz: u32) -> u64 {
     let hz = hz.max(1);
     ((1000.0 / f64::from(hz)).round() as u64).clamp(8, 1000)
+}
+
+/// Soft-present iced tick period. Clamps Hz to [`SOFT_PRESENT_MAX`] and never
+/// schedules faster than 16 ms (an 8 ms floor raced the audio clock when callers
+/// passed raw panel Hz by mistake).
+pub fn soft_period_ms(hz: u32) -> u64 {
+    period_ms(hz.min(SOFT_PRESENT_MAX)).max(16)
 }
 
 /// Probe once at process start for warm cache; full resolve still re-reads prefs.
@@ -347,22 +357,16 @@ fn resolve_pref(pref: FpsCapPref, env: Option<u32>, auto_hz: u32) -> u32 {
 fn soft_video_budget(tier: GpuTier, stage_wh: Option<(u32, u32)>, on_battery: bool) -> u32 {
     let (w, h) = stage_wh.unwrap_or((1280, 720));
     let pixels = w.saturating_mul(h);
+    // Soft present is AO-safe ≤60 (`SOFT_PRESENT_MAX` / `set_present_hz`) — never
+    // advertise 90/120 here; that lied in settings while iced still clamped.
     let mut base = match tier {
-        GpuTier::Discrete => 120,
-        GpuTier::Integrated => {
-            if cfg!(target_os = "android") {
-                // Flagship MediaCodec-copy soft present targets 60fps @ ≤1080p.
-                60
-            } else {
-                60
-            }
-        }
-        // Android probe has no lspci — Unknown must not claim 90Hz soft RGBA.
+        GpuTier::Discrete | GpuTier::Integrated => 60,
+        // Android probe has no lspci — Unknown must not claim high soft RGBA.
         GpuTier::Unknown => {
             if cfg!(target_os = "android") {
                 48
             } else {
-                90
+                60
             }
         }
     };
@@ -370,7 +374,6 @@ fn soft_video_budget(tier: GpuTier, stage_wh: Option<(u32, u32)>, on_battery: bo
         base = base.min(60);
     }
     // Soft RGBA upload is heavy — step caps, avoid cliff that flaps with ±1px resize.
-    // Discrete can sustain 1080p @ 60–120; UHD stays conservative unless FLUXPLAY_SOFT_UHD.
     if std::env::var_os("FLUXPLAY_SOFT_UHD").is_some() {
         base.min(60)
     } else if pixels > 2560 * 1440 {
@@ -383,11 +386,7 @@ fn soft_video_budget(tier: GpuTier, stage_wh: Option<(u32, u32)>, on_battery: bo
             45
         })
     } else if pixels > 1280 * 720 {
-        base.min(if matches!(tier, GpuTier::Discrete) {
-            120
-        } else {
-            60
-        })
+        base.min(60)
     } else {
         base
     }
@@ -398,6 +397,17 @@ fn env_u32(key: &str) -> Option<u32> {
 }
 
 fn probe_hardware() -> DisplayProbe {
+    // apply_gpu_topology_opts / ticks call resolve_caps without a cache — memoize the probe.
+    static CACHE: OnceLock<DisplayProbe> = OnceLock::new();
+    if let Some(p) = CACHE.get() {
+        return p.clone();
+    }
+    let probed = probe_hardware_uncached();
+    let _ = CACHE.set(probed.clone());
+    probed
+}
+
+fn probe_hardware_uncached() -> DisplayProbe {
     static WARNED: OnceLock<()> = OnceLock::new();
     let topo = probe_gpu_topology();
     let gpu_name = topo.display.name.clone();
@@ -550,10 +560,28 @@ fn probe_on_battery() -> bool {
         }
         false
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    {
+        // `pmset -g batt` prints "Now drawing from 'Battery Power'" vs 'AC Power'.
+        let out = run_cmd("pmset", &["-g", "batt"]);
+        parse_macos_on_battery(&out)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         false
     }
+}
+
+/// Parse `pmset -g batt` for discharging / battery-power draw.
+#[cfg(any(target_os = "macos", all(test, not(target_os = "android"))))]
+fn parse_macos_on_battery(out: &str) -> bool {
+    let lower = out.to_ascii_lowercase();
+    if lower.contains("drawing from 'ac power'") || lower.contains("drawing from \"ac power\"") {
+        return false;
+    }
+    lower.contains("drawing from 'battery power'")
+        || lower.contains("drawing from \"battery power\"")
+        || (lower.contains("discharging") && !lower.contains("charging"))
 }
 
 fn probe_monitor() -> Option<(String, u32, u32, u32, &'static str)> {
@@ -587,16 +615,36 @@ fn probe_monitor() -> Option<(String, u32, u32, u32, &'static str)> {
             .unwrap_or_else(|| "Écran principal".into());
         return Some((name, hz.clamp(MIN_HZ, MAX_HZ), w, h, "win32"));
     }
-    #[cfg(all(not(target_os = "android"), not(windows)))]
+    #[cfg(target_os = "macos")]
     {
-        if let Some(v) = parse_xrandr(&run_cmd("xrandr", &[])) {
-            return Some((v.0, v.1, v.2, v.3, "xrandr"));
+        if let Some(v) = probe_macos_display() {
+            return Some((v.0, v.1, v.2, v.3, "macos"));
         }
-        if let Some(v) = parse_wlr_randr(&run_cmd("wlr-randr", &[])) {
-            return Some((v.0, v.1, v.2, v.3, "wlr-randr"));
-        }
-        if let Some(v) = probe_drm_sysfs() {
-            return Some((v.0, v.1, v.2, v.3, "drm"));
+        None
+    }
+    #[cfg(all(target_os = "linux", not(target_os = "android")))]
+    {
+        // Wayland: prefer wlr-randr / DRM active `mode`. xrandr via XWayland often
+        // reports a stale `*` mode and lies about panel Hz (NativeGpu resample).
+        let wayland = std::env::var_os("WAYLAND_DISPLAY")
+            .is_some_and(|v| !v.is_empty());
+        if wayland {
+            if let Some(v) = parse_wlr_randr(&run_cmd("wlr-randr", &[])) {
+                return Some((v.0, v.1, v.2, v.3, "wlr-randr"));
+            }
+            if let Some(v) = probe_drm_sysfs() {
+                return Some((v.0, v.1, v.2, v.3, "drm"));
+            }
+            if let Some(v) = parse_xrandr(&run_cmd("xrandr", &[])) {
+                return Some((v.0, v.1, v.2, v.3, "xrandr"));
+            }
+        } else {
+            if let Some(v) = parse_xrandr(&run_cmd("xrandr", &[])) {
+                return Some((v.0, v.1, v.2, v.3, "xrandr"));
+            }
+            if let Some(v) = probe_drm_sysfs() {
+                return Some((v.0, v.1, v.2, v.3, "drm"));
+            }
         }
         None
     }
@@ -623,7 +671,10 @@ fn parse_mode_wh(mode: &str) -> (u32, u32) {
     let Some((w, h)) = mode.split_once('x') else {
         return (0, 0);
     };
+    // macOS `system_profiler` uses "3024 x 1964 Retina" (spaces around x).
+    let w = w.trim().chars().take_while(|c| c.is_ascii_digit()).collect::<String>();
     let h = h
+        .trim()
         .chars()
         .take_while(|c| c.is_ascii_digit())
         .collect::<String>();
@@ -732,19 +783,40 @@ fn probe_drm_sysfs() -> Option<(String, u32, u32, u32)> {
         if !status.trim().eq_ignore_ascii_case("connected") {
             continue;
         }
-        let modes = std::fs::read_to_string(path.join("modes")).unwrap_or_default();
-        let (hz, w, h) = modes
-            .lines()
-            .find_map(|line| {
-                let hz = parse_drm_mode_hz(line).unwrap_or(DEFAULT_HZ);
-                let (w, h) = parse_mode_wh(line.split('@').next().unwrap_or(line));
-                if w > 0 {
-                    Some((hz, w, h))
-                } else {
-                    None
+        // Prefer the active CRTC mode (`mode`) over the first listed available mode.
+        let mut hz = DEFAULT_HZ;
+        let mut w = 0u32;
+        let mut h = 0u32;
+        if let Ok(cur) = std::fs::read_to_string(path.join("mode")) {
+            let cur = cur.trim();
+            if !cur.is_empty() {
+                let (cw, ch) = parse_mode_wh(cur.split('@').next().unwrap_or(cur));
+                if cw > 0 {
+                    w = cw;
+                    h = ch;
+                    hz = parse_drm_mode_hz(cur).unwrap_or(DEFAULT_HZ);
                 }
-            })
-            .unwrap_or((DEFAULT_HZ, 0, 0));
+            }
+        }
+        let modes = std::fs::read_to_string(path.join("modes")).unwrap_or_default();
+        if w == 0 {
+            if let Some((bh, mw, mh)) = pick_drm_modes_fallback(&modes) {
+                hz = bh;
+                w = mw;
+                h = mh;
+            }
+        } else if hz == DEFAULT_HZ {
+            // Active mode often lacks @Hz — match WxH in `modes` for refresh.
+            for line in modes.lines() {
+                let (mw, mh) = parse_mode_wh(line.split('@').next().unwrap_or(line));
+                if mw == w && mh == h {
+                    if let Some(hertz) = parse_drm_mode_hz(line) {
+                        hz = hertz;
+                        break;
+                    }
+                }
+            }
+        }
         let nice = name
             .trim_start_matches("card0-")
             .trim_start_matches("card1-")
@@ -754,6 +826,69 @@ fn probe_drm_sysfs() -> Option<(String, u32, u32, u32)> {
     }
     connected.sort_by(|a, b| rank_connector(&a.0).cmp(&rank_connector(&b.0)));
     connected.into_iter().next()
+}
+
+/// macOS: `system_profiler SPDisplaysDataType` for panel Hz / resolution.
+#[cfg(target_os = "macos")]
+fn probe_macos_display() -> Option<(String, u32, u32, u32)> {
+    let out = run_cmd("system_profiler", &["SPDisplaysDataType", "-detailLevel", "mini"]);
+    parse_macos_system_profiler(&out)
+}
+
+#[cfg(any(target_os = "macos", all(test, not(target_os = "android"))))]
+fn parse_macos_system_profiler(out: &str) -> Option<(String, u32, u32, u32)> {
+    let mut name = String::from("Display");
+    let mut hz = DEFAULT_HZ;
+    let mut w = 0u32;
+    let mut h = 0u32;
+    for line in out.lines() {
+        let t = line.trim();
+        if let Some(rest) = t.strip_prefix("Resolution:") {
+            // "3024 x 1964 Retina" or "1920 x 1080 @ 60 Hz"
+            let (mw, mh) = parse_mode_wh(rest.trim());
+            if mw > 0 {
+                w = mw;
+                h = mh;
+            }
+            if let Some(at) = rest.find('@') {
+                if let Some(hertz) = parse_drm_mode_hz(&rest[at..]) {
+                    hz = hertz;
+                }
+            }
+        }
+        if let Some(rest) = t.strip_prefix("UI Looks like:") {
+            let (mw, mh) = parse_mode_wh(rest.trim());
+            if mw > 0 {
+                w = mw;
+                h = mh;
+            }
+        }
+        if t.starts_with("Main Display:") && t.contains("Yes") {
+            // keep current name
+        } else if !t.contains(':') && !t.is_empty() && !t.starts_with("Graphics") {
+            // Display product lines are often bare names under the GPU block.
+            if t.len() > 2 && t.len() < 64 && !t.starts_with("Chipset") {
+                name = t.to_string();
+            }
+        }
+        // ProMotion is adaptive (often 10–120). Never invent 120 when profiler
+        // only says "Supported" — keep parsed Hz (usually 60) until an explicit
+        // "N Hz" / "Maximum Refresh Rate" token appears below.
+        if let Some(idx) = t.find(" Hz") {
+            let before = &t[..idx];
+            if let Some(tok) = before.split_whitespace().last() {
+                if let Ok(f) = tok.parse::<f64>() {
+                    if (20.0..=360.0).contains(&f) {
+                        hz = f.round() as u32;
+                    }
+                }
+            }
+        }
+    }
+    if w == 0 && hz == DEFAULT_HZ && name == "Display" {
+        return None;
+    }
+    Some((name, hz.clamp(MIN_HZ, MAX_HZ), w, h))
 }
 
 #[cfg(not(target_os = "android"))]
@@ -786,6 +921,42 @@ fn parse_drm_mode_hz(line: &str) -> Option<u32> {
     None
 }
 
+/// When DRM sysfs `mode` is empty, pick a honest fallback from `modes`.
+/// Never advertise the max listed Hz (144 listed while the session is 60).
+/// Prefer marked preferred (`+`/`*`), else first ≤60, else first clamped to DEFAULT.
+#[cfg(not(target_os = "android"))]
+fn pick_drm_modes_fallback(modes: &str) -> Option<(u32, u32, u32)> {
+    let mut preferred: Option<(u32, u32, u32)> = None;
+    let mut first_ok: Option<(u32, u32, u32)> = None;
+    let mut first_any: Option<(u32, u32, u32)> = None;
+    for line in modes.lines() {
+        let line_hz = parse_drm_mode_hz(line).unwrap_or(DEFAULT_HZ);
+        let (mw, mh) = parse_mode_wh(line.split('@').next().unwrap_or(line));
+        if mw == 0 {
+            continue;
+        }
+        let marked = line.contains('+') || line.contains('*');
+        if marked && preferred.is_none() {
+            preferred = Some((line_hz, mw, mh));
+        }
+        if line_hz <= 60 && first_ok.is_none() {
+            first_ok = Some((line_hz, mw, mh));
+        }
+        if first_any.is_none() {
+            first_any = Some((line_hz.min(DEFAULT_HZ), mw, mh));
+        }
+    }
+    let used_preferred = preferred.is_some();
+    preferred.or(first_ok).or(first_any).map(|(bh, mw, mh)| {
+        let hz = if used_preferred {
+            bh
+        } else {
+            bh.min(DEFAULT_HZ).max(24)
+        };
+        (hz, mw, mh)
+    })
+}
+
 fn probe_gpu_topology() -> GpuTopology {
     #[cfg(target_os = "android")]
     {
@@ -805,8 +976,12 @@ fn probe_gpu_topology() -> GpuTopology {
     }
     #[cfg(windows)]
     {
-        // `adapters()` lists the adapter driving the primary display first: use it
-        // as display + decode GPU instead of the Linux "iGPU drives the panel" guess.
+        // `adapters()` lists the adapter driving the primary display first.
+        // Hybrid laptops often expose a discrete second adapter — NativeGpu
+        // zero-copy across adapters blacks; force copy when tiers diverge.
+        // `render_node` carries the full DXGI/GDI description for mpv
+        // `--d3d11-adapter=` (prefix match). UI `name` may be truncated; never
+        // pin the ellipsis-truncated form (would fail soft_set / no-op CycleGpu).
         let devices: Vec<GpuDevice> = win_display::adapters()
             .into_iter()
             .map(|a| {
@@ -814,21 +989,63 @@ fn probe_gpu_topology() -> GpuTopology {
                 GpuDevice {
                     name: truncate_gpu_name(&a.name),
                     tier,
-                    render_node: None,
+                    render_node: Some(a.name),
                 }
             })
             .collect();
         let Some(display) = devices.first().cloned() else {
             return GpuTopology::single("GPU", GpuTier::Unknown);
         };
+        let hybrid = devices.len() > 1
+            && devices.iter().any(|d| d.tier == GpuTier::Discrete)
+            && devices.iter().any(|d| d.tier == GpuTier::Integrated);
+        let decode = if hybrid {
+            devices
+                .iter()
+                .find(|d| d.tier == GpuTier::Discrete)
+                .cloned()
+                .unwrap_or_else(|| display.clone())
+        } else {
+            display.clone()
+        };
+        let policy = if hybrid && decode.name != display.name {
+            crate::gpu_topology::GpuDecodePolicy::StrongDecodeCopy
+        } else {
+            crate::gpu_topology::GpuDecodePolicy::SameAsDisplay
+        };
         return GpuTopology {
             devices,
-            decode: display.clone(),
+            decode,
             display,
-            policy: crate::gpu_topology::GpuDecodePolicy::SameAsDisplay,
+            policy,
         };
     }
-    #[cfg(all(not(target_os = "android"), not(windows)))]
+    #[cfg(target_os = "macos")]
+    {
+        // lspci is absent on Darwin — classify Apple Silicon / Metal GPU as Integrated.
+        let out = run_cmd("system_profiler", &["SPDisplaysDataType", "-detailLevel", "mini"]);
+        let lower = out.to_ascii_lowercase();
+        let name = if lower.contains("apple m") || lower.contains("apple gpu") {
+            "Apple GPU".to_string()
+        } else if let Some(line) = out.lines().find(|l| {
+            let t = l.trim();
+            t.starts_with("Chipset Model:")
+        }) {
+            truncate_gpu_name(line.split(':').nth(1).unwrap_or("GPU").trim())
+        } else {
+            "GPU".to_string()
+        };
+        let tier = if name.to_ascii_lowercase().contains("apple")
+            || lower.contains("apple m")
+        {
+            GpuTier::Integrated
+        } else {
+            let (t, _) = classify_gpu(&name.to_ascii_lowercase());
+            t
+        };
+        return GpuTopology::single(name, tier);
+    }
+    #[cfg(all(target_os = "linux", not(target_os = "android")))]
     {
         let out = run_cmd("lspci", &["-nn"]);
         let mut devices = parse_lspci_gpus(&out);
@@ -938,6 +1155,10 @@ fn classify_gpu(lower: &str) -> (GpuTier, u8) {
     let nvidia = lower.contains("nvidia");
     let amd = word("amd") || word("ati") || lower.contains("radeon");
     let intel = lower.contains("intel");
+    // Apple Silicon (macOS probe + chipset name fallback).
+    if lower.contains("apple") || word("m1") || word("m2") || word("m3") || word("m4") {
+        return (GpuTier::Integrated, 2);
+    }
     if nvidia {
         return (GpuTier::Discrete, 0);
     }
@@ -1040,6 +1261,50 @@ eDP-1 "BOE 0x0A1C"
     }
 
     #[test]
+    #[cfg(not(target_os = "android"))]
+    fn macos_system_profiler_promotion() {
+        let out = r#"
+Graphics/Displays:
+
+    Apple M2:
+
+      Chipset Model: Apple M2
+      Displays:
+        Color LCD:
+          Resolution: 3024 x 1964 Retina
+          UI Looks like: 1512 x 982
+          Main Display: Yes
+          Mirror: Off
+          Online: Yes
+          Automatically Adjust Brightness: Yes
+          Connection Type: Internal
+          ProMotion: Supported
+"#;
+        let (_name, hz, w, h) = parse_macos_system_profiler(out).unwrap();
+        // "ProMotion: Supported" alone must not invent 120 — adaptive range.
+        assert_eq!(hz, 60, "ProMotion without explicit Hz stays at default 60");
+        assert!(w >= 1512);
+        assert!(h >= 982);
+    }
+
+    #[test]
+    #[cfg(not(target_os = "android"))]
+    fn macos_pmset_battery_power() {
+        let batt = "Now drawing from 'Battery Power'\n -InternalBattery-0\t50%; discharging; 3:00 remaining present: true\n";
+        assert!(parse_macos_on_battery(batt));
+        let ac = "Now drawing from 'AC Power'\n -InternalBattery-0\t80%; charged; 0:00 remaining present: true\n";
+        assert!(!parse_macos_on_battery(ac));
+    }
+
+    #[test]
+    #[cfg(not(target_os = "android"))]
+    fn classify_gpu_apple_silicon_integrated() {
+        assert_eq!(classify_gpu("apple m2").0, GpuTier::Integrated);
+        assert_eq!(classify_gpu("chipset model: apple m3 pro").0, GpuTier::Integrated);
+        assert_eq!(classify_gpu("apple gpu").0, GpuTier::Integrated);
+    }
+
+    #[test]
     fn lspci_prefers_nvidia_discrete() {
         let out = r#"
 01:00.0 VGA compatible controller: NVIDIA Corporation AD107M [GeForce RTX 4050 Max-Q / Mobile] [10de:28e1]
@@ -1061,6 +1326,38 @@ eDP-1 "BOE 0x0A1C"
         assert_eq!(period_ms(60), 17);
         assert_eq!(period_ms(120), 8);
         assert_eq!(period_ms(30), 33);
+        assert_eq!(soft_period_ms(60), 17);
+        assert_eq!(soft_period_ms(120), 17, "soft clamps to ≤60 before period");
+        assert_eq!(soft_period_ms(240), 17);
+        assert!(soft_period_ms(90) >= 16);
+    }
+
+    #[test]
+    #[cfg(not(target_os = "android"))]
+    fn drm_modes_fallback_never_picks_max_hz() {
+        // Empty active `mode` with 144 listed must not advertise 144.
+        let modes = "\
+3840x2160@144.00
+1920x1080@60.00
+1280x720@60.00
+";
+        let (hz, w, h) = pick_drm_modes_fallback(modes).unwrap();
+        assert_eq!(hz, 60, "must not pick max listed 144 without active mode");
+        assert_eq!((w, h), (1920, 1080));
+
+        let preferred = "\
+3840x2160@144.00+
+1920x1080@60.00
+";
+        let (hz, _, _) = pick_drm_modes_fallback(preferred).unwrap();
+        assert_eq!(hz, 144, "marked preferred may exceed 60");
+
+        let only_high = "\
+2560x1440@165.00
+2560x1440@144.00
+";
+        let (hz, _, _) = pick_drm_modes_fallback(only_high).unwrap();
+        assert_eq!(hz, 60, "no ≤60 mode → clamp first to DEFAULT, never max");
     }
 
     #[test]
@@ -1072,7 +1369,7 @@ eDP-1 "BOE 0x0A1C"
         assert!(hz_720 <= 60);
         assert!(hz_1080 <= 60);
         assert!(hz_uhd <= 30);
-        assert!(SOFT_PRESENT_MAX <= 240);
+        assert_eq!(SOFT_PRESENT_MAX, 60);
     }
 
     #[test]
@@ -1104,7 +1401,8 @@ eDP-1 "BOE 0x0A1C"
     fn soft_video_budget_discrete_keeps_headroom_at_1080p() {
         let hz = soft_video_budget(GpuTier::Discrete, Some((1920, 1080)), false);
         assert!(hz >= 60, "discrete 1080p soft present too low: {hz}");
-        assert!(hz <= SOFT_PRESENT_MAX);
+        // Budget may report >60; resolve_caps clamps video_hz with SOFT_PRESENT_MAX.
+        assert!(hz.min(SOFT_PRESENT_MAX) <= 60);
     }
 
     #[test]

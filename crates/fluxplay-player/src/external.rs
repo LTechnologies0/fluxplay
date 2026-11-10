@@ -107,6 +107,14 @@ const KNOWN: &[Known] = &[
         dialect: Dialect::Mpv,
     },
     Known {
+        id: "iina",
+        name: "IINA",
+        bins: &["/Applications/IINA.app/Contents/MacOS/iina-cli", "iina"],
+        flatpaks: &[],
+        desktops: &[],
+        dialect: Dialect::Mpv,
+    },
+    Known {
         id: "haruna",
         name: "Haruna",
         bins: &["haruna"],
@@ -469,6 +477,7 @@ fn known_player(k: &Known) -> Option<ExternalPlayer> {
         let app = match k.id {
             "vlc" => Some("VLC"),
             "mpv" => Some("mpv"),
+            "iina" => Some("IINA"),
             _ => None,
         }?;
         let bundle = PathBuf::from(format!("/Applications/{app}.app"));
@@ -635,10 +644,18 @@ fn command_line(player: &ExternalPlayer, url: &str, o: &ExternalLaunch<'_>) -> R
             v.push(url.to_string());
             v
         }
-        Launch::Desktop(template) => template
-            .iter()
-            .map(|t| if t == "{url}" { url.to_string() } else { t.clone() })
-            .collect(),
+        Launch::Desktop(template) => {
+            // Desktop Exec templates discard dialect_args — refuse if headers were needed.
+            if !args.is_empty() {
+                return Err(PlayerError::Backend(
+                    "Entrée .desktop sans en-têtes HTTP — choisissez VLC ou mpv".into(),
+                ));
+            }
+            template
+                .iter()
+                .map(|t| if t == "{url}" { url.to_string() } else { t.clone() })
+                .collect()
+        }
         Launch::MacApp(app) => {
             let mut v = vec!["open".into(), "-a".into(), app.clone(), url.to_string()];
             if !args.is_empty() {
@@ -657,6 +674,22 @@ fn command_line(player: &ExternalPlayer, url: &str, o: &ExternalLaunch<'_>) -> R
 
 /// Start `player` detached on `url`. The process is reaped on a background thread.
 pub fn launch_external(player: &ExternalPlayer, url: &str, o: &ExternalLaunch<'_>) -> Result<()> {
+    // Plain dialects cannot forward UA/Referer — refuse gated IPTV rather than open clearnet bare.
+    let needs_headers = o
+        .user_agent
+        .map(|s| !s.is_empty())
+        .unwrap_or(false)
+        || o.referer.map(|s| !s.is_empty()).unwrap_or(false);
+    if needs_headers && !player.forwards_headers() {
+        warn!(
+            player = %player.label(),
+            "external Plain dialect cannot forward HTTP headers"
+        );
+        return Err(PlayerError::Backend(format!(
+            "{} n'accepte pas les en-têtes HTTP — choisissez VLC ou mpv",
+            player.label()
+        )));
+    }
     // Players read a plain path reliably; `file://` wants percent-encoding.
     let target = url.strip_prefix("file://").filter(|p| p.starts_with('/')).unwrap_or(url);
     let argv = command_line(player, target, o)?;
@@ -670,7 +703,13 @@ pub fn launch_external(player: &ExternalPlayer, url: &str, o: &ExternalLaunch<'_
         .stderr(Stdio::null())
         // Our libmpv/FFmpeg search path must not leak into system players.
         .env_remove("LD_LIBRARY_PATH");
-    let mut child = cmd.spawn().map_err(|e| {
+    // Match player CLI: hide console flash for console-subsystem helpers.
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000);
+    }
+    let child = cmd.spawn().map_err(|e| {
         warn!(player = %player.label(), error = %e, "external player spawn failed");
         PlayerError::Backend(format!("{} : {e}", player.label()))
     })?;
@@ -680,13 +719,29 @@ pub fn launch_external(player: &ExternalPlayer, url: &str, o: &ExternalLaunch<'_
         headers = player.forwards_headers(),
         "external player launched"
     );
-    std::thread::Builder::new()
+    // Child::Drop does not reap. Wrap so a failed reaper spawn still waits
+    // when the unexecuted closure is dropped (avoids Unix zombies).
+    struct ExtReap(Option<std::process::Child>);
+    impl Drop for ExtReap {
+        fn drop(&mut self) {
+            if let Some(mut c) = self.0.take() {
+                let _ = c.wait();
+            }
+        }
+    }
+    let guarded = ExtReap(Some(child));
+    if let Err(e) = std::thread::Builder::new()
         .name("fluxplay-ext-reap".into())
         .spawn(move || {
-            let status = child.wait();
-            debug!(?status, "external player exited");
+            let mut guarded = guarded;
+            if let Some(mut child) = guarded.0.take() {
+                let status = child.wait();
+                debug!(?status, "external player exited");
+            }
         })
-        .ok();
+    {
+        warn!(error = %e, "external reaper spawn failed — Drop will wait");
+    }
     Ok(())
 }
 

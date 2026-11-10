@@ -20,7 +20,8 @@ use crate::{ProviderError, Result};
 
 static NET: OnceLock<Mutex<NetworkSettings>> = OnceLock::new();
 static PORTAL: OnceLock<Mutex<Option<reqwest::Client>>> = OnceLock::new();
-static GENERIC: OnceLock<Mutex<Option<reqwest::Client>>> = OnceLock::new();
+/// Cached generic client keyed by `user_agent|timeout_secs`.
+static GENERIC: OnceLock<Mutex<Option<(String, reqwest::Client)>>> = OnceLock::new();
 static SOCKS: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 
 fn net_lock() -> &'static Mutex<NetworkSettings> {
@@ -31,7 +32,7 @@ fn portal_lock() -> &'static Mutex<Option<reqwest::Client>> {
     PORTAL.get_or_init(|| Mutex::new(None))
 }
 
-fn generic_lock() -> &'static Mutex<Option<reqwest::Client>> {
+fn generic_lock() -> &'static Mutex<Option<(String, reqwest::Client)>> {
     GENERIC.get_or_init(|| Mutex::new(None))
 }
 
@@ -118,24 +119,77 @@ pub fn shared_http() -> Result<reqwest::Client> {
 }
 
 /// Generic app HTTP (images / metadata) — same DNS prefs, shorter timeouts.
-pub fn app_http(_user_agent: &str, timeout_secs: u64) -> Result<reqwest::Client> {
+///
+/// `user_agent` is honored (IPTV logo CDNs often require a Smarters-like UA).
+/// Clients are cached per `(user_agent, timeout_secs)` and reset on network/SOCKS changes.
+pub fn app_http(user_agent: &str, timeout_secs: u64) -> Result<reqwest::Client> {
+    let timeout_secs = timeout_secs.max(8);
+    let cache_key = format!("{user_agent}|{timeout_secs}");
     let mut slot = generic_lock()
         .lock()
         .map_err(|_| ProviderError::Message("http client lock poisoned".into()))?;
-    if let Some(c) = slot.as_ref() {
-        return Ok(c.clone());
+    if let Some((key, c)) = slot.as_ref() {
+        if key == &cache_key {
+            return Ok(c.clone());
+        }
     }
     let net = current_network_settings();
     let client = build_client(
-        "FluxPlay/0.2 (+catalog; images; metadata)",
-        Duration::from_secs(timeout_secs.max(14)),
+        user_agent,
+        Duration::from_secs(timeout_secs),
         Duration::from_secs(8),
         true,
         &net,
     )?;
-    debug!("shared app HTTP client initialized");
-    *slot = Some(client.clone());
+    debug!(ua = user_agent, timeout_secs, "shared app HTTP client initialized");
+    *slot = Some((cache_key, client.clone()));
     Ok(client)
+}
+
+/// Last-resort HTTP client that still respects WireGuard fail-closed.
+///
+/// Prefer [`app_http`] / [`shared_http`]. This path exists so `unwrap_or_else`
+/// callers never fall through to a clearnet builder while the tunnel is required.
+pub fn emergency_http(user_agent: &str, timeout_secs: u64) -> reqwest::Client {
+    match app_http(user_agent, timeout_secs) {
+        Ok(c) => c,
+        Err(e) => {
+            warn!(error = %e, "app_http failed — building fail-closed emergency client");
+            let net = current_network_settings();
+            match build_client(
+                user_agent,
+                Duration::from_secs(timeout_secs.max(8)),
+                Duration::from_secs(6),
+                true,
+                &net,
+            ) {
+                Ok(c) => c,
+                Err(_) => {
+                    // Absolute last resort: still never clearnet when WG is on.
+                    let mut b = reqwest::Client::builder()
+                        .user_agent(user_agent)
+                        .timeout(Duration::from_secs(timeout_secs.max(8)))
+                        .connect_timeout(Duration::from_secs(6))
+                        .redirect(reqwest::redirect::Policy::limited(8))
+                        .referer(false);
+                    if let Some(px) = required_proxy() {
+                        match reqwest::Proxy::all(&px) {
+                            Ok(proxy) => b = b.proxy(proxy),
+                            Err(_) => {
+                                b = b.proxy(
+                                    reqwest::Proxy::all(DEAD_PROXY)
+                                        .expect("DEAD_PROXY is a valid socks URL"),
+                                );
+                            }
+                        }
+                    } else {
+                        b = b.no_proxy();
+                    }
+                    b.build().expect("emergency http client")
+                }
+            }
+        }
+    }
 }
 
 fn build_client(
@@ -159,8 +213,12 @@ fn build_client(
 
     // App-scoped WireGuard proxy takes priority over "no env proxy".
     if let Some(ref socks) = socks {
-        let proxy = reqwest::Proxy::all(socks)
-            .map_err(|e| ProviderError::Message(format!("tunnel proxy URL: {e}")))?;
+        let proxy = reqwest::Proxy::all(socks).map_err(|e| {
+            ProviderError::Message(
+                fluxplay_core::FpCode::NetProxyRefuse
+                    .ensure_coded(format!("tunnel proxy URL: {e}")),
+            )
+        })?;
         b = b.proxy(proxy);
         debug!("HTTP client routed via WireGuard proxy (tunnel DNS)");
     } else {
@@ -174,8 +232,47 @@ fn build_client(
         }
     }
 
-    b.build()
-        .map_err(|e| ProviderError::Message(format!("http client build failed: {e}")))
+    b.build().map_err(|e| {
+        ProviderError::Message(
+            fluxplay_core::FpCode::NetTcpConnect
+                .ensure_coded(format!("http client build failed: {e}")),
+        )
+    })
+}
+
+/// Read a response body with a hard byte budget (CWE-400).
+/// Rejects oversized `Content-Length` before buffering; streams otherwise.
+pub async fn read_body_capped(
+    mut resp: reqwest::Response,
+    max_bytes: usize,
+) -> Result<Vec<u8>> {
+    if let Some(len) = resp.content_length() {
+        if len as usize > max_bytes {
+            return Err(ProviderError::Message(
+                fluxplay_core::FpCode::NetHttpBody.ensure_coded(format!(
+                    "réponse trop volumineuse ({len} o, max {max_bytes})"
+                )),
+            ));
+        }
+    }
+    let mut out = Vec::with_capacity(max_bytes.min(64 * 1024));
+    loop {
+        match resp.chunk().await {
+            Ok(Some(chunk)) => {
+                if out.len().saturating_add(chunk.len()) > max_bytes {
+                    return Err(ProviderError::Message(
+                        fluxplay_core::FpCode::NetHttpBody.ensure_coded(format!(
+                            "réponse trop volumineuse (max {max_bytes} o)"
+                        )),
+                    ));
+                }
+                out.extend_from_slice(&chunk);
+            }
+            Ok(None) => break,
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(out)
 }
 
 struct HickoryResolve {
@@ -200,14 +297,21 @@ fn build_dns_resolver(net: &NetworkSettings) -> Option<Arc<HickoryResolve>> {
     if matches!(net.dns_mode, DnsMode::System) {
         return None;
     }
+    // Non-System modes must never silently fall back to OS DNS (UI would lie).
+    // Incomplete Custom/DoH/DoT → Cloudflare preset matching the selected mode.
     let config = match resolver_config(net) {
         Some(c) => c,
         None => {
+            let fallback = match net.dns_mode {
+                DnsMode::Dot => ResolverConfig::cloudflare_tls(),
+                DnsMode::Custom => ResolverConfig::cloudflare(),
+                DnsMode::Doh | DnsMode::System => ResolverConfig::cloudflare_https(),
+            };
             warn!(
                 mode = net.dns_mode.label(),
-                "DNS config incomplete — falling back to system"
+                "DNS config incomplete — using Cloudflare preset (not system DNS)"
             );
-            return None;
+            fallback
         }
     };
     let mut opts = ResolverOpts::default();

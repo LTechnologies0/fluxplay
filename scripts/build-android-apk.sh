@@ -29,8 +29,17 @@ fi
 # Keep inject-script default ($HOME/.android/...) aligned when present.
 export FLUXPLAY_ANDROID_KS="${FLUXPLAY_ANDROID_KS:-$KS_CRATE}"
 
+# Per-ABI CPU/linker flags from .cargo/config.toml; optional native override via
+# FLUXPLAY_CPU (default: portable cortex-a76 / x86-64-v3 from config).
+# shellcheck source=rustc-flags.sh
+# shellcheck disable=SC1091
+if [[ "${FLUXPLAY_CPU:-}" == "native" ]]; then
+  source "$ROOT/scripts/rustc-flags.sh"
+  fluxplay_export_rustflags
+fi
+
 echo "building APK (Cargo.toml build_targets unless --target passed)…"
-cargo apk build -p fluxplay-android --profile release-ci "$@"
+cargo apk build -p fluxplay-android --profile release-ci --locked "$@"
 
 APK=""
 # Prefer newest FluxPlay.apk under target/*/apk/ (profile or triple layout).

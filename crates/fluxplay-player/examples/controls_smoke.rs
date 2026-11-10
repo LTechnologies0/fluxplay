@@ -28,6 +28,8 @@ fn main() {
         source_id: None,
         kind: ContentKind::Live,
         catchup: None,
+                http_user_agent: None,
+                http_referer: None,
     };
 
     println!("open…");

@@ -3,6 +3,8 @@ name = "fluxplay-ffi"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+authors.workspace = true
+repository.workspace = true
 description = "C FFI bridge for Android / iOS FluxPlay shells"
 
 [lib]
@@ -15,3 +17,6 @@ fluxplay-core.workspace = true
 fluxplay-player = { path = "../fluxplay-player", default-features = false }
 serde_json.workspace = true
 tracing.workspace = true
+
+[lints]
+workspace = true

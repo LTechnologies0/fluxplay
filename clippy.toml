@@ -1,0 +1,11 @@
+# Clippy knobs shared by `cargo clippy` / CI / tdd-gate.
+# Prefer `cargo clippy --workspace --locked -- -D warnings` over per-crate flags.
+
+cognitive-complexity-threshold = 40
+too-many-arguments-threshold = 10
+type-complexity-threshold = 350
+avoid-breaking-exported-api = true
+allow-expect-in-tests = true
+allow-unwrap-in-tests = true
+allow-dbg-in-tests = true
+allow-print-in-tests = true

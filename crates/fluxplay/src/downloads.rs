@@ -40,7 +40,9 @@ use tokio::io::AsyncWriteExt;
 /// streams forever.
 const MAX_BYTES: u64 = 128 * 1024 * 1024 * 1024;
 /// Abort one attempt when the server sends nothing for this long (then retry).
-const STALL_TIMEOUT: Duration = Duration::from_secs(45);
+fn stall_timeout() -> Duration {
+    Duration::from_secs(crate::policy::get().downloads.stall_timeout_secs)
+}
 const PROGRESS_EVERY: Duration = Duration::from_millis(500);
 /// Fewer, larger writes: one `spawn_blocking` per MiB instead of per 16 KiB chunk.
 const WRITE_BUFFER: usize = 1024 * 1024;
@@ -53,10 +55,22 @@ const META_MAGIC: &str = "fluxplay-download 1";
 /// Segmented `.part` (preallocated, holes listed in `todo=`). A new magic so
 /// older builds never mistake the preallocated length for progress.
 const META_MAGIC_SEGMENTED: &str = "fluxplay-download 2";
+/// Hard ceiling for parallel download workers (submodules + loops).
+pub(crate) const MAX_CONNECTIONS: usize = 8;
 /// Connections per account when the panel does not say (`max_connections`).
-const DEFAULT_CONNECTIONS: usize = 2;
-/// Never more than this per account, whatever the panel allows.
-const MAX_CONNECTIONS: usize = 8;
+fn default_connections() -> usize {
+    crate::policy::get()
+        .downloads
+        .default_connections
+        .clamp(1, MAX_CONNECTIONS)
+}
+/// Effective max from policy, never above the hard ceiling.
+fn effective_max_connections() -> usize {
+    crate::policy::get()
+        .downloads
+        .max_connections
+        .clamp(1, MAX_CONNECTIONS)
+}
 /// First wait before renewing a stream token another player keeps taking back.
 const RENEW_WAIT: Duration = Duration::from_secs(15);
 const KNOWN_EXTENSIONS: &[&str] = &[
@@ -153,6 +167,9 @@ pub struct DownloadRequest {
     /// Runs while the user watches (next-episode preload): skipped when the
     /// account allows a single connection, which playback already holds.
     pub background: bool,
+    /// Viewer already holds the panel stream (play does not share `Account`
+    /// leases). With `max_connections=1`, refuse like `background`.
+    pub playback_busy: bool,
 }
 
 /// Resolved transfer plan: every server of the file, and the account whose
@@ -167,10 +184,19 @@ pub(crate) struct Plan {
 pub fn run(req: DownloadRequest) -> impl Stream<Item = DownloadEvent> {
     iced::stream::channel(16, async move |mut tx: mpsc::Sender<DownloadEvent>| {
         let (plan, referer, max_connections) = resolve_plan(&req).await;
-        // Preloading while the viewer watches is a second stream: the panel
-        // would revoke playback's on a single-stream account.
-        let lease = if req.background {
-            match plan.account.try_lease().filter(|_| max_connections != Some(1)) {
+        // Playback does not take an Account lease. On a single-stream panel,
+        // a second transfer (preload or user download) fights the live slot.
+        let single_busy =
+            max_connections == Some(1) && (req.background || req.playback_busy);
+        let lease = if single_busy {
+            let _ = tx
+                .send(DownloadEvent::Finished(Err(
+                    "connexions du compte déjà occupées".into(),
+                )))
+                .await;
+            return;
+        } else if req.background {
+            match plan.account.try_lease() {
                 Some(lease) => lease,
                 None => {
                     let _ = tx
@@ -217,7 +243,7 @@ async fn resolve_plan(req: &DownloadRequest) -> (Plan, Option<String>, Option<u3
         return (
             Plan {
                 links: Arc::new(Links::new(vec![req.url.clone()], RENEW_WAIT)),
-                account: Account::shared("", DEFAULT_CONNECTIONS, MAX_PARALLEL),
+                account: Account::shared("", default_connections(), MAX_PARALLEL),
                 tuning: parallel::Tuning::DEFAULT,
             },
             None,
@@ -240,10 +266,11 @@ async fn resolve_plan(req: &DownloadRequest) -> (Plan, Option<String>, Option<u3
 
 /// Connections a download starts with. They share one stream, so the
 /// announced limit only scales the start; probing finds the rest.
-fn connections_for(max_connections: Option<u32>) -> usize {
-    match max_connections {
-        Some(n) => (n as usize).clamp(DEFAULT_CONNECTIONS, MAX_CONNECTIONS),
-        None => DEFAULT_CONNECTIONS,
+/// Panel `max_connections=1` must stay at 1 — starting 2 fights the live slot.
+fn connections_for(panel_max: Option<u32>) -> usize {
+    match panel_max {
+        Some(n) => (n as usize).clamp(1, effective_max_connections()),
+        None => default_connections(),
     }
 }
 
@@ -727,7 +754,7 @@ async fn download_into(
 
     let mut builder = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(20))
-        .read_timeout(STALL_TIMEOUT)
+        .read_timeout(stall_timeout())
         .tcp_keepalive(Duration::from_secs(30))
         // Compressed transfer hides the real length and breaks byte ranges;
         // video does not compress anyway.
@@ -739,8 +766,14 @@ async fn download_into(
         builder = builder.default_headers(headers);
     }
     if let Some(px) = fluxplay_providers::required_proxy() {
-        let proxy = reqwest::Proxy::all(px).map_err(|e| format!("proxy tunnel : {e}"))?;
+        let proxy = reqwest::Proxy::all(&px).map_err(|e| {
+            fluxplay_core::FpCode::NetProxyRefuse
+                .ensure_coded(format!("proxy tunnel : {e}"))
+        })?;
         builder = builder.proxy(proxy);
+    } else {
+        // Match portal client: never inherit HTTP(S)_PROXY / Tor when WG is off.
+        builder = builder.no_proxy();
     }
     let client = builder.build().map_err(|e| e.to_string())?;
 
@@ -1284,11 +1317,72 @@ pub fn sanitize_file_name(name: &str) -> String {
         .collect::<Vec<_>>()
         .join(" ");
     let trimmed = collapsed.trim_start_matches('.').trim_end_matches(['.', ' ']);
-    let mut out: String = trimmed.chars().take(150).collect();
-    if out.is_empty() {
-        out = "FluxPlay".into();
+    // Cap both Unicode scalars (UI) and UTF-8 bytes (PATH_MAX / file:// safety).
+    // 150 emoji ≈ 600 B otherwise — Windows MAX_PATH and Android content URIs choke.
+    const MAX_CHARS: usize = 150;
+    const MAX_BYTES: usize = 240;
+    let mut out = String::new();
+    for c in trimmed.chars().take(MAX_CHARS) {
+        let mut buf = [0u8; 4];
+        let enc = c.encode_utf8(&mut buf);
+        if out.len() + enc.len() > MAX_BYTES {
+            break;
+        }
+        out.push_str(enc);
     }
-    out
+    let out = out.trim_end_matches(['.', ' ']).to_string();
+    if out.is_empty() {
+        return "FluxPlay".into();
+    }
+    // Windows reserved device names (CON/PRN/…) are illegal path leaves even
+    // with an extension-less stem — rewrite so downloads stay portable.
+    let stem = out.split_once('.').map(|(s, _)| s).unwrap_or(&out);
+    let reserved = matches!(
+        stem.to_ascii_uppercase().as_str(),
+        "CON"
+            | "PRN"
+            | "AUX"
+            | "NUL"
+            | "COM1"
+            | "COM2"
+            | "COM3"
+            | "COM4"
+            | "COM5"
+            | "COM6"
+            | "COM7"
+            | "COM8"
+            | "COM9"
+            | "LPT1"
+            | "LPT2"
+            | "LPT3"
+            | "LPT4"
+            | "LPT5"
+            | "LPT6"
+            | "LPT7"
+            | "LPT8"
+            | "LPT9"
+    );
+    let out = if reserved {
+        format!("_{out}")
+    } else {
+        out
+    };
+    // Re-cap after the reserved-name prefix so we never exceed the UI/PATH budgets.
+    let mut capped = String::new();
+    for c in out.chars().take(MAX_CHARS) {
+        let mut buf = [0u8; 4];
+        let enc = c.encode_utf8(&mut buf);
+        if capped.len() + enc.len() > MAX_BYTES {
+            break;
+        }
+        capped.push_str(enc);
+    }
+    let capped = capped.trim_end_matches(['.', ' ']).to_string();
+    if capped.is_empty() {
+        "FluxPlay".into()
+    } else {
+        capped
+    }
 }
 
 /// `Série — S01E02 — Titre`. Panel titles often already carry `S01E02` (and
@@ -1374,6 +1468,15 @@ mod tests {
         assert_eq!(sanitize_file_name("a\u{0}b\nc"), "a b c");
         assert_eq!(sanitize_file_name(&"x".repeat(400)).chars().count(), 150);
         assert_eq!(sanitize_file_name("100% Loup"), "100 Loup");
+        assert_eq!(sanitize_file_name("CON"), "_CON");
+        assert_eq!(sanitize_file_name("nul"), "_nul");
+        assert_eq!(sanitize_file_name("com1"), "_com1");
+        // Reserved rewrite must not blow the char ceiling.
+        let long_reserved = format!("NUL{}", "I".repeat(200));
+        let s = sanitize_file_name(&long_reserved);
+        assert!(s.chars().count() <= 150);
+        assert!(s.len() <= 240);
+        assert_ne!(s.to_ascii_uppercase(), "NUL");
     }
 
     #[test]
@@ -2310,6 +2413,7 @@ mod tests {
             user_agent: "VLC/3.0.20 LibVLC/3.0.20".into(),
             dir: dir.clone(),
             background: false,
+            playback_busy: false,
         });
         tokio::pin!(events);
         let started = Instant::now();
@@ -2351,9 +2455,9 @@ mod tests {
         assert_eq!(streams_for(Some(1)), 1);
         assert_eq!(streams_for(Some(2)), 1);
         assert_eq!(streams_for(Some(4)), 3);
-        assert_eq!(connections_for(None), DEFAULT_CONNECTIONS);
-        assert_eq!(connections_for(Some(1)), DEFAULT_CONNECTIONS);
+        assert_eq!(connections_for(None), default_connections());
+        assert_eq!(connections_for(Some(1)), 1);
         assert_eq!(connections_for(Some(4)), 4);
-        assert_eq!(connections_for(Some(100)), MAX_CONNECTIONS);
+        assert_eq!(connections_for(Some(100)), effective_max_connections());
     }
 }

@@ -202,6 +202,11 @@ impl StreamUrl {
             warn!("StreamUrl::parse empty");
             return Err(Error::Validation("empty stream URL".into()));
         }
+        // Embedded NUL breaks C FFI / libmpv / HTTP stacks — refuse early.
+        if trimmed.contains('\0') {
+            warn!("StreamUrl::parse embedded NUL");
+            return Err(Error::Validation("stream URL contains NUL".into()));
+        }
 
         let scheme = StreamScheme::parse(trimmed);
         let delivery = DeliveryKind::detect(trimmed);
@@ -278,6 +283,11 @@ mod tests {
         let u = StreamUrl::parse("srt://192.168.1.100:4200?mode=listener").unwrap();
         assert_eq!(u.scheme, StreamScheme::Srt);
         assert_eq!(u.port, Some(4200));
+    }
+
+    #[test]
+    fn rejects_embedded_nul() {
+        assert!(StreamUrl::parse("udp://239.0.0.1:\0\01234").is_err());
     }
 
     proptest! {
