@@ -316,7 +316,7 @@ impl FpCode {
             NetProxyDead => "Proxy: tunnel mort (fail-closed)",
             NetProxyRefuse => "Proxy: connexion refusée",
             NetTunnelDown => "Tunnel WG/SOCKS inactif",
-            NetClearnetBlocked => "Réseau: chemins IPTV coupés (Wi‑Fi/FAI/WAF)",
+            NetClearnetBlocked => "Réseau: chemins IPTV coupés (Wi‑Fi/hotspot/VPN/WAF)",
 
             CatM3uEmpty => "M3U: liste vide",
             CatM3uParse => "M3U: parse échoué",
@@ -691,7 +691,7 @@ pub fn classify_message(msg: &str) -> FpCode {
     }
     // Transport before catalog: reqwest "error sending request for url (…player_api…)"
     // must not become FP-CAT-XTREAM-API just because the path contains player_api.
-    // RST on IPTV paths (player_api/live/movie) = Wi‑Fi/FAI/WAF, not a random TCP blip.
+    // RST on IPTV paths (player_api/live/movie) = filtered egress/WAF, not a random TCP blip.
     if (has("connection reset") || has("broken pipe") || (has("reset") && has("error sending")))
         && (has("player_api")
             || has("/movie/")

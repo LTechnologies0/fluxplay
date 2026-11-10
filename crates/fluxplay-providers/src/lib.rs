@@ -23,7 +23,8 @@ pub use health::{check_xtream_portal, format_health, PortalHealth};
 pub use api_cache::configure_runtime_policy;
 pub use http_client::{
     app_http, apply_network_settings, bootstrap_lookup_ip, current_network_settings, emergency_http,
-    path_policy_blocked_msg, probe_dns, probe_http_path_policy, read_body_capped, required_proxy,
+    path_policy_blocked_msg, probe_dns, probe_egress_and_path, probe_egress_ip,
+    probe_http_path_policy, probe_network_diag, read_body_capped, required_proxy,
     set_socks_proxy, shared_http, socks_proxy, HttpPathPolicy,
 };
 pub use m3u_source::load_m3u_source;

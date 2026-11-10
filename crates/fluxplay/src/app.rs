@@ -6688,9 +6688,14 @@ impl FluxPlay {
                 self.status = "Paramètres DNS enregistrés".into();
             }
             Message::ProbeDns => {
-                self.network_probe = "Test DNS…".into();
+                self.network_probe = "Test réseau…".into();
+                let portal = self
+                    .sources
+                    .iter()
+                    .find(|s| s.enabled)
+                    .map(|s| s.endpoint.clone());
                 return Task::perform(
-                    async { crate::wg_tunnel::probe_dns("cloudflare.com").await },
+                    async move { crate::wg_tunnel::probe_network_diag("cloudflare.com", portal).await },
                     Message::DnsProbeDone,
                 );
             }
@@ -11661,7 +11666,7 @@ impl FluxPlay {
                 .unwrap_or_else(|| "portail".into());
             return fluxplay_player::PlayerError::Message(
                 fluxplay_core::FpCode::NetClearnetBlocked.ensure_coded(format!(
-                    "Wi‑Fi/FAI: {host} coupe les chemins IPTV (RST) — la page `/` peut encore répondre ; changez de réseau ou activez un tunnel"
+                    "Réseau filtré: {host} coupe les chemins IPTV (RST, `/` peut répondre) — hotspot/VPN téléphone ou FAI ; coupe le VPN du téléphone, autre réseau, ou tunnel FluxPlay"
                 )),
             );
         }

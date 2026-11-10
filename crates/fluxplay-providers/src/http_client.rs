@@ -443,12 +443,13 @@ pub async fn bootstrap_lookup_ip(bootstrap_dns: &str, host: &str) -> std::io::Re
     Ok(lookup.iter().collect())
 }
 
-/// Outcome of a cheap `/` vs deep-path probe (Wi‑Fi/FAI WAF class).
+/// Outcome of a cheap `/` vs deep-path probe (WAF / sortie filtrée).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HttpPathPolicy {
     /// Both root and a deep path answered (or deep path gave HTTP, not RST).
     Open,
-    /// TCP works for `/` but any deeper path is reset — classic DPI/WAF on clearnet Wi‑Fi.
+    /// TCP works for `/` but any deeper path is reset — WAF on filtered egress
+    /// (home Wi‑Fi, phone hotspot, phone/system VPN exit, ISP DPI).
     RootOnly,
     /// Host unreachable / root also fails.
     Unreachable,
@@ -457,7 +458,7 @@ pub enum HttpPathPolicy {
 /// Detect “landing page OK, every IPTV path RST” (origine.one / drm-cloud class).
 ///
 /// Used after a `connection reset` on `player_api` / media so the UI can say
-/// clearnet/Wi‑Fi policy instead of a vague TCP error — DNSCrypt/`127.0.0.1` is fine.
+/// path policy instead of a vague TCP error — DNSCrypt/`127.0.0.1` is fine.
 pub async fn probe_http_path_policy(origin: &str) -> HttpPathPolicy {
     let origin = origin.trim_end_matches('/');
     if origin.is_empty() {
@@ -493,7 +494,7 @@ pub async fn probe_http_path_policy(origin: &str) -> HttpPathPolicy {
             if blob.contains("reset") || blob.contains("broken pipe") {
                 warn!(
                     origin = %origin,
-                    "HTTP path policy: root OK, deep path RST (Wi‑Fi/FAI/WAF)"
+                    "HTTP path policy: root OK, deep path RST (filtered egress/WAF)"
                 );
                 HttpPathPolicy::RootOnly
             } else {
@@ -507,8 +508,58 @@ pub async fn probe_http_path_policy(origin: &str) -> HttpPathPolicy {
 /// Human + coded error when [`HttpPathPolicy::RootOnly`] is confirmed.
 pub fn path_policy_blocked_msg(origin: &str) -> String {
     fluxplay_core::FpCode::NetClearnetBlocked.ensure_coded(format!(
-        "Wi‑Fi/FAI: {origin} répond sur `/` mais coupe player_api/live/movie (RST) — changez de réseau ou activez un tunnel"
+        "Réseau filtré: {origin} répond sur `/` mais RST sur player_api/live/movie — hotspot téléphone, VPN téléphone/système (pas FluxPlay) ou FAI ; DNSCrypt OK. Autre réseau, coupe le VPN du téléphone, ou tunnel FluxPlay"
     ))
+}
+
+/// Best-effort public egress IP (via app HTTP client / SOCKS when tunnel is up).
+pub async fn probe_egress_ip() -> Option<String> {
+    let client = shared_http().ok()?;
+    // Plain HTTP avoids TLS traps on locked-down nets; body is a single IPv4/IPv6.
+    let resp = client
+        .get("http://api.ipify.org/")
+        .timeout(Duration::from_secs(4))
+        .send()
+        .await
+        .ok()?;
+    let body = resp.text().await.ok()?;
+    let ip = body.trim();
+    if ip.is_empty() || ip.len() > 64 || ip.contains(char::is_whitespace) {
+        return None;
+    }
+    Some(ip.to_string())
+}
+
+/// Egress IP + optional portal `/` vs deep-path (no DNS line — caller prepends).
+pub async fn probe_egress_and_path(portal_origin: Option<&str>) -> String {
+    let mut parts = Vec::with_capacity(2);
+    match probe_egress_ip().await {
+        Some(ip) => parts.push(format!(
+            "sortie {ip} (si ≠ IP mobile/FAI attendue → VPN téléphone/système probable)"
+        )),
+        None => parts.push("sortie publique: indisponible".into()),
+    }
+    if let Some(origin) = portal_origin.map(str::trim).filter(|s| !s.is_empty()) {
+        let origin = origin.trim_end_matches('/');
+        let path = match probe_http_path_policy(origin).await {
+            HttpPathPolicy::Open => format!("{origin} chemins IPTV OK"),
+            HttpPathPolicy::RootOnly => {
+                format!("{origin} `/` OK mais chemins IPTV RST (réseau/VPN filtré)")
+            }
+            HttpPathPolicy::Unreachable => format!("{origin} injoignable"),
+        };
+        parts.push(path);
+    }
+    parts.join(" · ")
+}
+
+/// Settings “Tester DNS”: resolver + egress IP + optional portal `/` vs deep-path.
+pub async fn probe_network_diag(dns_host: &str, portal_origin: Option<&str>) -> String {
+    format!(
+        "{} · {}",
+        probe_dns(dns_host).await,
+        probe_egress_and_path(portal_origin).await
+    )
 }
 
 /// Quick connectivity probe for settings UI (does not throw).

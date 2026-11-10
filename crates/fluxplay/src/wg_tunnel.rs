@@ -64,6 +64,13 @@ pub async fn probe_dns(host: &str) -> String {
     }
 }
 
+/// Settings probe: DNS (+ tunnel if up) + public egress + portal path policy.
+pub async fn probe_network_diag(host: &str, portal_origin: Option<String>) -> String {
+    let dns = probe_dns(host).await;
+    let rest = fluxplay_providers::probe_egress_and_path(portal_origin.as_deref()).await;
+    format!("{dns} · {rest}")
+}
+
 /// Rewrite `Endpoint = hostname:port` → IP using bootstrap DNS (profile `DNS=`).
 async fn prepare_conf_with_bootstrap(conf: &str, bootstrap_dns: &str) -> Result<String, String> {
     let mut out = String::with_capacity(conf.len() + 32);

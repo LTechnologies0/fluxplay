@@ -327,7 +327,7 @@ impl XtreamClient {
         ))
     }
 
-    /// After TCP RST on player_api, distinguish dead host vs Wi‑Fi/FAI path block.
+    /// After TCP RST on player_api, distinguish dead host vs filtered-egress path block.
     async fn remap_path_policy_err(&self, e: ProviderError) -> ProviderError {
         let s = e.to_string().to_ascii_lowercase();
         let looks_rst = s.contains("reset")
